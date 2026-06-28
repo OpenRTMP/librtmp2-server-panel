@@ -1,25 +1,63 @@
 services:
-  librtmp2-panel:
+  panel:
     build: .
-    image: librtmp2-server-panel:latest
+    image: ghcr.io/OpenRTMP/librtmp2-server-panel:latest
     container_name: librtmp2-server-panel
     restart: unless-stopped
     environment:
-      - LRTMP2_API_URL=http://librtmp2-server:8080
-      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN}
-      - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-your-domain-or-ip}
+      - LRTMP2_API_URL=http://server:8080
+      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
+      - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-localhost}
       - LRTMP2_RTMP_PORT=1935
       - LRTMP2_APP=live
       - REQUIRE_LOGIN=True
       - USERNAME=${USERNAME:-admin}
-      - PASSWORD=${PASSWORD}
-      - SECRET_KEY=${SECRET_KEY}
+      - PASSWORD=${PASSWORD:?Set PASSWORD in .env}
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
       - PANEL_DB_PATH=/data/panel.db
-      - WERKZEUG_RUN_MAIN=true
     volumes:
       - panel-data:/data
     ports:
       - "8000:8000"
+    networks:
+      - openrtmp
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  server:
+    build: ../librtmp2-server
+    image: ghcr.io/OpenRTMP/librtmp2-server:latest
+    container_name: librtmp2-server
+    restart: unless-stopped
+    environment:
+      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
+      - LRTMP2_HTTP_BIND=0.0.0.0:8080
+      - LRTMP2_RTMP_BIND=0.0.0.0:1935
+      - LRTMP2_LOG_LEVEL=2
+      - LRTMP2_DB_PATH=/data/server.db
+    volumes:
+      - server-data:/data
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+    networks:
+      - openrtmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   panel-data:
+  server-data:
+
+networks:
+  openrtmp:
+    driver: bridge
