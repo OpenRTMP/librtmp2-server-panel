@@ -1,0 +1,45 @@
+* {
+    font-family: 'Roboto', Arial, sans-serif;
+}
+body.dark {
+    background: #121212;
+    color: #eee;
+}
+.bg-dark, .accordion-button.bg-dark {
+    background: #222 !important;
+    color: #eee !important;
+}
+.btn-primary, .btn-success, .btn-danger {
+    border: none;
+}
+.blur-text {
+    filter: blur(4px);
+    cursor: pointer;
+    transition: filter 0.3s ease;
+    -webkit-user-select: none;
+    user-select: none;
+    padding: 2px 4px;
+    border-radius: 4px;
+    display: inline-block;
+}
+.blur-text:focus,
+.blur-text:hover {
+    filter: none;
+    -webkit-user-select: none;
+    user-select: none;
+    outline: none;
+}
+.copy-feedback {
+    color: #0cac0c;
+    margin-left: 8px;
+    margin-right: 18px;
+    font-weight: bold;
+    display: none;
+}
+.copy-feedback.visible {
+    display: inline;
+}
+[id^="stats-"] p {
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+}

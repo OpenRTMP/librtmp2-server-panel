@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block title %}Create Stream{% endblock %}
+{% block content %}
+<div class="mx-auto" style="max-width: 600px;">
+    <h1 class="mb-4">Create Stream</h1>
+    <form method="post" autocomplete="off">
+        <div class="mb-4">
+            <label for="id" class="form-label fw-bold">Stream ID</label>
+            <input type="text" class="form-control form-control-lg" id="id" name="id" placeholder="auto-generated if empty">
+        </div>
+        <div class="mb-4">
+            <label for="name" class="form-label fw-bold">Display Name</label>
+            <input type="text" class="form-control form-control-lg" id="name" name="name">
+        </div>
+        <div class="mb-4">
+            <label for="app" class="form-label fw-bold">RTMP App</label>
+            <input type="text" class="form-control form-control-lg" id="app" name="app" value="{{ default_app }}">
+        </div>
+        <div class="mb-3 d-grid">
+            <button type="submit" class="btn btn-primary btn-lg">Create</button>
+        </div>
+        {% if error %}
+        <div class="alert alert-danger mt-3">{{ error }}</div>
+        {% endif %}
+    </form>
+    <a href="{{ url_for('index') }}" class="btn btn-outline-light mt-2">Back</a>
+</div>
+{% endblock %}
