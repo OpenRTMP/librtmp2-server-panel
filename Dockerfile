@@ -7,8 +7,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /data
+RUN mkdir -p /data && adduser -D -h /app appuser && chown -R appuser:appuser /app /data
 ENV PANEL_DB_PATH=/data/panel.db
+
+USER appuser
 
 EXPOSE 8000
 

@@ -1,7 +1,12 @@
+import hmac
 import secrets
 from functools import wraps
+from datetime import datetime
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, abort
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect
 
 from config import Config
 from store import Store
@@ -12,6 +17,24 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    # CSRF protection for all POST forms
+    csrf = CSRFProtect(app)
+
+    # Rate limiting: 100/min default, 5/min for login
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=app,
+        default_limits=["100 per minute"],
+        storage_uri="memory://",
+    )
+
+    # Secure session cookie settings
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+    )
+
     store = Store(app.config["PANEL_DB_PATH"])
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
 
@@ -21,7 +44,6 @@ def create_app():
             if app.config["REQUIRE_LOGIN"] and not session.get("logged_in"):
                 return redirect(url_for("login"))
             return view_func(*args, **kwargs)
-
         return wrapped
 
     def build_urls(stream):
@@ -36,13 +58,19 @@ def create_app():
         }
 
     @app.route("/login", methods=["GET", "POST"])
+    @limiter.limit("5 per minute")
     def login():
         error = None
         if request.method == "POST":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            if username == app.config["USERNAME"] and password == app.config["PASSWORD"]:
+            # Timing-safe comparison to prevent timing attacks
+            user_ok = hmac.compare_digest(username, app.config["USERNAME"])
+            pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
+            if user_ok and pass_ok:
+                session.clear()
                 session["logged_in"] = True
+                session["_csrf_token"] = secrets.token_hex(32)
                 return redirect(url_for("index"))
             error = "Invalid credentials"
         return render_template("login.html", error=error)

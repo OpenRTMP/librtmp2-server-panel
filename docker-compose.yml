@@ -6,15 +6,16 @@ services:
     restart: unless-stopped
     environment:
       - LRTMP2_API_URL=http://librtmp2-server:8080
-      - LRTMP2_API_TOKEN=change-me-to-a-secure-token
-      - LRTMP2_DOMAIN=your-domain-or-ip
+      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN}
+      - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-your-domain-or-ip}
       - LRTMP2_RTMP_PORT=1935
       - LRTMP2_APP=live
       - REQUIRE_LOGIN=True
-      - USERNAME=admin
-      - PASSWORD=password
-      - SECRET_KEY=change-me-to-a-random-value
+      - USERNAME=${USERNAME:-admin}
+      - PASSWORD=${PASSWORD}
+      - SECRET_KEY=${SECRET_KEY}
       - PANEL_DB_PATH=/data/panel.db
+      - WERKZEUG_RUN_MAIN=true
     volumes:
       - panel-data:/data
     ports:

@@ -4,6 +4,7 @@
 <div class="mx-auto" style="max-width: 600px;">
     <h1 class="mb-4">Create Stream</h1>
     <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="mb-4">
             <label for="id" class="form-label fw-bold">Stream ID</label>
             <input type="text" class="form-control form-control-lg" id="id" name="id" placeholder="auto-generated if empty">

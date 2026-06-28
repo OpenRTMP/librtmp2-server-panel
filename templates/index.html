@@ -52,6 +52,7 @@
                 </div>
 
                 <form method="post" action="{{ url_for('delete_stream', stream_id=stream.id) }}" class="mt-3">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-danger">Delete Stream</button>
                 </form>
             </div>

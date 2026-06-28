@@ -3,6 +3,7 @@
 {% block content %}
 <form method="post" class="mt-5 p-4 bg-secondary bg-opacity-10 rounded" style="max-width: 400px; margin:auto">
     <h2 class="mb-4">Login</h2>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     {% if error %}
         <div class="alert alert-danger">{{ error }}</div>
     {% endif %}
