@@ -4,51 +4,21 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run config validation
-        env:
-          SECRET_KEY: test-secret-key-for-ci-only-32chars
-          PASSWORD: test-password-for-ci
-          LRTMP2_API_TOKEN: test-api-token-for-ci
-        run: python -c "from config import Config; print('Config OK')"
-
   build:
-    name: build & push (${{ matrix.platform }})
-    needs: test
+    name: build (${{ matrix.platform }})
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     permissions:
       packages: write
       contents: read
     strategy:
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-          - linux/arm/v7
+        platform: [linux/amd64, linux/arm64]
     steps:
       - uses: actions/checkout@v7
 
@@ -70,11 +40,6 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -84,5 +49,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

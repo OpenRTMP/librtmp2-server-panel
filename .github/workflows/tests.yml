@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate config loading
+        env:
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+          LRTMP2_API_TOKEN: test-api-token-for-ci-only
+        run: python -c "from config import Config; print('Config OK')"
