@@ -1,4 +1,4 @@
-FROM python:3.12-alpine AS builder
+FROM python:alpine AS builder
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ RUN apk add --no-cache gcc musl-dev libffi-dev openssl-dev
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-FROM python:3.12-alpine
+FROM python:alpine
 
 WORKDIR /app
 
