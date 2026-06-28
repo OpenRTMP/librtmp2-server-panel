@@ -1,6 +1,6 @@
 # librtmp2-server-panel
 
-A web-based control panel for [librtmp2-server](https://github.com/OpenRTMP/librtmp2-server), inspired by [slspanel-docker](https://github.com/AlexanderWagnerDev/slspanel-docker). Manage streams, copy publish/play URLs, and view live stats through a simple UI.
+A web-based control panel for [librtmp2-server](https://github.com/OpenRTMP/librtmp2-server). Manage streams, copy publish/play URLs, and view live stats through a simple UI.
 
 ## Why a local database?
 
