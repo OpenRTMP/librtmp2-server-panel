@@ -2,10 +2,8 @@ FROM python:alpine
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p /data && adduser -D -h /app appuser && chown -R appuser:appuser /app /data
 ENV PANEL_DB_PATH=/data/panel.db
