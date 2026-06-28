@@ -1,0 +1,128 @@
+document.addEventListener('DOMContentLoaded', function () {
+    initializeStats();
+});
+
+async function copyToClipboard(element) {
+    const text = element.getAttribute('data-url');
+    try {
+        await navigator.clipboard.writeText(text);
+        showCopyFeedback(element, 'Copied');
+    } catch (err) {
+        copyToClipboardFallback(text, element);
+    }
+}
+
+function copyToClipboardFallback(text, element) {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    textArea.style.cssText = 'position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent;opacity:0;';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    try {
+        const successful = document.execCommand('copy');
+        showCopyFeedback(element, successful ? 'Copied' : 'Copy failed');
+    } catch (err) {
+        showCopyFeedback(element, 'Copy failed');
+    } finally {
+        document.body.removeChild(textArea);
+    }
+}
+
+function showCopyFeedback(element, text) {
+    const feedback = element.nextElementSibling;
+    if (feedback) {
+        feedback.textContent = text;
+        feedback.classList.add('visible');
+        setTimeout(() => {
+            feedback.textContent = '';
+            feedback.classList.remove('visible');
+        }, 2000);
+    }
+}
+
+function initializeStats() {
+    const statsContainers = document.querySelectorAll('[id^="stats-"]');
+    if (statsContainers.length === 0) {
+        return;
+    }
+    const tick = () => statsContainers.forEach(container => {
+        const streamId = container.dataset.streamId;
+        if (streamId) {
+            loadStats(streamId);
+        }
+    });
+    tick();
+    setInterval(tick, 3000);
+}
+
+function loadStats(streamId) {
+    const statsContainer = document.getElementById(`stats-${streamId}`);
+    if (!statsContainer) {
+        return;
+    }
+    fetch(`/streams/${streamId}/stats.json`)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            return response.json();
+        })
+        .then(data => {
+            if (data.error) {
+                statsContainer.innerHTML = `<p class="text-danger">${data.error}</p>`;
+                return;
+            }
+            const streams = data.streams || [];
+            if (streams.length === 0) {
+                statsContainer.innerHTML = `<p class="text-muted"><em>Stream offline</em></p>`;
+                return;
+            }
+            const s = streams[0];
+            const video = s.video || {};
+            statsContainer.innerHTML = `
+                <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
+                    <h6 class="mb-2">Stream Statistics</h6>
+                    <div class="row g-2">
+                        <div class="col-md-4 col-6">
+                            <p>Bitrate:</p>
+                            <strong>${(s.bitrate_kbps || 0).toFixed ? s.bitrate_kbps.toFixed(1) : s.bitrate_kbps} kbps</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Uptime:</p>
+                            <strong>${formatUptime(s.uptime || 0)}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Codec:</p>
+                            <strong>${video.codec || 'n/a'}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Resolution:</p>
+                            <strong>${video.width || 0}x${video.height || 0}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>FPS:</p>
+                            <strong>${video.fps || 0}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Players:</p>
+                            <strong>${(data.summary || {}).players || 0}</strong>
+                        </div>
+                    </div>
+                </div>
+            `;
+        })
+        .catch(() => {
+            statsContainer.innerHTML = `<p><em>Stats not available</em></p>`;
+        });
+}
+
+function formatUptime(seconds) {
+    if (!seconds) return '00:00:00';
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    const time = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    return days > 0 ? `${days}d ${time}` : time;
+}
