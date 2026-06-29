@@ -89,13 +89,18 @@ function loadStats(streamId) {
             }
             const s = streams[0];
             const video = s.video || {};
+            const bitrate = Number(s.bitrate_kbps);
+            const width = Number(video.width);
+            const height = Number(video.height);
+            const fps = Number(video.fps);
+            const players = Number((data.summary || {}).players);
             statsContainer.innerHTML = `
                 <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
                     <h6 class="mb-2">Stream Statistics</h6>
                     <div class="row g-2">
                         <div class="col-md-4 col-6">
                             <p>Bitrate:</p>
-                            <strong>${(s.bitrate_kbps || 0).toFixed ? s.bitrate_kbps.toFixed(1) : s.bitrate_kbps} kbps</strong>
+                            <strong>${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps</strong>
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Uptime:</p>
@@ -107,15 +112,15 @@ function loadStats(streamId) {
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Resolution:</p>
-                            <strong>${video.width || 0}x${video.height || 0}</strong>
+                            <strong>${Number.isFinite(width) ? width : 0}x${Number.isFinite(height) ? height : 0}</strong>
                         </div>
                         <div class="col-md-4 col-6">
                             <p>FPS:</p>
-                            <strong>${video.fps || 0}</strong>
+                            <strong>${Number.isFinite(fps) ? fps : 0}</strong>
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Players:</p>
-                            <strong>${(data.summary || {}).players || 0}</strong>
+                            <strong>${Number.isFinite(players) ? players : 0}</strong>
                         </div>
                     </div>
                 </div>
