@@ -56,6 +56,15 @@ function initializeStats() {
     setInterval(tick, 3000);
 }
 
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function loadStats(streamId) {
     const statsContainer = document.getElementById(`stats-${streamId}`);
     if (!statsContainer) {
@@ -70,7 +79,7 @@ function loadStats(streamId) {
         })
         .then(data => {
             if (data.error) {
-                statsContainer.innerHTML = `<p class="text-danger">${data.error}</p>`;
+                statsContainer.innerHTML = `<p class="text-danger">${escapeHtml(data.error)}</p>`;
                 return;
             }
             const streams = data.streams || [];
@@ -94,7 +103,7 @@ function loadStats(streamId) {
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Codec:</p>
-                            <strong>${video.codec || 'n/a'}</strong>
+                            <strong>${escapeHtml(video.codec || 'n/a')}</strong>
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Resolution:</p>
