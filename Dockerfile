@@ -17,12 +17,12 @@ COPY --from=builder /install /usr/local
 COPY . .
 
 RUN mkdir -p /data && \
-    adduser -D -h /app appuser && \
-    chown -R appuser:appuser /app /data
+    adduser -D -h /app openrtmp && \
+    chown -R openrtmp:openrtmp /app /data
 
 ENV PANEL_DB_PATH=/data/panel.db
 
-USER appuser
+USER openrtmp
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
