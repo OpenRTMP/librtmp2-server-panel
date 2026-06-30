@@ -17,7 +17,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest
 
       - name: Validate config loading
         env:
@@ -25,3 +25,10 @@ jobs:
           PASSWORD: test-password-for-ci-only
           LRTMP2_API_TOKEN: test-api-token-for-ci-only
         run: python -c "from config import Config; print('Config OK')"
+
+      - name: Run tests
+        env:
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+          LRTMP2_API_TOKEN: test-api-token-for-ci-only
+        run: pytest -q
