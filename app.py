@@ -107,9 +107,13 @@ def create_app():
                 except sqlite3.IntegrityError:
                     try:
                         client.delete_stream(result["id"])
-                    except Lrtmp2ApiError:
-                        pass
-                    error = f"Stream ID '{result['id']}' already exists"
+                    except Lrtmp2ApiError as rollback_exc:
+                        error = (
+                            f"Stream ID '{result['id']}' already exists and rollback failed "
+                            f"({rollback_exc}). The stream may still be running on the server."
+                        )
+                    else:
+                        error = f"Stream ID '{result['id']}' already exists"
                 else:
                     return redirect(url_for("index"))
             except Lrtmp2ApiError as exc:

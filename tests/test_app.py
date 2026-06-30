@@ -8,7 +8,8 @@ os.environ.setdefault("PASSWORD", "test-password-for-ci-only")
 os.environ.setdefault("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
 
 
-def test_session_cookie_secure_defaults_false():
+def test_session_cookie_secure_defaults_false(monkeypatch):
+    monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
     import importlib
     import config
 
@@ -42,9 +43,9 @@ def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
         mock_client = mock_client_cls.return_value
         mock_client.create_stream.return_value = mock_result
 
-        import importlib
         import app as app_module
 
+        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
         application = app_module.create_app()
         application.config["TESTING"] = True
         application.config["WTF_CSRF_ENABLED"] = False
@@ -85,9 +86,9 @@ def test_delete_stream_keeps_local_row_when_api_fails(tmp_path, monkeypatch):
         mock_client = mock_client_cls.return_value
         mock_client.delete_stream.side_effect = Lrtmp2ApiError("server down")
 
-        import importlib
         import app as app_module
 
+        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
         application = app_module.create_app()
         application.config["TESTING"] = True
         application.config["WTF_CSRF_ENABLED"] = False
