@@ -59,3 +59,6 @@ class Config:
     LRTMP2_APP = os.environ.get("LRTMP2_APP", "live")
 
     PANEL_DB_PATH = os.environ.get("PANEL_DB_PATH", "panel.db")
+
+    # Only enable Secure cookies when the panel is served over HTTPS.
+    SESSION_COOKIE_SECURE = _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)

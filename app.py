@@ -1,7 +1,7 @@
 import hmac
 import secrets
+import sqlite3
 from functools import wraps
-from datetime import datetime
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, abort
 from flask_limiter import Limiter
@@ -28,9 +28,8 @@ def create_app():
         storage_uri="memory://",
     )
 
-    # Secure session cookie settings
+    # Secure session cookie settings (SESSION_COOKIE_SECURE defaults to False for HTTP)
     app.config.update(
-        SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
     )
@@ -96,15 +95,27 @@ def create_app():
             app_name = request.form.get("app") or app.config["LRTMP2_APP"]
             try:
                 result = client.create_stream(stream_id, name, app_name)
-                store.add_stream(
-                    stream_id=result["id"],
-                    name=result["name"],
-                    app=result["app"],
-                    publish_key=result["publish_key"],
-                    play_key=result["play_key"],
-                    stats_key=result["stats_key"],
-                )
-                return redirect(url_for("index"))
+                try:
+                    store.add_stream(
+                        stream_id=result["id"],
+                        name=result["name"],
+                        app=result["app"],
+                        publish_key=result["publish_key"],
+                        play_key=result["play_key"],
+                        stats_key=result["stats_key"],
+                    )
+                except sqlite3.IntegrityError:
+                    try:
+                        client.delete_stream(result["id"])
+                    except Lrtmp2ApiError as rollback_exc:
+                        error = (
+                            f"Stream ID '{result['id']}' already exists and rollback failed "
+                            f"({rollback_exc}). The stream may still be running on the server."
+                        )
+                    else:
+                        error = f"Stream ID '{result['id']}' already exists"
+                else:
+                    return redirect(url_for("index"))
             except Lrtmp2ApiError as exc:
                 error = str(exc)
         return render_template(
@@ -119,7 +130,7 @@ def create_app():
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError:
-            pass
+            return redirect(url_for("index"))
         store.delete_stream(stream_id)
         return redirect(url_for("index"))
 
