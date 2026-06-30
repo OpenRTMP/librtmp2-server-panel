@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 import requests
 
 
@@ -41,7 +43,7 @@ class Lrtmp2Client:
 
     def delete_stream(self, stream_id):
         resp = requests.delete(
-            f"{self.base_url}/api/v1/streams/{stream_id}",
+            f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}",
             headers=self._headers(),
             timeout=self.timeout,
         )

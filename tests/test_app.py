@@ -103,3 +103,41 @@ def test_delete_stream_keeps_local_row_when_api_fails(tmp_path, monkeypatch):
         r = client.post("/streams/keep-me/delete")
         assert r.status_code == 302
         assert store.get_stream("keep-me") is not None
+
+
+def test_create_stream_rejects_path_unsafe_stream_id(tmp_path, monkeypatch):
+    db_path = tmp_path / "panel.db"
+    monkeypatch.setenv("PANEL_DB_PATH", str(db_path))
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/new",
+            data={"id": "bad/id", "name": "Bad", "app": "live"},
+        )
+        assert r.status_code == 200
+        assert b"Stream ID must be" in r.data
+        mock_client_cls.return_value.create_stream.assert_not_called()
+
+
+def test_delete_stream_url_encodes_stream_id():
+    from lrtmp2_client import Lrtmp2Client
+
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete:
+        mock_delete.return_value.ok = True
+        client.delete_stream("a/b?c")
+
+    assert mock_delete.call_args.args[0] == "http://example.test/api/v1/streams/a%2Fb%3Fc"
