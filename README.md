@@ -13,7 +13,7 @@ Copy `.env.example` to `.env` and adjust:
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `LRTMP2_API_URL` | Base URL of librtmp2-server's HTTP API (`http.bind`) | Yes |
-| `LRTMP2_API_TOKEN` | Must match `auth.api_token` in librtmp2-server's config | Yes |
+| `LRTMP2_API_TOKEN` | Token printed by `librtmp2-server` on first startup and stored in its SQLite DB | Yes |
 | `LRTMP2_DOMAIN` | Public host/IP clients use to reach the RTMP listener | Yes |
 | `LRTMP2_RTMP_PORT` | RTMP port (`rtmp.bind` port), default `1935` | No |
 | `LRTMP2_APP` | Default RTMP app name for new streams, default `live` | No |
