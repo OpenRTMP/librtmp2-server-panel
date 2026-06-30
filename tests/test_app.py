@@ -46,6 +46,7 @@ def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
         import app as app_module
 
         monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
         application.config["WTF_CSRF_ENABLED"] = False
@@ -89,6 +90,7 @@ def test_delete_stream_keeps_local_row_when_api_fails(tmp_path, monkeypatch):
         import app as app_module
 
         monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
         application.config["WTF_CSRF_ENABLED"] = False
