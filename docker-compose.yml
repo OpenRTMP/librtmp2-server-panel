@@ -1,11 +1,12 @@
 services:
-  panel:
+  openrtmp-panel:
     build: .
     image: ghcr.io/OpenRTMP/librtmp2-server-panel:latest
     container_name: librtmp2-server-panel
     restart: unless-stopped
     environment:
-      - LRTMP2_API_URL=http://server:8080
+      - LRTMP2_API_URL=http://openrtmp-server:8080
+      - LRTMP2_STATS_URL=${LRTMP2_STATS_URL:-http://localhost:8080}
       - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
       - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-localhost}
       - LRTMP2_RTMP_PORT=1935
@@ -27,7 +28,7 @@ services:
       timeout: 5s
       retries: 3
 
-  server:
+  openrtmp-server:
     build: ../librtmp2-server
     image: ghcr.io/OpenRTMP/librtmp2-server:latest
     container_name: librtmp2-server
@@ -36,7 +37,6 @@ services:
       - LRTMP2_HTTP_BIND=0.0.0.0:8080
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
-      - LRTMP2_DB_PATH=/data/server.db
     volumes:
       - server-data:/data
     ports:

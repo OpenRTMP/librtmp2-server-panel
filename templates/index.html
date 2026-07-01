@@ -9,6 +9,10 @@
 <div class="alert alert-danger">{{ api_error }}</div>
 {% endif %}
 
+{% if flash_error is defined and flash_error %}
+<div class="alert alert-danger">{{ flash_error }}</div>
+{% endif %}
+
 {% if streams %}
 <div class="accordion accordion-flush" id="streamAccordion">
     {% for stream in streams %}

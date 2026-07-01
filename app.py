@@ -41,6 +41,7 @@ def create_app():
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
+        SESSION_COOKIE_SECURE=app.config["SESSION_COOKIE_SECURE"],
     )
 
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
@@ -64,7 +65,7 @@ def create_app():
                 f"rtmp://{domain}:{port}/{app_name}/{stream.get('play_key', '')}"
             ),
             "stats_url": (
-                f"{app.config['LRTMP2_API_URL']}/stats?"
+                f"{app.config['LRTMP2_STATS_URL']}/stats?"
                 f"{urlencode({'key': stream.get('stats_key', '')})}"
             ),
         }
@@ -94,13 +95,19 @@ def create_app():
     @app.route("/")
     @login_required
     def index():
+        flash_error = session.pop("flash_error", None)
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
-            return render_template("index.html", streams=[], api_error=str(exc))
+            return render_template(
+                "index.html",
+                streams=[],
+                api_error=str(exc),
+                flash_error=flash_error,
+            )
         for stream in streams:
             stream.update(build_urls(stream))
-        return render_template("index.html", streams=streams)
+        return render_template("index.html", streams=streams, flash_error=flash_error)
 
     @app.route("/streams/new", methods=["GET", "POST"])
     @login_required

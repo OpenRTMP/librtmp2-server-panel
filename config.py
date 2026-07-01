@@ -53,6 +53,8 @@ class Config:
     PASSWORD = os.environ.get("PASSWORD", "")
 
     LRTMP2_API_URL = os.environ.get("LRTMP2_API_URL", "http://localhost:8080").rstrip("/")
+    # Browser-reachable HTTP API base URL for copied stats links (defaults to LRTMP2_API_URL).
+    LRTMP2_STATS_URL = os.environ.get("LRTMP2_STATS_URL", LRTMP2_API_URL).rstrip("/")
     LRTMP2_API_TOKEN = os.environ["LRTMP2_API_TOKEN"]
 
     LRTMP2_DOMAIN = os.environ.get("LRTMP2_DOMAIN", "localhost")

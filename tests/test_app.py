@@ -6,6 +6,9 @@ import pytest
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
 os.environ.setdefault("PASSWORD", "test-password-for-ci-only")
 os.environ.setdefault("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
+# Force panel login credentials for isolated tests (override host .env).
+os.environ["USERNAME"] = "admin"
+os.environ["PASSWORD"] = "test-password-for-ci-only"
 
 
 def test_session_cookie_secure_defaults_false(monkeypatch):
@@ -142,6 +145,10 @@ def test_delete_stream_surfaces_api_error(monkeypatch):
 
         r = client.post("/streams/gone/delete")
         assert r.status_code == 302
+
+        r2 = client.get("/")
+        assert r2.status_code == 200
+        assert b"server down" in r2.data
 
 
 def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):

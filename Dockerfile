@@ -20,8 +20,6 @@ RUN mkdir -p /data && \
     adduser -D -h /app openrtmp && \
     chown -R openrtmp:openrtmp /app /data
 
-ENV PANEL_DB_PATH=/data/panel.db
-
 USER openrtmp
 EXPOSE 8000
 

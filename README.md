@@ -10,7 +10,8 @@ Copy `.env.example` to `.env` and adjust:
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `LRTMP2_API_URL` | Base URL of librtmp2-server's HTTP API (`http.bind`) | Yes |
+| `LRTMP2_API_URL` | Base URL of librtmp2-server's HTTP API (`http.bind`; server-side / internal) | Yes |
+| `LRTMP2_STATS_URL` | Browser-reachable HTTP API URL for copied stats links (defaults to `LRTMP2_API_URL`) | No |
 | `LRTMP2_API_TOKEN` | Bearer token from librtmp2-server (printed once on first server startup, stored in its SQLite DB) | Yes |
 | `LRTMP2_DOMAIN` | Public host/IP clients use to reach the RTMP listener | Yes |
 | `LRTMP2_RTMP_PORT` | RTMP port (`rtmp.bind` port), default `1935` | No |
@@ -49,5 +50,5 @@ python3 app.py
 
 - Create/delete streams against librtmp2-server's REST API
 - One-click copy for publish URL, stream key, play URL, and stats URL
-- Live per-stream stats (bitrate, resolution, codec, uptime) polled from `/stats?key=...`
+- Live per-stream stats (bitrate, resolution, codec, uptime, RTT) polled from `/stats?key=...`
 - Optional login gate for the whole panel

@@ -90,10 +90,21 @@ function loadStats(streamId) {
             const s = streams[0];
             const video = s.video || {};
             const bitrate = Number(s.bitrate_kbps);
+            const rtt = Number(s.rtt_ms);
             const width = Number(video.width);
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
+            const playerRows = (data.players || [])
+                .map((pl, index) => {
+                    const plRtt = Number(pl.rtt_ms);
+                    if (!Number.isFinite(plRtt) || plRtt <= 0) {
+                        return '';
+                    }
+                    const label = data.players.length > 1 ? `Player ${index + 1} RTT` : 'Player RTT';
+                    return `<div class="col-md-4 col-6"><p>${escapeHtml(label)}:</p><strong>${plRtt.toFixed(1)} ms</strong></div>`;
+                })
+                .join('');
             statsContainer.innerHTML = `
                 <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
                     <h6 class="mb-2">Stream Statistics</h6>
@@ -101,6 +112,10 @@ function loadStats(streamId) {
                         <div class="col-md-4 col-6">
                             <p>Bitrate:</p>
                             <strong>${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Publisher RTT:</p>
+                            <strong>${Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a'}</strong>
                         </div>
                         <div class="col-md-4 col-6">
                             <p>Uptime:</p>
@@ -122,6 +137,7 @@ function loadStats(streamId) {
                             <p>Players:</p>
                             <strong>${Number.isFinite(players) ? players : 0}</strong>
                         </div>
+                        ${playerRows}
                     </div>
                 </div>
             `;
