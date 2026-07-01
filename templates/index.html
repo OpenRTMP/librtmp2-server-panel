@@ -5,6 +5,10 @@
 <a class="btn btn-outline-light mb-3" href="{{ url_for('logout') }}">Logout</a>
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
 
+{% if api_error is defined and api_error %}
+<div class="alert alert-danger">{{ api_error }}</div>
+{% endif %}
+
 {% if streams %}
 <div class="accordion accordion-flush" id="streamAccordion">
     {% for stream in streams %}
@@ -12,7 +16,7 @@
         <h2 class="accordion-header" id="heading{{ loop.index }}">
             <button class="accordion-button collapsed bg-dark text-light" type="button" data-bs-toggle="collapse"
                 data-bs-target="#collapse{{ loop.index }}">
-                <strong>{{ stream.name }}</strong>&nbsp;<span class="text-muted">({{ stream.app }})</span>
+                <strong>{{ stream.name }}</strong>&nbsp;<span class="text-muted">({{ stream.id }} / {{ stream.app }})</span>
             </button>
         </h2>
         <div id="collapse{{ loop.index }}" class="accordion-collapse collapse" data-bs-parent="#streamAccordion">

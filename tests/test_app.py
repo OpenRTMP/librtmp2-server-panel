@@ -42,13 +42,46 @@ def test_password_not_required_when_login_disabled(monkeypatch):
     importlib.reload(config)
 
 
-def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
-    db_path = tmp_path / "panel.db"
-    monkeypatch.setenv("PANEL_DB_PATH", str(db_path))
+def test_index_lists_streams_from_api(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.list_streams.return_value = [
+            {
+                "id": "s1",
+                "name": "Stream One",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
 
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"Stream One" in r.data
+        assert b"s1" in r.data
+        assert b"pub_k" in r.data
+        mock_client.list_streams.assert_called_once()
+
+
+def test_create_stream_shows_keys_once(monkeypatch):
     mock_result = {
-        "id": "dup-stream",
-        "name": "Dup",
+        "id": "new-stream",
+        "name": "New",
         "app": "live",
         "publish_key": "pk",
         "play_key": "plk",
@@ -61,7 +94,6 @@ def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
 
         import app as app_module
 
-        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
@@ -72,40 +104,32 @@ def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
             data={"username": "admin", "password": os.environ["PASSWORD"]},
         )
 
-        r1 = client.post(
+        r = client.post(
             "/streams/new",
-            data={"id": "dup-stream", "name": "First", "app": "live"},
+            data={"id": "new-stream", "name": "New", "app": "live"},
         )
-        assert r1.status_code == 302
+        assert r.status_code == 302
+        assert "/streams/created" in r.headers["Location"]
 
-        r2 = client.post(
-            "/streams/new",
-            data={"id": "dup-stream", "name": "Second", "app": "live"},
-        )
+        r2 = client.get("/streams/created")
         assert r2.status_code == 200
-        assert b"already exists" in r2.data
-        assert mock_client.create_stream.call_count == 2
-        mock_client.delete_stream.assert_called_once_with("dup-stream")
+        assert b"pk" in r2.data
+        assert b"plk" in r2.data
+
+        r3 = client.get("/streams/created")
+        assert r3.status_code == 302
 
 
-def test_delete_stream_keeps_local_row_when_api_fails(tmp_path, monkeypatch):
-    db_path = tmp_path / "panel.db"
-    monkeypatch.setenv("PANEL_DB_PATH", str(db_path))
-
-    from store import Store
-
-    store = Store(str(db_path))
-    store.add_stream("keep-me", "Keep", "live", "pk", "plk", "stk")
-
+def test_delete_stream_surfaces_api_error(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         from lrtmp2_client import Lrtmp2ApiError
 
         mock_client = mock_client_cls.return_value
+        mock_client.list_streams.return_value = []
         mock_client.delete_stream.side_effect = Lrtmp2ApiError("server down")
 
         import app as app_module
 
-        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
@@ -116,19 +140,14 @@ def test_delete_stream_keeps_local_row_when_api_fails(tmp_path, monkeypatch):
             data={"username": "admin", "password": os.environ["PASSWORD"]},
         )
 
-        r = client.post("/streams/keep-me/delete")
+        r = client.post("/streams/gone/delete")
         assert r.status_code == 302
-        assert store.get_stream("keep-me") is not None
 
 
-def test_create_stream_rejects_path_unsafe_stream_id(tmp_path, monkeypatch):
-    db_path = tmp_path / "panel.db"
-    monkeypatch.setenv("PANEL_DB_PATH", str(db_path))
-
+def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         import app as app_module
 
-        monkeypatch.setattr(app_module.Config, "PANEL_DB_PATH", str(db_path))
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
@@ -157,3 +176,16 @@ def test_delete_stream_url_encodes_stream_id():
         client.delete_stream("a/b?c")
 
     assert mock_delete.call_args.args[0] == "http://example.test/api/v1/streams/a%2Fb%3Fc"
+
+
+def test_stream_stats_by_id_uses_bearer_auth():
+    from lrtmp2_client import Lrtmp2Client
+
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.get") as mock_get:
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.return_value = {"streams": []}
+        client.stream_stats_by_id("mystream")
+
+    assert mock_get.call_args.kwargs["headers"]["Authorization"] == "Bearer tok"
+    assert mock_get.call_args.args[0] == "http://example.test/api/v1/streams/mystream/stats"

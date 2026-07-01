@@ -14,9 +14,6 @@ services:
       - USERNAME=${USERNAME:-admin}
       - PASSWORD=${PASSWORD:?Set PASSWORD in .env}
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
-      - PANEL_DB_PATH=/data/panel.db
-    volumes:
-      - panel-data:/data
     ports:
       - "8000:8000"
     networks:
@@ -36,7 +33,6 @@ services:
     container_name: librtmp2-server
     restart: unless-stopped
     environment:
-      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
       - LRTMP2_HTTP_BIND=0.0.0.0:8080
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
@@ -55,9 +51,9 @@ services:
       retries: 3
 
 volumes:
-  panel-data:
   server-data:
 
 networks:
   openrtmp:
     driver: bridge
+    enable_ipv6: true

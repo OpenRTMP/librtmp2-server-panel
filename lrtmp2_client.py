@@ -27,7 +27,8 @@ class Lrtmp2Client:
         resp = requests.get(
             f"{self.base_url}/api/v1/streams", headers=self._headers(), timeout=self.timeout
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise Lrtmp2ApiError(f"list_streams failed: HTTP {resp.status_code} {resp.text}")
         return resp.json()
 
     def create_stream(self, stream_id, name, app):
@@ -55,4 +56,16 @@ class Lrtmp2Client:
             f"{self.base_url}/stats", params={"key": stats_key}, timeout=self.timeout
         )
         resp.raise_for_status()
+        return resp.json()
+
+    def stream_stats_by_id(self, stream_id):
+        resp = requests.get(
+            f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        if not resp.ok:
+            raise Lrtmp2ApiError(
+                f"stream_stats_by_id failed: HTTP {resp.status_code} {resp.text}"
+            )
         return resp.json()

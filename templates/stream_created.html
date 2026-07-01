@@ -1,0 +1,50 @@
+{% extends 'base.html' %}
+{% block title %}Stream Created{% endblock %}
+{% block content %}
+<div class="mx-auto" style="max-width: 700px;">
+    <h1 class="mb-3">Stream Created</h1>
+    <div class="alert alert-success">
+        Stream created. You can copy the values below or find them anytime in the overview (hover to reveal).
+    </div>
+
+    <p><strong>ID:</strong> {{ stream.id }}</p>
+    <p><strong>Name:</strong> {{ stream.name }}</p>
+    <p><strong>App:</strong> {{ stream.app }}</p>
+
+    <h5 class="mt-4">Publish</h5>
+    <p><strong>Server URL:</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ stream.publish_url }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+    <p><strong>Stream Key:</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_key }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ stream.publish_key }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+
+    <h5 class="mt-4">Play</h5>
+    <p><strong>Play URL:</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.play_url }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ stream.play_url }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+
+    <h5 class="mt-4">Stats</h5>
+    <p><strong>Stats URL:</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.stats_url }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ stream.stats_url }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+
+    <a href="{{ url_for('index') }}" class="btn btn-primary mt-4">Back to Streams</a>
+</div>
+{% endblock %}

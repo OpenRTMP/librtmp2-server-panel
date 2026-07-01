@@ -31,7 +31,8 @@ def _validate_config():
     if not api_token or api_token == "change-me-to-a-secure-token":
         errors.append(
             "LRTMP2_API_TOKEN is not set or uses the placeholder. "
-            "Set a secure token."
+            "Copy the token printed by librtmp2-server on first startup "
+            "(stored in the server's SQLite database)."
         )
 
     if errors:
@@ -57,8 +58,6 @@ class Config:
     LRTMP2_DOMAIN = os.environ.get("LRTMP2_DOMAIN", "localhost")
     LRTMP2_RTMP_PORT = os.environ.get("LRTMP2_RTMP_PORT", "1935")
     LRTMP2_APP = os.environ.get("LRTMP2_APP", "live")
-
-    PANEL_DB_PATH = os.environ.get("PANEL_DB_PATH", "panel.db")
 
     # Only enable Secure cookies when the panel is served over HTTPS.
     SESSION_COOKIE_SECURE = _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)

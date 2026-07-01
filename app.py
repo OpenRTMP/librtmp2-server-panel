@@ -1,7 +1,6 @@
 import hmac
 import re
 import secrets
-import sqlite3
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -11,7 +10,6 @@ from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 
 from config import Config
-from store import Store
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 
 
@@ -31,10 +29,8 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    # CSRF protection for all POST forms
     csrf = CSRFProtect(app)
 
-    # Rate limiting: 100/min default, 5/min for login
     limiter = Limiter(
         key_func=get_remote_address,
         app=app,
@@ -42,13 +38,11 @@ def create_app():
         storage_uri="memory://",
     )
 
-    # Secure session cookie settings (SESSION_COOKIE_SECURE defaults to False for HTTP)
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
     )
 
-    store = Store(app.config["PANEL_DB_PATH"])
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
 
     def login_required(view_func):
@@ -65,9 +59,14 @@ def create_app():
         app_name = stream["app"]
         return {
             "publish_url": f"rtmp://{domain}:{port}/{app_name}",
-            "publish_key": stream["publish_key"],
-            "play_url": f"rtmp://{domain}:{port}/{app_name}/{stream['play_key']}",
-            "stats_url": f"{app.config['LRTMP2_API_URL']}/stats?{urlencode({'key': stream['stats_key']})}",
+            "publish_key": stream.get("publish_key", ""),
+            "play_url": (
+                f"rtmp://{domain}:{port}/{app_name}/{stream.get('play_key', '')}"
+            ),
+            "stats_url": (
+                f"{app.config['LRTMP2_API_URL']}/stats?"
+                f"{urlencode({'key': stream.get('stats_key', '')})}"
+            ),
         }
 
     @app.route("/login", methods=["GET", "POST"])
@@ -77,7 +76,6 @@ def create_app():
         if request.method == "POST":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            # Timing-safe comparison to prevent timing attacks
             user_ok = hmac.compare_digest(username, app.config["USERNAME"])
             pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
             if user_ok and pass_ok:
@@ -96,7 +94,12 @@ def create_app():
     @app.route("/")
     @login_required
     def index():
-        streams = [dict(s, **build_urls(s)) for s in store.list_streams()]
+        try:
+            streams = client.list_streams()
+        except Lrtmp2ApiError as exc:
+            return render_template("index.html", streams=[], api_error=str(exc))
+        for stream in streams:
+            stream.update(build_urls(stream))
         return render_template("index.html", streams=streams)
 
     @app.route("/streams/new", methods=["GET", "POST"])
@@ -120,27 +123,8 @@ def create_app():
             else:
                 try:
                     result = client.create_stream(stream_id, name, app_name)
-                    try:
-                        store.add_stream(
-                            stream_id=result["id"],
-                            name=result["name"],
-                            app=result["app"],
-                            publish_key=result["publish_key"],
-                            play_key=result["play_key"],
-                            stats_key=result["stats_key"],
-                        )
-                    except sqlite3.IntegrityError:
-                        try:
-                            client.delete_stream(result["id"])
-                        except Lrtmp2ApiError as rollback_exc:
-                            error = (
-                                f"Stream ID '{result['id']}' already exists and rollback failed "
-                                f"({rollback_exc}). The stream may still be running on the server."
-                            )
-                        else:
-                            error = f"Stream ID '{result['id']}' already exists"
-                    else:
-                        return redirect(url_for("index"))
+                    session["created_stream"] = result
+                    return redirect(url_for("stream_created"))
                 except Lrtmp2ApiError as exc:
                     error = str(exc)
         return render_template(
@@ -149,25 +133,30 @@ def create_app():
             default_app=app.config["LRTMP2_APP"],
         )
 
+    @app.route("/streams/created")
+    @login_required
+    def stream_created():
+        stream = session.pop("created_stream", None)
+        if not stream:
+            return redirect(url_for("index"))
+        stream = dict(stream, **build_urls(stream))
+        return render_template("stream_created.html", stream=stream)
+
     @app.route("/streams/<stream_id>/delete", methods=["POST"])
     @login_required
     def delete_stream(stream_id):
         try:
             client.delete_stream(stream_id)
-        except Lrtmp2ApiError:
-            return redirect(url_for("index"))
-        store.delete_stream(stream_id)
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/stats.json")
     @login_required
     def stream_stats(stream_id):
-        stream = store.get_stream(stream_id)
-        if not stream:
-            return jsonify({"error": "Stream not found"}), 404
         try:
-            return jsonify(client.stream_stats(stream["stats_key"]))
-        except Exception:
+            return jsonify(client.stream_stats_by_id(stream_id))
+        except Lrtmp2ApiError:
             return jsonify({"error": "Failed to fetch stats"}), 502
 
     return app
