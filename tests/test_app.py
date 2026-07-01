@@ -26,6 +26,17 @@ def test_session_cookie_secure_honors_env(monkeypatch):
     assert config.Config.SESSION_COOKIE_SECURE is True
 
 
+def test_config_loads_without_password_when_login_disabled(monkeypatch):
+    monkeypatch.setenv("REQUIRE_LOGIN", "false")
+    monkeypatch.delenv("PASSWORD", raising=False)
+    import importlib
+    import config
+
+    importlib.reload(config)
+    assert config.Config.REQUIRE_LOGIN is False
+    assert config.Config.PASSWORD == ""
+
+
 def test_create_stream_rolls_back_on_duplicate_id(tmp_path, monkeypatch):
     db_path = tmp_path / "panel.db"
     monkeypatch.setenv("PANEL_DB_PATH", str(db_path))

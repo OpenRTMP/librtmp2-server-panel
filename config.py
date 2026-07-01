@@ -49,7 +49,7 @@ class Config:
 
     REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), True)
     USERNAME = os.environ.get("USERNAME", "admin")
-    PASSWORD = os.environ["PASSWORD"]
+    PASSWORD = os.environ.get("PASSWORD", "")
 
     LRTMP2_API_URL = os.environ.get("LRTMP2_API_URL", "http://localhost:8080").rstrip("/")
     LRTMP2_API_TOKEN = os.environ["LRTMP2_API_TOKEN"]
