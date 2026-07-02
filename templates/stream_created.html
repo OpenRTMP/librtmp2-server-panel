@@ -28,13 +28,23 @@
     </p>
 
     <h5 class="mt-4">Play</h5>
+    {% for player in stream.get('players', []) %}
+    <p><strong>{{ player.name }}</strong></p>
     <p><strong>Play URL:</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.play_url }}"
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
               onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
-            {{ stream.play_url }}
+            {{ player.play_url }}
         </span>
         <span class="copy-feedback"></span>
     </p>
+    <p><strong>Play Key:</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ player.play_key }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+    {% endfor %}
 
     <h5 class="mt-4">Stats</h5>
     <p><strong>Stats URL:</strong>

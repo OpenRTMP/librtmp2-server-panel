@@ -58,12 +58,20 @@ def create_app():
         domain = app.config["LRTMP2_DOMAIN"]
         port = app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
+        publish_url = f"rtmp://{domain}:{port}/{app_name}"
+        players = stream.get("players") or []
+        for player in players:
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"
+        first_play_key = ""
+        if players:
+            first_play_key = players[0].get("play_key", "")
+        elif stream.get("play_key"):
+            first_play_key = stream["play_key"]
         return {
-            "publish_url": f"rtmp://{domain}:{port}/{app_name}",
+            "publish_url": publish_url,
             "publish_key": stream.get("publish_key", ""),
-            "play_url": (
-                f"rtmp://{domain}:{port}/{app_name}/{stream.get('play_key', '')}"
-            ),
+            "play_url": f"rtmp://{domain}:{port}/{app_name}/{first_play_key}",
+            "play_key": first_play_key,
             "stats_url": (
                 f"{app.config['LRTMP2_STATS_URL']}/stats?"
                 f"{urlencode({'key': stream.get('stats_key', '')})}"
@@ -165,6 +173,31 @@ def create_app():
             return redirect(url_for("index"))
         stream = dict(stream, **build_urls(stream))
         return render_template("stream_created.html", stream=stream)
+
+    @app.route("/streams/<stream_id>/players/new", methods=["POST"])
+    @login_required
+    def add_player(stream_id):
+        if not _is_valid_stream_id(stream_id):
+            session["flash_error"] = "Invalid stream ID"
+            return redirect(url_for("index"))
+        name = (request.form.get("name") or "").strip() or None
+        try:
+            client.create_player(stream_id, name=name)
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+        return redirect(url_for("index"))
+
+    @app.route("/streams/<stream_id>/players/<player_id>/delete", methods=["POST"])
+    @login_required
+    def delete_player(stream_id, player_id):
+        if not _is_valid_stream_id(stream_id):
+            session["flash_error"] = "Invalid stream ID"
+            return redirect(url_for("index"))
+        try:
+            client.delete_player(stream_id, player_id)
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+        return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/delete", methods=["POST"])
     @login_required

@@ -43,12 +43,39 @@
                 <span class="copy-feedback"></span><br><br>
 
                 <h5>Play</h5>
-                <strong>Play URL:</strong>
-                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.play_url }}"
-                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
-                    {{ stream.play_url }}
-                </span>
-                <span class="copy-feedback"></span><br><br>
+                {% for player in stream.get('players', []) %}
+                <div class="mb-3 border-bottom border-secondary pb-3">
+                    <strong>{{ player.name }}</strong><br>
+                    <strong>Play URL:</strong>
+                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
+                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                        {{ player.play_url }}
+                    </span>
+                    <span class="copy-feedback"></span><br>
+                    <strong>Play Key:</strong>
+                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
+                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                        {{ player.play_key }}
+                    </span>
+                    <span class="copy-feedback"></span>
+                    {% if stream.get('players')|length > 1 %}
+                    <form method="post" action="{{ url_for('delete_player', stream_id=stream.id, player_id=player.id) }}" class="mt-2">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-outline-danger">Delete Player</button>
+                    </form>
+                    {% endif %}
+                </div>
+                {% else %}
+                <p class="text-muted"><em>No play keys configured</em></p>
+                {% endfor %}
+                <form method="post" action="{{ url_for('add_player', stream_id=stream.id) }}" class="mt-2">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <div class="input-group">
+                        <input type="text" class="form-control" name="name" placeholder="Player name (optional)">
+                        <button type="submit" class="btn btn-outline-success">Add Player</button>
+                    </div>
+                </form>
+                <br>
 
                 <h5>Stats</h5>
                 <strong>Stats URL:</strong>

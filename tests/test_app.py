@@ -56,6 +56,13 @@ def test_index_lists_streams_from_api(monkeypatch):
                 "publish_key": "pub_k",
                 "play_key": "pl_k",
                 "stats_key": "st_k",
+                "players": [
+                    {
+                        "id": "vi_s1",
+                        "name": "Player 1",
+                        "play_key": "pl_k",
+                    }
+                ],
                 "enabled": True,
                 "created_at": 1,
             }
@@ -89,6 +96,13 @@ def test_create_stream_shows_keys_without_session_storage(monkeypatch):
         "publish_key": "pk",
         "play_key": "plk",
         "stats_key": "stk",
+        "players": [
+            {
+                "id": "vi_new",
+                "name": "Player 1",
+                "play_key": "plk",
+            }
+        ],
     }
 
     with patch("app.Lrtmp2Client") as mock_client_cls:

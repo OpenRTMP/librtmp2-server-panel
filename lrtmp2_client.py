@@ -51,6 +51,29 @@ class Lrtmp2Client:
         if not resp.ok and resp.status_code != 404:
             raise Lrtmp2ApiError(f"delete_stream failed: HTTP {resp.status_code} {resp.text}")
 
+    def create_player(self, stream_id, name=None):
+        payload = {}
+        if name:
+            payload["name"] = name
+        resp = requests.post(
+            f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players",
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+        if not resp.ok:
+            raise Lrtmp2ApiError(f"create_player failed: HTTP {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def delete_player(self, stream_id, player_id):
+        resp = requests.delete(
+            f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players/{quote(player_id, safe='')}",
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        if not resp.ok and resp.status_code != 404:
+            raise Lrtmp2ApiError(f"delete_player failed: HTTP {resp.status_code} {resp.text}")
+
     def stream_stats(self, stats_key):
         resp = requests.get(
             f"{self.base_url}/stats", params={"key": stats_key}, timeout=self.timeout
