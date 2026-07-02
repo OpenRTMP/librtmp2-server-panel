@@ -45,12 +45,12 @@ class Lrtmp2Client:
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _request(self, method, url, operation, **kwargs):
+    def _request(self, request_func, url, operation, **kwargs):
         """Perform an HTTP request, translating network-level failures (connection
         refused, DNS failure, timeout, ...) into Lrtmp2ApiError so callers only ever
         need to catch one exception type instead of the request crashing the panel."""
         try:
-            return method(url, timeout=self.timeout, **kwargs)
+            return request_func(url, timeout=self.timeout, **kwargs)
         except requests.exceptions.Timeout as exc:
             raise Lrtmp2ApiError(
                 f"{operation} failed: librtmp2-server did not respond in time"

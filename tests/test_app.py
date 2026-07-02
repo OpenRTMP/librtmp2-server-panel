@@ -300,3 +300,39 @@ def test_stream_stats_by_id_uses_bearer_auth():
 
     assert mock_get.call_args.kwargs["headers"]["Authorization"] == "Bearer tok"
     assert mock_get.call_args.args[0] == "http://example.test/api/v1/streams/mystream/stats"
+
+
+def test_request_timeout_raised_as_api_error():
+    import requests
+
+    from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.get", side_effect=requests.exceptions.Timeout):
+        with pytest.raises(Lrtmp2ApiError):
+            client.list_streams()
+
+
+def test_request_connection_error_raised_as_api_error():
+    import requests
+
+    from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch(
+        "lrtmp2_client.requests.get",
+        side_effect=requests.exceptions.ConnectionError,
+    ):
+        with pytest.raises(Lrtmp2ApiError):
+            client.list_streams()
+
+
+def test_malformed_json_response_raised_as_api_error():
+    from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.get") as mock_get:
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.side_effect = ValueError("not json")
+        with pytest.raises(Lrtmp2ApiError):
+            client.list_streams()
