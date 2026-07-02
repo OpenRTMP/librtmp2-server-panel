@@ -60,34 +60,36 @@ class Lrtmp2Client:
                 f"{operation} failed: could not reach librtmp2-server"
             ) from exc
 
-    def health(self):
-        resp = self._request(requests.get, f"{self.base_url}/api/v1/health", "health")
+    def _request_json(self, request_func, url, operation, **kwargs):
+        """_request + the raise-on-error/parse-JSON sequence shared by every
+        endpoint that returns a body (i.e. everything but the 404-tolerant
+        deletes, which need their own status handling)."""
+        resp = self._request(request_func, url, operation, **kwargs)
         if not resp.ok:
-            raise _api_error(resp, "health")
-        return _parse_json(resp, "health")
+            raise _api_error(resp, operation)
+        return _parse_json(resp, operation)
+
+    def health(self):
+        return self._request_json(
+            requests.get, f"{self.base_url}/api/v1/health", "health"
+        )
 
     def list_streams(self):
-        resp = self._request(
+        return self._request_json(
             requests.get,
             f"{self.base_url}/api/v1/streams",
             "list_streams",
             headers=self._headers(),
         )
-        if not resp.ok:
-            raise _api_error(resp, "list_streams")
-        return _parse_json(resp, "list_streams")
 
     def create_stream(self, stream_id, name, app):
-        resp = self._request(
+        return self._request_json(
             requests.post,
             f"{self.base_url}/api/v1/streams",
             "create_stream",
             headers=self._headers(),
             json={"id": stream_id, "name": name, "app": app},
         )
-        if not resp.ok:
-            raise _api_error(resp, "create_stream")
-        return _parse_json(resp, "create_stream")
 
     def delete_stream(self, stream_id):
         resp = self._request(
@@ -103,16 +105,13 @@ class Lrtmp2Client:
         payload = {}
         if name:
             payload["name"] = name
-        resp = self._request(
+        return self._request_json(
             requests.post,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players",
             "create_player",
             headers=self._headers(),
             json=payload,
         )
-        if not resp.ok:
-            raise _api_error(resp, "create_player")
-        return _parse_json(resp, "create_player")
 
     def delete_player(self, stream_id, player_id):
         resp = self._request(
@@ -125,23 +124,17 @@ class Lrtmp2Client:
             raise _api_error(resp, "delete_player")
 
     def stream_stats(self, stats_key):
-        resp = self._request(
+        return self._request_json(
             requests.get,
             f"{self.base_url}/stats",
             "stream_stats",
             params={"key": stats_key},
         )
-        if not resp.ok:
-            raise _api_error(resp, "stream_stats")
-        return _parse_json(resp, "stream_stats")
 
     def stream_stats_by_id(self, stream_id):
-        resp = self._request(
+        return self._request_json(
             requests.get,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
             "stream_stats_by_id",
             headers=self._headers(),
         )
-        if not resp.ok:
-            raise _api_error(resp, "stream_stats_by_id")
-        return _parse_json(resp, "stream_stats_by_id")
