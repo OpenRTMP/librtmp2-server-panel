@@ -63,3 +63,6 @@ class Config:
 
     # Only enable Secure cookies when the panel is served over HTTPS.
     SESSION_COOKIE_SECURE = _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)
+
+    # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
+    RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", "memory://")

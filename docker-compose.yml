@@ -15,6 +15,7 @@ services:
       - USERNAME=${USERNAME:-admin}
       - PASSWORD=${PASSWORD:?Set PASSWORD in .env}
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
+      - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-memory://}
     ports:
       - "8000:8000"
     networks:

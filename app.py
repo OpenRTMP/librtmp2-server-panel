@@ -35,7 +35,7 @@ def create_app():
         key_func=get_remote_address,
         app=app,
         default_limits=["100 per minute"],
-        storage_uri="memory://",
+        storage_uri=app.config["RATELIMIT_STORAGE_URI"],
     )
 
     app.config.update(
@@ -87,10 +87,16 @@ def create_app():
             error = "Invalid credentials"
         return render_template("login.html", error=error)
 
-    @app.route("/logout")
+    @app.route("/logout", methods=["POST"])
+    @login_required
     def logout():
         session.clear()
         return redirect(url_for("login"))
+
+    @app.after_request
+    def set_security_headers(response):
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
 
     @app.route("/")
     @login_required

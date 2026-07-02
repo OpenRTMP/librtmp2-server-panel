@@ -2,7 +2,10 @@
 {% block title %}Streams on librtmp2-server{% endblock %}
 {% block content %}
 <h1>Streams on librtmp2-server</h1>
-<a class="btn btn-outline-light mb-3" href="{{ url_for('logout') }}">Logout</a>
+<form method="post" action="{{ url_for('logout') }}" class="d-inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
+</form>
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
 
 {% if api_error is defined and api_error %}
