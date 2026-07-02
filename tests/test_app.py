@@ -243,6 +243,52 @@ def test_delete_stream_url_encodes_stream_id():
     assert mock_delete.call_args.args[0] == "http://example.test/api/v1/streams/a%2Fb%3Fc"
 
 
+def test_create_stream_rejects_invalid_display_name(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/new",
+            data={"id": "ok-stream", "name": "bad\nname", "app": "live"},
+        )
+        assert r.status_code == 200
+        assert b"Name must be" in r.data
+        mock_client_cls.return_value.create_stream.assert_not_called()
+
+
+def test_delete_player_rejects_invalid_player_id(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post("/streams/s1/players/not-a-real-id/delete")
+        assert r.status_code == 302
+
+        r2 = client.get("/")
+        assert r2.status_code == 200
+        assert b"Invalid player ID" in r2.data
+        mock_client_cls.return_value.delete_player.assert_not_called()
+
+
 def test_stream_stats_by_id_uses_bearer_auth():
     from lrtmp2_client import Lrtmp2Client
 

@@ -7,6 +7,22 @@ class Lrtmp2ApiError(Exception):
     pass
 
 
+def _api_error(resp, operation):
+    """Return a user-safe error; log details only in the exception message prefix."""
+    msg = f"{operation} failed (HTTP {resp.status_code})"
+    try:
+        body = resp.json()
+    except ValueError:
+        return Lrtmp2ApiError(msg)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return Lrtmp2ApiError(f"{operation} failed: {err['message']}")
+        if isinstance(err, str) and err:
+            return Lrtmp2ApiError(f"{operation} failed: {err}")
+    return Lrtmp2ApiError(msg)
+
+
 class Lrtmp2Client:
     """Thin client for the librtmp2-server REST API."""
 
@@ -28,7 +44,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/streams", headers=self._headers(), timeout=self.timeout
         )
         if not resp.ok:
-            raise Lrtmp2ApiError(f"list_streams failed: HTTP {resp.status_code} {resp.text}")
+            raise _api_error(resp, "list_streams")
         return resp.json()
 
     def create_stream(self, stream_id, name, app):
@@ -39,7 +55,7 @@ class Lrtmp2Client:
             timeout=self.timeout,
         )
         if not resp.ok:
-            raise Lrtmp2ApiError(f"create_stream failed: HTTP {resp.status_code} {resp.text}")
+            raise _api_error(resp, "create_stream")
         return resp.json()
 
     def delete_stream(self, stream_id):
@@ -49,7 +65,7 @@ class Lrtmp2Client:
             timeout=self.timeout,
         )
         if not resp.ok and resp.status_code != 404:
-            raise Lrtmp2ApiError(f"delete_stream failed: HTTP {resp.status_code} {resp.text}")
+            raise _api_error(resp, "delete_stream")
 
     def create_player(self, stream_id, name=None):
         payload = {}
@@ -62,7 +78,7 @@ class Lrtmp2Client:
             timeout=self.timeout,
         )
         if not resp.ok:
-            raise Lrtmp2ApiError(f"create_player failed: HTTP {resp.status_code} {resp.text}")
+            raise _api_error(resp, "create_player")
         return resp.json()
 
     def delete_player(self, stream_id, player_id):
@@ -72,7 +88,7 @@ class Lrtmp2Client:
             timeout=self.timeout,
         )
         if not resp.ok and resp.status_code != 404:
-            raise Lrtmp2ApiError(f"delete_player failed: HTTP {resp.status_code} {resp.text}")
+            raise _api_error(resp, "delete_player")
 
     def stream_stats(self, stats_key):
         resp = requests.get(
@@ -88,7 +104,5 @@ class Lrtmp2Client:
             timeout=self.timeout,
         )
         if not resp.ok:
-            raise Lrtmp2ApiError(
-                f"stream_stats_by_id failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise _api_error(resp, "stream_stats_by_id")
         return resp.json()

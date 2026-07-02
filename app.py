@@ -15,6 +15,8 @@ from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
+DISPLAY_NAME_MAX_LEN = 128
 
 
 def _is_valid_stream_id(value):
@@ -23,6 +25,18 @@ def _is_valid_stream_id(value):
 
 def _is_valid_app_name(value):
     return bool(APP_NAME_RE.fullmatch(value or ""))
+
+
+def _is_valid_viewer_id(value):
+    return bool(VIEWER_ID_RE.fullmatch(value or ""))
+
+
+def _is_valid_display_name(value):
+    if not isinstance(value, str) or not value:
+        return False
+    if len(value) > DISPLAY_NAME_MAX_LEN:
+        return False
+    return all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
 
 
 def create_app():
@@ -141,6 +155,11 @@ def create_app():
                     "RTMP app must be 1-63 characters and use only letters, "
                     "numbers, dots, underscores, or hyphens."
                 )
+            elif not _is_valid_display_name(name):
+                error = (
+                    "Name must be 1-128 characters and must not contain "
+                    "control characters."
+                )
             else:
                 try:
                     result = client.create_stream(stream_id, name, app_name)
@@ -181,6 +200,11 @@ def create_app():
             session["flash_error"] = "Invalid stream ID"
             return redirect(url_for("index"))
         name = (request.form.get("name") or "").strip() or None
+        if name is not None and not _is_valid_display_name(name):
+            session["flash_error"] = (
+                "Name must be 1-128 characters and must not contain control characters."
+            )
+            return redirect(url_for("index"))
         try:
             client.create_player(stream_id, name=name)
         except Lrtmp2ApiError as exc:
@@ -192,6 +216,9 @@ def create_app():
     def delete_player(stream_id, player_id):
         if not _is_valid_stream_id(stream_id):
             session["flash_error"] = "Invalid stream ID"
+            return redirect(url_for("index"))
+        if not _is_valid_viewer_id(player_id):
+            session["flash_error"] = "Invalid player ID"
             return redirect(url_for("index"))
         try:
             client.delete_player(stream_id, player_id)
