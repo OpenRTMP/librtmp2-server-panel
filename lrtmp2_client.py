@@ -23,6 +23,17 @@ def _api_error(resp, operation):
     return Lrtmp2ApiError(msg)
 
 
+def _parse_json(resp, operation):
+    """Parse a successful response body, surfacing malformed JSON as an API error
+    instead of letting a raw ValueError escape to the caller."""
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise Lrtmp2ApiError(
+            f"{operation} failed: received an invalid response from librtmp2-server"
+        ) from exc
+
+
 class Lrtmp2Client:
     """Thin client for the librtmp2-server REST API."""
 
@@ -34,35 +45,58 @@ class Lrtmp2Client:
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
+    def _request(self, request_func, url, operation, **kwargs):
+        """Perform an HTTP request, translating network-level failures (connection
+        refused, DNS failure, timeout, ...) into Lrtmp2ApiError so callers only ever
+        need to catch one exception type instead of the request crashing the panel."""
+        try:
+            return request_func(url, timeout=self.timeout, **kwargs)
+        except requests.exceptions.Timeout as exc:
+            raise Lrtmp2ApiError(
+                f"{operation} failed: librtmp2-server did not respond in time"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise Lrtmp2ApiError(
+                f"{operation} failed: could not reach librtmp2-server"
+            ) from exc
+
+    def _request_json(self, request_func, url, operation, **kwargs):
+        """_request + the raise-on-error/parse-JSON sequence shared by every
+        endpoint that returns a body (i.e. everything but the 404-tolerant
+        deletes, which need their own status handling)."""
+        resp = self._request(request_func, url, operation, **kwargs)
+        if not resp.ok:
+            raise _api_error(resp, operation)
+        return _parse_json(resp, operation)
+
     def health(self):
-        resp = requests.get(f"{self.base_url}/api/v1/health", timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json(
+            requests.get, f"{self.base_url}/api/v1/health", "health"
+        )
 
     def list_streams(self):
-        resp = requests.get(
-            f"{self.base_url}/api/v1/streams", headers=self._headers(), timeout=self.timeout
+        return self._request_json(
+            requests.get,
+            f"{self.base_url}/api/v1/streams",
+            "list_streams",
+            headers=self._headers(),
         )
-        if not resp.ok:
-            raise _api_error(resp, "list_streams")
-        return resp.json()
 
     def create_stream(self, stream_id, name, app):
-        resp = requests.post(
+        return self._request_json(
+            requests.post,
             f"{self.base_url}/api/v1/streams",
+            "create_stream",
             headers=self._headers(),
             json={"id": stream_id, "name": name, "app": app},
-            timeout=self.timeout,
         )
-        if not resp.ok:
-            raise _api_error(resp, "create_stream")
-        return resp.json()
 
     def delete_stream(self, stream_id):
-        resp = requests.delete(
+        resp = self._request(
+            requests.delete,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}",
+            "delete_stream",
             headers=self._headers(),
-            timeout=self.timeout,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_stream")
@@ -71,38 +105,36 @@ class Lrtmp2Client:
         payload = {}
         if name:
             payload["name"] = name
-        resp = requests.post(
+        return self._request_json(
+            requests.post,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players",
+            "create_player",
             headers=self._headers(),
             json=payload,
-            timeout=self.timeout,
         )
-        if not resp.ok:
-            raise _api_error(resp, "create_player")
-        return resp.json()
 
     def delete_player(self, stream_id, player_id):
-        resp = requests.delete(
+        resp = self._request(
+            requests.delete,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players/{quote(player_id, safe='')}",
+            "delete_player",
             headers=self._headers(),
-            timeout=self.timeout,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_player")
 
     def stream_stats(self, stats_key):
-        resp = requests.get(
-            f"{self.base_url}/stats", params={"key": stats_key}, timeout=self.timeout
+        return self._request_json(
+            requests.get,
+            f"{self.base_url}/stats",
+            "stream_stats",
+            params={"key": stats_key},
         )
-        resp.raise_for_status()
-        return resp.json()
 
     def stream_stats_by_id(self, stream_id):
-        resp = requests.get(
+        return self._request_json(
+            requests.get,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
+            "stream_stats_by_id",
             headers=self._headers(),
-            timeout=self.timeout,
         )
-        if not resp.ok:
-            raise _api_error(resp, "stream_stats_by_id")
-        return resp.json()
