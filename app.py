@@ -130,8 +130,7 @@ def create_app():
             else:
                 try:
                     result = client.create_stream(stream_id, name, app_name)
-                    session["created_stream"] = result
-                    return redirect(url_for("stream_created"))
+                    return redirect(url_for("stream_created", stream_id=result["id"]))
                 except Lrtmp2ApiError as exc:
                     error = str(exc)
         return render_template(
@@ -143,8 +142,20 @@ def create_app():
     @app.route("/streams/created")
     @login_required
     def stream_created():
-        stream = session.pop("created_stream", None)
+        stream_id = request.args.get("stream_id", "")
+        if not _is_valid_stream_id(stream_id):
+            return redirect(url_for("index"))
+        try:
+            streams = client.list_streams()
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+            return redirect(url_for("index"))
+        stream = next((s for s in streams if s.get("id") == stream_id), None)
         if not stream:
+            session["flash_error"] = (
+                f"Stream '{stream_id}' was created but is not listed yet. "
+                "Check the overview."
+            )
             return redirect(url_for("index"))
         stream = dict(stream, **build_urls(stream))
         return render_template("stream_created.html", stream=stream)
@@ -152,6 +163,9 @@ def create_app():
     @app.route("/streams/<stream_id>/delete", methods=["POST"])
     @login_required
     def delete_stream(stream_id):
+        if not _is_valid_stream_id(stream_id):
+            session["flash_error"] = "Invalid stream ID"
+            return redirect(url_for("index"))
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError as exc:
@@ -161,6 +175,8 @@ def create_app():
     @app.route("/streams/<stream_id>/stats.json")
     @login_required
     def stream_stats(stream_id):
+        if not _is_valid_stream_id(stream_id):
+            return jsonify({"error": "Invalid stream ID"}), 400
         try:
             return jsonify(client.stream_stats_by_id(stream_id))
         except Lrtmp2ApiError:
