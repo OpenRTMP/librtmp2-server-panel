@@ -81,7 +81,7 @@ def test_index_lists_streams_from_api(monkeypatch):
         mock_client.list_streams.assert_called_once()
 
 
-def test_create_stream_shows_keys_once(monkeypatch):
+def test_create_stream_shows_keys_without_session_storage(monkeypatch):
     mock_result = {
         "id": "new-stream",
         "name": "New",
@@ -94,6 +94,7 @@ def test_create_stream_shows_keys_once(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.create_stream.return_value = mock_result
+        mock_client.list_streams.return_value = [mock_result]
 
         import app as app_module
 
@@ -112,15 +113,15 @@ def test_create_stream_shows_keys_once(monkeypatch):
             data={"id": "new-stream", "name": "New", "app": "live"},
         )
         assert r.status_code == 302
-        assert "/streams/created" in r.headers["Location"]
+        assert "/streams/created?stream_id=new-stream" in r.headers["Location"]
 
-        r2 = client.get("/streams/created")
+        with client.session_transaction() as sess:
+            assert "created_stream" not in sess
+
+        r2 = client.get("/streams/created?stream_id=new-stream")
         assert r2.status_code == 200
         assert b"pk" in r2.data
         assert b"plk" in r2.data
-
-        r3 = client.get("/streams/created")
-        assert r3.status_code == 302
 
 
 def test_delete_stream_surfaces_api_error(monkeypatch):
@@ -172,6 +173,49 @@ def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):
         assert r.status_code == 200
         assert b"Stream ID must be" in r.data
         mock_client_cls.return_value.create_stream.assert_not_called()
+
+
+def test_delete_stream_rejects_invalid_stream_id(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post("/streams/bad%00id/delete")
+        assert r.status_code == 302
+
+        r2 = client.get("/")
+        assert r2.status_code == 200
+        assert b"Invalid stream ID" in r2.data
+        mock_client_cls.return_value.delete_stream.assert_not_called()
+
+
+def test_stream_stats_rejects_invalid_stream_id(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/streams/bad%00id/stats.json")
+        assert r.status_code == 400
+        assert r.get_json() == {"error": "Invalid stream ID"}
+        mock_client_cls.return_value.stream_stats_by_id.assert_not_called()
 
 
 def test_delete_stream_url_encodes_stream_id():
