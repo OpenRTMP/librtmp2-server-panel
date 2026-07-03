@@ -188,6 +188,50 @@ def test_index_shows_rtmps_urls_when_server_reports_enabled(monkeypatch):
         assert b"rtmps://localhost:1936/live" in r.data
 
 
+def test_index_prefers_public_rtmps_port_over_health_bind_port(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "rtmp_port": 1935,
+            "rtmps_enabled": True,
+            "rtmps_port": 1936,
+        }
+        mock_client.list_streams.return_value = [
+            {
+                "id": "s1",
+                "name": "Stream One",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "players": [
+                    {"id": "vi_s1", "name": "Player 1", "play_key": "pl_k"}
+                ],
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        monkeypatch.setattr(app_module.Config, "LRTMP2_RTMPS_PORT", "443")
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"RTMPS enabled" in r.data
+        assert b"rtmps://localhost:443/live" in r.data
+        assert b"rtmps://localhost:1936/live" not in r.data
+
+
 def test_index_hides_rtmps_urls_when_server_reports_disabled(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
