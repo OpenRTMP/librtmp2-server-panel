@@ -86,6 +86,10 @@ class Config:
 
     LRTMP2_DOMAIN = os.environ.get("LRTMP2_DOMAIN", "localhost")
     LRTMP2_RTMP_PORT = os.environ.get("LRTMP2_RTMP_PORT", "1935")
+    # Publicly-reachable RTMPS port. Only used when librtmp2-server reports
+    # RTMPS as enabled (via /api/v1/health) — kept separate from RTMP_PORT
+    # since RTMPS is a second listener, not a mode switch on the same port.
+    LRTMP2_RTMPS_PORT = os.environ.get("LRTMP2_RTMPS_PORT", "1936")
     LRTMP2_APP = os.environ.get("LRTMP2_APP", "live")
 
     # Only enable Secure cookies when the panel is served over HTTPS.
