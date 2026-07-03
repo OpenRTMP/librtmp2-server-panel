@@ -29,6 +29,39 @@ def test_session_cookie_secure_honors_env(monkeypatch):
     assert config.Config.SESSION_COOKIE_SECURE is True
 
 
+def test_config_rejects_env_example_placeholders(monkeypatch):
+    valid = {
+        "SECRET_KEY": "valid-test-secret-key-for-placeholder-check",
+        "PASSWORD": "valid-test-password-for-placeholder-check",
+        "LRTMP2_API_TOKEN": "valid-test-api-token-for-placeholder-check",
+    }
+    placeholders = {
+        "SECRET_KEY": "<generate-with-python3-secrets-token-hex-32>",
+        "PASSWORD": "<generate-strong-password>",
+        "LRTMP2_API_TOKEN": "<generate-with-openssl-rand-hex-32>",
+    }
+    for key, placeholder in placeholders.items():
+        for env_key, env_value in valid.items():
+            monkeypatch.setenv(env_key, env_value)
+        monkeypatch.setenv(key, placeholder)
+        monkeypatch.setenv("REQUIRE_LOGIN", "true")
+        import importlib
+        import config
+
+        with pytest.raises(SystemExit) as exc:
+            importlib.reload(config)
+        assert exc.value.code == 1
+
+
+def test_require_login_empty_string_defaults_to_true(monkeypatch):
+    monkeypatch.setenv("REQUIRE_LOGIN", "")
+    import importlib
+    import config
+
+    importlib.reload(config)
+    assert config.Config.REQUIRE_LOGIN is True
+
+
 def test_password_not_required_when_login_disabled(monkeypatch):
     original_password = os.environ.get("PASSWORD", "test-password-for-ci-only")
     monkeypatch.setenv("REQUIRE_LOGIN", "false")

@@ -1,11 +1,33 @@
 import os
 import sys
 
+_INSECURE_DEFAULTS = frozenset(
+    {
+        "change-me-to-a-random-value",
+        "dev-insecure-secret-key",
+        "change-me-to-a-secure-token",
+        "password",
+        "<generate-with-python3-secrets-token-hex-32>",
+        "<generate-strong-password>",
+        "<generate-with-openssl-rand-hex-32>",
+    }
+)
+
 
 def _bool(value, default=False):
-    if value is None:
+    if value is None or not str(value).strip():
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_insecure_secret(value):
+    """Reject missing, blank, known-default, or .env.example placeholder values."""
+    if not value or not value.strip():
+        return True
+    stripped = value.strip()
+    if stripped in _INSECURE_DEFAULTS:
+        return True
+    return stripped.startswith("<") and stripped.endswith(">")
 
 
 def _validate_config():
@@ -13,7 +35,7 @@ def _validate_config():
     errors = []
 
     secret_key = os.environ.get("SECRET_KEY")
-    if not secret_key or secret_key in ("change-me-to-a-random-value", "dev-insecure-secret-key"):
+    if _is_insecure_secret(secret_key):
         errors.append(
             "SECRET_KEY is not set or uses an insecure default. "
             "Generate one with: python3 -c 'import secrets; print(secrets.token_hex(32))'"
@@ -21,14 +43,14 @@ def _validate_config():
 
     password = os.environ.get("PASSWORD")
     require_login = _bool(os.environ.get("REQUIRE_LOGIN"), True)
-    if require_login and (not password or password == "password"):
+    if require_login and _is_insecure_secret(password):
         errors.append(
             "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
             "Set a strong password."
         )
 
     api_token = os.environ.get("LRTMP2_API_TOKEN")
-    if not api_token or api_token == "change-me-to-a-secure-token":
+    if _is_insecure_secret(api_token):
         errors.append(
             "LRTMP2_API_TOKEN is not set or uses the placeholder. "
             "Copy the token printed by librtmp2-server on first startup "

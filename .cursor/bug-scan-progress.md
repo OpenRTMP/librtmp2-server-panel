@@ -1,14 +1,32 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-07-02
+Last scanned: config.py — 2026-07-03
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-07-03 config.py pass)
+
+- **`_validate_config()` / `.env.example` placeholders** — Copy-pasting `.env.example`
+  to `.env` without replacing `SECRET_KEY`, `PASSWORD`, or `LRTMP2_API_TOKEN`
+  placeholders (`<generate-with-python3-secrets-token-hex-32>`, etc.) passed
+  startup validation because only a small hard-coded blocklist was checked.
+  Impact: documented placeholder values are effectively public secrets — an
+  attacker can forge Flask sessions (known `SECRET_KEY`) or log in with the
+  documented `PASSWORD`, gaining full admin access to stream CRUD. Fixed by
+  `_is_insecure_secret()` that rejects blank values, known defaults, and any
+  `<...>` placeholder pattern.
+- **`_bool()` / `REQUIRE_LOGIN=`** — An empty `REQUIRE_LOGIN` env var (`""`) was
+  parsed as `False`, silently disabling the login gate while operators expect
+  the documented default of `True` (e.g. accidental `REQUIRE_LOGIN=` in `.env`).
+  Impact: unauthenticated access to the entire admin panel (create/delete
+  streams, view keys). Fixed by treating blank env values as unset so
+  `REQUIRE_LOGIN` defaults to `True`.
 
 ## Findings (2026-07-02 lrtmp2_client.py pass)
 
