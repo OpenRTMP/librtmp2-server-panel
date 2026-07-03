@@ -15,17 +15,22 @@ _INSECURE_DEFAULTS = frozenset(
 
 
 def _bool(value, default=False):
-    if value is None or not str(value).strip():
+    if value is None:
         return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
+    stripped = str(value).strip()
+    if not stripped:
+        return default
+    return stripped.lower() in ("1", "true", "yes", "on")
 
 
 def _is_insecure_secret(value):
     """Reject missing, blank, known-default, or .env.example placeholder values."""
-    if not value or not value.strip():
+    if value is None:
         return True
-    stripped = value.strip()
-    if stripped in _INSECURE_DEFAULTS:
+    stripped = str(value).strip()
+    if not stripped:
+        return True
+    if stripped.lower() in _INSECURE_DEFAULTS:
         return True
     return stripped.startswith("<") and stripped.endswith(">")
 
