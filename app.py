@@ -68,23 +68,26 @@ def create_app():
             return view_func(*args, **kwargs)
         return wrapped
 
-    def rtmps_enabled():
-        """Whether the connected librtmp2-server currently has RTMPS enabled.
+    def rtmps_health():
+        """Return RTMPS availability and public port from server health.
 
-        Read live from /api/v1/health rather than a panel-side config flag,
+        Read live from /api/v1/health rather than trusting a panel-side flag,
         so the panel never advertises rtmps:// URLs the server won't accept.
-        Defaults to disabled if the server can't be reached.
+        Defaults to disabled if the server can't be reached. If older server
+        versions omit rtmps_port, fall back to the panel config value.
         """
+        fallback_port = str(app.config["LRTMP2_RTMPS_PORT"])
         try:
             health = client.health()
         except Lrtmp2ApiError:
-            return False
-        return bool(health.get("rtmps_enabled"))
+            return False, fallback_port
+        if not health.get("rtmps_enabled"):
+            return False, fallback_port
+        return True, str(health.get("rtmps_port") or fallback_port)
 
-    def build_urls(stream, rtmps_on):
+    def build_urls(stream, rtmps_on, rtmps_port):
         domain = app.config["LRTMP2_DOMAIN"]
         port = app.config["LRTMP2_RTMP_PORT"]
-        rtmps_port = app.config["LRTMP2_RTMPS_PORT"]
         app_name = stream["app"]
         publish_url = f"rtmp://{domain}:{port}/{app_name}"
         players = stream.get("players") or []
@@ -157,9 +160,9 @@ def create_app():
                 flash_error=flash_error,
                 rtmps_enabled=False,
             )
-        rtmps_on = rtmps_enabled()
+        rtmps_on, rtmps_port = rtmps_health()
         for stream in streams:
-            stream.update(build_urls(stream, rtmps_on))
+            stream.update(build_urls(stream, rtmps_on, rtmps_port))
         return render_template(
             "index.html",
             streams=streams,
@@ -220,7 +223,8 @@ def create_app():
                 "Check the overview."
             )
             return redirect(url_for("index"))
-        stream = dict(stream, **build_urls(stream, rtmps_enabled()))
+        rtmps_on, rtmps_port = rtmps_health()
+        stream = dict(stream, **build_urls(stream, rtmps_on, rtmps_port))
         return render_template("stream_created.html", stream=stream)
 
     @app.route("/streams/<stream_id>/players/new", methods=["POST"])
