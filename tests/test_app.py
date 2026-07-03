@@ -1,4 +1,6 @@
+import importlib
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +11,10 @@ os.environ.setdefault("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
 # Force panel login credentials for isolated tests (override host .env).
 os.environ["USERNAME"] = "admin"
 os.environ["PASSWORD"] = "test-password-for-ci-only"
+
+
+def _forget_config_module():
+    sys.modules.pop("config", None)
 
 
 def test_session_cookie_secure_defaults_false(monkeypatch):
@@ -27,6 +33,56 @@ def test_session_cookie_secure_honors_env(monkeypatch):
 
     importlib.reload(config)
     assert config.Config.SESSION_COOKIE_SECURE is True
+
+
+def test_config_rejects_env_example_placeholders(monkeypatch):
+    valid = {
+        "SECRET_KEY": "valid-test-secret-key-for-placeholder-check",
+        "PASSWORD": "valid-test-password-for-placeholder-check",
+        "LRTMP2_API_TOKEN": "valid-test-api-token-for-placeholder-check",
+    }
+    placeholders = {
+        "SECRET_KEY": "<generate-with-python3-secrets-token-hex-32>",
+        "PASSWORD": "<generate-strong-password>",
+        "LRTMP2_API_TOKEN": "<generate-with-openssl-rand-hex-32>",
+    }
+    for key, placeholder in placeholders.items():
+        for env_key, env_value in valid.items():
+            monkeypatch.setenv(env_key, env_value)
+        monkeypatch.setenv(key, placeholder)
+        monkeypatch.setenv("REQUIRE_LOGIN", "true")
+
+        _forget_config_module()
+        try:
+            with pytest.raises(SystemExit) as exc:
+                importlib.import_module("config")
+            assert exc.value.code == 1
+        finally:
+            _forget_config_module()
+
+
+def test_config_rejects_insecure_defaults_case_insensitive(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-case-check")
+    monkeypatch.setenv("PASSWORD", "PASSWORD")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-case-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_require_login_empty_string_defaults_to_true(monkeypatch):
+    monkeypatch.setenv("REQUIRE_LOGIN", "")
+    import importlib
+    import config
+
+    importlib.reload(config)
+    assert config.Config.REQUIRE_LOGIN is True
 
 
 def test_password_not_required_when_login_disabled(monkeypatch):
