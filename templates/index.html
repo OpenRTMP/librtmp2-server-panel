@@ -8,6 +8,12 @@
 </form>
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
 
+{% if rtmps_enabled %}
+<span class="badge bg-success mb-3">RTMPS enabled</span>
+{% else %}
+<span class="badge bg-secondary mb-3">RTMPS disabled</span>
+{% endif %}
+
 {% if api_error is defined and api_error %}
 <div class="alert alert-danger">{{ api_error }}</div>
 {% endif %}
@@ -29,12 +35,20 @@
         <div id="collapse{{ loop.index }}" class="accordion-collapse collapse" data-bs-parent="#streamAccordion">
             <div class="accordion-body">
                 <h5>Publish</h5>
-                <strong>Server URL:</strong>
+                <strong>Server URL (RTMP):</strong>
                 <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url }}"
                       onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
                     {{ stream.publish_url }}
                 </span>
                 <span class="copy-feedback"></span><br>
+                {% if stream.publish_url_tls %}
+                <strong>Server URL (RTMPS):</strong>
+                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url_tls }}"
+                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                    {{ stream.publish_url_tls }}
+                </span>
+                <span class="copy-feedback"></span><br>
+                {% endif %}
                 <strong>Stream Key:</strong>
                 <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_key }}"
                       onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
@@ -46,12 +60,20 @@
                 {% for player in stream.get('players', []) %}
                 <div class="mb-3 border-bottom border-secondary pb-3">
                     <strong>{{ player.name }}</strong><br>
-                    <strong>Play URL:</strong>
+                    <strong>Play URL (RTMP):</strong>
                     <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
                           onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
                         {{ player.play_url }}
                     </span>
                     <span class="copy-feedback"></span><br>
+                    {% if player.play_url_tls %}
+                    <strong>Play URL (RTMPS):</strong>
+                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url_tls }}"
+                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                        {{ player.play_url_tls }}
+                    </span>
+                    <span class="copy-feedback"></span><br>
+                    {% endif %}
                     <strong>Play Key:</strong>
                     <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
                           onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
