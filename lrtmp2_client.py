@@ -82,13 +82,28 @@ class Lrtmp2Client:
             headers=self._headers(),
         )
 
-    def create_stream(self, stream_id, name, app):
+    def create_stream(
+        self,
+        stream_id,
+        name,
+        app,
+        publish_key=None,
+        play_key=None,
+        stats_key=None,
+    ):
+        payload = {"id": stream_id, "name": name, "app": app}
+        if publish_key:
+            payload["publish_key"] = publish_key
+        if play_key:
+            payload["play_key"] = play_key
+        if stats_key:
+            payload["stats_key"] = stats_key
         return self._request_json(
             requests.post,
             f"{self.base_url}/api/v1/streams",
             "create_stream",
             headers=self._headers(),
-            json={"id": stream_id, "name": name, "app": app},
+            json=payload,
         )
 
     def delete_stream(self, stream_id):
@@ -101,10 +116,12 @@ class Lrtmp2Client:
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_stream")
 
-    def create_player(self, stream_id, name=None):
+    def create_player(self, stream_id, name=None, play_key=None):
         payload = {}
         if name:
             payload["name"] = name
+        if play_key:
+            payload["play_key"] = play_key
         return self._request_json(
             requests.post,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players",
