@@ -69,21 +69,23 @@ def create_app():
         return wrapped
 
     def rtmps_health():
-        """Return RTMPS availability and public port from server health.
+        """Return RTMPS availability and the public RTMPS port to advertise.
 
-        Read live from /api/v1/health rather than trusting a panel-side flag,
-        so the panel never advertises rtmps:// URLs the server won't accept.
-        Defaults to disabled if the server can't be reached. If older server
-        versions omit rtmps_port, fall back to the panel config value.
+        RTMPS enablement is read live from /api/v1/health, but URLs must use
+        the panel's public port config first. That preserves Docker/NAT/reverse
+        proxy mappings such as public 443 -> server bind 1936. The server's
+        reported bind port is only used as a fallback when the public config is
+        empty or missing.
         """
-        fallback_port = str(app.config["LRTMP2_RTMPS_PORT"])
+        configured_port = str(app.config.get("LRTMP2_RTMPS_PORT") or "")
         try:
             health = client.health()
         except Lrtmp2ApiError:
-            return False, fallback_port
+            return False, configured_port or "1936"
         if not health.get("rtmps_enabled"):
-            return False, fallback_port
-        return True, str(health.get("rtmps_port") or fallback_port)
+            return False, configured_port or "1936"
+        reported_port = str(health.get("rtmps_port") or "")
+        return True, configured_port or reported_port or "1936"
 
     def build_urls(stream, rtmps_on, rtmps_port):
         domain = app.config["LRTMP2_DOMAIN"]
