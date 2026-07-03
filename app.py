@@ -68,7 +68,26 @@ def create_app():
             return view_func(*args, **kwargs)
         return wrapped
 
-    def build_urls(stream):
+    def rtmps_health():
+        """Return RTMPS availability and the public RTMPS port to advertise.
+
+        RTMPS enablement is read live from /api/v1/health, but URLs must use
+        the panel's public port config first. That preserves Docker/NAT/reverse
+        proxy mappings such as public 443 -> server bind 1936. The server's
+        reported bind port is only used as a fallback when the public config is
+        empty or missing.
+        """
+        configured_port = str(app.config.get("LRTMP2_RTMPS_PORT") or "")
+        try:
+            health = client.health()
+        except Lrtmp2ApiError:
+            return False, configured_port or "1936"
+        if not health.get("rtmps_enabled"):
+            return False, configured_port or "1936"
+        reported_port = str(health.get("rtmps_port") or "")
+        return True, configured_port or reported_port or "1936"
+
+    def build_urls(stream, rtmps_on, rtmps_port):
         domain = app.config["LRTMP2_DOMAIN"]
         port = app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
@@ -76,21 +95,30 @@ def create_app():
         players = stream.get("players") or []
         for player in players:
             player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"
+            if rtmps_on:
+                player["play_url_tls"] = (
+                    f"rtmps://{domain}:{rtmps_port}/{app_name}/{player.get('play_key', '')}"
+                )
         first_play_key = ""
         if players:
             first_play_key = players[0].get("play_key", "")
         elif stream.get("play_key"):
             first_play_key = stream["play_key"]
-        return {
+        urls = {
             "publish_url": publish_url,
             "publish_key": stream.get("publish_key", ""),
             "play_url": f"rtmp://{domain}:{port}/{app_name}/{first_play_key}",
             "play_key": first_play_key,
+            "rtmps_enabled": rtmps_on,
             "stats_url": (
                 f"{app.config['LRTMP2_STATS_URL']}/stats?"
                 f"{urlencode({'key': stream.get('stats_key', '')})}"
             ),
         }
+        if rtmps_on:
+            urls["publish_url_tls"] = f"rtmps://{domain}:{rtmps_port}/{app_name}"
+            urls["play_url_tls"] = f"rtmps://{domain}:{rtmps_port}/{app_name}/{first_play_key}"
+        return urls
 
     @app.route("/login", methods=["GET", "POST"])
     @limiter.limit("5 per minute")
@@ -132,10 +160,17 @@ def create_app():
                 streams=[],
                 api_error=str(exc),
                 flash_error=flash_error,
+                rtmps_enabled=False,
             )
+        rtmps_on, rtmps_port = rtmps_health()
         for stream in streams:
-            stream.update(build_urls(stream))
-        return render_template("index.html", streams=streams, flash_error=flash_error)
+            stream.update(build_urls(stream, rtmps_on, rtmps_port))
+        return render_template(
+            "index.html",
+            streams=streams,
+            flash_error=flash_error,
+            rtmps_enabled=rtmps_on,
+        )
 
     @app.route("/streams/new", methods=["GET", "POST"])
     @login_required
@@ -190,7 +225,8 @@ def create_app():
                 "Check the overview."
             )
             return redirect(url_for("index"))
-        stream = dict(stream, **build_urls(stream))
+        rtmps_on, rtmps_port = rtmps_health()
+        stream = dict(stream, **build_urls(stream, rtmps_on, rtmps_port))
         return render_template("stream_created.html", stream=stream)
 
     @app.route("/streams/<stream_id>/players/new", methods=["POST"])
