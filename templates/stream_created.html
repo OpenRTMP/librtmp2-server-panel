@@ -12,13 +12,22 @@
     <p><strong>App:</strong> {{ stream.app }}</p>
 
     <h5 class="mt-4">Publish</h5>
-    <p><strong>Server URL:</strong>
+    <p><strong>Server URL (RTMP):</strong>
         <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url }}"
               onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
             {{ stream.publish_url }}
         </span>
         <span class="copy-feedback"></span>
     </p>
+    {% if stream.publish_url_tls %}
+    <p><strong>Server URL (RTMPS):</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url_tls }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ stream.publish_url_tls }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+    {% endif %}
     <p><strong>Stream Key:</strong>
         <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_key }}"
               onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
@@ -30,13 +39,22 @@
     <h5 class="mt-4">Play</h5>
     {% for player in stream.get('players', []) %}
     <p><strong>{{ player.name }}</strong></p>
-    <p><strong>Play URL:</strong>
+    <p><strong>Play URL (RTMP):</strong>
         <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
               onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
             {{ player.play_url }}
         </span>
         <span class="copy-feedback"></span>
     </p>
+    {% if player.play_url_tls %}
+    <p><strong>Play URL (RTMPS):</strong>
+        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url_tls }}"
+              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+            {{ player.play_url_tls }}
+        </span>
+        <span class="copy-feedback"></span>
+    </p>
+    {% endif %}
     <p><strong>Play Key:</strong>
         <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
               onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
