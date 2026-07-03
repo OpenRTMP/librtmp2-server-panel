@@ -1,22 +1,57 @@
 {% extends 'base.html' %}
 {% block title %}Create Stream{% endblock %}
 {% block content %}
-<div class="mx-auto content-narrow">
+<div class="mx-auto content-narrow-lg">
     <h1 class="mb-4">Create Stream</h1>
     <form method="post" autocomplete="off">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="mb-4">
             <label for="id" class="form-label fw-bold">Stream ID</label>
-            <input type="text" class="form-control form-control-lg" id="id" name="id" placeholder="auto-generated if empty">
+            <input type="text" class="form-control form-control-lg" id="id" name="id"
+                   value="{{ form.id }}" placeholder="auto-generated if empty">
         </div>
         <div class="mb-4">
             <label for="name" class="form-label fw-bold">Display Name</label>
-            <input type="text" class="form-control form-control-lg" id="name" name="name">
+            <input type="text" class="form-control form-control-lg" id="name" name="name"
+                   value="{{ form.name }}">
         </div>
         <div class="mb-4">
             <label for="app" class="form-label fw-bold">RTMP App</label>
-            <input type="text" class="form-control form-control-lg" id="app" name="app" value="{{ default_app }}">
+            <input type="text" class="form-control form-control-lg" id="app" name="app"
+                   value="{{ form.app }}">
         </div>
+
+        <div class="mb-4">
+            <button class="btn btn-outline-secondary btn-sm" type="button"
+                    data-bs-toggle="collapse" data-bs-target="#customKeys"
+                    aria-expanded="{% if form.publish_key or form.play_key or form.stats_key %}true{% else %}false{% endif %}"
+                    aria-controls="customKeys">
+                Custom keys (optional)
+            </button>
+            <div class="collapse{% if form.publish_key or form.play_key or form.stats_key %} show{% endif %} mt-3"
+                 id="customKeys">
+                <p class="text-muted small mb-3">
+                    Leave blank to let librtmp2-server generate keys automatically.
+                    Each key must be unique when provided.
+                </p>
+                <div class="mb-3">
+                    <label for="publish_key" class="form-label">Publish key (OBS stream key)</label>
+                    <input type="text" class="form-control" id="publish_key" name="publish_key"
+                           value="{{ form.publish_key }}" autocomplete="off">
+                </div>
+                <div class="mb-3">
+                    <label for="play_key" class="form-label">Play key</label>
+                    <input type="text" class="form-control" id="play_key" name="play_key"
+                           value="{{ form.play_key }}" autocomplete="off">
+                </div>
+                <div class="mb-3">
+                    <label for="stats_key" class="form-label">Stats key</label>
+                    <input type="text" class="form-control" id="stats_key" name="stats_key"
+                           value="{{ form.stats_key }}" autocomplete="off">
+                </div>
+            </div>
+        </div>
+
         <div class="mb-3 d-grid">
             <button type="submit" class="btn btn-primary btn-lg">Create</button>
         </div>

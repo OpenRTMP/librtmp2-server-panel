@@ -17,6 +17,10 @@ STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
+ACCESS_KEY_HELP = (
+    "Must be 1-63 characters and use only letters, numbers, dots, "
+    "underscores, or hyphens."
+)
 
 
 def _is_valid_stream_id(value):
@@ -37,6 +41,35 @@ def _is_valid_display_name(value):
     if len(value) > DISPLAY_NAME_MAX_LEN:
         return False
     return all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
+
+
+def _is_valid_access_key(value):
+    return _is_valid_stream_id(value)
+
+
+def _optional_form_value(raw):
+    if raw is None:
+        return None
+    stripped = str(raw).strip()
+    return stripped or None
+
+
+def _validate_optional_access_keys(publish_key, play_key, stats_key):
+    fields = (
+        ("publish_key", publish_key),
+        ("play_key", play_key),
+        ("stats_key", stats_key),
+    )
+    provided = []
+    for label, value in fields:
+        if value is None:
+            continue
+        if not _is_valid_access_key(value):
+            return f"{label}: {ACCESS_KEY_HELP}"
+        provided.append(value)
+    if len(provided) != len(set(provided)):
+        return "publish_key, play_key, and stats_key must be distinct when provided."
+    return None
 
 
 def create_app():
@@ -176,10 +209,29 @@ def create_app():
     @login_required
     def create_stream():
         error = None
+        form = {
+            "id": "",
+            "name": "",
+            "app": app.config["LRTMP2_APP"],
+            "publish_key": "",
+            "play_key": "",
+            "stats_key": "",
+        }
         if request.method == "POST":
             stream_id = (request.form.get("id") or secrets.token_hex(8)).strip()
             name = (request.form.get("name") or stream_id).strip()
             app_name = (request.form.get("app") or app.config["LRTMP2_APP"]).strip()
+            publish_key = _optional_form_value(request.form.get("publish_key"))
+            play_key = _optional_form_value(request.form.get("play_key"))
+            stats_key = _optional_form_value(request.form.get("stats_key"))
+            form = {
+                "id": request.form.get("id", "").strip(),
+                "name": request.form.get("name", "").strip(),
+                "app": app_name,
+                "publish_key": publish_key or "",
+                "play_key": play_key or "",
+                "stats_key": stats_key or "",
+            }
             if not _is_valid_stream_id(stream_id):
                 error = (
                     "Stream ID must be 1-63 characters and use only letters, "
@@ -195,16 +247,27 @@ def create_app():
                     "Name must be 1-128 characters and must not contain "
                     "control characters."
                 )
+            elif (key_error := _validate_optional_access_keys(
+                publish_key, play_key, stats_key
+            )):
+                error = key_error
             else:
                 try:
-                    result = client.create_stream(stream_id, name, app_name)
+                    result = client.create_stream(
+                        stream_id,
+                        name,
+                        app_name,
+                        publish_key=publish_key,
+                        play_key=play_key,
+                        stats_key=stats_key,
+                    )
                     return redirect(url_for("stream_created", stream_id=result["id"]))
                 except Lrtmp2ApiError as exc:
                     error = str(exc)
         return render_template(
             "create_stream.html",
             error=error,
-            default_app=app.config["LRTMP2_APP"],
+            form=form,
         )
 
     @app.route("/streams/created")
@@ -236,13 +299,17 @@ def create_app():
             session["flash_error"] = "Invalid stream ID"
             return redirect(url_for("index"))
         name = (request.form.get("name") or "").strip() or None
+        play_key = _optional_form_value(request.form.get("play_key"))
         if name is not None and not _is_valid_display_name(name):
             session["flash_error"] = (
                 "Name must be 1-128 characters and must not contain control characters."
             )
             return redirect(url_for("index"))
+        if play_key is not None and not _is_valid_access_key(play_key):
+            session["flash_error"] = f"play_key: {ACCESS_KEY_HELP}"
+            return redirect(url_for("index"))
         try:
-            client.create_player(stream_id, name=name)
+            client.create_player(stream_id, name=name, play_key=play_key)
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))

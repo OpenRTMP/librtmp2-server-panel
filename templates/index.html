@@ -92,10 +92,12 @@
                 {% endfor %}
                 <form method="post" action="{{ url_for('add_player', stream_id=stream.id) }}" class="mt-2">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <div class="input-group">
+                    <div class="input-group mb-2">
                         <input type="text" class="form-control" name="name" placeholder="Player name (optional)">
                         <button type="submit" class="btn btn-outline-success">Add Player</button>
                     </div>
+                    <input type="text" class="form-control form-control-sm" name="play_key"
+                           placeholder="Custom play key (optional)" autocomplete="off">
                 </form>
                 <br>
 

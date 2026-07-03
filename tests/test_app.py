@@ -346,6 +346,135 @@ def test_create_stream_shows_keys_without_session_storage(monkeypatch):
         assert b"plk" in r2.data
 
 
+def test_create_stream_forwards_custom_keys(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.create_stream.return_value = {
+            "id": "custom",
+            "name": "Custom",
+            "app": "live",
+            "publish_key": "my_pub",
+            "play_key": "my_play",
+            "stats_key": "my_stats",
+            "players": [],
+        }
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/new",
+            data={
+                "id": "custom",
+                "name": "Custom",
+                "app": "live",
+                "publish_key": "my_pub",
+                "play_key": "my_play",
+                "stats_key": "my_stats",
+            },
+        )
+        assert r.status_code == 302
+        mock_client.create_stream.assert_called_once_with(
+            "custom",
+            "Custom",
+            "live",
+            publish_key="my_pub",
+            play_key="my_play",
+            stats_key="my_stats",
+        )
+
+
+def test_create_stream_rejects_invalid_custom_key(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/new",
+            data={"id": "badkey", "name": "Bad", "app": "live", "publish_key": "bad/key"},
+        )
+        assert r.status_code == 200
+        assert b"publish_key:" in r.data
+        mock_client_cls.return_value.create_stream.assert_not_called()
+
+
+def test_create_stream_rejects_duplicate_custom_keys(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/new",
+            data={
+                "id": "dup",
+                "name": "Dup",
+                "app": "live",
+                "publish_key": "same_key",
+                "play_key": "same_key",
+            },
+        )
+        assert r.status_code == 200
+        assert b"must be distinct" in r.data
+        mock_client_cls.return_value.create_stream.assert_not_called()
+
+
+def test_add_player_forwards_custom_play_key(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.post(
+            "/streams/s1/players/new",
+            data={"name": "Guest", "play_key": "guest_key"},
+        )
+        assert r.status_code == 302
+        mock_client.create_player.assert_called_once_with(
+            "s1",
+            name="Guest",
+            play_key="guest_key",
+        )
+
+
 def test_delete_stream_surfaces_api_error(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         from lrtmp2_client import Lrtmp2ApiError
