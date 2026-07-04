@@ -11,21 +11,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project has no fixed version; semantic-versioning guarantees
 only begin at a future `1.0.0`.
 
-## [Unreleased] — alpha
+## [Unreleased]
+
+## [0.1.0] — 2026-07-04
+
+First tagged pre-release.
 
 ### Added
 - Web-based control panel (Flask) for `librtmp2-server`
-- Stream management: create and delete streams via the server's HTTP API
+- Stream management: create and delete streams via the server's HTTP API,
+  including optional operator-supplied custom publish/play keys
 - Local SQLite store for created streams and their `publish_key` / `play_key` /
   `stats_key`, so publish/play/stats URLs can be rebuilt after creation
-- Publish/play URL display with one-click copy
+- Publish/play URL display with one-click copy, including `rtmps://` URLs
+  when the connected `librtmp2-server` reports RTMPS enabled (via
+  `/api/v1/health` and `LRTMP2_RTMPS_PORT`)
 - Live stats view per stream
 - Optional panel login (`REQUIRE_LOGIN`, `USERNAME` / `PASSWORD`)
 - Configuration via environment variables / `.env` (API URL & token, public
-  domain, RTMP port, default app name, session secret, DB path)
+  domain, RTMP/RTMPS port, default app name, session secret, DB path)
 - Docker / docker-compose deployment and a local development workflow
 
 ### Planned
-- RTMPS (`rtmps://`) publish/play URL support, matching librtmp2-server's TLS
-  termination
-- First tagged pre-release once routes and configuration settle
+- Further UI polish once user feedback comes in from the first release
