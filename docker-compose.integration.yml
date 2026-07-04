@@ -1,0 +1,29 @@
+# Docker Compose stack for CI / local cross-repo integration tests.
+# Requires librtmp2-server checked out at ./librtmp2-server (see integration workflow).
+
+services:
+  server:
+    build:
+      context: ./librtmp2-server
+      dockerfile: Dockerfile
+    container_name: librtmp2-server-integration
+    environment:
+      LRTMP2_DB: /data/server.db
+      LRTMP2_HTTP_BIND: 0.0.0.0:8080
+      LRTMP2_RTMP_BIND: 0.0.0.0:1935
+      LRTMP2_LOG_LEVEL: 2
+      LRTMP2_API_TOKEN: ${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN for integration tests}
+    volumes:
+      - integration-data:/data
+    ports:
+      - "8080:8080"
+      - "1935:1935"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  integration-data:

@@ -21,7 +21,7 @@ services:
     networks:
       - openrtmp
     depends_on:
-      server:
+      openrtmp-server:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8000/login"]
@@ -38,6 +38,7 @@ services:
       - LRTMP2_HTTP_BIND=0.0.0.0:8080
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
+      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
     volumes:
       - server-data:/data
     ports:

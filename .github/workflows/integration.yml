@@ -1,0 +1,50 @@
+name: Integration
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  LRTMP2_API_TOKEN: ci0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
+
+jobs:
+  panel-server-docker:
+    name: panel + librtmp2-server (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout panel
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout librtmp2-server
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRTMP/librtmp2-server
+          path: librtmp2-server
+          persist-credentials: false
+
+      - name: Build and start librtmp2-server
+        run: docker compose -f docker-compose.integration.yml up -d --build --wait
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run integration tests against live server
+        env:
+          RUN_INTEGRATION: "1"
+          LRTMP2_API_URL: http://localhost:8080
+          LRTMP2_STATS_URL: http://localhost:8080
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+        run: python -m pytest -m integration -q --tb=short
+
+      - name: Tear down Docker stack
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v

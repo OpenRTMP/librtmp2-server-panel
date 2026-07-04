@@ -31,4 +31,4 @@ jobs:
           SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
           PASSWORD: test-password-for-ci-only
           LRTMP2_API_TOKEN: test-api-token-for-ci-only
-        run: python -m pytest -q
+        run: python -m pytest -q --tb=short -m "not integration"
