@@ -34,3 +34,6 @@ First tagged pre-release.
 
 ### Planned
 - Further UI polish once user feedback comes in from the first release
+
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/OpenRTMP/librtmp2-server-panel/releases/tag/v0.1.0
