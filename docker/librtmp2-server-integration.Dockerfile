@@ -1,0 +1,34 @@
+# CI integration image: glibc runtime matches rust:latest builder output.
+# Upstream GHCR image uses Alpine/musl and cannot execute the glibc-linked binary.
+
+FROM rust:latest AS builder
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/
+COPY --from=builder /build/.env.example /etc/librtmp2-server/.env
+
+RUN useradd -r -s /usr/sbin/nologin -d /nonexistent -M openrtmp \
+    && mkdir -p /data \
+    && chown openrtmp:openrtmp /data
+
+ENV LRTMP2_DB=/data/server.db
+
+WORKDIR /etc/librtmp2-server
+
+USER openrtmp
+
+EXPOSE 1935 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
+
+ENTRYPOINT ["librtmp2-server"]
