@@ -20,14 +20,15 @@ jobs:
 
       - name: Extract API token from server logs
         run: |
-          echo "=== librtmp2-server startup logs ==="
-          docker logs librtmp2-server-integration
-          echo "=== end of server logs ==="
-          TOKEN=$(docker logs librtmp2-server-integration 2>&1 | awk '/Generated API token/{getline; print; exit}')
+          LOGS=$(docker logs librtmp2-server-integration 2>&1)
+          TOKEN=$(echo "$LOGS" | awk '/Generated API token/{getline; print; exit}')
           if [ -z "$TOKEN" ]; then
             echo "::error::Could not extract API token from server logs. See logs above."
+            echo "=== librtmp2-server startup logs (for debugging) ==="
+            echo "$LOGS"
             exit 1
           fi
+          echo "::add-mask::$TOKEN"
           echo "Extracted token (first 8 chars): ${TOKEN:0:8}..."
           echo "LRTMP2_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
