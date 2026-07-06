@@ -5,9 +5,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  LRTMP2_API_TOKEN: ci0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
-
 jobs:
   panel-server-docker:
     name: panel + librtmp2-server (Docker)
@@ -20,6 +17,20 @@ jobs:
 
       - name: Start librtmp2-server from GHCR
         run: docker compose -f docker-compose.integration.yml up -d --wait
+
+      - name: Extract API token from server logs
+        run: |
+          LOGS=$(docker logs librtmp2-server-integration 2>&1)
+          TOKEN=$(echo "$LOGS" | awk '/Generated API token/{getline; print; exit}')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not extract API token from server logs. See logs above."
+            echo "=== librtmp2-server startup logs (for debugging) ==="
+            echo "$LOGS"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "Extracted token (first 8 chars): ${TOKEN:0:8}..."
+          echo "LRTMP2_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v6

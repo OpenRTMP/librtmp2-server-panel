@@ -23,7 +23,7 @@ pytestmark = [
 ]
 
 CI_API_TOKEN = (
-    "ci0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+    "c10123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
 )
 PUB_KEY = "pub_integration_key_with_sufficient_length01"
 PLAY_KEY = "play_integration_key_with_sufficient_length01"
