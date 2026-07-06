@@ -18,8 +18,23 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check ports before startup
+        run: |
+          echo "=== Listening ports ==="
+          ss -tlnp || true
+          echo "=== Port 8080 ===" && ss -tlnp | grep :8080 && echo "PORT 8080 IN USE" || echo "Port 8080 free"
+          echo "=== Port 1935 ===" && ss -tlnp | grep :1935 && echo "PORT 1935 IN USE" || echo "Port 1935 free"
+
       - name: Start librtmp2-server from GHCR
         run: docker compose -f docker-compose.integration.yml up -d --wait
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo "=== Container logs ==="
+          docker logs librtmp2-server-integration 2>&1 || true
+          echo "=== Container inspect ==="
+          docker inspect librtmp2-server-integration 2>&1 || true
 
       - name: Set up Python
         uses: actions/setup-python@v6
