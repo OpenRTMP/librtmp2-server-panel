@@ -23,7 +23,7 @@ jobs:
           echo "=== librtmp2-server startup logs ==="
           docker logs librtmp2-server-integration
           echo "=== end of server logs ==="
-          TOKEN=$(docker logs librtmp2-server-integration 2>&1 | grep -iE 'token' | grep -oE '[a-f0-9A-F]{32,}' | head -1)
+          TOKEN=$(docker logs librtmp2-server-integration 2>&1 | awk '/Generated API token/{getline; print; exit}')
           if [ -z "$TOKEN" ]; then
             echo "::error::Could not extract API token from server logs. See logs above."
             exit 1
