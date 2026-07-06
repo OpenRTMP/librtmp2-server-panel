@@ -9,7 +9,7 @@ services:
       LRTMP2_DB: /data/server.db
       LRTMP2_HTTP_BIND: 0.0.0.0:8080
       LRTMP2_RTMP_BIND: 0.0.0.0:1935
-      LRTMP2_LOG_LEVEL: 2
+      LRTMP2_LOG_LEVEL: 1
     volumes:
       - integration-data:/data
     ports:
