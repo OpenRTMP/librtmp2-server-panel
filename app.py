@@ -182,7 +182,10 @@ def create_app():
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        if response.content_type and "text/html" in response.content_type:
+        if response.content_type and (
+            "text/html" in response.content_type
+            or "application/json" in response.content_type
+        ):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 

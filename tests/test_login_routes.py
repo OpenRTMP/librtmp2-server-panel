@@ -30,6 +30,14 @@ def test_security_headers_on_html_responses():
         assert r.headers.get("Cache-Control") == "no-store"
 
 
+def test_cache_control_no_store_on_json_responses(app_client):
+    """JSON stats responses may carry stream keys and must not be cached."""
+    client, mock_api = app_client
+    mock_api.stream_stats_by_id.return_value = {"stats_key": "secret"}
+    r = client.get("/streams/s1/stats.json")
+    assert r.headers.get("Cache-Control") == "no-store"
+
+
 def test_login_rejects_bad_password():
     with patch("app.Lrtmp2Client"):
         import app as app_module
