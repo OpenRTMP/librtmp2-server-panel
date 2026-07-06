@@ -15,6 +15,29 @@ def test_login_page_renders_without_session():
         assert r.status_code == 200
 
 
+def test_security_headers_on_html_responses():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        client = application.test_client()
+        r = client.get("/login")
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert r.headers.get("Content-Security-Policy") == "frame-ancestors 'none'"
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_cache_control_no_store_on_json_responses(app_client):
+    """JSON stats responses may carry stream keys and must not be cached."""
+    client, mock_api = app_client
+    mock_api.stream_stats_by_id.return_value = {"stats_key": "secret"}
+    r = client.get("/streams/s1/stats.json")
+    assert r.headers.get("Cache-Control") == "no-store"
+
+
 def test_login_rejects_bad_password():
     with patch("app.Lrtmp2Client"):
         import app as app_module
