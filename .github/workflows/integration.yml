@@ -18,8 +18,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Start librtmp2-server from GHCR
-        run: docker compose -f docker-compose.integration.yml up -d --wait
+      - name: Checkout librtmp2-server
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRTMP/librtmp2-server
+          path: librtmp2-server
+          persist-credentials: false
+
+      - name: Build and start librtmp2-server
+        run: docker compose -f docker-compose.integration.yml up -d --build --wait
 
       - name: Set up Python
         uses: actions/setup-python@v6
