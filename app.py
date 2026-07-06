@@ -342,6 +342,9 @@ def create_app():
         return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/stats.json")
+    # Shared across all stream_ids (Flask-Limiter keys per endpoint, not per URL
+    # parameter) — 300/min supports ~15 streams polling every 3s from scripts.js.
+    @limiter.limit("300 per minute")
     @login_required
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):

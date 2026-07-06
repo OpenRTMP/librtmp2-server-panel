@@ -1,14 +1,41 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-07-03
+Last scanned: static/js/ — 2026-07-06
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-07-06 static/js/ pass)
+
+- **`scripts.js` `initializeStats()` / `loadStats()` + `app.py` default rate limit** —
+  `initializeStats()` polls `/streams/<id>/stats.json` for every stream on the
+  index page every 3 seconds (20 requests/min per stream). The route inherited
+  Flask-Limiter's default `100 per minute` per IP. With 6+ streams the panel
+  exceeds that budget within ~50s; further polls return HTTP 429, `loadStats()`
+  treats non-OK responses as failures, and live stats permanently show
+  "Stats not available" for operators managing multiple streams. Fixed by
+  `@limiter.exempt` on `stream_stats` (endpoint is already behind
+  `@login_required`).
+- Reviewed but not a bug: `innerHTML` assignments escape `data.error` and
+  `video.codec` via `escapeHtml()`; numeric fields are coerced with `Number()`
+  before interpolation. `streamId` in fetch URLs comes from
+  `data-stream-id="{{ stream.id }}"` (Jinja auto-escaped; validated server-side
+  on the stats route). All POST forms in templates include CSRF tokens.
+  `fetch()` uses same-origin defaults so session cookies are sent. No `|safe`
+  filters or unescaped API strings in templates.
+
+## Findings (2026-07-05 templates/ pass)
+
+- No critical bugs found. All POST forms include `csrf_token`. User/API-derived
+  strings are rendered with Jinja auto-escaping (verified for attribute and body
+  contexts, including malicious `name`, `app`, and URL payloads). `Referrer-Policy:
+  no-referrer` is set in `base.html` and via `set_security_headers` to avoid
+  leaking stream keys in stats URL query strings.
 
 ## Findings (2026-07-03 config.py pass)
 
