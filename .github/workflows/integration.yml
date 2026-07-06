@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  LRTMP2_API_TOKEN: ci0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
+  LRTMP2_API_TOKEN: c10123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 
 jobs:
   panel-server-docker:

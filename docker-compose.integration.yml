@@ -10,7 +10,7 @@ services:
       LRTMP2_HTTP_BIND: 0.0.0.0:8080
       LRTMP2_RTMP_BIND: 0.0.0.0:1935
       LRTMP2_LOG_LEVEL: 1
-      LRTMP2_API_TOKEN: ${LRTMP2_API_TOKEN}
+      LRTMP2_API_TOKEN: ${LRTMP2_API_TOKEN:?LRTMP2_API_TOKEN must be set}
     volumes:
       - integration-data:/data
     ports:
