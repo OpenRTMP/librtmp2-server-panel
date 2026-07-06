@@ -179,6 +179,11 @@ def create_app():
     @app.after_request
     def set_security_headers(response):
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        if response.content_type and "text/html" in response.content_type:
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     @app.route("/")
