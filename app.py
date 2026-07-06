@@ -342,7 +342,7 @@ def create_app():
         return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/stats.json")
-    @limiter.exempt
+    @limiter.limit("300 per minute")
     @login_required
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):

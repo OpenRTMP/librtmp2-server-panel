@@ -107,8 +107,8 @@ def test_stream_stats_json_api_failure_returns_502(app_client):
     assert r.get_json() == {"error": "Failed to fetch stats"}
 
 
-def test_stream_stats_json_exempt_from_default_rate_limit(app_client):
-    """scripts.js polls each stream every 3s; 6+ streams exceed 100/min otherwise."""
+def test_stream_stats_json_scoped_rate_limit_allows_polling(app_client):
+    """scripts.js polls each stream every 3s; 300/min allows up to 15 streams."""
     client, mock_api = app_client
     mock_api.stream_stats_by_id.return_value = {"streams": []}
 
