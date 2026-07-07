@@ -1,12 +1,13 @@
-# Docker Compose stack for CI / local integration tests against the published server image.
+# Docker Compose stack for CI / local integration tests against librtmp2-server.
 
 services:
   server:
-    image: ghcr.io/openrtmp/librtmp2-server:latest
-    pull_policy: always
+    build: ./librtmp2-server
+    image: librtmp2-server-integration:local
     container_name: librtmp2-server-integration
     environment:
       LRTMP2_DB: /data/server.db
+      LRTMP2_API_TOKEN: ${LRTMP2_API_TOKEN}
       LRTMP2_HTTP_BIND: 0.0.0.0:8080
       LRTMP2_RTMP_BIND: 0.0.0.0:1935
       LRTMP2_LOG_LEVEL: 1

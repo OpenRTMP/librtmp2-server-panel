@@ -1,7 +1,6 @@
 name: Integration
 
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
@@ -15,22 +14,37 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Start librtmp2-server from GHCR
-        run: docker compose -f docker-compose.integration.yml up -d --wait
-
-      - name: Extract API token from server logs
+      - name: Determine librtmp2-server ref
+        id: server_ref
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          LOGS=$(docker logs librtmp2-server-integration 2>&1)
-          TOKEN=$(echo "$LOGS" | awk '/Generated API token/{getline; print; exit}')
-          if [ -z "$TOKEN" ]; then
-            echo "::error::Could not extract API token from server logs. See logs above."
-            echo "=== librtmp2-server startup logs (for debugging) ==="
-            echo "$LOGS"
-            exit 1
+          CANDIDATE="$HEAD_REF"
+          if [ -n "$CANDIDATE" ] && git ls-remote --exit-code --heads \
+              https://github.com/OpenRTMP/librtmp2-server.git "$CANDIDATE" >/dev/null 2>&1; then
+            echo "ref=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Checkout librtmp2-server
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRTMP/librtmp2-server
+          ref: ${{ steps.server_ref.outputs.ref }}
+          path: librtmp2-server
+          persist-credentials: false
+
+      - name: Start librtmp2-server from source
+        id: server_stack
+        run: |
+          TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
           echo "::add-mask::$TOKEN"
-          echo "Extracted token (first 8 chars): ${TOKEN:0:8}..."
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
           echo "LRTMP2_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          export LRTMP2_API_TOKEN="$TOKEN"
+          docker compose -f docker-compose.integration.yml down -v --remove-orphans || true
+          docker compose -f docker-compose.integration.yml up -d --build --wait
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -45,6 +59,7 @@ jobs:
           RUN_INTEGRATION: "1"
           LRTMP2_API_URL: http://localhost:8080
           LRTMP2_STATS_URL: http://localhost:8080
+          LRTMP2_API_TOKEN: ${{ steps.server_stack.outputs.token }}
           SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
           PASSWORD: test-password-for-ci-only
         run: python -m pytest -m integration -q --tb=short
