@@ -14,11 +14,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Determine librtmp2-server ref
+        id: server_ref
+        run: |
+          CANDIDATE="${{ github.head_ref }}"
+          if [ -n "$CANDIDATE" ] && git ls-remote --exit-code --heads \
+              https://github.com/OpenRTMP/librtmp2-server.git "$CANDIDATE" >/dev/null 2>&1; then
+            echo "ref=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout librtmp2-server
         uses: actions/checkout@v7
         with:
           repository: OpenRTMP/librtmp2-server
-          ref: ${{ github.head_ref || 'main' }}
+          ref: ${{ steps.server_ref.outputs.ref }}
           path: librtmp2-server
           persist-credentials: false
 

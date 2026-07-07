@@ -47,6 +47,39 @@ def test_delete_stream_treats_404_as_success():
         client.delete_stream("missing")
 
 
+def test_delete_stream_polls_until_gone_on_202():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.get"
+    ) as mock_get, patch("lrtmp2_client.time.sleep") as mock_sleep:
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 202
+
+        still_present = type("R", (), {"ok": True, "json": lambda self: [{"id": "s1"}]})()
+        gone = type("R", (), {"ok": True, "json": lambda self: []})()
+        mock_get.return_value = still_present
+        mock_get.side_effect = [still_present, gone]
+
+        client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
+
+    assert mock_get.call_count == 2
+    mock_sleep.assert_called_once()
+
+
+def test_delete_stream_202_gives_up_after_timeout():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.get"
+    ) as mock_get, patch("lrtmp2_client.time.sleep"):
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 202
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.return_value = [{"id": "s1"}]
+
+        # Should return without raising even though the stream never disappears.
+        client.delete_stream("s1", wait_timeout=0, poll_interval=0.1)
+
+
 def test_delete_stream_raises_on_server_error():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete:

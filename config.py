@@ -36,11 +36,15 @@ def _is_insecure_secret(value):
 
 
 def _session_cookie_secure_default():
-    for key in ("PANEL_PUBLIC_URL", "LRTMP2_STATS_URL", "LRTMP2_API_URL"):
-        value = os.environ.get(key, "").strip().lower()
-        if value.startswith("https://"):
-            return True
-    return _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)
+    """Auto-detect from the panel's own public URL only — the API/stats URLs
+    say nothing about whether the panel itself is served over HTTPS, and an
+    explicit SESSION_COOKIE_SECURE always takes precedence over detection.
+    """
+    explicit = os.environ.get("SESSION_COOKIE_SECURE")
+    if explicit is not None and explicit.strip() != "":
+        return _bool(explicit, False)
+    public_url = os.environ.get("PANEL_PUBLIC_URL", "").strip().lower()
+    return public_url.startswith("https://")
 
 
 def _validate_config():
