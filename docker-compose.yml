@@ -11,7 +11,7 @@ services:
       - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-localhost}
       - LRTMP2_RTMP_PORT=1935
       - LRTMP2_APP=live
-      - REQUIRE_LOGIN=True
+      - REQUIRE_LOGIN=${REQUIRE_LOGIN:-False}
       - USERNAME=${USERNAME:-admin}
       - PASSWORD=${PASSWORD:?Set PASSWORD in .env}
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}

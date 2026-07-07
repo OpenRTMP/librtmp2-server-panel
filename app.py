@@ -17,8 +17,10 @@ STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
+MIN_ACCESS_KEY_LEN = 32
+
 ACCESS_KEY_HELP = (
-    "Must be 1-63 characters and use only letters, numbers, dots, "
+    f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
     "underscores, or hyphens."
 )
 
@@ -44,7 +46,7 @@ def _is_valid_display_name(value):
 
 
 def _is_valid_access_key(value):
-    return _is_valid_stream_id(value)
+    return _is_valid_stream_id(value) and len(value) >= MIN_ACCESS_KEY_LEN
 
 
 def _optional_form_value(raw):
@@ -84,6 +86,11 @@ def create_app():
         default_limits=["100 per minute"],
         storage_uri=app.config["RATELIMIT_STORAGE_URI"],
     )
+    if app.config["RATELIMIT_STORAGE_URI"] == "memory://":
+        app.logger.warning(
+            "RATELIMIT_STORAGE_URI=memory:// is per worker process; "
+            "use a shared backend such as redis:// for multi-worker deployments"
+        )
 
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,

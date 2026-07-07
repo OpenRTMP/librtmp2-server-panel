@@ -113,7 +113,7 @@ class Lrtmp2Client:
             "delete_stream",
             headers=self._headers(),
         )
-        if not resp.ok and resp.status_code != 404:
+        if not resp.ok and resp.status_code not in (404, 202):
             raise _api_error(resp, "delete_stream")
 
     def create_player(self, stream_id, name=None, play_key=None):

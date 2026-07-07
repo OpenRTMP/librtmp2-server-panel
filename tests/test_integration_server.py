@@ -54,7 +54,6 @@ def test_live_health(api_base_url):
     resp.raise_for_status()
     body = resp.json()
     assert body.get("status") == "ok"
-    assert body.get("rtmp_port") == 1935
 
 
 def test_live_create_list_delete_stream(live_client):

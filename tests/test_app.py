@@ -76,13 +76,13 @@ def test_config_rejects_insecure_defaults_case_insensitive(monkeypatch):
         _forget_config_module()
 
 
-def test_require_login_empty_string_defaults_to_true(monkeypatch):
+def test_require_login_empty_string_defaults_to_false(monkeypatch):
     monkeypatch.setenv("REQUIRE_LOGIN", "")
     import importlib
     import config
 
     importlib.reload(config)
-    assert config.Config.REQUIRE_LOGIN is True
+    assert config.Config.REQUIRE_LOGIN is False
 
 
 def test_password_not_required_when_login_disabled(monkeypatch):
@@ -377,9 +377,9 @@ def test_create_stream_forwards_custom_keys(monkeypatch):
                 "id": "custom",
                 "name": "Custom",
                 "app": "live",
-                "publish_key": "my_pub",
-                "play_key": "my_play",
-                "stats_key": "my_stats",
+                "publish_key": "my_pub_key_with_sufficient_length_here01",
+                "play_key": "my_play_key_with_sufficient_length_here01",
+                "stats_key": "my_stats_key_with_sufficient_length_here01",
             },
         )
         assert r.status_code == 302
@@ -387,9 +387,9 @@ def test_create_stream_forwards_custom_keys(monkeypatch):
             "custom",
             "Custom",
             "live",
-            publish_key="my_pub",
-            play_key="my_play",
-            stats_key="my_stats",
+            publish_key="my_pub_key_with_sufficient_length_here01",
+            play_key="my_play_key_with_sufficient_length_here01",
+            stats_key="my_stats_key_with_sufficient_length_here01",
         )
 
 
@@ -436,8 +436,8 @@ def test_create_stream_rejects_duplicate_custom_keys(monkeypatch):
                 "id": "dup",
                 "name": "Dup",
                 "app": "live",
-                "publish_key": "same_key",
-                "play_key": "same_key",
+                "publish_key": "same_custom_key_with_sufficient_length01",
+                "play_key": "same_custom_key_with_sufficient_length01",
             },
         )
         assert r.status_code == 200
@@ -465,13 +465,13 @@ def test_add_player_forwards_custom_play_key(monkeypatch):
 
         r = client.post(
             "/streams/s1/players/new",
-            data={"name": "Guest", "play_key": "guest_key"},
+            data={"name": "Guest", "play_key": "guest_play_key_with_sufficient_length01"},
         )
         assert r.status_code == 302
         mock_client.create_player.assert_called_once_with(
             "s1",
             name="Guest",
-            play_key="guest_key",
+            play_key="guest_play_key_with_sufficient_length01",
         )
 
 

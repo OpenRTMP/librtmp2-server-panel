@@ -35,6 +35,14 @@ def _is_insecure_secret(value):
     return stripped.startswith("<") and stripped.endswith(">")
 
 
+def _session_cookie_secure_default():
+    for key in ("PANEL_PUBLIC_URL", "LRTMP2_STATS_URL", "LRTMP2_API_URL"):
+        value = os.environ.get(key, "").strip().lower()
+        if value.startswith("https://"):
+            return True
+    return _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)
+
+
 def _validate_config():
     """Fail fast on insecure or missing configuration at startup."""
     errors = []
@@ -47,7 +55,7 @@ def _validate_config():
         )
 
     password = os.environ.get("PASSWORD")
-    require_login = _bool(os.environ.get("REQUIRE_LOGIN"), True)
+    require_login = _bool(os.environ.get("REQUIRE_LOGIN"), False)
     if require_login and _is_insecure_secret(password):
         errors.append(
             "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
@@ -58,8 +66,8 @@ def _validate_config():
     if _is_insecure_secret(api_token):
         errors.append(
             "LRTMP2_API_TOKEN is not set or uses the placeholder. "
-            "Copy the token printed by librtmp2-server on first startup "
-            "(stored in the server's SQLite database)."
+            "Set the same token in librtmp2-server and panel (via LRTMP2_API_TOKEN env "
+            "or the value stored in the server's SQLite database)."
         )
 
     if errors:
@@ -75,7 +83,7 @@ _validate_config()
 class Config:
     SECRET_KEY = os.environ["SECRET_KEY"]
 
-    REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), True)
+    REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), False)
     USERNAME = os.environ.get("USERNAME", "admin")
     PASSWORD = os.environ.get("PASSWORD", "")
 
@@ -92,8 +100,8 @@ class Config:
     LRTMP2_RTMPS_PORT = os.environ.get("LRTMP2_RTMPS_PORT", "1936")
     LRTMP2_APP = os.environ.get("LRTMP2_APP", "live")
 
-    # Only enable Secure cookies when the panel is served over HTTPS.
-    SESSION_COOKIE_SECURE = _bool(os.environ.get("SESSION_COOKIE_SECURE"), False)
+    # Enable Secure cookies automatically when public URLs use HTTPS.
+    SESSION_COOKIE_SECURE = _session_cookie_secure_default()
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
     RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", "memory://")
