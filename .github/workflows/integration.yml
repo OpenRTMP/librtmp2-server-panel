@@ -16,8 +16,10 @@ jobs:
 
       - name: Determine librtmp2-server ref
         id: server_ref
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          CANDIDATE="${{ github.head_ref }}"
+          CANDIDATE="$HEAD_REF"
           if [ -n "$CANDIDATE" ] && git ls-remote --exit-code --heads \
               https://github.com/OpenRTMP/librtmp2-server.git "$CANDIDATE" >/dev/null 2>&1; then
             echo "ref=$CANDIDATE" >> "$GITHUB_OUTPUT"

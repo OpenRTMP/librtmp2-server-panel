@@ -70,14 +70,24 @@ def test_delete_stream_202_gives_up_after_timeout():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
         "lrtmp2_client.requests.get"
-    ) as mock_get, patch("lrtmp2_client.time.sleep"):
+    ) as mock_get, patch("lrtmp2_client.time.sleep") as mock_sleep, patch(
+        "lrtmp2_client.time.monotonic"
+    ) as mock_monotonic:
         mock_delete.return_value.ok = True
         mock_delete.return_value.status_code = 202
         mock_get.return_value.ok = True
         mock_get.return_value.json.return_value = [{"id": "s1"}]
 
-        # Should return without raising even though the stream never disappears.
-        client.delete_stream("s1", wait_timeout=0, poll_interval=0.1)
+        # Simulate the clock advancing past the deadline after two polls, so
+        # the while loop actually iterates before giving up (rather than
+        # exiting immediately, which wouldn't exercise the polling/timeout
+        # logic at all).
+        mock_monotonic.side_effect = [0, 1, 2, 10]
+
+        client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
+
+    assert mock_get.call_count == 2
+    assert mock_sleep.call_count == 2
 
 
 def test_delete_stream_raises_on_server_error():
