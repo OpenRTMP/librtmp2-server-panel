@@ -28,6 +28,7 @@ jobs:
           TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
           echo "::add-mask::$TOKEN"
           echo "LRTMP2_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          docker compose -f docker-compose.integration.yml down -v --remove-orphans || true
           LRTMP2_API_TOKEN="$TOKEN" docker compose -f docker-compose.integration.yml up -d --build --wait
 
       - name: Set up Python
@@ -43,6 +44,7 @@ jobs:
           RUN_INTEGRATION: "1"
           LRTMP2_API_URL: http://localhost:8080
           LRTMP2_STATS_URL: http://localhost:8080
+          LRTMP2_API_TOKEN: ${{ env.LRTMP2_API_TOKEN }}
           SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
           PASSWORD: test-password-for-ci-only
         run: python -m pytest -m integration -q --tb=short

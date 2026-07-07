@@ -124,6 +124,7 @@ def _fresh_flask_app(monkeypatch, api_base_url, api_token):
     application = app_module.create_app()
     application.config["TESTING"] = True
     application.config["WTF_CSRF_ENABLED"] = False
+    application.config["REQUIRE_LOGIN"] = True
     return application
 
 
