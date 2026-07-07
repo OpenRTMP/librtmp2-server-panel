@@ -15,12 +15,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Start librtmp2-server from GHCR
+      - name: Checkout librtmp2-server
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRTMP/librtmp2-server
+          ref: ${{ github.head_ref || 'main' }}
+          path: librtmp2-server
+          persist-credentials: false
+
+      - name: Start librtmp2-server from source
         run: |
           TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
           echo "::add-mask::$TOKEN"
           echo "LRTMP2_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          LRTMP2_API_TOKEN="$TOKEN" docker compose -f docker-compose.integration.yml up -d --wait
+          LRTMP2_API_TOKEN="$TOKEN" docker compose -f docker-compose.integration.yml up -d --build --wait
 
       - name: Set up Python
         uses: actions/setup-python@v6

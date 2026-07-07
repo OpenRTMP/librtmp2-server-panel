@@ -4,6 +4,21 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture
+def login_required_app():
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["REQUIRE_LOGIN"] = True
+        yield application.test_client()
+
+
 def test_login_page_renders_without_session():
     with patch("app.Lrtmp2Client"):
         import app as app_module
@@ -73,40 +88,25 @@ def test_login_accepts_valid_credentials():
         assert r.headers["Location"].endswith("/")
 
 
-def test_logout_clears_session():
-    with patch("app.Lrtmp2Client") as mock_client_cls:
-        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
-        mock_client_cls.return_value.list_streams.return_value = []
+def test_logout_clears_session(login_required_app):
+    client = login_required_app
+    client.post(
+        "/login",
+        data={"username": "admin", "password": os.environ["PASSWORD"]},
+    )
+    r = client.post("/logout")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
 
-        import app as app_module
-
-        application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
-        client = application.test_client()
-        client.post(
-            "/login",
-            data={"username": "admin", "password": os.environ["PASSWORD"]},
-        )
-        r = client.post("/logout")
-        assert r.status_code == 302
-        assert "/login" in r.headers["Location"]
-
-        r2 = client.get("/")
-        assert r2.status_code == 302
-        assert "/login" in r2.headers["Location"]
+    r2 = client.get("/")
+    assert r2.status_code == 302
+    assert "/login" in r2.headers["Location"]
 
 
-def test_index_requires_login_when_not_authenticated():
-    with patch("app.Lrtmp2Client"):
-        import app as app_module
-
-        application = app_module.create_app()
-        application.config["TESTING"] = True
-        client = application.test_client()
-        r = client.get("/")
-        assert r.status_code == 302
-        assert "/login" in r.headers["Location"]
+def test_index_requires_login_when_not_authenticated(login_required_app):
+    r = login_required_app.get("/")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
 
 
 def test_stream_stats_json_returns_data(app_client):
