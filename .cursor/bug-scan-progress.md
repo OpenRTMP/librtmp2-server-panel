@@ -1,14 +1,34 @@
 # Bug scan progress
 
-Last scanned: static/js/ — 2026-07-06
+Last scanned: app.py — 2026-07-08
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [x] `config.py` — startup validation and environment configuration
-- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [ ] `config.py` — startup validation and environment configuration
+- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-07-08 app.py pass)
+
+- **`login_required` / `REQUIRE_LOGIN` default False** — `app.py` gates every
+  admin route on `app.config["REQUIRE_LOGIN"]`, but `config.py`,
+  `docker-compose.yml`, and `.env.example` all defaulted `REQUIRE_LOGIN` to
+  `False` while gunicorn/Docker bind `0.0.0.0:8000`. Scenario: operator
+  deploys with docker-compose defaults (or copies `.env.example` as-is) without
+  explicitly enabling login — any remote host reaching port 8000 gets full
+  unauthenticated access to stream CRUD and all publish/play/stats keys.
+  Impact: complete admin-panel compromise (create/delete streams, view secrets).
+  Fixed by defaulting `REQUIRE_LOGIN` to `True` in config/docker-compose/
+  `.env.example`, adding a startup warning in `app.py` when login is
+  explicitly disabled, and regression tests for the secure default.
+- Reviewed but not a bug: `session.clear()` on login changes the signed session
+  cookie (no fixation). All POST routes use CSRF tokens. `stream_id`/`player_id`
+  validated with strict regex before API calls. `login_required` wraps every
+  sensitive route. `stream_stats` is behind auth with a scoped 300/min limit
+  (supports ~15 streams polling every 3s). Security headers set on all
+  responses. `hmac.compare_digest` used for credential checks.
 
 ## Findings (2026-07-06 static/js/ pass)
 
