@@ -103,6 +103,18 @@ def test_logout_clears_session(login_required_app):
     assert "/login" in r2.headers["Location"]
 
 
+def test_index_requires_login_by_default():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        client = application.test_client()
+        r = client.get("/")
+        assert r.status_code == 302
+        assert "/login" in r.headers["Location"]
+
+
 def test_index_requires_login_when_not_authenticated(login_required_app):
     r = login_required_app.get("/")
     assert r.status_code == 302

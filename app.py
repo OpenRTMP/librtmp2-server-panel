@@ -91,6 +91,11 @@ def create_app():
             "RATELIMIT_STORAGE_URI=memory:// is per worker process; "
             "use a shared backend such as redis:// for multi-worker deployments"
         )
+    if not app.config["REQUIRE_LOGIN"]:
+        app.logger.warning(
+            "REQUIRE_LOGIN=False: the panel admin UI is open without authentication. "
+            "Only disable login on trusted local networks."
+        )
 
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
