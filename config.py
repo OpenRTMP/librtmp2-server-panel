@@ -59,7 +59,7 @@ def _validate_config():
         )
 
     password = os.environ.get("PASSWORD")
-    require_login = _bool(os.environ.get("REQUIRE_LOGIN"), False)
+    require_login = _bool(os.environ.get("REQUIRE_LOGIN"), True)
     if require_login and _is_insecure_secret(password):
         errors.append(
             "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
@@ -87,7 +87,7 @@ _validate_config()
 class Config:
     SECRET_KEY = os.environ["SECRET_KEY"]
 
-    REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), False)
+    REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), True)
     USERNAME = os.environ.get("USERNAME", "admin")
     PASSWORD = os.environ.get("PASSWORD", "")
 

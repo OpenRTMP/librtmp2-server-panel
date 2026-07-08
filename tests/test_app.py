@@ -76,13 +76,22 @@ def test_config_rejects_insecure_defaults_case_insensitive(monkeypatch):
         _forget_config_module()
 
 
-def test_require_login_empty_string_defaults_to_false(monkeypatch):
+def test_require_login_empty_string_defaults_to_true(monkeypatch):
     monkeypatch.setenv("REQUIRE_LOGIN", "")
     import importlib
     import config
 
     importlib.reload(config)
-    assert config.Config.REQUIRE_LOGIN is False
+    assert config.Config.REQUIRE_LOGIN is True
+
+
+def test_require_login_unset_defaults_to_true(monkeypatch):
+    monkeypatch.delenv("REQUIRE_LOGIN", raising=False)
+    import importlib
+    import config
+
+    importlib.reload(config)
+    assert config.Config.REQUIRE_LOGIN is True
 
 
 def test_password_not_required_when_login_disabled(monkeypatch):
