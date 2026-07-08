@@ -1,5 +1,8 @@
 # librtmp2-server-panel
 
+![Version](https://img.shields.io/badge/version-v0.1.0-orange)
+![Language](https://img.shields.io/badge/language-Python-orange)
+
 A web-based control panel for [librtmp2-server](https://github.com/OpenRTMP/librtmp2-server). Manage streams, copy publish/play URLs, and view live stats through a simple UI.
 
 The panel reads streams, keys, and stats directly from the server REST API. Keys are shown blurred in the overview and can be copied on click.
@@ -51,4 +54,4 @@ python3 app.py
 - Create/delete streams against librtmp2-server's REST API
 - One-click copy for publish URL, stream key, play URL, and stats URL
 - Live per-stream stats (bitrate, resolution, codec, uptime, RTT) polled from `/stats?key=...`
-- Optional login gate for the whole panel
+- Optional login gate for the whole panel, enabled by default on network-exposed deployments
