@@ -1,14 +1,32 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-07-08
+Last scanned: lrtmp2_client.py — 2026-07-09
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-07-09 lrtmp2_client.py pass)
+
+- **`delete_stream()` 202 polling / `wait_timeout=5`** — librtmp2-server returns
+  HTTP 202 when a stream has active RTMP sessions and drains them asynchronously
+  for up to 30s before finalizing the delete (or re-enabling the stream on
+  timeout). The client only polled `list_streams()` for 5s, then returned without
+  error. Scenario: operator deletes a live stream from the panel; the redirect
+  shows no flash error, but the stream remains listed (and may be re-enabled by
+  the server if sessions never drop). Impact: failed/incorrect delete appears
+  successful — stream keys stay valid during incident response. Fixed by defaulting
+  `wait_timeout` to 35s (server drain window + buffer) and raising
+  `Lrtmp2ApiError` when the stream is still present after polling exhausts.
+- Reviewed but not a bug: network/JSON errors already wrapped as `Lrtmp2ApiError`;
+  path segments URL-encoded; Bearer token only in Authorization header; per-call
+  timeouts; no shared mutable request state; `health()` intentionally unauthenticated
+  per server API; `stream_stats()` unused by `app.py` (panel uses
+  `stream_stats_by_id` with Bearer auth).
 
 ## Findings (2026-07-08 app.py pass)
 
