@@ -66,7 +66,7 @@ def test_delete_stream_polls_until_gone_on_202():
     mock_sleep.assert_called_once()
 
 
-def test_delete_stream_202_gives_up_after_timeout():
+def test_delete_stream_202_raises_when_still_present_after_timeout():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
         "lrtmp2_client.requests.get"
@@ -84,9 +84,10 @@ def test_delete_stream_202_gives_up_after_timeout():
         # logic at all).
         mock_monotonic.side_effect = [0, 1, 2, 10]
 
-        client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
+        with pytest.raises(Lrtmp2ApiError, match="still present"):
+            client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
 
-    assert mock_get.call_count == 2
+    assert mock_get.call_count == 3
     assert mock_sleep.call_count == 2
 
 

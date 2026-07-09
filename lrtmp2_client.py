@@ -107,14 +107,16 @@ class Lrtmp2Client:
             json=payload,
         )
 
-    def delete_stream(self, stream_id, wait_timeout=5, poll_interval=0.5):
+    def delete_stream(self, stream_id, wait_timeout=35, poll_interval=0.5):
         """Delete a stream. librtmp2-server may accept the request with `202`
         and finish the delete asynchronously (draining active RTMP sessions
         first) — poll until the stream actually disappears from the list so
         callers can rely on the stream being gone once this returns, rather
-        than racing the background delete. Best-effort: if the delete is
-        still pending after `wait_timeout` seconds, this returns anyway and
-        the caller will see the stream reappear as still-present.
+        than racing the background delete. librtmp2-server waits up to 30s for
+        active RTMP sessions to drain before giving up, so the default
+        wait_timeout is 35s. If the stream is still listed after that window,
+        raises Lrtmp2ApiError so the panel can surface the incomplete delete
+        instead of silently redirecting while the stream remains.
         """
         resp = self._request(
             requests.delete,
@@ -129,8 +131,14 @@ class Lrtmp2Client:
             while time.monotonic() < deadline:
                 streams = self.list_streams()
                 if not any(s.get("id") == stream_id for s in streams):
-                    break
+                    return
                 time.sleep(poll_interval)
+            streams = self.list_streams()
+            if any(s.get("id") == stream_id for s in streams):
+                raise Lrtmp2ApiError(
+                    "delete_stream failed: stream is still present after waiting "
+                    "for active RTMP sessions to drain. Try again shortly."
+                )
 
     def create_player(self, stream_id, name=None, play_key=None):
         payload = {}
