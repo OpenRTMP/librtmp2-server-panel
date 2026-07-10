@@ -47,36 +47,41 @@ def _session_cookie_secure_default():
     return public_url.startswith("https://")
 
 
+def _emit_config_error(message: str) -> None:
+    """Emit a startup config error without interpolating sensitive env values."""
+    sys.stderr.write("CONFIG ERROR: ")
+    sys.stderr.write(message)
+    sys.stderr.write("\n")
+
+
 def _validate_config():
     """Fail fast on insecure or missing configuration at startup."""
-    errors = []
+    had_error = False
 
-    secret_key = os.environ.get("SECRET_KEY")
-    if _is_insecure_secret(secret_key):
-        errors.append(
+    if _is_insecure_secret(os.environ.get("SECRET_KEY")):
+        _emit_config_error(
             "SECRET_KEY is not set or uses an insecure default. "
             "Generate one with: python3 -c 'import secrets; print(secrets.token_hex(32))'"
         )
+        had_error = True
 
-    password = os.environ.get("PASSWORD")
     require_login = _bool(os.environ.get("REQUIRE_LOGIN"), True)
-    if require_login and _is_insecure_secret(password):
-        errors.append(
+    if require_login and _is_insecure_secret(os.environ.get("PASSWORD")):
+        _emit_config_error(
             "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
             "Set a strong password."
         )
+        had_error = True
 
-    api_token = os.environ.get("LRTMP2_API_TOKEN")
-    if _is_insecure_secret(api_token):
-        errors.append(
+    if _is_insecure_secret(os.environ.get("LRTMP2_API_TOKEN")):
+        _emit_config_error(
             "LRTMP2_API_TOKEN is not set or uses the placeholder. "
             "Set the same token in librtmp2-server and panel (via LRTMP2_API_TOKEN env "
             "or the value stored in the server's SQLite database)."
         )
+        had_error = True
 
-    if errors:
-        for err in errors:
-            print(f"CONFIG ERROR: {err}", file=sys.stderr)
+    if had_error:
         sys.exit(1)
 
 
