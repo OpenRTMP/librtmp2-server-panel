@@ -157,6 +157,34 @@ def test_password_not_required_when_login_disabled(monkeypatch):
     importlib.reload(config)
 
 
+def test_config_rejects_short_password_when_login_enabled(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-placeholder-check")
+    monkeypatch.setenv("PASSWORD", "12345678")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-placeholder-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_config_accepts_long_password_when_login_enabled(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-placeholder-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-placeholder-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-placeholder-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+
+    _forget_config_module()
+    try:
+        importlib.import_module("config")
+    finally:
+        _forget_config_module()
+
+
 def test_index_lists_streams_from_api(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
