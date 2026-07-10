@@ -94,6 +94,53 @@ def test_require_login_unset_defaults_to_true(monkeypatch):
     assert config.Config.REQUIRE_LOGIN is True
 
 
+def test_require_login_false_string_disables_login(monkeypatch):
+    monkeypatch.setenv("REQUIRE_LOGIN", "false")
+    import config
+
+    importlib.reload(config)
+    assert config.Config.REQUIRE_LOGIN is False
+
+
+def test_config_rejects_require_login_typo(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-require-login-typo")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-require-login-typo")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-require-login-typo")
+    monkeypatch.setenv("REQUIRE_LOGIN", "Tru")
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_config_rejects_short_secret_key(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "abc")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-short-secret-key")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-short-secret-key")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_session_cookie_secure_from_panel_public_url(monkeypatch):
+    monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
+    monkeypatch.setenv("PANEL_PUBLIC_URL", "https://panel.example.com")
+    import config
+
+    importlib.reload(config)
+    assert config.Config.SESSION_COOKIE_SECURE is True
+
+
 def test_password_not_required_when_login_disabled(monkeypatch):
     original_password = os.environ.get("PASSWORD", "test-password-for-ci-only")
     monkeypatch.setenv("REQUIRE_LOGIN", "false")

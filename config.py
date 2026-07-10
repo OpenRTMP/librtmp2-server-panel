@@ -12,6 +12,9 @@ _INSECURE_DEFAULTS = frozenset(
         "<generate-with-openssl-rand-hex-32>",
     }
 )
+_MIN_SECRET_KEY_LEN = 32
+_REQUIRE_LOGIN_TRUE = frozenset({"1", "true", "yes", "on"})
+_REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
 
 def _bool(value, default=False):
@@ -20,15 +23,36 @@ def _bool(value, default=False):
     stripped = str(value).strip()
     if not stripped:
         return default
-    return stripped.lower() in ("1", "true", "yes", "on")
+    return stripped.lower() in _REQUIRE_LOGIN_TRUE
 
 
-def _is_insecure_secret(value):
+def _parse_require_login(value, default=True):
+    """Parse REQUIRE_LOGIN; blank/unset uses default (True).
+
+    Returns None when the value is set but not a recognized true/false token so
+    startup validation can fail closed instead of silently disabling login.
+    """
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped:
+        return default
+    lower = stripped.lower()
+    if lower in _REQUIRE_LOGIN_TRUE:
+        return True
+    if lower in _REQUIRE_LOGIN_FALSE:
+        return False
+    return None
+
+
+def _is_insecure_secret(value, *, min_length=0):
     """Reject missing, blank, known-default, or .env.example placeholder values."""
     if value is None:
         return True
     stripped = str(value).strip()
     if not stripped:
+        return True
+    if min_length and len(stripped) < min_length:
         return True
     if stripped.lower() in _INSECURE_DEFAULTS:
         return True
@@ -58,15 +82,22 @@ def _validate_config():
     """Fail fast on insecure or missing configuration at startup."""
     had_error = False
 
-    if _is_insecure_secret(os.environ.get("SECRET_KEY")):
+    if _is_insecure_secret(os.environ.get("SECRET_KEY"), min_length=_MIN_SECRET_KEY_LEN):
         _emit_config_error(
-            "SECRET_KEY is not set or uses an insecure default. "
-            "Generate one with: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+            "SECRET_KEY is not set, is shorter than 32 characters, or uses an "
+            "insecure default. Generate one with: python3 -c 'import secrets; "
+            "print(secrets.token_hex(32))'"
         )
         had_error = True
 
-    require_login = _bool(os.environ.get("REQUIRE_LOGIN"), True)
-    if require_login and _is_insecure_secret(os.environ.get("PASSWORD")):
+    require_login = _parse_require_login(os.environ.get("REQUIRE_LOGIN"), True)
+    if require_login is None:
+        _emit_config_error(
+            "REQUIRE_LOGIN has an unrecognized value. "
+            "Use True/False (or 1/0, yes/no, on/off)."
+        )
+        had_error = True
+    elif require_login and _is_insecure_secret(os.environ.get("PASSWORD")):
         _emit_config_error(
             "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
             "Set a strong password."
@@ -92,7 +123,7 @@ _validate_config()
 class Config:
     SECRET_KEY = os.environ["SECRET_KEY"]
 
-    REQUIRE_LOGIN = _bool(os.environ.get("REQUIRE_LOGIN"), True)
+    REQUIRE_LOGIN = _parse_require_login(os.environ.get("REQUIRE_LOGIN"), True)
     USERNAME = os.environ.get("USERNAME", "admin")
     PASSWORD = os.environ.get("PASSWORD", "")
 

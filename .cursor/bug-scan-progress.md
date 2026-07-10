@@ -1,14 +1,35 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-07-09
+Last scanned: config.py — 2026-07-10
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-07-10 config.py pass)
+
+- **`_bool()` / `REQUIRE_LOGIN` typos** — Any non-empty `REQUIRE_LOGIN` value that is
+  not an explicit true/false token (e.g. `Tru`, `2`, `enabled`) was parsed as `False`,
+  silently disabling the login gate. Scenario: operator typo `REQUIRE_LOGIN=Tru` in
+  `.env`; panel starts normally and exposes full unauthenticated stream CRUD on port
+  8000. Impact: same as the prior blank-`REQUIRE_LOGIN` bug — complete admin-panel
+  compromise. Fixed with `_parse_require_login()` that only accepts known true/false
+  tokens and fails startup on unrecognized values.
+- **`SECRET_KEY` minimum length** — `_is_insecure_secret()` rejected known defaults
+  and placeholders but accepted arbitrarily short values (e.g. `SECRET_KEY=abc`).
+  Scenario: operator sets a trivial key for testing and deploys; attacker brute-forces
+  the HMAC secret from a captured session cookie and forges `logged_in` sessions.
+  Impact: authentication bypass when `REQUIRE_LOGIN=True`. Fixed by requiring at least
+  32 characters at startup.
+- Reviewed but not a bug: `PANEL_PUBLIC_URL` https auto-detection for
+  `SESSION_COOKIE_SECURE`; blank `SESSION_COOKIE_SECURE` in docker-compose falls
+  through to URL detection; explicit false overrides https URL as documented;
+  `REQUIRE_LOGIN=false` still skips `PASSWORD` validation; no python-dotenv (env must
+  be injected by operator); `LRTMP2_*` URL/domain values are operator-controlled.
 
 ## Findings (2026-07-09 lrtmp2_client.py pass)
 
