@@ -13,6 +13,15 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- Reject panel passwords shorter than 12 characters at startup when
+  `REQUIRE_LOGIN` is enabled, closing an online brute-force path against the
+  default `admin` account
+- Reject unrecognized `REQUIRE_LOGIN` values (e.g. a typo like `Tru`) at
+  startup instead of silently falling back to disabling the login gate
+- Require `SECRET_KEY` to be at least 32 characters at startup, blocking a
+  trivially brute-forceable session-signing secret
+
 ## [0.1.0] — 2026-07-08
 
 First tagged pre-release.
