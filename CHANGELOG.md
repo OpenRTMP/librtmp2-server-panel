@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-10
+
 ### Security
 - Reject panel passwords shorter than 12 characters at startup when
   `REQUIRE_LOGIN` is enabled, closing an online brute-force path against the
@@ -53,5 +55,6 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server-panel/releases/tag/v0.1.0
