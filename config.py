@@ -16,6 +16,8 @@ _MIN_SECRET_KEY_LEN = 32
 _REQUIRE_LOGIN_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
+MIN_PASSWORD_LEN = 12
+
 
 def _bool(value, default=False):
     if value is None:
@@ -59,6 +61,13 @@ def _is_insecure_secret(value, *, min_length=0):
     return stripped.startswith("<") and stripped.endswith(">")
 
 
+def _is_weak_panel_password(value):
+    """Reject short or otherwise weak panel passwords when login is required."""
+    if _is_insecure_secret(value):
+        return True
+    return len(str(value).strip()) < MIN_PASSWORD_LEN
+
+
 def _session_cookie_secure_default():
     """Auto-detect from the panel's own public URL only — the API/stats URLs
     say nothing about whether the panel itself is served over HTTPS, and an
@@ -97,10 +106,10 @@ def _validate_config():
             "Use True/False (or 1/0, yes/no, on/off)."
         )
         had_error = True
-    elif require_login and _is_insecure_secret(os.environ.get("PASSWORD")):
+    elif require_login and _is_weak_panel_password(os.environ.get("PASSWORD")):
         _emit_config_error(
-            "PASSWORD is not set or uses an insecure default while REQUIRE_LOGIN=True. "
-            "Set a strong password."
+            "PASSWORD is not set, uses an insecure default, or is shorter than "
+            "12 characters while REQUIRE_LOGIN=True. Set a strong password."
         )
         had_error = True
 
