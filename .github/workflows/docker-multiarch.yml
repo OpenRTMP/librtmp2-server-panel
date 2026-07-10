@@ -49,8 +49,10 @@ jobs:
           ghcr.io/openrtmp/librtmp2-server-panel:beta
           ghcr.io/openrtmp/librtmp2-server-panel:alpha"
           if [ -n "$VERSION" ]; then
+            BARE_VERSION="${VERSION#v}"
             TAGS="$TAGS
-          ghcr.io/openrtmp/librtmp2-server-panel:$VERSION"
+          ghcr.io/openrtmp/librtmp2-server-panel:$BARE_VERSION
+          ghcr.io/openrtmp/librtmp2-server-panel:v$BARE_VERSION"
           fi
           {
             echo "tags<<EOF"
