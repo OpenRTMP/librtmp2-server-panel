@@ -79,7 +79,7 @@ def test_login_rate_limit_blocks_after_five_attempts():
 
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         for i in range(5):
             r = client.post(
