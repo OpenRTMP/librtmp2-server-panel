@@ -53,6 +53,63 @@ def test_cache_control_no_store_on_json_responses(app_client):
     assert r.headers.get("Cache-Control") == "no-store"
 
 
+def test_login_rate_limit_blocks_after_five_attempts():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        for i in range(5):
+            r = client.post(
+                "/login",
+                data={"username": "admin", "password": f"wrong-password-{i}"},
+            )
+            assert r.status_code == 200
+            assert b"Invalid credentials" in r.data
+
+        r = client.post(
+            "/login",
+            data={"username": "admin", "password": "wrong-password-final"},
+        )
+        assert r.status_code == 429
+
+
+def test_login_rate_limit_is_per_process_with_memory_storage():
+    """Documents why docker-compose defaults to a shared redis:// limiter backend."""
+    from multiprocessing import Process, Queue
+
+    def attempt_logins(queue):
+        with patch("app.Lrtmp2Client"):
+            import app as app_module
+
+            application = app_module.create_app()
+            application.config["TESTING"] = True
+            application.config["WTF_CSRF_ENABLED"] = False
+            client = application.test_client()
+            accepted = 0
+            for i in range(8):
+                r = client.post(
+                    "/login",
+                    data={"username": "admin", "password": f"wrong-password-{i}"},
+                )
+                if r.status_code == 200 and b"Invalid credentials" in r.data:
+                    accepted += 1
+            queue.put(accepted)
+
+    queue = Queue()
+    workers = [Process(target=attempt_logins, args=(queue,)) for _ in range(3)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    accepted_per_worker = [queue.get() for _ in workers]
+    assert accepted_per_worker == [5, 5, 5]
+    assert sum(accepted_per_worker) == 15
+
+
 def test_login_rejects_bad_password():
     with patch("app.Lrtmp2Client"):
         import app as app_module
