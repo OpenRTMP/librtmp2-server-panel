@@ -55,7 +55,7 @@ def test_cache_control_no_store_on_json_responses(app_client):
 
 def _attempt_login_rate_limit_in_subprocess(queue):
     """Run login attempts in a child process for memory:// rate-limit isolation tests."""
-    with patch("app.Lrtmp2Client"):
+    with patch("app.Lrtmp2Client"), patch("app.Config.RATELIMIT_STORAGE_URI", "memory://"):
         import app as app_module
 
         application = app_module.create_app()
@@ -74,7 +74,7 @@ def _attempt_login_rate_limit_in_subprocess(queue):
 
 
 def test_login_rate_limit_blocks_after_five_attempts():
-    with patch("app.Lrtmp2Client"):
+    with patch("app.Lrtmp2Client"), patch("app.Config.RATELIMIT_STORAGE_URI", "memory://"):
         import app as app_module
 
         application = app_module.create_app()
@@ -108,9 +108,17 @@ def test_login_rate_limit_is_per_process_with_memory_storage():
     for worker in workers:
         worker.start()
     for worker in workers:
+        worker.join(timeout=30)
+
+    alive = [worker for worker in workers if worker.is_alive()]
+    for worker in alive:
+        worker.terminate()
         worker.join()
 
-    accepted_per_worker = [queue.get() for _ in workers]
+    assert not alive, "Login rate-limit workers timed out"
+    assert all(worker.exitcode == 0 for worker in workers)
+
+    accepted_per_worker = [queue.get(timeout=5) for _ in workers]
     assert accepted_per_worker == [5, 5, 5]
     assert sum(accepted_per_worker) == 15
 
