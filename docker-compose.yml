@@ -1,4 +1,16 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: librtmp2-panel-redis
+    restart: unless-stopped
+    networks:
+      - openrtmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
   openrtmp-panel:
     build: .
     image: ghcr.io/OpenRTMP/librtmp2-server-panel:latest
@@ -15,7 +27,7 @@ services:
       - USERNAME=${USERNAME:-admin}
       - PASSWORD=${PASSWORD:?Set PASSWORD in .env}
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
-      - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-memory://}
+      - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-redis://redis:6379/0}
       - PANEL_PUBLIC_URL=${PANEL_PUBLIC_URL:-}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
     ports:
@@ -23,6 +35,8 @@ services:
     networks:
       - openrtmp
     depends_on:
+      redis:
+        condition: service_healthy
       openrtmp-server:
         condition: service_healthy
     healthcheck:

@@ -13,6 +13,12 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- Default Docker Compose stack now includes Redis and uses
+  `RATELIMIT_STORAGE_URI=redis://redis:6379/0` so the `/login` rate limit is
+  shared across Gunicorn workers instead of allowing `5 × worker_count`
+  attempts per minute with in-memory storage
+
 ## [0.1.1] — 2026-07-10
 
 ### Security

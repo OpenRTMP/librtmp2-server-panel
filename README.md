@@ -22,6 +22,7 @@ Copy `.env.example` to `.env` and adjust:
 | `REQUIRE_LOGIN` | Enable panel login (`True`/`False`, default `True`) | No |
 | `USERNAME` / `PASSWORD` | Panel admin credentials | If login enabled |
 | `SECRET_KEY` | Flask session secret | Yes |
+| `RATELIMIT_STORAGE_URI` | Shared rate-limit store for multi-worker Gunicorn (`redis://…`; docker-compose defaults to Redis) | No |
 
 ## Quick Start (Docker Compose)
 
