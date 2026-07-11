@@ -13,6 +13,13 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- `Limiter` had no socket/connect timeout on its Redis backend. Since the
+  rate limiter runs as a `before_request` hook for every route (not just
+  `/login`), a Redis instance that's up but not responding (network
+  stall, overload) would hang every Gunicorn worker indefinitely on any
+  request. Added a 2s `socket_timeout`/`socket_connect_timeout`.
+
 ### Security
 - Default Docker Compose stack now includes Redis and uses
   `RATELIMIT_STORAGE_URI=redis://redis:6379/0` so the `/login` rate limit is

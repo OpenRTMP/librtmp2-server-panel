@@ -1,14 +1,49 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-07-10
+Last scanned: app.py rate limiter — 2026-07-11
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+(`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
+below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-07-11 Redis rate-limiter pass)
+
+Reviewed the Redis-backed shared login rate limiter added since the last
+pass (`38bc33f`, `9fa5e83`, `2860249`, `4b19d6b`), plus every other file
+changed since 2026-07-10. Verified against the actual `Flask-Limiter==4.1.1`
+/ `limits==5.8.0` source (not from memory): the limiter fails **closed** on a
+Redis outage (no bypass of the login limit), increments atomically via a
+Redis Lua script (no cross-worker TOCTOU), and counts every `/login` request
+before password comparison (no uncounted bypass path).
+
+- **Bug (fixed):** `Limiter(...)` in `app.py` passed no `storage_options`, so
+  the underlying `redis.Redis` client used redis-py's default `None` socket
+  timeout. Because the limiter runs as a `before_request` hook for *every*
+  route (not just `/login`, `default_limits=["100 per minute"]` is global), a
+  Redis instance that's up but not responding (network stall, overload)
+  would hang every Gunicorn worker indefinitely on any request — a
+  Redis-side stall becomes a full panel DoS. Fixed by adding
+  `storage_options={"socket_timeout": 2, "socket_connect_timeout": 2}`
+  (a no-op for the in-memory test backend).
+- Reviewed but not a bug: fail-closed on Redis outage blocks the whole panel
+  (not just login) rather than degrading to a per-worker in-memory
+  fallback — correct from a brute-force standpoint (no bypass), but worth
+  keeping in mind as the failure blast radius; not changed since adding an
+  in-memory fallback would reopen the original multi-worker rate-limit
+  bypass this PR fixed. Rate limit is keyed on source IP only (no
+  username-scoping, no `ProxyFix`/XFF trust configured) — pre-existing
+  architectural property, not a regression, and `request.remote_addr` isn't
+  spoofable as currently deployed (no reverse-proxy trust configured).
+  Redis has no host port mapping and isn't reachable outside the Docker
+  network. CSRF validation runs before the rate-limit hook but tokens aren't
+  single-use, so this doesn't let an attacker skip being counted.
 
 ## Findings (2026-07-10 config.py pass)
 
