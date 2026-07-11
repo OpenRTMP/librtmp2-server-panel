@@ -85,6 +85,13 @@ def create_app():
         app=app,
         default_limits=["100 per minute"],
         storage_uri=app.config["RATELIMIT_STORAGE_URI"],
+        # Bound how long a rate-limit check can block on the storage backend.
+        # Without this, a Redis instance that's up but not responding (network
+        # black-hole, overload) hangs every Gunicorn worker indefinitely on
+        # every request (the limiter runs as a before_request hook for all
+        # routes, not just /login), since redis-py's default socket timeout
+        # is None. Ignored by the in-memory backend.
+        storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
     )
     if app.config["RATELIMIT_STORAGE_URI"] == "memory://":
         app.logger.warning(
