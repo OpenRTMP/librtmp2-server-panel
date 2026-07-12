@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-12
+
 ### Fixed
 - `Limiter` had no socket/connect timeout on its Redis backend. Since the
   rate limiter runs as a `before_request` hook for every route (not just
@@ -68,6 +70,7 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server-panel/releases/tag/v0.1.0
