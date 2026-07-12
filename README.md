@@ -1,6 +1,6 @@
 # librtmp2-server-panel
 
-![Version](https://img.shields.io/badge/version-v0.1.0-orange)
+![GitHub Release](https://img.shields.io/github/v/release/OpenRTMP/librtmp2-server)
 ![Language](https://img.shields.io/badge/language-Python-orange)
 
 A web-based control panel for [librtmp2-server](https://github.com/OpenRTMP/librtmp2-server). Manage streams, copy publish/play URLs, and view live stats through a simple UI.
