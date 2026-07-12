@@ -40,6 +40,30 @@ The server generates its API token **once** on first startup, stores it in SQLit
 
 Open `http://localhost:8000`.
 
+## Quick Start (prebuilt image)
+
+Prebuilt multi-arch images (`amd64`/`arm64`/`riscv64`) are published to
+`ghcr.io/openrtmp/librtmp2-server-panel` on every release — no local build
+needed. Assumes a [librtmp2-server](https://github.com/OpenRTMP/librtmp2-server#docker)
+container is already running and you've copied its API token from `docker logs`:
+
+```bash
+docker run -d \
+  --name librtmp2-server-panel \
+  -p 8000:8000 \
+  -e LRTMP2_API_URL=http://<server-host>:8080 \
+  -e LRTMP2_DOMAIN=<public-host-or-ip> \
+  -e LRTMP2_API_TOKEN=<token-from-server-logs> \
+  -e PASSWORD=<panel-password-12-chars-or-more> \
+  -e SECRET_KEY=<random-32-plus-char-secret> \
+  ghcr.io/openrtmp/librtmp2-server-panel:latest
+```
+
+Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.2` /
+`v0.1.2`). Without `RATELIMIT_STORAGE_URI` the `/login` rate limit is
+per-worker in-memory; use `docker compose up -d` (see above) for the Redis-backed,
+production-ready multi-worker setup.
+
 ## Local Development
 
 ```bash
