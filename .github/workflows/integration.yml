@@ -4,6 +4,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   panel-server-docker:
     name: panel + librtmp2-server (Docker)
