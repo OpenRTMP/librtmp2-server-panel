@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-12
+
 ### Fixed
 - `Limiter` had no socket/connect timeout on its Redis backend. Since the
   rate limiter runs as a `before_request` hook for every route (not just
