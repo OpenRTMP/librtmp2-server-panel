@@ -13,6 +13,27 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- `/streams/<id>/stats.json` now applies both a per-IP cap (300/min) and a
+  per-stream cap (25/min); unauthenticated redirects and invalid stream IDs
+  are exempt from the per-stream bucket so login redirects and junk paths
+  do not pollute the rate-limit store.
+- Startup rejects `RATELIMIT_STORAGE_URI=memory://` when multiple Gunicorn
+  workers are configured (`WEB_CONCURRENCY`, `GUNICORN_WORKERS`, or
+  `GUNICORN_CMD_ARGS`), preventing per-worker login rate-limit bypass.
+- Docker Compose now passes `ALLOW_INSECURE_NO_LOGIN` through to the panel
+  container.
+
+### Security
+- `REQUIRE_LOGIN=False` requires `ALLOW_INSECURE_NO_LOGIN=1` at startup,
+  closing an accidental open-admin footgun.
+- Panel session lifetime capped at 8 hours (`PERMANENT_SESSION_LIFETIME`).
+
+### Changed
+- Stats rate-limit decorators run after authentication checks via
+  `exempt_when`, so unauthenticated polling does not consume login or
+  per-stream buckets.
+
 ## [0.1.2] — 2026-07-12
 
 ### Fixed
