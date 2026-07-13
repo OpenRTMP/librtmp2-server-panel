@@ -105,6 +105,12 @@ def _workers_from_command_tokens(tokens: list[str]) -> int:
             value = tok.split("=", 1)[1]
             if value.isdigit():
                 count = max(count, int(value))
+        elif tok.startswith("-w="):
+            value = tok.split("=", 1)[1]
+            if value.isdigit():
+                count = max(count, int(value))
+        elif tok.startswith("-w") and len(tok) > 2 and tok[2:].isdigit():
+            count = max(count, int(tok[2:]))
         i += 1
     return count
 
@@ -117,8 +123,9 @@ def _detect_worker_count() -> int:
         if raw.isdigit():
             count = max(count, int(raw))
     cmd_args = os.environ.get("GUNICORN_CMD_ARGS", "")
-    for match in re.finditer(r"(?:--workers|-w)[= ](\d+)", cmd_args):
-        count = max(count, int(match.group(1)))
+    for match in re.finditer(r"(?:--workers|-w)(?:=(\d+)| ?(\d+))", cmd_args):
+        value = match.group(1) or match.group(2)
+        count = max(count, int(value))
     count = max(count, _workers_from_command_tokens(sys.argv))
     return count
 
