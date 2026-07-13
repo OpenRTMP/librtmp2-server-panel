@@ -14,6 +14,10 @@ only begin at a future `1.0.0`.
 ## [Unreleased]
 
 ### Fixed
+- `_detect_worker_count()` also parses `-w` / `--workers` from the gunicorn
+  process command line (`sys.argv`), not only `GUNICORN_CMD_ARGS` and env
+  vars, so the multi-worker `memory://` guard cannot be bypassed via
+  `gunicorn --workers N app:app`.
 - `/streams/<id>/stats.json` now applies both a per-IP cap (300/min) and a
   per-stream cap (25/min); unauthenticated redirects and invalid stream IDs
   are exempt from the per-stream bucket so login redirects and junk paths
