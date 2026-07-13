@@ -9,7 +9,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 
-from config import Config
+from config import Config, RATELIMIT_MEMORY_URI
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 
 
@@ -74,6 +74,14 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
     return None
 
 
+def _stats_rate_limit_key():
+    """Per-stream bucket so polling many streams does not share one global cap."""
+    stream_id = ""
+    if request.view_args:
+        stream_id = request.view_args.get("stream_id", "") or ""
+    return f"{get_remote_address()}:{stream_id}"
+
+
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
@@ -93,9 +101,9 @@ def create_app():
         # is None. Ignored by the in-memory backend.
         storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
     )
-    if app.config["RATELIMIT_STORAGE_URI"] == "memory://":
+    if app.config["RATELIMIT_STORAGE_URI"] == RATELIMIT_MEMORY_URI:
         app.logger.warning(
-            "RATELIMIT_STORAGE_URI=memory:// is per worker process; "
+            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process; "
             "use a shared backend such as redis:// for multi-worker deployments"
         )
     if not app.config["REQUIRE_LOGIN"]:
@@ -108,6 +116,7 @@ def create_app():
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=app.config["SESSION_COOKIE_SECURE"],
+        PERMANENT_SESSION_LIFETIME=app.config["SESSION_LIFETIME"],
     )
 
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
@@ -119,6 +128,15 @@ def create_app():
                 return redirect(url_for("login"))
             return view_func(*args, **kwargs)
         return wrapped
+
+    def _stats_per_stream_rate_limit_exempt():
+        if app.config["REQUIRE_LOGIN"] and not session.get("logged_in"):
+            return True
+        if request.view_args:
+            raw = request.view_args.get("stream_id", "") or ""
+            if not _is_valid_stream_id(raw):
+                return True
+        return False
 
     def rtmps_health():
         """Return RTMPS availability and the public RTMPS port to advertise.
@@ -369,10 +387,17 @@ def create_app():
         return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/stats.json")
-    # Shared across all stream_ids (Flask-Limiter keys per endpoint, not per URL
-    # parameter) — 300/min supports ~15 streams polling every 3s from scripts.js.
-    @limiter.limit("300 per minute")
     @login_required
+    @limiter.limit(
+        "300 per minute",
+        key_func=get_remote_address,
+        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
+    )
+    @limiter.limit(
+        "25 per minute",
+        key_func=_stats_rate_limit_key,
+        exempt_when=_stats_per_stream_rate_limit_exempt,
+    )
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):
             return jsonify({"error": "Invalid stream ID"}), 400

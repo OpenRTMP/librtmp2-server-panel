@@ -212,14 +212,55 @@ def test_stream_stats_json_api_failure_returns_502(app_client):
     assert r.get_json() == {"error": "Failed to fetch stats"}
 
 
-def test_stream_stats_json_scoped_rate_limit_allows_polling(app_client):
-    """scripts.js polls each stream every 3s; 300/min allows up to 15 streams."""
+def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
+    """Each stream_id gets its own 25/min bucket (scripts.js polls every 3s)."""
     client, mock_api = app_client
     mock_api.stream_stats_by_id.return_value = {"streams": []}
 
-    for _ in range(110):
-        r = client.get("/streams/s1/stats.json")
-        assert r.status_code == 200
+    for stream_id in ("s1", "s2", "s3"):
+        for _ in range(20):
+            r = client.get(f"/streams/{stream_id}/stats.json")
+            assert r.status_code == 200
+
+
+def test_invalid_stream_stats_skip_per_stream_rate_limit(app_client):
+    """Invalid stream IDs are rejected without consuming per-stream buckets."""
+    client, _mock_api = app_client
+    for i in range(30):
+        r = client.get(f"/streams/bad!{i}/stats.json")
+        assert r.status_code == 400
+        assert r.status_code != 429
+
+
+def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.Config.RATELIMIT_STORAGE_URI", "memory://"
+    ):
+        mock_api = mock_client_cls.return_value
+        mock_api.health.return_value = {"rtmps_enabled": False}
+        mock_api.list_streams.return_value = []
+        mock_api.stream_stats_by_id.return_value = {"streams": []}
+
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        for _ in range(30):
+            r = client.get("/streams/s1/stats.json")
+            assert r.status_code == 302
+            assert r.status_code != 429
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        for _ in range(20):
+            r = client.get("/streams/s1/stats.json")
+            assert r.status_code == 200
 
 
 def test_create_stream_get_renders_form(app_client):
