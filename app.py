@@ -76,9 +76,11 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
 
 def _stats_rate_limit_key():
     """Per-stream bucket so polling many streams does not share one global cap."""
-    stream_id = ""
+    stream_id = "_invalid_"
     if request.view_args:
-        stream_id = request.view_args.get("stream_id", "") or ""
+        raw = request.view_args.get("stream_id", "") or ""
+        if _is_valid_stream_id(raw):
+            stream_id = raw
     return f"{get_remote_address()}:{stream_id}"
 
 
