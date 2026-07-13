@@ -236,7 +236,7 @@ def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
 
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         application.config["REQUIRE_LOGIN"] = True
         client = application.test_client()
 
