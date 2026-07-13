@@ -212,14 +212,15 @@ def test_stream_stats_json_api_failure_returns_502(app_client):
     assert r.get_json() == {"error": "Failed to fetch stats"}
 
 
-def test_stream_stats_json_scoped_rate_limit_allows_polling(app_client):
-    """scripts.js polls each stream every 3s; 300/min allows up to 15 streams."""
+def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
+    """Each stream_id gets its own 25/min bucket (scripts.js polls every 3s)."""
     client, mock_api = app_client
     mock_api.stream_stats_by_id.return_value = {"streams": []}
 
-    for _ in range(110):
-        r = client.get("/streams/s1/stats.json")
-        assert r.status_code == 200
+    for stream_id in ("s1", "s2", "s3"):
+        for _ in range(20):
+            r = client.get(f"/streams/{stream_id}/stats.json")
+            assert r.status_code == 200
 
 
 def test_create_stream_get_renders_form(app_client):

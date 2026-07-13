@@ -74,6 +74,14 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
     return None
 
 
+def _stats_rate_limit_key():
+    """Per-stream bucket so polling many streams does not share one global cap."""
+    stream_id = ""
+    if request.view_args:
+        stream_id = request.view_args.get("stream_id", "") or ""
+    return f"{get_remote_address()}:{stream_id}"
+
+
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
@@ -108,6 +116,7 @@ def create_app():
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=app.config["SESSION_COOKIE_SECURE"],
+        PERMANENT_SESSION_LIFETIME=app.config["SESSION_LIFETIME"],
     )
 
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
@@ -369,10 +378,9 @@ def create_app():
         return redirect(url_for("index"))
 
     @app.route("/streams/<stream_id>/stats.json")
-    # Shared across all stream_ids (Flask-Limiter keys per endpoint, not per URL
-    # parameter) — 300/min supports ~15 streams polling every 3s from scripts.js.
-    @limiter.limit("300 per minute")
     @login_required
+    # Per-stream bucket: scripts.js polls each stream every 3s (20/min).
+    @limiter.limit("25 per minute", key_func=_stats_rate_limit_key)
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):
             return jsonify({"error": "Invalid stream ID"}), 400

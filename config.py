@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import timedelta
 
 _INSECURE_DEFAULTS = frozenset(
     {
@@ -112,6 +113,26 @@ def _validate_config():
             "12 characters while REQUIRE_LOGIN=True. Set a strong password."
         )
         had_error = True
+    elif not require_login and not _bool(os.environ.get("ALLOW_INSECURE_NO_LOGIN"), False):
+        _emit_config_error(
+            "REQUIRE_LOGIN=False exposes the full admin panel without authentication. "
+            "Set ALLOW_INSECURE_NO_LOGIN=1 to acknowledge this risk."
+        )
+        had_error = True
+
+    ratelimit_uri = os.environ.get("RATELIMIT_STORAGE_URI", "memory://").strip() or "memory://"
+    worker_count = 1
+    for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw.isdigit():
+            worker_count = max(worker_count, int(raw))
+    if worker_count > 1 and ratelimit_uri == "memory://":
+        _emit_config_error(
+            "RATELIMIT_STORAGE_URI=memory:// is per worker process and bypasses "
+            "login rate limits with multiple Gunicorn workers. Set a shared backend "
+            "(e.g. redis://redis:6379/0) or run with a single worker."
+        )
+        had_error = True
 
     if _is_insecure_secret(os.environ.get("LRTMP2_API_TOKEN")):
         _emit_config_error(
@@ -135,6 +156,7 @@ class Config:
     REQUIRE_LOGIN = _parse_require_login(os.environ.get("REQUIRE_LOGIN"), True)
     USERNAME = os.environ.get("USERNAME", "admin")
     PASSWORD = os.environ.get("PASSWORD", "")
+    SESSION_LIFETIME = timedelta(hours=8)
 
     LRTMP2_API_URL = os.environ.get("LRTMP2_API_URL", "http://localhost:8080").rstrip("/")
     # Browser-reachable HTTP API base URL for copied stats links (defaults to LRTMP2_API_URL).
