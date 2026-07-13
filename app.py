@@ -9,7 +9,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 
-from config import Config
+from config import Config, RATELIMIT_MEMORY_URI
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 
 
@@ -101,9 +101,9 @@ def create_app():
         # is None. Ignored by the in-memory backend.
         storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
     )
-    if app.config["RATELIMIT_STORAGE_URI"] == "memory://":
+    if app.config["RATELIMIT_STORAGE_URI"] == RATELIMIT_MEMORY_URI:
         app.logger.warning(
-            "RATELIMIT_STORAGE_URI=memory:// is per worker process; "
+            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process; "
             "use a shared backend such as redis:// for multi-worker deployments"
         )
     if not app.config["REQUIRE_LOGIN"]:

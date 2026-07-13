@@ -18,6 +18,7 @@ _REQUIRE_LOGIN_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
 MIN_PASSWORD_LEN = 12
+RATELIMIT_MEMORY_URI = "memory://"
 
 
 def _bool(value, default=False):
@@ -120,15 +121,18 @@ def _validate_config():
         )
         had_error = True
 
-    ratelimit_uri = os.environ.get("RATELIMIT_STORAGE_URI", "memory://").strip() or "memory://"
+    ratelimit_uri = (
+        os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI).strip()
+        or RATELIMIT_MEMORY_URI
+    )
     worker_count = 1
     for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
         raw = os.environ.get(env_key, "").strip()
         if raw.isdigit():
             worker_count = max(worker_count, int(raw))
-    if worker_count > 1 and ratelimit_uri == "memory://":
+    if worker_count > 1 and ratelimit_uri == RATELIMIT_MEMORY_URI:
         _emit_config_error(
-            "RATELIMIT_STORAGE_URI=memory:// is per worker process and bypasses "
+            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and bypasses "
             "login rate limits with multiple Gunicorn workers. Set a shared backend "
             "(e.g. redis://redis:6379/0) or run with a single worker."
         )
@@ -175,4 +179,4 @@ class Config:
     SESSION_COOKIE_SECURE = _session_cookie_secure_default()
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
-    RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", "memory://")
+    RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI)
