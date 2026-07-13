@@ -189,6 +189,35 @@ def test_config_rejects_require_login_false_without_ack(monkeypatch):
         _forget_config_module()
 
 
+def test_config_rejects_memory_ratelimit_with_gunicorn_cmd_args_workers(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-workers-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-workers-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-workers-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setenv("GUNICORN_CMD_ARGS", "--bind=0.0.0.0:8000 --workers=3")
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_detect_worker_count_parses_gunicorn_cmd_args(monkeypatch):
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setenv("GUNICORN_CMD_ARGS", "--bind=0.0.0.0:8000 -w 4")
+    assert config._detect_worker_count() == 4
+
+
 def test_config_accepts_long_password_when_login_enabled(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-placeholder-check")
     monkeypatch.setenv("PASSWORD", "valid-test-password-for-placeholder-check")

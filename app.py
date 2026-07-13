@@ -379,8 +379,16 @@ def create_app():
 
     @app.route("/streams/<stream_id>/stats.json")
     @login_required
-    # Per-stream bucket: scripts.js polls each stream every 3s (20/min).
-    @limiter.limit("25 per minute", key_func=_stats_rate_limit_key)
+    @limiter.limit(
+        "300 per minute",
+        key_func=get_remote_address,
+        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
+    )
+    @limiter.limit(
+        "25 per minute",
+        key_func=_stats_rate_limit_key,
+        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
+    )
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):
             return jsonify({"error": "Invalid stream ID"}), 400

@@ -223,6 +223,37 @@ def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
             assert r.status_code == 200
 
 
+def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.Config.RATELIMIT_STORAGE_URI", "memory://"
+    ):
+        mock_api = mock_client_cls.return_value
+        mock_api.health.return_value = {"rtmps_enabled": False}
+        mock_api.list_streams.return_value = []
+        mock_api.stream_stats_by_id.return_value = {"streams": []}
+
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        for _ in range(30):
+            r = client.get("/streams/s1/stats.json")
+            assert r.status_code == 302
+            assert r.status_code != 429
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        for _ in range(20):
+            r = client.get("/streams/s1/stats.json")
+            assert r.status_code == 200
+
+
 def test_create_stream_get_renders_form(app_client):
     client, _mock_api = app_client
     r = client.get("/streams/new")

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from datetime import timedelta
 
@@ -89,6 +90,19 @@ def _emit_config_error(message: str) -> None:
     sys.stderr.write("\n")
 
 
+def _detect_worker_count() -> int:
+    """Best-effort worker count for multi-process Gunicorn deployments."""
+    count = 1
+    for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw.isdigit():
+            count = max(count, int(raw))
+    cmd_args = os.environ.get("GUNICORN_CMD_ARGS", "")
+    for match in re.finditer(r"(?:--workers|-w)[= ](\d+)", cmd_args):
+        count = max(count, int(match.group(1)))
+    return count
+
+
 def _validate_config():
     """Fail fast on insecure or missing configuration at startup."""
     had_error = False
@@ -125,11 +139,7 @@ def _validate_config():
         os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI).strip()
         or RATELIMIT_MEMORY_URI
     )
-    worker_count = 1
-    for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw.isdigit():
-            worker_count = max(worker_count, int(raw))
+    worker_count = _detect_worker_count()
     if worker_count > 1 and ratelimit_uri == RATELIMIT_MEMORY_URI:
         _emit_config_error(
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and bypasses "
