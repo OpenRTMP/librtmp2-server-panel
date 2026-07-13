@@ -90,6 +90,25 @@ def _emit_config_error(message: str) -> None:
     sys.stderr.write("\n")
 
 
+def _workers_from_command_tokens(tokens: list[str]) -> int:
+    """Parse Gunicorn `-w` / `--workers` flags from a token list."""
+    count = 1
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("--workers", "-w"):
+            if i + 1 < len(tokens) and tokens[i + 1].isdigit():
+                count = max(count, int(tokens[i + 1]))
+                i += 2
+                continue
+        elif tok.startswith("--workers="):
+            value = tok.split("=", 1)[1]
+            if value.isdigit():
+                count = max(count, int(value))
+        i += 1
+    return count
+
+
 def _detect_worker_count() -> int:
     """Best-effort worker count for multi-process Gunicorn deployments."""
     count = 1
@@ -100,6 +119,7 @@ def _detect_worker_count() -> int:
     cmd_args = os.environ.get("GUNICORN_CMD_ARGS", "")
     for match in re.finditer(r"(?:--workers|-w)[= ](\d+)", cmd_args):
         count = max(count, int(match.group(1)))
+    count = max(count, _workers_from_command_tokens(sys.argv))
     return count
 
 
