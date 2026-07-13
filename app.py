@@ -76,11 +76,9 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
 
 def _stats_rate_limit_key():
     """Per-stream bucket so polling many streams does not share one global cap."""
-    stream_id = "_invalid_"
+    stream_id = ""
     if request.view_args:
-        raw = request.view_args.get("stream_id", "") or ""
-        if _is_valid_stream_id(raw):
-            stream_id = raw
+        stream_id = request.view_args.get("stream_id", "") or ""
     return f"{get_remote_address()}:{stream_id}"
 
 
@@ -130,6 +128,15 @@ def create_app():
                 return redirect(url_for("login"))
             return view_func(*args, **kwargs)
         return wrapped
+
+    def _stats_per_stream_rate_limit_exempt():
+        if app.config["REQUIRE_LOGIN"] and not session.get("logged_in"):
+            return True
+        if request.view_args:
+            raw = request.view_args.get("stream_id", "") or ""
+            if not _is_valid_stream_id(raw):
+                return True
+        return False
 
     def rtmps_health():
         """Return RTMPS availability and the public RTMPS port to advertise.
@@ -389,7 +396,7 @@ def create_app():
     @limiter.limit(
         "25 per minute",
         key_func=_stats_rate_limit_key,
-        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
+        exempt_when=_stats_per_stream_rate_limit_exempt,
     )
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):

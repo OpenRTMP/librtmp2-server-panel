@@ -223,19 +223,13 @@ def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
             assert r.status_code == 200
 
 
-def test_stats_rate_limit_key_collapses_invalid_stream_ids():
-    from flask_limiter.util import get_remote_address
-
-    with patch("app.Lrtmp2Client"), patch("app.Config.RATELIMIT_STORAGE_URI", "memory://"):
-        import app as app_module
-
-        application = app_module.create_app()
-        application.config["TESTING"] = True
-        with application.test_request_context("/streams/not-valid!/stats.json"):
-            assert (
-                app_module._stats_rate_limit_key()
-                == f"{get_remote_address()}:_invalid_"
-            )
+def test_invalid_stream_stats_skip_per_stream_rate_limit(app_client):
+    """Invalid stream IDs are rejected without consuming per-stream buckets."""
+    client, _mock_api = app_client
+    for i in range(30):
+        r = client.get(f"/streams/bad!{i}/stats.json")
+        assert r.status_code == 400
+        assert r.status_code != 429
 
 
 def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
