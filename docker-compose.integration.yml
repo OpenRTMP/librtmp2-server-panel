@@ -11,6 +11,12 @@ services:
       LRTMP2_HTTP_BIND: 0.0.0.0:8080
       LRTMP2_RTMP_BIND: 0.0.0.0:1935
       LRTMP2_LOG_LEVEL: 1
+      # HTTP rate limiting (optional — defaults shown):
+      # LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS: 60
+      # LRTMP2_HTTP_RATE_LIMIT_STATS: 30
+      # LRTMP2_HTTP_RATE_LIMIT_API: 120
+      # LRTMP2_HTTP_RATE_LIMIT_DEFAULT: 60
+      # LRTMP2_HTTP_MAX_BODY_BYTES: 65536
     volumes:
       - integration-data:/data
     ports:

@@ -35,6 +35,26 @@ def test_session_cookie_secure_honors_env(monkeypatch):
     assert config.Config.SESSION_COOKIE_SECURE is True
 
 
+def test_session_cookie_secure_rejects_unrecognized_value(monkeypatch):
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "Tru")
+    import importlib
+
+    _forget_config_module()
+    with pytest.raises(SystemExit):
+        importlib.import_module("config")
+
+
+def test_stats_rate_limit_defaults(monkeypatch):
+    monkeypatch.delenv("STATS_RATE_LIMIT_PER_IP", raising=False)
+    monkeypatch.delenv("STATS_RATE_LIMIT_PER_STREAM", raising=False)
+    import importlib
+    import config
+
+    importlib.reload(config)
+    assert config.Config.STATS_RATE_LIMIT_PER_IP == 600
+    assert config.Config.STATS_RATE_LIMIT_PER_STREAM == 25
+
+
 def test_config_rejects_env_example_placeholders(monkeypatch):
     valid = {
         "SECRET_KEY": "valid-test-secret-key-for-placeholder-check",
@@ -711,14 +731,12 @@ def test_add_player_forwards_custom_play_key(monkeypatch):
         )
 
 
-def test_delete_stream_surfaces_api_error(monkeypatch):
+def test_delete_stream_starts_background_delete(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
-        from lrtmp2_client import Lrtmp2ApiError
-
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"rtmps_enabled": False}
         mock_client.list_streams.return_value = []
-        mock_client.delete_stream.side_effect = Lrtmp2ApiError("server down")
+        mock_client.delete_stream.return_value = None
 
         import app as app_module
 
@@ -737,7 +755,16 @@ def test_delete_stream_surfaces_api_error(monkeypatch):
 
         r2 = client.get("/")
         assert r2.status_code == 200
-        assert b"server down" in r2.data
+        assert b"deletion started" in r2.data.lower()
+
+        import time
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if mock_client.delete_stream.called:
+                break
+            time.sleep(0.05)
+        mock_client.delete_stream.assert_called_once_with("gone")
 
 
 def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):

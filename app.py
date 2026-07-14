@@ -1,6 +1,7 @@
 import hmac
 import re
 import secrets
+import threading
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -201,8 +202,8 @@ def create_app():
             pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
             if user_ok and pass_ok:
                 session.clear()
+                session.permanent = True
                 session["logged_in"] = True
-                session["_csrf_token"] = secrets.token_hex(32)
                 return redirect(url_for("index"))
             error = "Invalid credentials"
         return render_template("login.html", error=error)
@@ -380,21 +381,41 @@ def create_app():
         if not _is_valid_stream_id(stream_id):
             session["flash_error"] = "Invalid stream ID"
             return redirect(url_for("index"))
-        try:
-            client.delete_stream(stream_id)
-        except Lrtmp2ApiError as exc:
-            session["flash_error"] = str(exc)
+
+        def _delete_in_background(valid_stream_id):
+            with app.app_context():
+                try:
+                    client.delete_stream(valid_stream_id)
+                except Lrtmp2ApiError as exc:
+                    app.logger.error(
+                        "Background delete for stream %s failed: %s",
+                        valid_stream_id,
+                        exc,
+                    )
+
+        threading.Thread(
+            target=_delete_in_background,
+            args=(stream_id,),
+            daemon=True,
+        ).start()
+        session["flash_error"] = (
+            "Stream deletion started. Active RTMP sessions may take up to 35 "
+            "seconds to drain."
+        )
         return redirect(url_for("index"))
+
+    stats_ip_limit = f"{app.config['STATS_RATE_LIMIT_PER_IP']} per minute"
+    stats_stream_limit = f"{app.config['STATS_RATE_LIMIT_PER_STREAM']} per minute"
 
     @app.route("/streams/<stream_id>/stats.json")
     @login_required
     @limiter.limit(
-        "300 per minute",
+        stats_ip_limit,
         key_func=get_remote_address,
         exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
     )
     @limiter.limit(
-        "25 per minute",
+        stats_stream_limit,
         key_func=_stats_rate_limit_key,
         exempt_when=_stats_per_stream_rate_limit_exempt,
     )

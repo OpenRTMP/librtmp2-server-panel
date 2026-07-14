@@ -71,6 +71,21 @@ def _is_weak_panel_password(value):
     return len(str(value).strip()) < MIN_PASSWORD_LEN
 
 
+def _parse_optional_bool(value):
+    """Parse explicit true/false tokens; return None when unrecognized."""
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    lower = stripped.lower()
+    if lower in _REQUIRE_LOGIN_TRUE:
+        return True
+    if lower in _REQUIRE_LOGIN_FALSE:
+        return False
+    return None
+
+
 def _session_cookie_secure_default():
     """Auto-detect from the panel's own public URL only — the API/stats URLs
     say nothing about whether the panel itself is served over HTTPS, and an
@@ -78,9 +93,33 @@ def _session_cookie_secure_default():
     """
     explicit = os.environ.get("SESSION_COOKIE_SECURE")
     if explicit is not None and explicit.strip() != "":
-        return _bool(explicit, False)
+        parsed = _parse_optional_bool(explicit)
+        if parsed is None:
+            _emit_config_error(
+                "SESSION_COOKIE_SECURE has an unrecognized value. "
+                "Use True/False (or 1/0, yes/no, on/off)."
+            )
+            sys.exit(1)
+        return parsed
     public_url = os.environ.get("PANEL_PUBLIC_URL", "").strip().lower()
     return public_url.startswith("https://")
+
+
+def _parse_positive_int(value, default, *, min_value=1, max_value=10_000, name="value"):
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped:
+        return default
+    try:
+        parsed = int(stripped)
+    except ValueError:
+        _emit_config_error(f"{name} must be an integer between {min_value} and {max_value}.")
+        sys.exit(1)
+    if not min_value <= parsed <= max_value:
+        _emit_config_error(f"{name} must be between {min_value} and {max_value}.")
+        sys.exit(1)
+    return parsed
 
 
 def _emit_config_error(message: str) -> None:
@@ -217,3 +256,19 @@ class Config:
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
     RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI)
+
+    # Live stats polling limits for /streams/<id>/stats.json (Flask-Limiter).
+    STATS_RATE_LIMIT_PER_IP = _parse_positive_int(
+        os.environ.get("STATS_RATE_LIMIT_PER_IP"),
+        default=600,
+        min_value=60,
+        max_value=10_000,
+        name="STATS_RATE_LIMIT_PER_IP",
+    )
+    STATS_RATE_LIMIT_PER_STREAM = _parse_positive_int(
+        os.environ.get("STATS_RATE_LIMIT_PER_STREAM"),
+        default=25,
+        min_value=5,
+        max_value=1_000,
+        name="STATS_RATE_LIMIT_PER_STREAM",
+    )

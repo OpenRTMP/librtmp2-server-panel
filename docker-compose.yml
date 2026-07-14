@@ -31,6 +31,9 @@ services:
       - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-redis://redis:6379/0}
       - PANEL_PUBLIC_URL=${PANEL_PUBLIC_URL:-}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
+      # Live stats polling limits for /streams/<id>/stats.json (per minute):
+      # - STATS_RATE_LIMIT_PER_IP=600
+      # - STATS_RATE_LIMIT_PER_STREAM=25
     ports:
       - "8000:8000"
     networks:
@@ -56,6 +59,12 @@ services:
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
       - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
+      # HTTP rate limiting (sliding window per client IP + route class):
+      # - LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS=60
+      # - LRTMP2_HTTP_RATE_LIMIT_STATS=30      # /stats, /stats-nginx
+      # - LRTMP2_HTTP_RATE_LIMIT_API=120       # /api/*
+      # - LRTMP2_HTTP_RATE_LIMIT_DEFAULT=60    # other HTTP routes
+      # - LRTMP2_HTTP_MAX_BODY_BYTES=65536
     volumes:
       - server-data:/data
     ports:
