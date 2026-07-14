@@ -157,6 +157,28 @@ def test_login_accepts_valid_credentials():
         assert r.status_code == 302
         assert r.headers["Location"].endswith("/")
 
+        with client.session_transaction() as sess:
+            assert sess.get("_permanent") is True
+            assert sess.get("logged_in") is True
+
+
+def test_create_app_applies_eight_hour_session_lifetime():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+        from datetime import timedelta
+
+        application = app_module.create_app()
+        assert application.config["PERMANENT_SESSION_LIFETIME"] == timedelta(hours=8)
+
+
+def test_create_app_applies_session_cookie_secure_from_config(monkeypatch):
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", True)
+        application = app_module.create_app()
+        assert application.config["SESSION_COOKIE_SECURE"] is True
+
 
 def test_logout_clears_session(login_required_app):
     client = login_required_app
@@ -221,6 +243,55 @@ def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
         for _ in range(20):
             r = client.get(f"/streams/{stream_id}/stats.json")
             assert r.status_code == 200
+
+
+def test_stats_ip_rate_limit_returns_429_with_low_limit(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.Config.RATELIMIT_STORAGE_URI", "memory://"
+    ):
+        mock_api = mock_client_cls.return_value
+        mock_api.health.return_value = {"rtmps_enabled": False}
+        mock_api.list_streams.return_value = []
+        mock_api.stream_stats_by_id.return_value = {"streams": []}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "STATS_RATE_LIMIT_PER_IP", 3)
+        monkeypatch.setattr(app_module.Config, "STATS_RATE_LIMIT_PER_STREAM", 100)
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        for _ in range(3):
+            r = client.get("/streams/s1/stats.json")
+            assert r.status_code == 200
+
+        r = client.get("/streams/s1/stats.json")
+        assert r.status_code == 429
+
+
+def test_index_accessible_without_login_when_require_login_disabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "REQUIRE_LOGIN", False)
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        client = application.test_client()
+
+        r = client.get("/")
+        assert r.status_code == 200
+        mock_client_cls.return_value.list_streams.assert_called_once()
 
 
 def test_invalid_stream_stats_skip_per_stream_rate_limit(app_client):

@@ -551,6 +551,129 @@ def test_index_treats_health_failure_as_rtmps_disabled(monkeypatch):
         assert b"RTMPS disabled" in r.data
 
 
+def test_index_shows_api_error_when_list_streams_fails(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        from lrtmp2_client import Lrtmp2ApiError
+
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.side_effect = Lrtmp2ApiError("API down")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"API down" in r.data
+
+
+def test_stream_created_renders_stream_keys(monkeypatch):
+    stream = {
+        "id": "created-one",
+        "name": "Created",
+        "app": "live",
+        "publish_key": "pub_created_key",
+        "play_key": "pl_created_key",
+        "stats_key": "st_created_key",
+        "players": [{"id": "vi_created", "name": "Player 1", "play_key": "pl_created_key"}],
+        "enabled": True,
+        "created_at": 1,
+    }
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.return_value = [stream]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/streams/created?stream_id=created-one")
+        assert r.status_code == 200
+        assert b"pub_created_key" in r.data
+        assert b"pl_created_key" in r.data
+
+
+def test_stream_created_redirects_when_stream_not_listed(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        r = client.get("/streams/created?stream_id=missing-one")
+        assert r.status_code == 302
+        assert r.headers["Location"].endswith("/")
+
+        r2 = client.get("/")
+        assert b"not listed yet" in r2.data
+
+
+def test_delete_stream_background_failure_is_logged(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        from lrtmp2_client import Lrtmp2ApiError
+
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.return_value = []
+        mock_client.delete_stream.side_effect = Lrtmp2ApiError("delete failed")
+
+        import app as app_module
+        import time
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        with patch.object(application.logger, "error") as mock_log:
+            r = client.post("/streams/fail/delete")
+            assert r.status_code == 302
+
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if mock_log.called:
+                    break
+                time.sleep(0.05)
+
+            mock_log.assert_called_once()
+            assert mock_log.call_args.args[1] == "fail"
+            assert "delete failed" in str(mock_log.call_args.args[2])
+
+
 def test_create_stream_shows_keys_without_session_storage(monkeypatch):
     mock_result = {
         "id": "new-stream",
