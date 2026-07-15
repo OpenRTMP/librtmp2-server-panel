@@ -12,6 +12,7 @@ from flask_wtf.csrf import CSRFProtect
 
 from config import Config, RATELIMIT_MEMORY_URI
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
+from session_store import SessionBackendUnavailable, create_session_store
 
 
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
@@ -121,17 +122,51 @@ def create_app():
     )
 
     client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
+    session_store = create_session_store(app.config["RATELIMIT_STORAGE_URI"])
+
+    def _session_ttl_seconds():
+        return int(app.permanent_session_lifetime.total_seconds())
+
+    def _revoke_session_token():
+        token = session.pop("session_token", None)
+        username = session.get("username")
+        if token and username:
+            session_store.revoke(username, token)
+
+    def _establish_logged_in_session():
+        token = secrets.token_hex(32)
+        username = app.config["USERNAME"]
+        # Persist the replacement token before touching the browser session. If
+        # Redis is unavailable, the caller can return a controlled 503 while
+        # preserving any currently valid login.
+        session_store.replace_user_session(username, token, _session_ttl_seconds())
+        session.clear()
+        session.permanent = True
+        session["logged_in"] = True
+        session["username"] = username
+        session["session_token"] = token
+
+    def _session_is_authenticated():
+        if not session.get("logged_in"):
+            return False
+        token = session.get("session_token")
+        username = session.get("username")
+        if not token or not username or not session_store.is_valid(username, token):
+            _revoke_session_token()
+            session.clear()
+            return False
+        return True
 
     def login_required(view_func):
         @wraps(view_func)
         def wrapped(*args, **kwargs):
-            if app.config["REQUIRE_LOGIN"] and not session.get("logged_in"):
+            if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated():
                 return redirect(url_for("login"))
             return view_func(*args, **kwargs)
         return wrapped
 
     def _stats_per_stream_rate_limit_exempt():
-        if app.config["REQUIRE_LOGIN"] and not session.get("logged_in"):
+        if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated():
             return True
         if request.view_args:
             raw = request.view_args.get("stream_id", "") or ""
@@ -201,9 +236,16 @@ def create_app():
             user_ok = hmac.compare_digest(username, app.config["USERNAME"])
             pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
             if user_ok and pass_ok:
-                session.clear()
-                session.permanent = True
-                session["logged_in"] = True
+                try:
+                    _establish_logged_in_session()
+                except SessionBackendUnavailable:
+                    app.logger.error(
+                        "Session backend unavailable during login for user %s",
+                        username,
+                        exc_info=True,
+                    )
+                    error = "Authentication service temporarily unavailable. Please try again."
+                    return render_template("login.html", error=error), 503
                 return redirect(url_for("index"))
             error = "Invalid credentials"
         return render_template("login.html", error=error)
@@ -211,6 +253,7 @@ def create_app():
     @app.route("/logout", methods=["POST"])
     @login_required
     def logout():
+        _revoke_session_token()
         session.clear()
         return redirect(url_for("login"))
 
@@ -412,7 +455,7 @@ def create_app():
     @limiter.limit(
         stats_ip_limit,
         key_func=get_remote_address,
-        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not session.get("logged_in"),
+        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not _session_is_authenticated(),
     )
     @limiter.limit(
         stats_stream_limit,
