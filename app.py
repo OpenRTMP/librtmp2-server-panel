@@ -383,6 +383,7 @@ def create_app():
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError as exc:
+            app.logger.warning("Delete for stream %s failed: %s", stream_id, exc)
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
