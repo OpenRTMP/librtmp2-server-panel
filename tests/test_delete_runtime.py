@@ -1,14 +1,22 @@
+import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
 
 def test_container_uses_threaded_gunicorn_for_long_running_deletes():
-    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    repository_root = Path(__file__).resolve().parents[1]
+    dockerfile = (repository_root / "Dockerfile").read_text(encoding="utf-8")
+    match = re.search(r"^CMD\s+(\[.*\])\s*$", dockerfile, flags=re.MULTILINE)
 
-    assert '"--worker-class", "gthread"' in dockerfile
-    assert '"--threads", "4"' in dockerfile
-    assert '"--timeout", "60"' in dockerfile
+    assert match is not None, "Dockerfile must use a JSON-array CMD"
+    command = json.loads(match.group(1))
+
+    assert command[0] == "gunicorn"
+    assert command[command.index("--worker-class") + 1] == "gthread"
+    assert command[command.index("--threads") + 1] == "4"
+    assert command[command.index("--timeout") + 1] == "60"
 
 
 def test_delete_stream_logs_api_failure(monkeypatch):
