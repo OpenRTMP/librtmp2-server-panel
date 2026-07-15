@@ -1,12 +1,25 @@
+import logging
 import sys
 from unittest.mock import MagicMock, call, patch
 
-from session_store import MemorySessionStore, RedisSessionStore, create_session_store
+import pytest
+
+from session_store import (
+    MemorySessionStore,
+    RedisSessionStore,
+    SessionBackendUnavailable,
+    create_session_store,
+)
+
+
+class FakeRedisError(Exception):
+    pass
 
 
 def _make_redis_store(uri="redis://redis:6379/0"):
     client = MagicMock()
     redis_module = MagicMock()
+    redis_module.exceptions.RedisError = FakeRedisError
     redis_module.from_url.return_value = client
     with patch.dict(sys.modules, {"redis": redis_module}):
         store = RedisSessionStore(uri)
@@ -62,7 +75,7 @@ def test_redis_store_uses_bounded_connection_timeouts():
     )
 
 
-def test_redis_store_replaces_previous_token_and_sets_ttls():
+def test_redis_store_replaces_previous_token_atomically_and_sets_ttls():
     store, client, _redis_module = _make_redis_store()
     client.get.return_value = b"old-token"
     pipeline = client.pipeline.return_value
@@ -70,14 +83,25 @@ def test_redis_store_replaces_previous_token_and_sets_ttls():
     store.replace_user_session("admin", "new-token", 300)
 
     client.get.assert_called_once_with("panel:session-user:admin")
-    client.delete.assert_called_once_with("panel:session:old-token")
     pipeline.setex.assert_has_calls(
         [
             call("panel:session:new-token", 300, "1"),
             call("panel:session-user:admin", 300, "new-token"),
         ]
     )
+    pipeline.delete.assert_called_once_with("panel:session:old-token")
     pipeline.execute.assert_called_once_with()
+
+
+def test_redis_store_login_write_failure_is_logged_and_raised(caplog):
+    store, client, _redis_module = _make_redis_store()
+    client.get.side_effect = FakeRedisError("redis unavailable")
+
+    with caplog.at_level(logging.ERROR, logger="session_store"):
+        with pytest.raises(SessionBackendUnavailable):
+            store.replace_user_session("admin", "new-token", 300)
+
+    assert "Failed to persist Redis session for user admin" in caplog.text
 
 
 def test_redis_store_validates_user_mapping_and_token_key():
@@ -95,33 +119,45 @@ def test_redis_store_validates_user_mapping_and_token_key():
     client.exists.assert_not_called()
 
 
-def test_redis_store_fails_closed_when_backend_is_unavailable():
+def test_redis_store_validation_fails_closed_and_logs(caplog):
     store, client, _redis_module = _make_redis_store()
-    client.get.side_effect = RuntimeError("redis unavailable")
+    client.get.side_effect = FakeRedisError("redis unavailable")
 
-    assert store.is_valid("admin", "token") is False
+    with caplog.at_level(logging.WARNING, logger="session_store"):
+        assert store.is_valid("admin", "token") is False
 
-    # Revocation is best-effort and must not break logout when Redis is down.
-    store.revoke("admin", "token")
+    assert "Failed to validate Redis session for user admin" in caplog.text
 
 
-def test_redis_store_revoke_deletes_active_mapping_and_token():
+def test_redis_store_revoke_deletes_active_mapping_and_token_atomically():
     store, client, _redis_module = _make_redis_store()
     client.get.return_value = b"token"
+    pipeline = client.pipeline.return_value
 
     store.revoke("admin", "token")
 
-    client.delete.assert_has_calls(
+    pipeline.delete.assert_has_calls(
         [
             call("panel:session-user:admin"),
             call("panel:session:token"),
         ]
     )
+    pipeline.execute.assert_called_once_with()
+
+
+def test_redis_store_revoke_failure_is_best_effort_and_logged(caplog):
+    store, client, _redis_module = _make_redis_store()
+    client.get.side_effect = FakeRedisError("redis unavailable")
+
+    with caplog.at_level(logging.WARNING, logger="session_store"):
+        store.revoke("admin", "token")
+
+    assert "Failed to revoke Redis session for user admin" in caplog.text
 
 
 def test_create_session_store_selects_backend_from_uri_scheme():
     assert isinstance(create_session_store("memory://"), MemorySessionStore)
 
-    with patch.dict(sys.modules, {"redis": MagicMock()}):
-        assert isinstance(create_session_store("redis://redis:6379/0"), RedisSessionStore)
-        assert isinstance(create_session_store("rediss://redis:6379/0"), RedisSessionStore)
+    with patch("session_store.RedisSessionStore") as redis_store_cls:
+        assert create_session_store("redis://redis:6379/0") is redis_store_cls.return_value
+        assert create_session_store("rediss://redis:6379/0") is redis_store_cls.return_value
