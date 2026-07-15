@@ -637,7 +637,7 @@ def test_stream_created_redirects_when_stream_not_listed(monkeypatch):
         assert b"not listed yet" in r2.data
 
 
-def test_delete_stream_background_failure_is_logged(monkeypatch):
+def test_delete_stream_surfaces_api_error(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         from lrtmp2_client import Lrtmp2ApiError
 
@@ -647,7 +647,6 @@ def test_delete_stream_background_failure_is_logged(monkeypatch):
         mock_client.delete_stream.side_effect = Lrtmp2ApiError("delete failed")
 
         import app as app_module
-        import time
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
@@ -659,19 +658,13 @@ def test_delete_stream_background_failure_is_logged(monkeypatch):
             data={"username": "admin", "password": os.environ["PASSWORD"]},
         )
 
-        with patch.object(application.logger, "error") as mock_log:
-            r = client.post("/streams/fail/delete")
-            assert r.status_code == 302
+        r = client.post("/streams/fail/delete")
+        assert r.status_code == 302
 
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
-                if mock_log.called:
-                    break
-                time.sleep(0.05)
-
-            mock_log.assert_called_once()
-            assert mock_log.call_args.args[1] == "fail"
-            assert "delete failed" in str(mock_log.call_args.args[2])
+        r2 = client.get("/")
+        assert r2.status_code == 200
+        assert b"delete failed" in r2.data
+        mock_client.delete_stream.assert_called_once_with("fail")
 
 
 def test_create_stream_shows_keys_without_session_storage(monkeypatch):
@@ -854,7 +847,7 @@ def test_add_player_forwards_custom_play_key(monkeypatch):
         )
 
 
-def test_delete_stream_starts_background_delete(monkeypatch):
+def test_delete_stream_calls_api_before_redirect(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"rtmps_enabled": False}
@@ -875,19 +868,11 @@ def test_delete_stream_starts_background_delete(monkeypatch):
 
         r = client.post("/streams/gone/delete")
         assert r.status_code == 302
+        mock_client.delete_stream.assert_called_once_with("gone")
 
         r2 = client.get("/")
         assert r2.status_code == 200
-        assert b"deletion started" in r2.data.lower()
-
-        import time
-
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            if mock_client.delete_stream.called:
-                break
-            time.sleep(0.05)
-        mock_client.delete_stream.assert_called_once_with("gone")
+        assert b"deletion started" not in r2.data.lower()
 
 
 def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):

@@ -1,17 +1,36 @@
 # Bug scan progress
 
-Last scanned: app.py rate limiter — 2026-07-11
+Last scanned: app.py — 2026-07-15
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [x] `config.py` — startup validation and environment configuration
-- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [ ] `config.py` — startup validation and environment configuration
+- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-07-15 app.py pass)
+
+- **Bug (fixed):** `delete_stream()` moved deletes into a daemon background
+  thread (`c29362a`) and always flashed "Stream deletion started…" before
+  redirecting. `Lrtmp2ApiError` from the thread was only logged — never shown
+  in the UI. Scenario: operator deletes a compromised stream during incident
+  response; API is down or the 35s RTMP drain times out; panel shows
+  "deletion started" but the stream (and publish/play keys) remain listed
+  with no error. Impact: failed revoke appears successful — keys stay valid
+  when the operator believes they are being removed. Fixed by restoring
+  synchronous `client.delete_stream()` so failures surface via `flash_error`
+  (Gunicorn `--timeout 60` still covers the client's 35s drain window).
+- Reviewed but not a bug: auth/session (`login_required` on all sensitive
+  routes, `session.clear()` on login, `hmac.compare_digest`, CSRF on POSTs,
+  security headers incl. `Cache-Control: no-store` on JSON); stream/player ID
+  and access-key validation; stats rate limits (per-IP + per-stream,
+  invalid-ID exempt); Redis limiter socket timeouts; `build_urls` /
+  `rtmps_health` caller chains; no open redirects or unguarded routes.
 
 ## Findings (2026-07-11 Redis rate-limiter pass)
 
