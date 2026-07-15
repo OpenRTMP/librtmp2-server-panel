@@ -59,8 +59,8 @@ docker run -d \
   ghcr.io/openrtmp/librtmp2-server-panel:latest
 ```
 
-Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.2` /
-`v0.1.2`). Without `RATELIMIT_STORAGE_URI` the `/login` rate limit is
+Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.3` /
+`v0.1.3`). Without `RATELIMIT_STORAGE_URI` the `/login` rate limit is
 per-worker in-memory; use `docker compose up -d` (see above) for the Redis-backed,
 production-ready multi-worker setup.
 

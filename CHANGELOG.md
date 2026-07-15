@@ -13,7 +13,15 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-15
+
 ### Fixed
+- Failed stream deletions now surface API errors to operators instead of only
+  reporting that deletion started; failures are also logged with the affected
+  stream ID for incident response and troubleshooting.
+- The Docker image now runs Gunicorn with a threaded worker model and a 60-second
+  timeout so a draining stream deletion cannot monopolize the panel's only
+  request worker.
 - `_detect_worker_count()` also parses `-w` / `--workers` from the gunicorn
   process command line (`sys.argv`), not only `GUNICORN_CMD_ARGS` and env
   vars, so the multi-worker `memory://` guard cannot be bypassed via
@@ -29,6 +37,13 @@ only begin at a future `1.0.0`.
   container.
 
 ### Security
+- Panel sessions are now tracked with server-side tokens, so copied signed
+  session cookies are invalidated immediately on logout or a subsequent login
+  and only the latest session for an account remains active.
+- Redis session-backend failures now fail closed and are logged. A failed login
+  persistence attempt returns a controlled HTTP 503 without destroying an
+  existing valid session, and session revocation uses an atomic compare-and-delete
+  operation to avoid concurrent login/logout races.
 - `REQUIRE_LOGIN=False` requires `ALLOW_INSECURE_NO_LOGIN=1` at startup,
   closing an accidental open-admin footgun.
 - Panel session lifetime capped at 8 hours (`PERMANENT_SESSION_LIFETIME`).
@@ -37,6 +52,9 @@ only begin at a future `1.0.0`.
 - Stats rate-limit decorators run after authentication checks via
   `exempt_when`, so unauthenticated polling does not consume login or
   per-stream buckets.
+- Intentional CSRF disabling in isolated tests is annotated for SonarCloud
+  S4502 so the security rating reflects production code rather than test-only
+  configuration.
 
 ## [0.1.2] — 2026-07-12
 
@@ -95,7 +113,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server-panel/releases/tag/v0.1.0
