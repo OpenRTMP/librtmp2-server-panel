@@ -170,7 +170,7 @@ def test_logout_invalidates_stolen_session_cookie():
 
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
 
         client.post(
@@ -194,7 +194,7 @@ def test_login_invalidates_previous_session_cookie():
 
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
 
         first = application.test_client()
         first.post(
