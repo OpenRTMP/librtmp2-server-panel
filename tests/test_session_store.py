@@ -129,25 +129,32 @@ def test_redis_store_validation_fails_closed_and_logs(caplog):
     assert "Failed to validate Redis session for user admin" in caplog.text
 
 
-def test_redis_store_revoke_deletes_active_mapping_and_token_atomically():
+def test_redis_store_revoke_uses_atomic_server_side_compare_and_delete():
     store, client, _redis_module = _make_redis_store()
-    client.get.return_value = b"token"
-    pipeline = client.pipeline.return_value
-
-    store.revoke("admin", "token")
-
-    pipeline.delete.assert_has_calls(
-        [
-            call("panel:session-user:admin"),
-            call("panel:session:token"),
-        ]
+    client.get.side_effect = AssertionError(
+        "revoke must not read the active mapping outside the atomic script"
     )
-    pipeline.execute.assert_called_once_with()
+
+    store.revoke("admin", "old-token")
+
+    client.get.assert_not_called()
+    client.pipeline.assert_not_called()
+    client.eval.assert_called_once()
+
+    script, key_count, user_key, token_key, token = client.eval.call_args.args
+    assert key_count == 2
+    assert user_key == "panel:session-user:admin"
+    assert token_key == "panel:session:old-token"
+    assert token == "old-token"
+    assert 'redis.call("GET", KEYS[1])' in script
+    assert "if active == ARGV[1] then" in script
+    assert 'redis.call("DEL", KEYS[1])' in script
+    assert 'redis.call("DEL", KEYS[2])' in script
 
 
 def test_redis_store_revoke_failure_is_best_effort_and_logged(caplog):
     store, client, _redis_module = _make_redis_store()
-    client.get.side_effect = FakeRedisError("redis unavailable")
+    client.eval.side_effect = FakeRedisError("redis unavailable")
 
     with caplog.at_level(logging.WARNING, logger="session_store"):
         store.revoke("admin", "token")
