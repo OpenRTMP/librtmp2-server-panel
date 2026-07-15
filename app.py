@@ -12,7 +12,7 @@ from flask_wtf.csrf import CSRFProtect
 
 from config import Config, RATELIMIT_MEMORY_URI
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
-from session_store import create_session_store
+from session_store import SessionBackendUnavailable, create_session_store
 
 
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
@@ -134,9 +134,11 @@ def create_app():
             session_store.revoke(username, token)
 
     def _establish_logged_in_session():
-        _revoke_session_token()
         token = secrets.token_hex(32)
         username = app.config["USERNAME"]
+        # Persist the replacement token before touching the browser session. If
+        # Redis is unavailable, the caller can return a controlled 503 while
+        # preserving any currently valid login.
         session_store.replace_user_session(username, token, _session_ttl_seconds())
         session.clear()
         session.permanent = True
@@ -234,7 +236,16 @@ def create_app():
             user_ok = hmac.compare_digest(username, app.config["USERNAME"])
             pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
             if user_ok and pass_ok:
-                _establish_logged_in_session()
+                try:
+                    _establish_logged_in_session()
+                except SessionBackendUnavailable:
+                    app.logger.error(
+                        "Session backend unavailable during login for user %s",
+                        username,
+                        exc_info=True,
+                    )
+                    error = "Authentication service temporarily unavailable. Please try again."
+                    return render_template("login.html", error=error), 503
                 return redirect(url_for("index"))
             error = "Invalid credentials"
         return render_template("login.html", error=error)
