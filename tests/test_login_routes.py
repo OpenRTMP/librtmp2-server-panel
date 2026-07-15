@@ -261,7 +261,7 @@ def test_stats_ip_rate_limit_returns_429_with_low_limit(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
