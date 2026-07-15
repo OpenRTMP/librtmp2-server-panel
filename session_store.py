@@ -6,6 +6,14 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 _REDIS_SCHEMES = frozenset({"redis", "rediss"})
+_REVOKE_SESSION_SCRIPT = """
+local active = redis.call("GET", KEYS[1])
+if active == ARGV[1] then
+    redis.call("DEL", KEYS[1])
+end
+redis.call("DEL", KEYS[2])
+return 1
+""".strip()
 
 
 class SessionBackendUnavailable(RuntimeError):
@@ -108,16 +116,18 @@ class RedisSessionStore:
             return False
 
     def revoke(self, username, token):
+        user_key = f"{self._user_prefix}{username}"
+        token_key = f"{self._token_prefix}{token}"
         try:
-            user_key = f"{self._user_prefix}{username}"
-            active = self._client.get(user_key)
-            active_token = active.decode() if isinstance(active, bytes) else active
-
-            pipe = self._client.pipeline()
-            if active_token == token:
-                pipe.delete(user_key)
-            pipe.delete(f"{self._token_prefix}{token}")
-            pipe.execute()
+            # Compare and delete entirely inside Redis so a concurrent login
+            # cannot have its newly written user mapping removed by an old logout.
+            self._client.eval(
+                _REVOKE_SESSION_SCRIPT,
+                2,
+                user_key,
+                token_key,
+                token,
+            )
         except self._redis_error:
             logger.warning(
                 "Failed to revoke Redis session for user %s",
