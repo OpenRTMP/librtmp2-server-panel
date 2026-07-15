@@ -160,6 +160,60 @@ def test_login_accepts_valid_credentials():
         with client.session_transaction() as sess:
             assert sess.get("_permanent") is True
             assert sess.get("logged_in") is True
+            assert sess.get("session_token")
+            assert sess.get("username") == "admin"
+
+
+def test_logout_invalidates_stolen_session_cookie():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+        client = application.test_client()
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        stolen = client.get_cookie("session")
+
+        client.post("/logout")
+
+        attacker = application.test_client()
+        attacker.set_cookie("session", stolen.value, domain="localhost", path="/")
+        r = attacker.get("/")
+        assert r.status_code == 302
+        assert "/login" in r.headers["Location"]
+
+
+def test_login_invalidates_previous_session_cookie():
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False
+
+        first = application.test_client()
+        first.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        old_cookie = first.get_cookie("session")
+
+        second = application.test_client()
+        second.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        attacker = application.test_client()
+        attacker.set_cookie("session", old_cookie.value, domain="localhost", path="/")
+        r = attacker.get("/")
+        assert r.status_code == 302
+        assert "/login" in r.headers["Location"]
 
 
 def test_create_app_applies_eight_hour_session_lifetime():
