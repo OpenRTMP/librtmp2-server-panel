@@ -1,8 +1,15 @@
+import logging
 import threading
 import time
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 _REDIS_SCHEMES = frozenset({"redis", "rediss"})
+
+
+class SessionBackendUnavailable(RuntimeError):
+    """Raised when the shared session backend cannot persist a login."""
 
 
 class MemorySessionStore:
@@ -50,6 +57,7 @@ class RedisSessionStore:
     def __init__(self, storage_uri):
         import redis
 
+        self._redis_error = redis.exceptions.RedisError
         self._client = redis.from_url(
             storage_uri,
             socket_timeout=2,
@@ -60,14 +68,26 @@ class RedisSessionStore:
 
     def replace_user_session(self, username, token, ttl_seconds):
         user_key = f"{self._user_prefix}{username}"
-        old = self._client.get(user_key)
-        if old:
+        try:
+            old = self._client.get(user_key)
             old_token = old.decode() if isinstance(old, bytes) else old
-            self._client.delete(f"{self._token_prefix}{old_token}")
-        pipe = self._client.pipeline()
-        pipe.setex(f"{self._token_prefix}{token}", ttl_seconds, "1")
-        pipe.setex(user_key, ttl_seconds, token)
-        pipe.execute()
+
+            # redis-py pipelines are transactional by default. Publish the new
+            # token and user mapping together, then remove the previous token in
+            # the same transaction so readers never observe a half-written login.
+            pipe = self._client.pipeline()
+            pipe.setex(f"{self._token_prefix}{token}", ttl_seconds, "1")
+            pipe.setex(user_key, ttl_seconds, token)
+            if old_token:
+                pipe.delete(f"{self._token_prefix}{old_token}")
+            pipe.execute()
+        except self._redis_error as exc:
+            logger.error(
+                "Failed to persist Redis session for user %s",
+                username,
+                exc_info=True,
+            )
+            raise SessionBackendUnavailable("Session backend unavailable") from exc
 
     def is_valid(self, username, token):
         try:
@@ -79,20 +99,31 @@ class RedisSessionStore:
             if active_token != token:
                 return False
             return bool(self._client.exists(f"{self._token_prefix}{token}"))
-        except Exception:
+        except self._redis_error:
+            logger.warning(
+                "Failed to validate Redis session for user %s; denying access",
+                username,
+                exc_info=True,
+            )
             return False
 
     def revoke(self, username, token):
         try:
             user_key = f"{self._user_prefix}{username}"
             active = self._client.get(user_key)
-            if active is not None:
-                active_token = active.decode() if isinstance(active, bytes) else active
-                if active_token == token:
-                    self._client.delete(user_key)
-            self._client.delete(f"{self._token_prefix}{token}")
-        except Exception:
-            return
+            active_token = active.decode() if isinstance(active, bytes) else active
+
+            pipe = self._client.pipeline()
+            if active_token == token:
+                pipe.delete(user_key)
+            pipe.delete(f"{self._token_prefix}{token}")
+            pipe.execute()
+        except self._redis_error:
+            logger.warning(
+                "Failed to revoke Redis session for user %s",
+                username,
+                exc_info=True,
+            )
 
 
 def create_session_store(storage_uri):
