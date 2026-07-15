@@ -1,7 +1,6 @@
 import hmac
 import re
 import secrets
-import threading
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -381,27 +380,10 @@ def create_app():
         if not _is_valid_stream_id(stream_id):
             session["flash_error"] = "Invalid stream ID"
             return redirect(url_for("index"))
-
-        def _delete_in_background(valid_stream_id):
-            with app.app_context():
-                try:
-                    client.delete_stream(valid_stream_id)
-                except Lrtmp2ApiError as exc:
-                    app.logger.error(
-                        "Background delete for stream %s failed: %s",
-                        valid_stream_id,
-                        exc,
-                    )
-
-        threading.Thread(
-            target=_delete_in_background,
-            args=(stream_id,),
-            daemon=True,
-        ).start()
-        session["flash_error"] = (
-            "Stream deletion started. Active RTMP sessions may take up to 35 "
-            "seconds to drain."
-        )
+        try:
+            client.delete_stream(stream_id)
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
     stats_ip_limit = f"{app.config['STATS_RATE_LIMIT_PER_IP']} per minute"
