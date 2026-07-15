@@ -564,7 +564,7 @@ def test_index_shows_api_error_when_list_streams_fails(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
@@ -598,7 +598,7 @@ def test_stream_created_renders_stream_keys(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
@@ -622,7 +622,7 @@ def test_stream_created_redirects_when_stream_not_listed(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
@@ -652,7 +652,7 @@ def test_delete_stream_background_failure_is_logged(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
@@ -866,7 +866,7 @@ def test_delete_stream_starts_background_delete(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
         application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
         client = application.test_client()
         client.post(
             "/login",
