@@ -4,6 +4,7 @@ import sys
 from unittest.mock import patch
 
 import pytest
+from flask_test_utils import configure_testing_app
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
 os.environ.setdefault("PASSWORD", "test-password-for-ci-only")
@@ -385,8 +386,7 @@ def test_index_lists_streams_from_api(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -430,8 +430,7 @@ def test_index_shows_rtmps_urls_when_server_reports_enabled(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         monkeypatch.setattr(app_module.Config, "LRTMP2_RTMPS_PORT", "1936")
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -473,8 +472,7 @@ def test_index_prefers_public_rtmps_port_over_health_bind_port(monkeypatch):
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         monkeypatch.setattr(app_module.Config, "LRTMP2_RTMPS_PORT", "443")
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -512,8 +510,7 @@ def test_index_hides_rtmps_urls_when_server_reports_disabled(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -538,8 +535,7 @@ def test_index_treats_health_failure_as_rtmps_disabled(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -563,8 +559,7 @@ def test_index_shows_api_error_when_list_streams_fails(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -597,8 +592,7 @@ def test_stream_created_renders_stream_keys(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -621,8 +615,7 @@ def test_stream_created_redirects_when_stream_not_listed(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -650,8 +643,7 @@ def test_delete_stream_surfaces_api_error(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -694,8 +686,7 @@ def test_create_stream_shows_keys_without_session_storage(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -735,8 +726,7 @@ def test_create_stream_forwards_custom_keys(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -771,8 +761,7 @@ def test_create_stream_rejects_invalid_custom_key(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -794,8 +783,7 @@ def test_create_stream_rejects_duplicate_custom_keys(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -827,8 +815,7 @@ def test_add_player_forwards_custom_play_key(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -858,8 +845,7 @@ def test_delete_stream_calls_api_before_redirect(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -881,8 +867,7 @@ def test_create_stream_rejects_path_unsafe_stream_id(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -904,8 +889,7 @@ def test_delete_stream_rejects_invalid_stream_id(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -927,8 +911,7 @@ def test_stream_stats_rejects_invalid_stream_id(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -958,8 +941,7 @@ def test_create_stream_rejects_invalid_display_name(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -981,8 +963,7 @@ def test_delete_player_rejects_invalid_player_id(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",

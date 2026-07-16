@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from flask_test_utils import configure_testing_app
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
 os.environ.setdefault("PASSWORD", "test-password-for-ci-only")
@@ -30,8 +31,7 @@ def app_client(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
