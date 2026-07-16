@@ -13,6 +13,11 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- Docker startup logs now print an OpenRTMP ASCII banner followed by the
+  `librtmp2-server-panel` name and running image version. Release builds embed
+  the workflow version; local builds without one are labelled `development`.
+
 ## [0.1.3] — 2026-07-15
 
 ### Fixed
