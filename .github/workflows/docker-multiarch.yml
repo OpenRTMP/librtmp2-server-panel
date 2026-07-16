@@ -54,6 +54,7 @@ jobs:
           TAGS="ghcr.io/openrtmp/librtmp2-server-panel:latest
           ghcr.io/openrtmp/librtmp2-server-panel:beta
           ghcr.io/openrtmp/librtmp2-server-panel:alpha"
+          APP_VERSION=""
           if [ -n "$VERSION" ]; then
             # Only treat this as a "v"-prefixed release version (and mirror
             # it under both the bare and v-prefixed tag) when it actually
@@ -70,6 +71,7 @@ jobs:
               echo "::error::Invalid version input '$VERSION' (normalized '$BARE_VERSION' must be a valid Docker tag: start with an alphanumeric or '_', then up to 126 more [A-Za-z0-9_.-] chars)"
               exit 1
             fi
+            APP_VERSION="$BARE_VERSION"
             TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server-panel:$BARE_VERSION"
             # Publish the v-prefixed alias too whenever this looks like a
@@ -87,6 +89,7 @@ jobs:
             echo "tags<<EOF"
             echo "$TAGS"
             echo "EOF"
+            echo "app_version=$APP_VERSION"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
@@ -97,4 +100,4 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
-            APP_VERSION=${{ inputs.version }}
+            APP_VERSION=${{ steps.tags.outputs.app_version }}
