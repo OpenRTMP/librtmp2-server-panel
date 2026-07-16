@@ -128,12 +128,13 @@ class RedisSessionStore:
                 token_key,
                 token,
             )
-        except self._redis_error:
-            logger.warning(
+        except self._redis_error as exc:
+            logger.error(
                 "Failed to revoke Redis session for user %s",
                 username,
                 exc_info=True,
             )
+            raise SessionBackendUnavailable("Session backend unavailable") from exc
 
 
 def create_session_store(storage_uri):

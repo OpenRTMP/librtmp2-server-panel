@@ -126,11 +126,16 @@ def create_app():
     def _session_ttl_seconds():
         return int(app.permanent_session_lifetime.total_seconds())
 
-    def _revoke_session_token():
+    def _revoke_session_token(*, fail_closed=False):
         token = session.pop("session_token", None)
         username = session.get("username")
         if token and username:
-            session_store.revoke(username, token)
+            try:
+                session_store.revoke(username, token)
+            except SessionBackendUnavailable:
+                if fail_closed:
+                    session["session_token"] = token
+                    raise
 
     def _establish_logged_in_session():
         token = secrets.token_hex(32)
@@ -252,7 +257,20 @@ def create_app():
     @app.route("/logout", methods=["POST"])
     @login_required
     def logout():
-        _revoke_session_token()
+        try:
+            _revoke_session_token(fail_closed=True)
+        except SessionBackendUnavailable:
+            app.logger.error(
+                "Session backend unavailable during logout for user %s",
+                session.get("username"),
+                exc_info=True,
+            )
+            session["flash_error"] = (
+                "Could not complete logout because the authentication service "
+                "is temporarily unavailable. Your session is still active; "
+                "please try again."
+            )
+            return redirect(url_for("index"))
         session.clear()
         return redirect(url_for("login"))
 

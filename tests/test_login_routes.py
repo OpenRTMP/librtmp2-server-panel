@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
+from session_store import SessionBackendUnavailable
+
 
 @pytest.fixture
 def login_required_app():
@@ -162,6 +164,46 @@ def test_login_accepts_valid_credentials():
             assert sess.get("logged_in") is True
             assert sess.get("session_token")
             assert sess.get("username") == "admin"
+
+
+def test_logout_returns_error_without_clearing_session_when_backend_revoke_fails():
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.create_session_store"
+    ) as create_store:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+        store = create_store.return_value
+        store.is_valid.return_value = True
+        store.revoke.side_effect = SessionBackendUnavailable(
+            "Session backend unavailable"
+        )
+
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        client = application.test_client()
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        stolen = client.get_cookie("session")
+
+        with patch.object(application.logger, "error") as log_error:
+            response = client.post("/logout")
+
+        assert response.status_code == 302
+        assert response.headers["Location"].endswith("/")
+        assert b"still active" in client.get(response.headers["Location"]).data
+        log_error.assert_called_once()
+        store.revoke.assert_called_once()
+
+        attacker = application.test_client()
+        attacker.set_cookie("session", stolen.value, domain="localhost", path="/")
+        attacker_response = attacker.get("/")
+        assert attacker_response.status_code == 200
 
 
 def test_logout_invalidates_stolen_session_cookie():
