@@ -17,12 +17,12 @@ RUN apk add --no-cache libffi openssl
 
 COPY --from=builder /install /usr/local
 COPY . .
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN version="${APP_VERSION:-development}" && \
     mkdir -p /data /usr/local/share/openrtmp && \
     printf '%s\n' "$version" > /usr/local/share/openrtmp/VERSION && \
-    chmod 0755 /usr/local/bin/docker-entrypoint.sh && \
+    chmod 0755 /usr/local/bin/entrypoint.sh && \
     adduser -D -h /app openrtmp && \
     chown -R openrtmp:openrtmp /app /data
 
@@ -34,5 +34,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -qO- http://localhost:8000/login || exit 1
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--worker-class", "gthread", "--threads", "4", "--timeout", "60", "app:app"]
