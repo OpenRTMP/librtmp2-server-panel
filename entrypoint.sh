@@ -7,11 +7,13 @@ if [ -r "$VERSION_FILE" ]; then
     VERSION="$(cat "$VERSION_FILE")"
 fi
 
-case "$VERSION" in
-    v[0-9]*) DISPLAY_VERSION="$VERSION" ;;
-    [0-9]*) DISPLAY_VERSION="v$VERSION" ;;
-    *) DISPLAY_VERSION="$VERSION" ;;
-esac
+if printf '%s\n' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]'; then
+    DISPLAY_VERSION="$VERSION"
+elif printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]'; then
+    DISPLAY_VERSION="v$VERSION"
+else
+    DISPLAY_VERSION="$VERSION"
+fi
 
 cat <<'BANNER'
    ___                   ____ ______ __  __ ____
