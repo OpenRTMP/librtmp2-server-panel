@@ -21,7 +21,6 @@ cat <<'BANNER'
   \___/| .__/ \___|_| |_|_| \_\|_| |_|  |_|_|
        |_|
 BANNER
-printf '  Service: librtmp2-server-panel\n'
-printf '  Version: %s\n\n' "$DISPLAY_VERSION"
+printf '  librtmp2-server-panel %s\n\n' "$DISPLAY_VERSION"
 
 exec "$@"
