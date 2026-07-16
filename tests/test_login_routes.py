@@ -2,6 +2,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+from flask_test_utils import configure_testing_app
 
 
 @pytest.fixture
@@ -13,8 +14,7 @@ def login_required_app():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         application.config["REQUIRE_LOGIN"] = True
         yield application.test_client()
 
@@ -59,8 +59,7 @@ def _attempt_login_rate_limit_in_subprocess(queue):
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         accepted = 0
         for i in range(8):
@@ -78,8 +77,7 @@ def test_login_rate_limit_blocks_after_five_attempts():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         for i in range(5):
             r = client.post(
@@ -128,8 +126,7 @@ def test_login_rejects_bad_password():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         r = client.post(
             "/login",
@@ -147,8 +144,7 @@ def test_login_accepts_valid_credentials():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False
+        configure_testing_app(application)
         client = application.test_client()
         r = client.post(
             "/login",
@@ -169,8 +165,7 @@ def test_logout_invalidates_stolen_session_cookie():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
 
         client.post(
@@ -193,8 +188,7 @@ def test_login_invalidates_previous_session_cookie():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
 
         first = application.test_client()
         first.post(
@@ -314,8 +308,7 @@ def test_stats_ip_rate_limit_returns_429_with_low_limit(monkeypatch):
         monkeypatch.setattr(app_module.Config, "STATS_RATE_LIMIT_PER_STREAM", 100)
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
@@ -369,8 +362,7 @@ def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         application.config["REQUIRE_LOGIN"] = True
         client = application.test_client()
 

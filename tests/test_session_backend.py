@@ -2,6 +2,7 @@ import os
 from unittest.mock import patch
 
 from session_store import SessionBackendUnavailable
+from flask_test_utils import configure_testing_app
 
 
 def test_login_returns_503_without_mutating_session_when_backend_write_fails():
@@ -18,8 +19,7 @@ def test_login_returns_503_without_mutating_session_when_backend_write_fails():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
 
         with client.session_transaction() as sess:

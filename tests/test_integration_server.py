@@ -13,6 +13,7 @@ import sys
 import uuid
 
 import pytest
+from flask_test_utils import configure_testing_app
 
 pytestmark = [
     pytest.mark.integration,
@@ -122,8 +123,7 @@ def _fresh_flask_app(monkeypatch, api_base_url, api_token):
     importlib.reload(app_module)
     monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
     application = app_module.create_app()
-    application.config["TESTING"] = True
-    application.config["WTF_CSRF_ENABLED"] = False
+    configure_testing_app(application)
     application.config["REQUIRE_LOGIN"] = True
     return application
 

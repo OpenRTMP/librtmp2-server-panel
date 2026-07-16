@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 from unittest.mock import patch
+from flask_test_utils import configure_testing_app
 
 
 def test_container_uses_threaded_gunicorn_for_long_running_deletes():
@@ -32,8 +33,7 @@ def test_delete_stream_logs_api_failure(monkeypatch):
 
         monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
         client.post(
             "/login",
