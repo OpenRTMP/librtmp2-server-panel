@@ -152,12 +152,13 @@ def test_redis_store_revoke_uses_atomic_server_side_compare_and_delete():
     assert 'redis.call("DEL", KEYS[2])' in script
 
 
-def test_redis_store_revoke_failure_is_best_effort_and_logged(caplog):
+def test_redis_store_revoke_failure_raises_and_logs(caplog):
     store, client, _redis_module = _make_redis_store()
     client.eval.side_effect = FakeRedisError("redis unavailable")
 
-    with caplog.at_level(logging.WARNING, logger="session_store"):
-        store.revoke("admin", "token")
+    with caplog.at_level(logging.ERROR, logger="session_store"):
+        with pytest.raises(SessionBackendUnavailable):
+            store.revoke("admin", "token")
 
     assert "Failed to revoke Redis session for user admin" in caplog.text
 

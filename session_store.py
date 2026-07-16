@@ -37,7 +37,7 @@ class MemorySessionStore:
             self._tokens[token] = expiry
             self._active_by_user[username] = token
 
-    def is_valid(self, username, token):
+    def is_valid(self, username, token, *, fail_closed=False):
         with self._lock:
             active = self._active_by_user.get(username)
             if active != token:
@@ -97,7 +97,7 @@ class RedisSessionStore:
             )
             raise SessionBackendUnavailable("Session backend unavailable") from exc
 
-    def is_valid(self, username, token):
+    def is_valid(self, username, token, *, fail_closed=False):
         try:
             user_key = f"{self._user_prefix}{username}"
             active = self._client.get(user_key)
@@ -107,12 +107,14 @@ class RedisSessionStore:
             if active_token != token:
                 return False
             return bool(self._client.exists(f"{self._token_prefix}{token}"))
-        except self._redis_error:
+        except self._redis_error as exc:
             logger.warning(
                 "Failed to validate Redis session for user %s; denying access",
                 username,
                 exc_info=True,
             )
+            if fail_closed:
+                raise SessionBackendUnavailable("Session backend unavailable") from exc
             return False
 
     def revoke(self, username, token):
@@ -128,12 +130,13 @@ class RedisSessionStore:
                 token_key,
                 token,
             )
-        except self._redis_error:
-            logger.warning(
+        except self._redis_error as exc:
+            logger.error(
                 "Failed to revoke Redis session for user %s",
                 username,
                 exc_info=True,
             )
+            raise SessionBackendUnavailable("Session backend unavailable") from exc
 
 
 def create_session_store(storage_uri):

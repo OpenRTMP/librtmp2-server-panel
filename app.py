@@ -126,11 +126,16 @@ def create_app():
     def _session_ttl_seconds():
         return int(app.permanent_session_lifetime.total_seconds())
 
-    def _revoke_session_token():
+    def _revoke_session_token(*, fail_closed=False):
         token = session.pop("session_token", None)
         username = session.get("username")
         if token and username:
-            session_store.revoke(username, token)
+            try:
+                session_store.revoke(username, token)
+            except SessionBackendUnavailable:
+                if fail_closed:
+                    session["session_token"] = token
+                    raise
 
     def _establish_logged_in_session():
         token = secrets.token_hex(32)
@@ -145,12 +150,14 @@ def create_app():
         session["username"] = username
         session["session_token"] = token
 
-    def _session_is_authenticated():
+    def _session_is_authenticated(*, fail_closed=False):
         if not session.get("logged_in"):
             return False
         token = session.get("session_token")
         username = session.get("username")
-        if not token or not username or not session_store.is_valid(username, token):
+        if not token or not username or not session_store.is_valid(
+            username, token, fail_closed=fail_closed
+        ):
             _revoke_session_token()
             session.clear()
             return False
@@ -250,9 +257,46 @@ def create_app():
         return render_template("login.html", error=error)
 
     @app.route("/logout", methods=["POST"])
-    @login_required
     def logout():
-        _revoke_session_token()
+        try:
+            if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated(
+                fail_closed=True
+            ):
+                return redirect(url_for("login"))
+        except SessionBackendUnavailable:
+            username = session.get("username")
+            app.logger.error(
+                "Session backend unavailable during logout validation for user %s",
+                username,
+                exc_info=True,
+            )
+            error = (
+                "Could not complete logout because the authentication service "
+                "is temporarily unavailable. Your session is still active; "
+                "please try again."
+            )
+            return render_template(
+                "index.html",
+                streams=[],
+                api_error=None,
+                flash_error=error,
+                rtmps_enabled=False,
+            ), 503
+
+        try:
+            _revoke_session_token(fail_closed=True)
+        except SessionBackendUnavailable:
+            app.logger.error(
+                "Session backend unavailable during logout for user %s",
+                session.get("username"),
+                exc_info=True,
+            )
+            session["flash_error"] = (
+                "Could not complete logout because the authentication service "
+                "is temporarily unavailable. Your session is still active; "
+                "please try again."
+            )
+            return redirect(url_for("index"))
         session.clear()
         return redirect(url_for("login"))
 
