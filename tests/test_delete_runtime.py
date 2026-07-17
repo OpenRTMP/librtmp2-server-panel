@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -43,9 +45,12 @@ def test_delete_stream_logs_api_failure(monkeypatch):
         with patch.object(application.logger, "warning") as log_warning:
             response = client.post("/streams/fail/delete")
 
+        expected_tag = hmac.new(
+            application.config["SECRET_KEY"].encode(), b"fail", hashlib.sha256
+        ).hexdigest()[:12]
         assert response.status_code == 302
         log_warning.assert_called_once_with(
-            "Delete for stream %s failed: %s",
-            "fail",
+            "Delete stream failed (stream_tag=%s): %s",
+            expected_tag,
             mock_client.delete_stream.side_effect,
         )

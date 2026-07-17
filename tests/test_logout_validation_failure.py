@@ -1,6 +1,7 @@
 import os
 from unittest.mock import patch
 
+from flask_test_utils import configure_testing_app
 from session_store import SessionBackendUnavailable
 
 
@@ -15,8 +16,7 @@ def test_logout_validation_failure_preserves_session_and_reports_error():
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         application.config["REQUIRE_LOGIN"] = True
         client = application.test_client()
 

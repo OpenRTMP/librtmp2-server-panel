@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import re
 import secrets
@@ -245,10 +246,8 @@ def create_app():
                 try:
                     _establish_logged_in_session()
                 except SessionBackendUnavailable:
-                    app.logger.error(
-                        "Session backend unavailable during login for user %s",
-                        username,
-                        exc_info=True,
+                    app.logger.exception(
+                        "Session backend unavailable during login"
                     )
                     error = "Authentication service temporarily unavailable. Please try again."
                     return render_template("login.html", error=error), 503
@@ -470,7 +469,16 @@ def create_app():
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError as exc:
-            app.logger.warning("Delete for stream %s failed: %s", stream_id, exc)
+            # Log a keyed correlation tag instead of the raw user-controlled
+            # stream_id (SonarCloud pythonsecurity:S5145). Stream IDs can be
+            # low-entropy/user-chosen, so an unkeyed hash would let anyone
+            # with log access recompute tags for candidate IDs; keying with
+            # SECRET_KEY (server-only) prevents that while still letting ops
+            # correlate failures to a specific stream.
+            stream_tag = hmac.new(
+                app.config["SECRET_KEY"].encode(), stream_id.encode(), hashlib.sha256
+            ).hexdigest()[:12]
+            app.logger.warning("Delete stream failed (stream_tag=%s): %s", stream_tag, exc)
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
