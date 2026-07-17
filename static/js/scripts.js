@@ -99,9 +99,12 @@ function loadStats(streamId) {
             // every librtmp2-server build yet (see librtmp2 CHANGELOG for
             // Conn::buffer_bytes()/latency_ms() and Server::backpressure_drops).
             // Render "n/a" rather than a stale/misleading zero when absent.
-            const bufferBytes = Number(s.buffer_bytes);
-            const latency = Number(s.latency_ms);
-            const droppedPkts = Number((data.summary || {}).dropped_pkts);
+            // Number(null) === 0, so nullish values must be turned into NaN
+            // first or they'd pass Number.isFinite() below as a real zero.
+            const toStatNumber = (value) => (value == null ? NaN : Number(value));
+            const bufferBytes = toStatNumber(s.buffer_bytes);
+            const latency = toStatNumber(s.latency_ms);
+            const droppedPkts = toStatNumber((data.summary || {}).dropped_pkts);
             const playerRows = (data.players || [])
                 .map((pl, index) => {
                     const plRtt = Number(pl.rtt_ms);
