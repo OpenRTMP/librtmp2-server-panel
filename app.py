@@ -61,15 +61,16 @@ def _optional_form_value(raw):
 def _credential_fingerprint(secret_key, username, password):
     """Stable marker for the active login credentials bound to a session.
 
-    The username/password material keys the HMAC rather than being hashed as
-    message content, so this isn't a password-storage digest CodeQL needs to
-    flag (py/weak-sensitive-data-hashing) - it can't be brute-forced offline
-    from the fingerprint alone the way a fast hash of the password would be.
+    This is a keyed MAC, not a password-storage digest: SECRET_KEY is the
+    HMAC key, so the fingerprint can't be brute-forced offline into the
+    username/password even if it leaked. CodeQL's weak-sensitive-data-hashing
+    query doesn't model HMAC's keyed construction and flags the password
+    reaching hashlib.sha256 as if this were a fast, unkeyed password hash.
     """
-    key = f"{username}\0{password}".encode()
-    return hmac.new(
-        key,
+    material = f"{username}\0{password}"
+    return hmac.new(  # codeql[py/weak-sensitive-data-hashing]
         secret_key.encode(),
+        material.encode(),
         hashlib.sha256,
     ).hexdigest()
 
