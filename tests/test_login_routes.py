@@ -251,6 +251,32 @@ def test_login_invalidates_previous_session_cookie():
         assert "/login" in r.headers["Location"]
 
 
+def test_username_change_invalidates_stolen_session_cookie():
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+
+        import app as app_module
+
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        stolen = client.get_cookie("session")
+
+        application.config["USERNAME"] = "rotated-admin"
+
+        attacker = application.test_client()
+        attacker.set_cookie("session", stolen.value, domain="localhost", path="/")
+        r = attacker.get("/")
+        assert r.status_code == 302
+        assert "/login" in r.headers["Location"]
+
+
 def test_create_app_applies_eight_hour_session_lifetime():
     with patch("app.Lrtmp2Client"):
         import app as app_module

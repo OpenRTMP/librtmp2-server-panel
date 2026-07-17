@@ -58,6 +58,23 @@ def _optional_form_value(raw):
     return stripped or None
 
 
+def _credential_fingerprint(secret_key, username, password):
+    """Stable marker for the active login credentials bound to a session.
+
+    This is a keyed MAC, not a password-storage digest: SECRET_KEY is the
+    HMAC key, so the fingerprint can't be brute-forced offline into the
+    username/password even if it leaked. CodeQL's weak-sensitive-data-hashing
+    query doesn't model HMAC's keyed construction and flags the password
+    reaching hashlib.sha256 as if this were a fast, unkeyed password hash.
+    """
+    material = f"{username}\0{password}"
+    return hmac.new(
+        secret_key.encode(),
+        material.encode(),  # codeql[py/weak-sensitive-data-hashing]
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _validate_optional_access_keys(publish_key, play_key, stats_key):
     fields = (
         ("publish_key", publish_key),
@@ -150,9 +167,24 @@ def create_app():
         session["logged_in"] = True
         session["username"] = username
         session["session_token"] = token
+        session["credential_fp"] = _credential_fingerprint(
+            app.config["SECRET_KEY"],
+            username,
+            app.config["PASSWORD"],
+        )
 
     def _session_is_authenticated(*, fail_closed=False):
         if not session.get("logged_in"):
+            return False
+        expected_fp = _credential_fingerprint(
+            app.config["SECRET_KEY"],
+            app.config["USERNAME"],
+            app.config["PASSWORD"],
+        )
+        stored_fp = session.get("credential_fp")
+        if not isinstance(stored_fp, str) or not hmac.compare_digest(stored_fp, expected_fp):
+            _revoke_session_token()
+            session.clear()
             return False
         token = session.get("session_token")
         username = session.get("username")

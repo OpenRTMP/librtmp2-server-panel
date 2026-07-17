@@ -18,6 +18,11 @@ only begin at a future `1.0.0`.
   `librtmp2-server-panel` name and running image version. Release builds embed
   the workflow version; local builds without one are labelled `development`.
 
+### Security
+- Active panel sessions are invalidated when the configured username or
+  password changes, preventing stolen session cookies from remaining valid
+  after credential rotation.
+
 ## [0.1.3] — 2026-07-15
 
 ### Fixed
