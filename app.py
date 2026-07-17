@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import re
 import secrets
@@ -55,6 +56,16 @@ def _optional_form_value(raw):
         return None
     stripped = str(raw).strip()
     return stripped or None
+
+
+def _credential_fingerprint(secret_key, username, password):
+    """Stable marker for the active login credentials bound to a session."""
+    material = f"{username}\0{password}"
+    return hmac.new(
+        secret_key.encode(),
+        material.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _validate_optional_access_keys(publish_key, play_key, stats_key):
@@ -149,9 +160,23 @@ def create_app():
         session["logged_in"] = True
         session["username"] = username
         session["session_token"] = token
+        session["credential_fp"] = _credential_fingerprint(
+            app.config["SECRET_KEY"],
+            username,
+            app.config["PASSWORD"],
+        )
 
     def _session_is_authenticated(*, fail_closed=False):
         if not session.get("logged_in"):
+            return False
+        expected_fp = _credential_fingerprint(
+            app.config["SECRET_KEY"],
+            app.config["USERNAME"],
+            app.config["PASSWORD"],
+        )
+        if session.get("credential_fp") != expected_fp:
+            _revoke_session_token()
+            session.clear()
             return False
         token = session.get("session_token")
         username = session.get("username")
