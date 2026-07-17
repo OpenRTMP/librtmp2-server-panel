@@ -95,6 +95,13 @@ function loadStats(streamId) {
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
+            // buffer_bytes / latency_ms / dropped_pkts are not emitted by
+            // every librtmp2-server build yet (see librtmp2 CHANGELOG for
+            // Conn::buffer_bytes()/latency_ms() and Server::backpressure_drops).
+            // Render "n/a" rather than a stale/misleading zero when absent.
+            const bufferBytes = Number(s.buffer_bytes);
+            const latency = Number(s.latency_ms);
+            const droppedPkts = Number((data.summary || {}).dropped_pkts);
             const playerRows = (data.players || [])
                 .map((pl, index) => {
                     const plRtt = Number(pl.rtt_ms);
@@ -136,6 +143,18 @@ function loadStats(streamId) {
                         <div class="col-md-4 col-6">
                             <p>Players:</p>
                             <strong>${Number.isFinite(players) ? players : 0}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Buffer:</p>
+                            <strong>${Number.isFinite(bufferBytes) ? `${(bufferBytes / 1024).toFixed(1)} KB` : 'n/a'}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Latency (est.):</p>
+                            <strong>${Number.isFinite(latency) ? `${latency.toFixed(1)} ms` : 'n/a'}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Dropped (backpressure):</p>
+                            <strong>${Number.isFinite(droppedPkts) ? droppedPkts : 'n/a'}</strong>
                         </div>
                         ${playerRows}
                     </div>

@@ -17,6 +17,9 @@ only begin at a future `1.0.0`.
 - Docker startup logs now print an OpenRTMP ASCII banner followed by the
   `librtmp2-server-panel` name and running image version. Release builds embed
   the workflow version; local builds without one are labelled `development`.
+- Stream Statistics panel: Buffer, Latency (est.), and Dropped (backpressure)
+  tiles, rendered from `buffer_bytes` / `latency_ms` / `summary.dropped_pkts`
+  when the upstream `/stats` response includes them; shown as "n/a" otherwise.
 
 ### Security
 - Active panel sessions are invalidated when the configured username or

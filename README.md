@@ -78,5 +78,8 @@ python3 app.py
 
 - Create/delete streams against librtmp2-server's REST API
 - One-click copy for publish URL, stream key, play URL, and stats URL
-- Live per-stream stats (bitrate, resolution, codec, uptime, RTT) polled from `/stats?key=...`
+- Live per-stream stats (bitrate, resolution, codec, uptime, RTT) polled from `/stats?key=...`,
+  plus outbound buffer/estimated latency/backpressure-drop tiles rendered whenever the
+  upstream `librtmp2-server` includes `buffer_bytes`, `latency_ms`, and `summary.dropped_pkts`
+  in that response (fields not yet emitted by every build; the panel shows "n/a" until they are)
 - Optional login gate for the whole panel, enabled by default on network-exposed deployments
