@@ -70,7 +70,7 @@ def _credential_fingerprint(secret_key, username, password):
     material = f"{username}\0{password}"
     return hmac.new(
         secret_key.encode(),
-        material.encode(),  # lgtm[py/weak-sensitive-data-hashing]
+        material.encode(),  # codeql[py/weak-sensitive-data-hashing]
         hashlib.sha256,
     ).hexdigest()
 
