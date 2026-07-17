@@ -252,7 +252,7 @@ def test_login_invalidates_previous_session_cookie():
         assert "/login" in r.headers["Location"]
 
 
-def test_password_change_invalidates_stolen_session_cookie():
+def test_username_change_invalidates_stolen_session_cookie():
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
         mock_client_cls.return_value.list_streams.return_value = []
@@ -269,7 +269,7 @@ def test_password_change_invalidates_stolen_session_cookie():
         )
         stolen = client.get_cookie("session")
 
-        application.config["PASSWORD"] = "new-rotated-password-that-is-long-enough"
+        application.config["USERNAME"] = "rotated-admin"
 
         attacker = application.test_client()
         attacker.set_cookie("session", stolen.value, domain="localhost", path="/")
