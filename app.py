@@ -68,10 +68,10 @@ def _credential_fingerprint(secret_key, username, password):
     reaching hashlib.sha256 as if this were a fast, unkeyed password hash.
     """
     material = f"{username}\0{password}"
-    return hmac.new(  # codeql[py/weak-sensitive-data-hashing]
+    return hmac.new(
         secret_key.encode(),
         material.encode(),
-        hashlib.sha256,
+        hashlib.sha256,  # codeql[py/weak-sensitive-data-hashing]
     ).hexdigest()
 
 
