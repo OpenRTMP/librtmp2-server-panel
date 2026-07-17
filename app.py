@@ -245,10 +245,8 @@ def create_app():
                 try:
                     _establish_logged_in_session()
                 except SessionBackendUnavailable:
-                    app.logger.error(
-                        "Session backend unavailable during login for user %s",
-                        username,
-                        exc_info=True,
+                    app.logger.exception(
+                        "Session backend unavailable during login"
                     )
                     error = "Authentication service temporarily unavailable. Please try again."
                     return render_template("login.html", error=error), 503
@@ -470,7 +468,7 @@ def create_app():
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError as exc:
-            app.logger.warning("Delete for stream %s failed: %s", stream_id, exc)
+            app.logger.warning("Delete stream failed: %s", exc)
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 

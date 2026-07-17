@@ -177,8 +177,7 @@ def test_logout_returns_error_without_clearing_session_when_backend_revoke_fails
         import app as app_module
 
         application = app_module.create_app()
-        application.config["TESTING"] = True
-        application.config["WTF_CSRF_ENABLED"] = False  # NOSONAR - test client posts without CSRF tokens
+        configure_testing_app(application)
         client = application.test_client()
 
         client.post(
