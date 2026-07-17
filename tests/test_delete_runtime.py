@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -45,6 +46,7 @@ def test_delete_stream_logs_api_failure(monkeypatch):
 
         assert response.status_code == 302
         log_warning.assert_called_once_with(
-            "Delete stream failed: %s",
+            "Delete stream failed (stream_tag=%s): %s",
+            hashlib.sha256(b"fail").hexdigest()[:12],
             mock_client.delete_stream.side_effect,
         )

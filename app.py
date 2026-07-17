@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import re
 import secrets
@@ -468,7 +469,11 @@ def create_app():
         try:
             client.delete_stream(stream_id)
         except Lrtmp2ApiError as exc:
-            app.logger.warning("Delete stream failed: %s", exc)
+            # Log a non-reversible correlation tag instead of the raw
+            # user-controlled stream_id (SonarCloud pythonsecurity:S5145),
+            # while still letting ops correlate failures to a specific stream.
+            stream_tag = hashlib.sha256(stream_id.encode()).hexdigest()[:12]
+            app.logger.warning("Delete stream failed (stream_tag=%s): %s", stream_tag, exc)
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
