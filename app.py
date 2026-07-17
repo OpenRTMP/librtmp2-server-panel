@@ -174,7 +174,8 @@ def create_app():
             app.config["USERNAME"],
             app.config["PASSWORD"],
         )
-        if session.get("credential_fp") != expected_fp:
+        stored_fp = session.get("credential_fp")
+        if not isinstance(stored_fp, str) or not hmac.compare_digest(stored_fp, expected_fp):
             _revoke_session_token()
             session.clear()
             return False
