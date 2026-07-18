@@ -6,14 +6,18 @@ import requests
 from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
 
 
-def test_health_calls_unauthenticated_endpoint():
+def test_health_sends_bearer_token():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.get") as mock_get:
         mock_get.return_value.ok = True
-        mock_get.return_value.json.return_value = {"status": "ok"}
+        mock_get.return_value.json.return_value = {
+            "status": "ok",
+            "rtmps_enabled": True,
+            "rtmps_port": 1936,
+        }
         result = client.health()
     assert result["status"] == "ok"
-    assert "Authorization" not in mock_get.call_args.kwargs.get("headers", {})
+    assert mock_get.call_args.kwargs.get("headers", {}).get("Authorization") == "Bearer tok"
 
 
 def test_create_stream_posts_json_payload():

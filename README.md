@@ -136,6 +136,7 @@ python3 -m venv venv
 pip install -r requirements.txt
 cp .env.example .env
 # Edit the required values, then:
+export $(grep -v '^#' .env | xargs)
 python3 app.py
 ```
 
