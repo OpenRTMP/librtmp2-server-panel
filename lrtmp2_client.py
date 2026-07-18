@@ -72,7 +72,10 @@ class Lrtmp2Client:
 
     def health(self):
         return self._request_json(
-            requests.get, f"{self.base_url}/api/v1/health", "health"
+            requests.get,
+            f"{self.base_url}/api/v1/health",
+            "health",
+            headers=self._headers(),
         )
 
     def list_streams(self):
