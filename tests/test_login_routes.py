@@ -1,10 +1,40 @@
 import os
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
 from flask_test_utils import configure_testing_app
 
 from session_store import SessionBackendUnavailable
+
+
+@contextmanager
+def _logged_in_client_with_mock_store():
+    """Yield (client, store) for a logged-in session backed by a mocked store.
+
+    The store's is_valid() returns True by default; set
+    store.is_valid.side_effect to simulate a backend outage.
+    """
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.create_session_store"
+    ) as create_store:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+        store = create_store.return_value
+        store.is_valid.return_value = True
+
+        import app as app_module
+
+        application = app_module.create_app()
+        configure_testing_app(application)
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+        yield client, store
 
 
 @pytest.fixture
@@ -454,25 +484,7 @@ def test_create_stream_get_renders_form(app_client):
 
 
 def test_auth_check_returns_503_without_clearing_session_when_backend_unavailable():
-    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
-        "app.create_session_store"
-    ) as create_store:
-        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
-        mock_client_cls.return_value.list_streams.return_value = []
-        store = create_store.return_value
-        store.is_valid.return_value = True
-
-        import app as app_module
-
-        application = app_module.create_app()
-        configure_testing_app(application)
-        application.config["REQUIRE_LOGIN"] = True
-        client = application.test_client()
-
-        client.post(
-            "/login",
-            data={"username": "admin", "password": os.environ["PASSWORD"]},
-        )
+    with _logged_in_client_with_mock_store() as (client, store):
         with client.session_transaction() as sess:
             token = sess["session_token"]
 
@@ -480,7 +492,7 @@ def test_auth_check_returns_503_without_clearing_session_when_backend_unavailabl
             "Session backend unavailable"
         )
 
-        with patch.object(application.logger, "error") as log_error:
+        with patch.object(client.application.logger, "error") as log_error:
             response = client.get("/")
 
         assert response.status_code == 503
@@ -505,26 +517,7 @@ def test_stats_ip_rate_limit_exempt_check_handles_backend_unavailable():
     limiter exempt_when, which also calls _session_is_authenticated() and
     must handle SessionBackendUnavailable rather than let it propagate.
     """
-    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
-        "app.create_session_store"
-    ) as create_store:
-        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
-        mock_client_cls.return_value.list_streams.return_value = []
-        store = create_store.return_value
-        store.is_valid.return_value = True
-
-        import app as app_module
-
-        application = app_module.create_app()
-        configure_testing_app(application)
-        application.config["REQUIRE_LOGIN"] = True
-        client = application.test_client()
-
-        client.post(
-            "/login",
-            data={"username": "admin", "password": os.environ["PASSWORD"]},
-        )
-
+    with _logged_in_client_with_mock_store() as (client, store):
         store.is_valid.side_effect = SessionBackendUnavailable(
             "Session backend unavailable"
         )
