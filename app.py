@@ -230,6 +230,14 @@ def create_app():
                 return True
         return False
 
+    def _stats_ip_rate_limit_exempt():
+        if not app.config["REQUIRE_LOGIN"]:
+            return False
+        try:
+            return not _session_is_authenticated()
+        except SessionBackendUnavailable:
+            return True
+
     def rtmps_health():
         """Return RTMPS availability and the public RTMPS port to advertise.
 
@@ -539,7 +547,7 @@ def create_app():
     @limiter.limit(
         stats_ip_limit,
         key_func=get_remote_address,
-        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not _session_is_authenticated(),
+        exempt_when=_stats_ip_rate_limit_exempt,
     )
     @limiter.limit(
         stats_stream_limit,
