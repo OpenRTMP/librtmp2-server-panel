@@ -110,5 +110,6 @@ jobs:
     permissions:
       packages: write
       contents: read
+    secrets: inherit
     with:
       version: ${{ needs.package.outputs.version }}
