@@ -497,3 +497,37 @@ def test_auth_check_returns_503_without_clearing_session_when_backend_unavailabl
 
         recovered = client.get("/")
         assert recovered.status_code == 200
+
+
+def test_stats_ip_rate_limit_exempt_check_handles_backend_unavailable():
+    """Stats polling stays a controlled 503 (never an unhandled 500) when the
+    session backend is unavailable, covering the stats.json route's IP rate
+    limiter exempt_when, which also calls _session_is_authenticated() and
+    must handle SessionBackendUnavailable rather than let it propagate.
+    """
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.create_session_store"
+    ) as create_store:
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        mock_client_cls.return_value.list_streams.return_value = []
+        store = create_store.return_value
+        store.is_valid.return_value = True
+
+        import app as app_module
+
+        application = app_module.create_app()
+        configure_testing_app(application)
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        store.is_valid.side_effect = SessionBackendUnavailable(
+            "Session backend unavailable"
+        )
+
+        response = client.get("/streams/s1/stats.json")
+        assert response.status_code == 503
