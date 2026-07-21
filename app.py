@@ -183,15 +183,16 @@ def create_app():
         )
         stored_fp = session.get("credential_fp")
         if not isinstance(stored_fp, str) or not hmac.compare_digest(stored_fp, expected_fp):
-            _revoke_session_token()
+            _revoke_session_token(fail_closed=fail_closed)
             session.clear()
             return False
         token = session.get("session_token")
         username = session.get("username")
-        if not token or not username or not session_store.is_valid(
-            username, token, fail_closed=fail_closed
-        ):
-            _revoke_session_token()
+        if not token or not username:
+            session.clear()
+            return False
+        if not session_store.is_valid(username, token, fail_closed=True):
+            _revoke_session_token(fail_closed=fail_closed)
             session.clear()
             return False
         return True
@@ -199,19 +200,43 @@ def create_app():
     def login_required(view_func):
         @wraps(view_func)
         def wrapped(*args, **kwargs):
-            if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated():
-                return redirect(url_for("login"))
+            if app.config["REQUIRE_LOGIN"]:
+                try:
+                    if not _session_is_authenticated():
+                        return redirect(url_for("login"))
+                except SessionBackendUnavailable:
+                    app.logger.error(
+                        "Session backend unavailable during auth check",
+                        exc_info=True,
+                    )
+                    return (
+                        "Authentication service temporarily unavailable. "
+                        "Please try again.",
+                        503,
+                    )
             return view_func(*args, **kwargs)
         return wrapped
 
     def _stats_per_stream_rate_limit_exempt():
-        if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated():
-            return True
+        if app.config["REQUIRE_LOGIN"]:
+            try:
+                if not _session_is_authenticated():
+                    return True
+            except SessionBackendUnavailable:
+                return True
         if request.view_args:
             raw = request.view_args.get("stream_id", "") or ""
             if not _is_valid_stream_id(raw):
                 return True
         return False
+
+    def _stats_ip_rate_limit_exempt():
+        if not app.config["REQUIRE_LOGIN"]:
+            return False
+        try:
+            return not _session_is_authenticated()
+        except SessionBackendUnavailable:
+            return True
 
     def rtmps_health():
         """Return RTMPS availability and the public RTMPS port to advertise.
@@ -522,7 +547,7 @@ def create_app():
     @limiter.limit(
         stats_ip_limit,
         key_func=get_remote_address,
-        exempt_when=lambda: app.config["REQUIRE_LOGIN"] and not _session_is_authenticated(),
+        exempt_when=_stats_ip_rate_limit_exempt,
     )
     @limiter.limit(
         stats_stream_limit,
