@@ -16,9 +16,10 @@ only begin at a future `1.0.0`.
 ### Fixed
 - Development Compose image references now use lowercase GHCR repository names,
   preventing Docker's `repository name must be lowercase` startup failure.
-- Manual releases now check out and package the selected existing tag, and the
-  Docker release build is pinned to the exact same commit SHA instead of the
-  workflow's current branch revision.
+- Manually dispatched releases now create the requested tag from the exact
+  workflow-selected commit when it does not exist yet. Source archives, GitHub
+  Release metadata, and Docker images are pinned to that same commit; an
+  existing tag that points elsewhere is rejected.
 - Live statistics are polled only for the currently opened stream accordion,
   pause while the browser tab is hidden, and prevent overlapping fetches.
 - RTMP and RTMPS URLs now bracket IPv6 literals correctly.
