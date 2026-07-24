@@ -73,15 +73,18 @@ def test_development_compose_uses_lowercase_registry_paths():
     assert "ghcr.io/openrtmp/librtmp2-server:latest" in compose
 
 
-def test_manual_release_and_docker_build_use_the_selected_source_ref():
+def test_manual_release_creates_tag_from_selected_source_commit():
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     docker = (ROOT / ".github/workflows/docker-multiarch.yml").read_text(encoding="utf-8")
 
-    assert release.count("ref: ${{ github.event.inputs.tag || github.ref }}") == 2
-    assert "source_sha: ${{ steps.ver.outputs.source_sha }}" in release
-    assert "ref: ${{ needs.package.outputs.source_sha }}" in release
+    assert "Version tag to create" in release
+    assert release.count("ref: ${{ github.sha }}") == 2
+    assert "Tag $TAG already exists" in release
+    assert "Publish GitHub Release and create tag when missing" in release
     assert "target_commitish: ${{ steps.ver.outputs.source_sha }}" in release
+    assert "ref: ${{ needs.package.outputs.source_sha }}" in release
     assert "ref: ${{ inputs.ref || github.ref }}" in docker
+    assert "ref: ${{ github.event.inputs.tag || github.ref }}" not in release
 
 
 def test_stats_polling_is_limited_to_visible_stream_and_prevents_overlap():
