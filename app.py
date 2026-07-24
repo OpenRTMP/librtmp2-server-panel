@@ -137,9 +137,9 @@ def create_app():
             x_proto=trusted_proxy_count,
         )
         app.logger.warning(
-            "TRUSTED_PROXY_COUNT=%s: forwarded client IP/scheme headers are trusted. "
-            "Ensure the panel is reachable only through those proxies.",
-            trusted_proxy_count,
+            "Forwarded client IP/scheme headers are trusted because "
+            "TRUSTED_PROXY_COUNT is enabled. Ensure the panel is reachable "
+            "only through the configured proxies."
         )
 
     csrf = CSRFProtect(app)
