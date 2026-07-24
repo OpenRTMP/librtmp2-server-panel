@@ -13,7 +13,7 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
-## [0.1.5] — 2026-07-24
+## [0.1.5] — 2026-07-25
 
 ### Fixed
 - Development Compose image references now use lowercase GHCR repository names,
