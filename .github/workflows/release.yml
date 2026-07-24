@@ -105,7 +105,8 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          awk -v ver="$VERSION" '
+          CHANGELOG_VERSION="${VERSION%%+*}"
+          awk -v ver="$CHANGELOG_VERSION" '
             /^## \[/ {
               if (found) exit
               if ($0 ~ ("^## \\[" ver "\\]")) { found=1; next }
@@ -115,7 +116,7 @@ jobs:
             found { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
-            echo "::error::No CHANGELOG.md section found for version $VERSION"
+            echo "::error::No CHANGELOG.md section found for version $CHANGELOG_VERSION (release tag version: $VERSION)"
             exit 1
           fi
           cat release-notes.md
