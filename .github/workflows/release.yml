@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag to create (e.g. v0.1.5)'
+        description: 'Version tag to create (e.g. v0.1.5 or v0.1.5.1)'
         required: true
 
 permissions:
@@ -69,8 +69,11 @@ jobs:
         env:
           REF: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "::error::Release tag must use semantic-version format such as v0.1.5, v0.1.5-rc1, or v0.1.5+build.1"
+          # Accept the project's extended numeric version scheme (at least
+          # MAJOR.MINOR.PATCH, with optional additional numeric components),
+          # plus optional pre-release and build metadata suffixes.
+          if [[ ! "$REF" =~ ^v[0-9]+(\.[0-9]+){2,}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Release tag must use a version format such as v0.1.5, v0.1.5.1, v0.1.5-rc1, or v0.1.5+build.1"
             exit 1
           fi
           if ! git check-ref-format "refs/tags/$REF"; then
