@@ -6,10 +6,17 @@ on:
       version:
         description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
         required: false
+      ref:
+        description: 'Optional branch, tag, or commit SHA to build'
+        required: false
   workflow_call:
     inputs:
       version:
         description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
+        type: string
+        required: false
+      ref:
+        description: 'Optional branch, tag, or commit SHA to build'
         type: string
         required: false
 
@@ -22,6 +29,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
