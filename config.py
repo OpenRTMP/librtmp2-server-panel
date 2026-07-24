@@ -254,6 +254,18 @@ class Config:
     # Enable Secure cookies automatically when public URLs use HTTPS.
     SESSION_COOKIE_SECURE = _session_cookie_secure_default()
 
+    # Number of trusted reverse proxies in front of the panel. Zero keeps
+    # X-Forwarded-For/X-Forwarded-Proto ignored so direct clients cannot spoof
+    # their source IP or scheme. Configure the exact hop count when the panel is
+    # reachable only through a trusted proxy chain.
+    TRUSTED_PROXY_COUNT = _parse_positive_int(
+        os.environ.get("TRUSTED_PROXY_COUNT"),
+        default=0,
+        min_value=0,
+        max_value=10,
+        name="TRUSTED_PROXY_COUNT",
+    )
+
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
     RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI)
 
