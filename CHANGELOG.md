@@ -22,9 +22,16 @@ only begin at a future `1.0.0`.
   workflow-selected commit when it does not exist yet. Source archives, GitHub
   Release metadata, and Docker images are pinned to that same commit; an
   existing tag that points elsewhere is rejected.
+- Release runs for the same tag are serialized, and workflow-dispatch tag input
+  is passed through the step environment instead of interpolated into shell code.
 - Live statistics are polled only for the currently opened stream accordion,
-  pause while the browser tab is hidden, and prevent overlapping fetches.
+  pause while the browser tab is hidden, prevent overlapping fetches, and abort
+  stalled requests so polling can recover automatically.
 - RTMP and RTMPS URLs now bracket IPv6 literals correctly.
+- HTTPS deployments preserve same-origin referrers so Flask-WTF strict CSRF
+  validation continues to accept legitimate form submissions.
+- Reverse-proxy documentation now requires `X-Forwarded-For` and
+  `X-Forwarded-Proto` to be normalized to matching trusted-value counts.
 
 ### Security
 - Added opt-in `TRUSTED_PROXY_COUNT` handling for deployments behind trusted
