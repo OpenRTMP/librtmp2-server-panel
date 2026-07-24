@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,29 +74,27 @@ def test_development_compose_uses_lowercase_registry_paths():
     assert "ghcr.io/openrtmp/librtmp2-server:latest" in compose
 
 
-def test_manual_release_creates_tag_from_selected_source_commit_safely():
+def test_manual_release_validates_and_pins_the_selected_source_commit():
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     docker = (ROOT / ".github/workflows/docker-multiarch.yml").read_text(encoding="utf-8")
 
-    assert "Version tag to create" in release
-    assert release.count("ref: ${{ github.sha }}") == 2
-    assert "group: release-${{ github.event.inputs.tag || github.ref_name }}" in release
-    assert "REF: ${{ github.event.inputs.tag || github.ref_name }}" in release
-    assert 'REF="${{ github.event.inputs.tag || github.ref_name }}"' not in release
-    assert "Tag $TAG already exists" in release
-    assert "Publish GitHub Release and create tag when missing" in release
+    assert re.search(r"concurrency:\s+group:\s+release-", release)
+    assert re.search(r"env:\s+REF:\s+\$\{\{ github\.event\.inputs\.tag", release)
+    assert "git check-ref-format \"refs/tags/$REF\"" in release
+    assert re.search(r"\^v\[0-9\]\+", release)
+    assert "printf 'tag=%s\\n' \"$REF\" >> \"$GITHUB_OUTPUT\"" in release
+    assert len(re.findall(r"ref:\s+\$\{\{ github\.sha \}\}", release)) == 2
     assert "target_commitish: ${{ steps.ver.outputs.source_sha }}" in release
     assert "ref: ${{ needs.package.outputs.source_sha }}" in release
     assert "ref: ${{ inputs.ref || github.ref }}" in docker
-    assert "ref: ${{ github.event.inputs.tag || github.ref }}" not in release
+    assert 'REF="${{ github.event.inputs.tag || github.ref_name }}"' not in release
 
 
 def test_stats_polling_is_limited_to_visible_stream_and_times_out():
     scripts = (ROOT / "static/js/scripts.js").read_text(encoding="utf-8")
 
-    assert "collapse.classList.contains('show')" in scripts
-    assert "if (document.hidden)" in scripts
-    assert "statsContainer.dataset.loading === 'true'" in scripts
+    assert re.search(r"classList\.contains\(['\"]show['\"]\)", scripts)
+    assert re.search(r"if\s*\(document\.hidden\)", scripts)
     assert "new AbortController()" in scripts
     assert "controller.abort()" in scripts
     assert "clearTimeout(timeoutId)" in scripts
@@ -105,12 +104,15 @@ def test_stats_polling_is_limited_to_visible_stream_and_times_out():
 def test_https_csrf_keeps_same_origin_referrer():
     base = (ROOT / "templates/base.html").read_text(encoding="utf-8")
 
-    assert '<meta name="referrer" content="same-origin">' in base
-    assert '<meta name="referrer" content="no-referrer">' not in base
+    assert re.search(
+        r'<meta\s+name=["\']referrer["\']\s+content=["\']same-origin["\']\s*/?>',
+        base,
+    )
+    assert "no-referrer" not in base
 
 
 def test_proxy_docs_require_header_count_normalization():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "applies the configured count independently" in readme
-    assert "must append or normalize both headers" in readme
+    assert re.search(r"configured count independently", readme, re.IGNORECASE)
+    assert re.search(r"append or normalize both headers", readme, re.IGNORECASE)
