@@ -50,6 +50,7 @@ services:
       RATELIMIT_STORAGE_URI: redis://redis:6379/0
       PANEL_PUBLIC_URL: ${PANEL_PUBLIC_URL:-}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-}
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-0}
     ports:
       - "8000:8000"
     networks:
