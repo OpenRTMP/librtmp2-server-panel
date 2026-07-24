@@ -73,12 +73,15 @@ def test_development_compose_uses_lowercase_registry_paths():
     assert "ghcr.io/openrtmp/librtmp2-server:latest" in compose
 
 
-def test_manual_release_creates_tag_from_selected_source_commit():
+def test_manual_release_creates_tag_from_selected_source_commit_safely():
     release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     docker = (ROOT / ".github/workflows/docker-multiarch.yml").read_text(encoding="utf-8")
 
     assert "Version tag to create" in release
     assert release.count("ref: ${{ github.sha }}") == 2
+    assert "group: release-${{ github.event.inputs.tag || github.ref_name }}" in release
+    assert "REF: ${{ github.event.inputs.tag || github.ref_name }}" in release
+    assert 'REF="${{ github.event.inputs.tag || github.ref_name }}"' not in release
     assert "Tag $TAG already exists" in release
     assert "Publish GitHub Release and create tag when missing" in release
     assert "target_commitish: ${{ steps.ver.outputs.source_sha }}" in release
@@ -87,10 +90,27 @@ def test_manual_release_creates_tag_from_selected_source_commit():
     assert "ref: ${{ github.event.inputs.tag || github.ref }}" not in release
 
 
-def test_stats_polling_is_limited_to_visible_stream_and_prevents_overlap():
+def test_stats_polling_is_limited_to_visible_stream_and_times_out():
     scripts = (ROOT / "static/js/scripts.js").read_text(encoding="utf-8")
 
     assert "collapse.classList.contains('show')" in scripts
     assert "if (document.hidden)" in scripts
     assert "statsContainer.dataset.loading === 'true'" in scripts
+    assert "new AbortController()" in scripts
+    assert "controller.abort()" in scripts
+    assert "clearTimeout(timeoutId)" in scripts
     assert "delete statsContainer.dataset.loading" in scripts
+
+
+def test_https_csrf_keeps_same_origin_referrer():
+    base = (ROOT / "templates/base.html").read_text(encoding="utf-8")
+
+    assert '<meta name="referrer" content="same-origin">' in base
+    assert '<meta name="referrer" content="no-referrer">' not in base
+
+
+def test_proxy_docs_require_header_count_normalization():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "applies the configured count independently" in readme
+    assert "must append or normalize both headers" in readme
