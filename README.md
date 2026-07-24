@@ -77,7 +77,7 @@ Copy `.env.example` to `.env` for a manual setup and adjust:
 | `LRTMP2_API_URL` | Internal/server-side base URL of librtmp2-server | Yes outside the quickstart stack |
 | `LRTMP2_STATS_URL` | Browser-reachable API URL used in copied stats links | No |
 | `LRTMP2_API_TOKEN` | Shared bearer token seeded into the server on first startup | Yes |
-| `LRTMP2_DOMAIN` | Public host/IP clients use for RTMP URLs | Yes |
+| `LRTMP2_DOMAIN` | Public host/IP clients use for RTMP URLs; IPv6 literals are bracketed automatically | Yes |
 | `LRTMP2_RTMP_PORT` | Public RTMP port, default `1935` | No |
 | `LRTMP2_RTMPS_PORT` | Public RTMPS port, default `1936` | No |
 | `LRTMP2_APP` | Default RTMP application, default `live` | No |
@@ -87,6 +87,18 @@ Copy `.env.example` to `.env` for a manual setup and adjust:
 | `RATELIMIT_STORAGE_URI` | Shared Flask-Limiter backend; quickstart uses Redis | No |
 | `PANEL_PUBLIC_URL` | Public panel URL, used for secure-cookie detection | No |
 | `SESSION_COOKIE_SECURE` | Force secure cookies when served over HTTPS | No |
+| `TRUSTED_PROXY_COUNT` | Exact trusted reverse-proxy hop count; default `0` ignores forwarded headers | No |
+
+### Reverse proxy deployments
+
+Keep `TRUSTED_PROXY_COUNT=0` when port `8000` is directly reachable. When the panel is reachable **only** through a trusted reverse proxy, set the exact number of proxy hops so login and stats rate limits use the real client address and the request scheme is detected correctly:
+
+```env
+PANEL_PUBLIC_URL=https://panel.example.com
+TRUSTED_PROXY_COUNT=1
+```
+
+Use `2` only when two trusted proxies are actually in the request path. Never enable forwarded-header trust while clients can bypass the proxy and connect directly to the panel.
 
 ## Source-development stack
 
