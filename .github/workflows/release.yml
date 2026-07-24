@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag to build (e.g. v0.1.0)'
+        description: 'Existing version tag to build (e.g. v0.1.0)'
         required: true
 
 permissions:
@@ -22,6 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -38,22 +41,31 @@ jobs:
           LRTMP2_API_TOKEN: test-api-token-for-ci-only
         run: python -m pytest -q --tb=short -m "not integration"
 
+      - name: Validate frontend JavaScript
+        run: node --check static/js/scripts.js
+
   package:
     name: build & package
     needs: verify
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.tag }}
+      source_sha: ${{ steps.ver.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Resolve version
         id: ver
         run: |
           REF="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${REF#v}"
+          SOURCE_SHA="$(git rev-parse HEAD)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$REF" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Extract changelog section for this version
         env:
@@ -96,7 +108,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ steps.ver.outputs.source_sha }}
           name: librtmp2-server-panel ${{ steps.ver.outputs.version }}
           body_path: release-notes.md
           files: |
@@ -113,3 +125,4 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.package.outputs.version }}
+      ref: ${{ needs.package.outputs.source_sha }}
