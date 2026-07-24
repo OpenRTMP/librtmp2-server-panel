@@ -81,8 +81,10 @@ def test_manual_release_validates_and_pins_the_selected_source_commit():
     assert re.search(r"concurrency:\s+group:\s+release-", release)
     assert re.search(r"env:\s+REF:\s+\$\{\{ github\.event\.inputs\.tag", release)
     assert "git check-ref-format \"refs/tags/$REF\"" in release
+    assert "(\\.[0-9]+){2,}" in release
     assert "(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?" in release
     assert "(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?" in release
+    assert "v0.1.5.1" in release
     assert "v0.1.5+build.1" in release
     assert "printf 'tag=%s\\n' \"$REF\" >> \"$GITHUB_OUTPUT\"" in release
     assert len(re.findall(r"ref:\s+\$\{\{ github\.sha \}\}", release)) == 2
