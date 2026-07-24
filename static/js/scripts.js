@@ -91,8 +91,13 @@ function loadStats(streamId) {
         return;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
     statsContainer.dataset.loading = 'true';
-    fetch(`/streams/${encodeURIComponent(streamId)}/stats.json`)
+    fetch(`/streams/${encodeURIComponent(streamId)}/stats.json`, {
+        signal: controller.signal,
+    })
         .then(response => {
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -168,6 +173,7 @@ function loadStats(streamId) {
             statsContainer.innerHTML = `<p><em>Stats not available</em></p>`;
         })
         .finally(() => {
+            clearTimeout(timeoutId);
             delete statsContainer.dataset.loading;
         });
 }
