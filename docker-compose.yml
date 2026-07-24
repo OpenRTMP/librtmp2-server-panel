@@ -13,7 +13,7 @@ services:
 
   openrtmp-panel:
     build: .
-    image: ghcr.io/OpenRTMP/librtmp2-server-panel:latest
+    image: ghcr.io/openrtmp/librtmp2-server-panel:latest
     container_name: librtmp2-server-panel
     restart: unless-stopped
     environment:
@@ -22,6 +22,7 @@ services:
       - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
       - LRTMP2_DOMAIN=${LRTMP2_DOMAIN:-localhost}
       - LRTMP2_RTMP_PORT=1935
+      - LRTMP2_RTMPS_PORT=${LRTMP2_RTMPS_PORT:-1936}
       - LRTMP2_APP=live
       - REQUIRE_LOGIN=${REQUIRE_LOGIN:-True}
       - ALLOW_INSECURE_NO_LOGIN=${ALLOW_INSECURE_NO_LOGIN:-}
@@ -31,6 +32,7 @@ services:
       - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-redis://redis:6379/0}
       - PANEL_PUBLIC_URL=${PANEL_PUBLIC_URL:-}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
+      - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-0}
       # Live stats polling limits for /streams/<id>/stats.json (per minute):
       # - STATS_RATE_LIMIT_PER_IP=600
       # - STATS_RATE_LIMIT_PER_STREAM=25
@@ -51,7 +53,7 @@ services:
 
   openrtmp-server:
     build: ../librtmp2-server
-    image: ghcr.io/OpenRTMP/librtmp2-server:latest
+    image: ghcr.io/openrtmp/librtmp2-server:latest
     container_name: librtmp2-server
     restart: unless-stopped
     environment:
