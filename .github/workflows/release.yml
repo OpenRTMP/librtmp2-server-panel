@@ -1,7 +1,7 @@
 name: Release
 
-# Builds and packages tagged releases. Push a tag like `v0.1.0` (or run
-# manually) to produce a source tarball and a GitHub Release.
+# Builds and packages tagged releases. Push a tag like `v0.1.0`, or run the
+# workflow manually to create the requested tag from the selected branch commit.
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing version tag to build (e.g. v0.1.0)'
+        description: 'Version tag to create (e.g. v0.1.5)'
         required: true
 
 permissions:
@@ -23,7 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # github.sha pins both tag-push and manual runs to the exact commit
+          # selected when the workflow was started. The manual tag does not need
+          # to exist yet; the release action creates it later.
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -54,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Resolve version
@@ -66,6 +69,20 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$REF" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag target
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          SOURCE_SHA: ${{ steps.ver.outputs.source_sha }}
+        run: |
+          git fetch --force --tags
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAG_SHA="$(git rev-list -n 1 "$TAG")"
+            if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
+              echo "::error::Tag $TAG already exists at $TAG_SHA, not selected source commit $SOURCE_SHA"
+              exit 1
+            fi
+          fi
 
       - name: Extract changelog section for this version
         env:
@@ -104,7 +121,7 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release and create tag when missing
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
