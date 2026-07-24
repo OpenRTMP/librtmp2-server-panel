@@ -13,6 +13,21 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- Development Compose image references now use lowercase GHCR repository names,
+  preventing Docker's `repository name must be lowercase` startup failure.
+- Manual releases now check out and package the selected existing tag, and the
+  Docker release build is pinned to the exact same commit SHA instead of the
+  workflow's current branch revision.
+- Live statistics are polled only for the currently opened stream accordion,
+  pause while the browser tab is hidden, and prevent overlapping fetches.
+- RTMP and RTMPS URLs now bracket IPv6 literals correctly.
+
+### Security
+- Added opt-in `TRUSTED_PROXY_COUNT` handling for deployments behind trusted
+  reverse proxies, so forwarded client IP and scheme headers are ignored by
+  default and trusted only for an explicitly configured proxy-hop count.
+
 ## [0.1.4] — 2026-07-21
 
 ### Added
