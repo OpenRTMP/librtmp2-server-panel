@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 from functools import wraps
@@ -9,6 +10,7 @@ from flask import Flask, render_template, request, redirect, url_for, session, j
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, RATELIMIT_MEMORY_URI
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
@@ -58,6 +60,24 @@ def _optional_form_value(raw):
     return stripped or None
 
 
+def _format_url_host(value):
+    """Return a hostname/IP suitable for the authority component of an RTMP URL.
+
+    IPv6 literals must be enclosed in brackets. Existing bracketed IPv6 values
+    are normalized without double-bracketing; DNS names and IPv4 addresses are
+    returned unchanged.
+    """
+    host = str(value or "").strip()
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        parsed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return host
+    if parsed.version == 6:
+        return f"[{candidate}]"
+    return candidate
+
+
 def _credential_fingerprint(secret_key, username, password):
     """Stable marker for the active login credentials bound to a session.
 
@@ -104,6 +124,23 @@ def _stats_rate_limit_key():
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    trusted_proxy_count = app.config["TRUSTED_PROXY_COUNT"]
+    if trusted_proxy_count:
+        # Only trust forwarded client IP and scheme information from the exact
+        # number of proxies configured by the operator. Keep this disabled by
+        # default because trusting forwarded headers while port 8000 is directly
+        # reachable would allow clients to spoof their source address.
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=trusted_proxy_count,
+            x_proto=trusted_proxy_count,
+        )
+        app.logger.warning(
+            "TRUSTED_PROXY_COUNT=%s: forwarded client IP/scheme headers are trusted. "
+            "Ensure the panel is reachable only through those proxies.",
+            trusted_proxy_count,
+        )
 
     csrf = CSRFProtect(app)
 
@@ -258,7 +295,7 @@ def create_app():
         return True, configured_port or reported_port or "1936"
 
     def build_urls(stream, rtmps_on, rtmps_port):
-        domain = app.config["LRTMP2_DOMAIN"]
+        domain = _format_url_host(app.config["LRTMP2_DOMAIN"])
         port = app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
         publish_url = f"rtmp://{domain}:{port}/{app_name}"
