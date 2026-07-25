@@ -42,18 +42,38 @@ function showCopyFeedback(element, text) {
 }
 
 function initializeStats() {
-    const statsContainers = document.querySelectorAll('[id^="stats-"]');
+    const statsContainers = Array.from(document.querySelectorAll('[id^="stats-"]'));
     if (statsContainers.length === 0) {
         return;
     }
-    const tick = () => statsContainers.forEach(container => {
-        const streamId = container.dataset.streamId;
-        if (streamId) {
-            loadStats(streamId);
+
+    const isVisible = (container) => {
+        const collapse = container.closest('.accordion-collapse');
+        return !collapse || collapse.classList.contains('show');
+    };
+
+    const loadVisibleStats = () => {
+        if (document.hidden) {
+            return;
         }
+        statsContainers.forEach(container => {
+            if (!isVisible(container)) {
+                return;
+            }
+            const streamId = container.dataset.streamId;
+            if (streamId) {
+                loadStats(streamId);
+            }
+        });
+    };
+
+    document.querySelectorAll('.accordion-collapse').forEach(collapse => {
+        collapse.addEventListener('shown.bs.collapse', loadVisibleStats);
     });
-    tick();
-    setInterval(tick, 3000);
+    document.addEventListener('visibilitychange', loadVisibleStats);
+
+    loadVisibleStats();
+    setInterval(loadVisibleStats, 3000);
 }
 
 function escapeHtml(value) {
@@ -67,10 +87,17 @@ function escapeHtml(value) {
 
 function loadStats(streamId) {
     const statsContainer = document.getElementById(`stats-${streamId}`);
-    if (!statsContainer) {
+    if (!statsContainer || statsContainer.dataset.loading === 'true') {
         return;
     }
-    fetch(`/streams/${streamId}/stats.json`)
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    statsContainer.dataset.loading = 'true';
+    fetch(`/streams/${encodeURIComponent(streamId)}/stats.json`, {
+        signal: controller.signal,
+    })
         .then(response => {
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -144,6 +171,10 @@ function loadStats(streamId) {
         })
         .catch(() => {
             statsContainer.innerHTML = `<p><em>Stats not available</em></p>`;
+        })
+        .finally(() => {
+            clearTimeout(timeoutId);
+            delete statsContainer.dataset.loading;
         });
 }
 

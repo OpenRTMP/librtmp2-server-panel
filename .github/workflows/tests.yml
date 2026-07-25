@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -35,3 +37,6 @@ jobs:
           PASSWORD: test-password-for-ci-only
           LRTMP2_API_TOKEN: test-api-token-for-ci-only
         run: python -m pytest -q --tb=short -m "not integration"
+
+      - name: Validate frontend JavaScript
+        run: node --check static/js/scripts.js
