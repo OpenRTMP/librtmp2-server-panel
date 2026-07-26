@@ -88,16 +88,18 @@ Copy `.env.example` to `.env` for a manual setup and adjust:
 | `PANEL_PUBLIC_URL` | Public panel URL, used for secure-cookie detection | No |
 | `SESSION_COOKIE_SECURE` | Force secure cookies when served over HTTPS | No |
 | `TRUSTED_PROXY_COUNT` | Trusted value count used independently for `X-Forwarded-For` and `X-Forwarded-Proto`; default `0` ignores both | No |
+| `TRUSTED_PROXY_IPS` | Comma-separated proxy IPs/CIDR ranges allowed to set forwarded headers | When `TRUSTED_PROXY_COUNT > 0` |
 
 ### Reverse proxy deployments
 
 Keep `TRUSTED_PROXY_COUNT=0` when port `8000` is directly reachable. Enable it only when the panel is reachable **exclusively** through trusted proxies.
 
-`ProxyFix` applies the configured count independently to `X-Forwarded-For` and `X-Forwarded-Proto`. Therefore every trusted proxy in the chain must append or normalize both headers so they contain the same number of trusted values. A common safe one-proxy setup is:
+`ProxyFix` applies the configured count independently to `X-Forwarded-For` and `X-Forwarded-Proto`. Therefore every trusted proxy in the chain must append or normalize both headers so they contain the same number of trusted values. Whenever `TRUSTED_PROXY_COUNT > 0`, `TRUSTED_PROXY_IPS` must also list the trusted proxies' IPs/CIDR ranges — the panel refuses to start without it, since otherwise a client reaching the panel directly could spoof `X-Forwarded-For` and bypass per-IP rate limits. A common safe one-proxy setup is:
 
 ```env
 PANEL_PUBLIC_URL=https://panel.example.com
 TRUSTED_PROXY_COUNT=1
+TRUSTED_PROXY_IPS=172.18.0.0/16
 ```
 
 ```nginx
