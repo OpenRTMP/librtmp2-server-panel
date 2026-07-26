@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import re
 import sys
@@ -86,6 +87,65 @@ def _parse_optional_bool(value):
     return None
 
 
+def _parse_trusted_proxy_networks(value):
+    """Parse TRUSTED_PROXY_IPS into ip_network objects (IPs or CIDR ranges)."""
+    if value is None:
+        return []
+    stripped = str(value).strip()
+    if not stripped:
+        return []
+    networks = []
+    for token in stripped.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            else:
+                parsed = ipaddress.ip_address(entry)
+                prefix = 128 if parsed.version == 6 else 32
+                networks.append(ipaddress.ip_network(f"{parsed}/{prefix}", strict=False))
+        except ValueError:
+            _emit_config_error(
+                "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
+            )
+            sys.exit(1)
+    return networks
+
+
+def ip_in_trusted_proxy_networks(address, networks):
+    """Return True when address belongs to a configured trusted proxy network."""
+    if not address or not networks:
+        return False
+    try:
+        parsed = ipaddress.ip_address(str(address).strip())
+    except ValueError:
+        return False
+    return any(parsed in network for network in networks)
+
+
+def client_ip_for_rate_limit(
+    *,
+    direct_addr,
+    forwarded_addr,
+    trusted_proxy_count,
+    trusted_networks,
+):
+    """Choose the client IP bucket for rate limiting.
+
+    When forwarded headers are trusted only from known proxy IPs, direct clients
+    cannot pick arbitrary X-Forwarded-For values to bypass per-IP limits.
+    """
+    if not trusted_proxy_count:
+        return forwarded_addr
+    if direct_addr and ip_in_trusted_proxy_networks(direct_addr, trusted_networks):
+        return forwarded_addr
+    if direct_addr:
+        return direct_addr
+    return forwarded_addr
+
+
 def _session_cookie_secure_default():
     """Auto-detect from the panel's own public URL only — the API/stats URLs
     say nothing about whether the panel itself is served over HTTPS, and an
@@ -102,7 +162,16 @@ def _session_cookie_secure_default():
             sys.exit(1)
         return parsed
     public_url = os.environ.get("PANEL_PUBLIC_URL", "").strip().lower()
-    return public_url.startswith("https://")
+    if public_url.startswith("https://"):
+        return True
+    trusted_proxy_count = _parse_positive_int(
+        os.environ.get("TRUSTED_PROXY_COUNT"),
+        default=0,
+        min_value=0,
+        max_value=10,
+        name="TRUSTED_PROXY_COUNT",
+    )
+    return trusted_proxy_count > 0
 
 
 def _parse_positive_int(value, default, *, min_value=1, max_value=10_000, name="value"):
@@ -222,6 +291,25 @@ def _validate_config():
         )
         had_error = True
 
+    trusted_proxy_count = _parse_positive_int(
+        os.environ.get("TRUSTED_PROXY_COUNT"),
+        default=0,
+        min_value=0,
+        max_value=10,
+        name="TRUSTED_PROXY_COUNT",
+    )
+    trusted_proxy_networks = _parse_trusted_proxy_networks(
+        os.environ.get("TRUSTED_PROXY_IPS")
+    )
+    if trusted_proxy_count > 0 and not trusted_proxy_networks:
+        _emit_config_error(
+            "TRUSTED_PROXY_COUNT is enabled but TRUSTED_PROXY_IPS is not set. "
+            "List the proxy IP addresses or CIDR ranges that may append "
+            "X-Forwarded-* headers (for example TRUSTED_PROXY_IPS=172.18.0.0/16) "
+            "so direct clients cannot spoof forwarded headers to bypass rate limits."
+        )
+        had_error = True
+
     if had_error:
         sys.exit(1)
 
@@ -264,6 +352,9 @@ class Config:
         min_value=0,
         max_value=10,
         name="TRUSTED_PROXY_COUNT",
+    )
+    TRUSTED_PROXY_NETWORKS = _parse_trusted_proxy_networks(
+        os.environ.get("TRUSTED_PROXY_IPS")
     )
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
