@@ -28,9 +28,9 @@ def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
 
 
 def test_config_requires_trusted_proxy_ips_when_proxy_count_enabled(monkeypatch):
-    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-proxy-ip-check")
-    monkeypatch.setenv("PASSWORD", "valid-test-password-for-proxy-ip-check")
-    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-proxy-ip-check")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
+    monkeypatch.setenv("PASSWORD", "test-password-for-ci-only")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
     monkeypatch.setenv("REQUIRE_LOGIN", "true")
     monkeypatch.setenv("TRUSTED_PROXY_COUNT", "1")
     monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
@@ -49,9 +49,9 @@ def test_session_cookie_secure_defaults_true_when_trusted_proxy_count_enabled(
 ):
     monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
     monkeypatch.delenv("PANEL_PUBLIC_URL", raising=False)
-    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-proxy-secure-cookie")
-    monkeypatch.setenv("PASSWORD", "valid-test-password-for-proxy-secure-cookie")
-    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-proxy-secure-cookie")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
+    monkeypatch.setenv("PASSWORD", "test-password-for-ci-only")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
     monkeypatch.setenv("REQUIRE_LOGIN", "true")
     monkeypatch.setenv("TRUSTED_PROXY_COUNT", "1")
     monkeypatch.setenv("TRUSTED_PROXY_IPS", "127.0.0.1")
