@@ -129,8 +129,6 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    app.wsgi_app = _PreserveDirectRemoteAddr(app.wsgi_app)
-
     trusted_proxy_count = app.config["TRUSTED_PROXY_COUNT"]
     if trusted_proxy_count:
         # Only trust forwarded client IP and scheme information from the exact
@@ -147,6 +145,10 @@ def create_app():
             "TRUSTED_PROXY_COUNT is enabled. Ensure the panel is reachable "
             "only through the configured proxies."
         )
+
+    # Must wrap the outermost app.wsgi_app so it captures the real TCP peer
+    # address before ProxyFix overwrites REMOTE_ADDR from X-Forwarded-For.
+    app.wsgi_app = _PreserveDirectRemoteAddr(app.wsgi_app)
 
     csrf = CSRFProtect(app)
 

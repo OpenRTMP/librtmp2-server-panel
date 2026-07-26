@@ -60,7 +60,7 @@ def test_session_cookie_secure_defaults_true_when_trusted_proxy_count_enabled(
     import sys
 
     sys.modules.pop("config", None)
-    import config
+    config = importlib.import_module("config")
 
     importlib.reload(config)
     assert config.Config.SESSION_COOKIE_SECURE is True

@@ -164,6 +164,8 @@ def _session_cookie_secure_default():
     public_url = os.environ.get("PANEL_PUBLIC_URL", "").strip().lower()
     if public_url.startswith("https://"):
         return True
+    if public_url.startswith("http://"):
+        return False
     trusted_proxy_count = _parse_positive_int(
         os.environ.get("TRUSTED_PROXY_COUNT"),
         default=0,
