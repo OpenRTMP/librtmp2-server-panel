@@ -12,7 +12,7 @@ from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import Config, RATELIMIT_MEMORY_URI
+from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 from session_store import SessionBackendUnavailable, create_session_store
 
@@ -27,6 +27,18 @@ ACCESS_KEY_HELP = (
     f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
     "underscores, or hyphens."
 )
+DIRECT_REMOTE_ADDR_KEY = "openrtmp.direct_remote_addr"
+
+
+class _PreserveDirectRemoteAddr:
+    """Record the TCP peer address before ProxyFix may replace REMOTE_ADDR."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        environ[DIRECT_REMOTE_ADDR_KEY] = environ.get("REMOTE_ADDR", "")
+        return self.app(environ, start_response)
 
 
 def _is_valid_stream_id(value):
@@ -113,14 +125,6 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
     return None
 
 
-def _stats_rate_limit_key():
-    """Per-stream bucket so polling many streams does not share one global cap."""
-    stream_id = ""
-    if request.view_args:
-        stream_id = request.view_args.get("stream_id", "") or ""
-    return f"{get_remote_address()}:{stream_id}"
-
-
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
@@ -142,10 +146,31 @@ def create_app():
             "only through the configured proxies."
         )
 
+    # Must wrap the outermost app.wsgi_app so it captures the real TCP peer
+    # address before ProxyFix overwrites REMOTE_ADDR from X-Forwarded-For.
+    app.wsgi_app = _PreserveDirectRemoteAddr(app.wsgi_app)
+
     csrf = CSRFProtect(app)
 
+    def _rate_limit_remote_addr():
+        """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
+        direct = request.environ.get(DIRECT_REMOTE_ADDR_KEY) or ""
+        return client_ip_for_rate_limit(
+            direct_addr=direct,
+            forwarded_addr=get_remote_address(),
+            trusted_proxy_count=app.config["TRUSTED_PROXY_COUNT"],
+            trusted_networks=app.config["TRUSTED_PROXY_NETWORKS"],
+        )
+
+    def _stats_rate_limit_key():
+        """Per-stream bucket so polling many streams does not share one global cap."""
+        stream_id = ""
+        if request.view_args:
+            stream_id = request.view_args.get("stream_id", "") or ""
+        return f"{_rate_limit_remote_addr()}:{stream_id}"
+
     limiter = Limiter(
-        key_func=get_remote_address,
+        key_func=_rate_limit_remote_addr,
         app=app,
         default_limits=["100 per minute"],
         storage_uri=app.config["RATELIMIT_STORAGE_URI"],
@@ -583,7 +608,7 @@ def create_app():
     @login_required
     @limiter.limit(
         stats_ip_limit,
-        key_func=get_remote_address,
+        key_func=_rate_limit_remote_addr,
         exempt_when=_stats_ip_rate_limit_exempt,
     )
     @limiter.limit(

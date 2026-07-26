@@ -33,6 +33,7 @@ services:
       - PANEL_PUBLIC_URL=${PANEL_PUBLIC_URL:-}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
       - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-0}
+      - TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-}
       # Live stats polling limits for /streams/<id>/stats.json (per minute):
       # - STATS_RATE_LIMIT_PER_IP=600
       # - STATS_RATE_LIMIT_PER_STREAM=25

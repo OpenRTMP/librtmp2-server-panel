@@ -23,10 +23,18 @@ def test_url_host_formatter_brackets_ipv6_literals():
     assert app_module._format_url_host("rtmp.example.test") == "rtmp.example.test"
 
 
-def _proxy_test_client(proxy_count):
+def _proxy_test_client(proxy_count, trusted_proxy_ips="127.0.0.1"):
     import app as app_module
 
+    trusted_networks = []
+    if trusted_proxy_ips:
+        import config as config_module
+
+        trusted_networks = config_module._parse_trusted_proxy_networks(trusted_proxy_ips)
+
     with patch.object(app_module.Config, "TRUSTED_PROXY_COUNT", proxy_count), patch.object(
+        app_module.Config, "TRUSTED_PROXY_NETWORKS", trusted_networks
+    ), patch.object(
         app_module.Config, "RATELIMIT_STORAGE_URI", "memory://"
     ), patch.object(app_module.Config, "SESSION_COOKIE_SECURE", False):
         application = app_module.create_app()
