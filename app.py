@@ -183,15 +183,20 @@ def create_app():
 
     # Enforce the login POST cap before CSRF validation. Flask-WTF rejects missing
     # tokens with 400 before the login view runs, so a route-level @limiter.limit
-    # never increments when attackers omit csrf_token.
-    @limiter.limit("5 per minute", methods=["POST"])
+    # never increments when attackers omit csrf_token. The exemption is evaluated
+    # by Flask-Limiter before quota consumption, so unrelated POST routes do not
+    # deplete the login bucket.
+    @limiter.limit(
+        "5 per minute",
+        methods=["POST"],
+        exempt_when=lambda: request.endpoint != "login",
+    )
     def _login_post_rate_limit():
-        if request.endpoint != "login" or request.method != "POST":
-            return
+        pass
 
     app.before_request(_login_post_rate_limit)
 
-    csrf = CSRFProtect(app)
+    CSRFProtect(app)
     if app.config["RATELIMIT_STORAGE_URI"] == RATELIMIT_MEMORY_URI:
         app.logger.warning(
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process; "
