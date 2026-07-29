@@ -104,6 +104,28 @@ def _attempt_login_rate_limit_in_subprocess(queue):
         queue.put(accepted)
 
 
+def test_login_rate_limit_blocks_missing_csrf_token():
+    """POST /login without csrf_token must count toward the 5/min login cap."""
+    with patch("app.Lrtmp2Client"), patch("app.Config.RATELIMIT_STORAGE_URI", "memory://"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config.update(TESTING=True, WTF_CSRF_ENABLED=True)
+        client = application.test_client()
+        for i in range(5):
+            r = client.post(
+                "/login",
+                data={"username": "admin", "password": f"wrong-password-{i}"},
+            )
+            assert r.status_code == 400
+
+        r = client.post(
+            "/login",
+            data={"username": "admin", "password": "wrong-password-final"},
+        )
+        assert r.status_code == 429
+
+
 def test_login_rate_limit_blocks_after_five_attempts():
     with patch("app.Lrtmp2Client"), patch("app.Config.RATELIMIT_STORAGE_URI", "memory://"):
         import app as app_module

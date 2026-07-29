@@ -150,8 +150,6 @@ def create_app():
     # address before ProxyFix overwrites REMOTE_ADDR from X-Forwarded-For.
     app.wsgi_app = _PreserveDirectRemoteAddr(app.wsgi_app)
 
-    csrf = CSRFProtect(app)
-
     def _rate_limit_remote_addr():
         """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
         direct = request.environ.get(DIRECT_REMOTE_ADDR_KEY) or ""
@@ -182,6 +180,23 @@ def create_app():
         # is None. Ignored by the in-memory backend.
         storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
     )
+
+    # Enforce the login POST cap before CSRF validation. Flask-WTF rejects missing
+    # tokens with 400 before the login view runs, so a route-level @limiter.limit
+    # never increments when attackers omit csrf_token. The exemption is evaluated
+    # by Flask-Limiter before quota consumption, so unrelated POST routes do not
+    # deplete the login bucket.
+    @limiter.limit(
+        "5 per minute",
+        methods=["POST"],
+        exempt_when=lambda: request.endpoint != "login",
+    )
+    def _login_post_rate_limit():
+        pass
+
+    app.before_request(_login_post_rate_limit)
+
+    CSRFProtect(app)
     if app.config["RATELIMIT_STORAGE_URI"] == RATELIMIT_MEMORY_URI:
         app.logger.warning(
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process; "
@@ -353,7 +368,6 @@ def create_app():
         return urls
 
     @app.route("/login", methods=["GET", "POST"])
-    @limiter.limit("5 per minute")
     def login():
         error = None
         if request.method == "POST":
