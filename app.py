@@ -90,7 +90,7 @@ def _format_url_host(value):
     return candidate
 
 
-def _credential_fingerprint(secret_key, username, password):
+def _credential_fingerprint(secret_key, username, password, api_token):
     """Stable marker for the active login credentials bound to a session.
 
     This is a keyed MAC, not a password-storage digest: SECRET_KEY is the
@@ -98,8 +98,8 @@ def _credential_fingerprint(secret_key, username, password):
     username/password even if it leaked. CodeQL's weak-sensitive-data-hashing
     query doesn't model HMAC's keyed construction and flags the password
     reaching hashlib.sha256 as if this were a fast, unkeyed password hash.
-    """
-    material = f"{username}\0{password}"
+  """
+    material = f"{username}\0{password}\0{api_token}"
     return hmac.new(
         secret_key.encode(),
         material.encode(),  # codeql[py/weak-sensitive-data-hashing]
@@ -248,6 +248,7 @@ def create_app():
             app.config["SECRET_KEY"],
             username,
             app.config["PASSWORD"],
+            app.config["LRTMP2_API_TOKEN"],
         )
 
     def _session_is_authenticated(*, fail_closed=False):
@@ -257,6 +258,7 @@ def create_app():
             app.config["SECRET_KEY"],
             app.config["USERNAME"],
             app.config["PASSWORD"],
+            app.config["LRTMP2_API_TOKEN"],
         )
         stored_fp = session.get("credential_fp")
         if not isinstance(stored_fp, str) or not hmac.compare_digest(stored_fp, expected_fp):
