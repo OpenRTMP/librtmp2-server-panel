@@ -448,20 +448,24 @@ def create_app():
         return response
 
     def detect_cluster():
-        """Return (enabled, health_or_none). Never required for standalone use."""
+        """Return (enabled, health_or_none, detect_error_or_none).
+
+        Health failures are not treated as standalone — callers must surface
+        ``detect_error`` separately from a confirmed ``cluster.enabled=false``.
+        """
         try:
             health = client.health()
-        except Lrtmp2ApiError:
-            return False, None
+        except Lrtmp2ApiError as exc:
+            return False, None, str(exc)
         cluster = health.get("cluster") if isinstance(health, dict) else None
         enabled = isinstance(cluster, dict) and bool(cluster.get("enabled"))
-        return enabled, health
+        return enabled, health, None
 
     @app.route("/")
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
-        cluster_on, _health = detect_cluster()
+        cluster_on, _health, _detect_error = detect_cluster()
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
@@ -499,7 +503,16 @@ def create_app():
     @login_required
     def cluster_overview():
         flash_error = session.pop("flash_error", None)
-        cluster_on, health = detect_cluster()
+        cluster_on, health, detect_error = detect_cluster()
+        if detect_error:
+            return render_template(
+                "cluster.html",
+                cluster_enabled=False,
+                cluster=None,
+                nodes=[],
+                flash_error=flash_error,
+                api_error=detect_error,
+            )
         if not cluster_on:
             return render_template(
                 "cluster.html",
@@ -509,15 +522,19 @@ def create_app():
                 flash_error=flash_error,
                 api_error=None,
             )
-        api_error = None
+        api_errors = []
         cluster = None
         nodes = []
         try:
             cluster = client.cluster_status()
+        except Lrtmp2ApiError as exc:
+            api_errors.append(str(exc))
+            cluster = (health or {}).get("cluster")
+        try:
             nodes = client.cluster_nodes() or []
         except Lrtmp2ApiError as exc:
-            api_error = str(exc)
-            cluster = (health or {}).get("cluster")
+            api_errors.append(str(exc))
+        api_error = "; ".join(api_errors) if api_errors else None
         return render_template(
             "cluster.html",
             cluster_enabled=True,
@@ -528,20 +545,25 @@ def create_app():
         )
 
     def _cluster_node_action(node_id, action):
-        if not str(node_id).isdigit():
+        try:
+            parsed_id = int(str(node_id), 10)
+        except (TypeError, ValueError):
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
-        cluster_on, _ = detect_cluster()
+        cluster_on, _, detect_error = detect_cluster()
+        if detect_error:
+            session["flash_error"] = detect_error
+            return redirect(url_for("cluster_overview"))
         if not cluster_on:
             session["flash_error"] = "Clustering is not enabled on the connected server"
             return redirect(url_for("index"))
         try:
             if action == "drain":
-                client.cluster_drain_node(node_id)
+                client.cluster_drain_node(parsed_id)
             elif action == "resume":
-                client.cluster_resume_node(node_id)
+                client.cluster_resume_node(parsed_id)
             elif action == "remove":
-                client.cluster_remove_node(node_id)
+                client.cluster_remove_node(parsed_id)
             else:
                 session["flash_error"] = "Unknown cluster action"
         except Lrtmp2ApiError as exc:

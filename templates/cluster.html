@@ -15,13 +15,13 @@
 <div class="alert alert-danger">{{ api_error }}</div>
 {% endif %}
 
-{% if not cluster_enabled %}
+{% if not cluster_enabled and not (api_error is defined and api_error) %}
 <div class="alert alert-secondary">
     The connected <code>librtmp2-server</code> is running in standalone mode.
     Cluster overview is unavailable. The panel does not participate in Raft and
     is not required for cluster availability.
 </div>
-{% else %}
+{% elif cluster_enabled %}
 {% set c = cluster or {} %}
 {% set load = c.get('load') if c.get('load') is mapping else {} %}
 <div class="mb-3">

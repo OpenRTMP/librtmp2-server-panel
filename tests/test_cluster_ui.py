@@ -257,6 +257,64 @@ def test_cluster_api_error_on_overview(monkeypatch):
         r = client.get("/cluster")
         assert r.status_code == 200
         assert b"cluster_status failed" in r.data
+        assert b"cluster_nodes failed" in r.data
+        assert b"standalone mode" not in r.data
+
+
+def test_cluster_health_failure_not_standalone(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timed out")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"health timed out" in r.data
+        assert b"standalone mode" not in r.data
+
+
+def test_cluster_status_failure_still_loads_nodes(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "cluster": {"enabled": True, "quorum": True, "leader_id": 1}
+        }
+        mock_client.cluster_status.side_effect = Lrtmp2ApiError("cluster_status failed")
+        mock_client.cluster_nodes.return_value = [
+            {
+                "id": 1,
+                "name": "node-1",
+                "role": "leader",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"cluster_status failed" in r.data
+        assert b"node-1" in r.data
+        assert b"Drain" in r.data
 
 
 def test_cluster_drain_action(monkeypatch):
@@ -277,4 +335,25 @@ def test_cluster_drain_action(monkeypatch):
 
         r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
         assert r.status_code == 200
-        mock_client.cluster_drain_node.assert_called_once_with("2")
+        mock_client.cluster_drain_node.assert_called_once_with(2)
+
+
+def test_cluster_invalid_node_id_redirects(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": True}}
+        mock_client.cluster_status.return_value = {"enabled": True, "quorum": True}
+        mock_client.cluster_nodes.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/\u00b2/drain", follow_redirects=True)
+        assert r.status_code == 200
+        assert b"Invalid node ID" in r.data
+        mock_client.cluster_drain_node.assert_not_called()
