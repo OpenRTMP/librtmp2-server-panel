@@ -495,7 +495,7 @@ def create_app():
             cluster_enabled=cluster_on,
         )
 
-    @app.route("/cluster")
+    @app.route("/cluster", methods=["GET"])
     @login_required
     def cluster_overview():
         flash_error = session.pop("flash_error", None)

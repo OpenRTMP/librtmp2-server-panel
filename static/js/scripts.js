@@ -132,11 +132,17 @@ function loadStats(streamId) {
                     return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
                 })
                 .join('');
-            const clusterRows = (ownerNode !== undefined && ownerNode !== null)
-                ? `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${escapeHtml(ownerNode)}</strong></div>
-                   <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${Number.isFinite(relayMbps) ? relayMbps.toFixed(1) : '0.0'} Mbps</strong></div>
-                   ${playerByNodeRows}`
-                : '';
+            const clusterRows = (() => {
+                if (ownerNode === undefined || ownerNode === null) {
+                    return '';
+                }
+                const relayLabel = Number.isFinite(relayMbps)
+                    ? `${relayMbps.toFixed(1)} Mbps`
+                    : '0.0 Mbps';
+                return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${escapeHtml(ownerNode)}</strong></div>
+                   <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
+                   ${playerByNodeRows}`;
+            })();
             const playerRows = (data.players || [])
                 .map((pl, index) => {
                     const plRtt = Number(pl.rtt_ms);

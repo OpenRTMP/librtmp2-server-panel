@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,8 +12,11 @@ def test_cluster_enabled_from_health_standalone():
 
 
 def test_cluster_enabled_from_health_clustered():
-    assert Lrtmp2Client.cluster_enabled_from_health(
-        {"status": "ok", "cluster": {"enabled": True, "node_id": 2}}
+    assert (
+        Lrtmp2Client.cluster_enabled_from_health(
+            {"status": "ok", "cluster": {"enabled": True, "node_id": 2}}
+        )
+        is True
     )
 
 
