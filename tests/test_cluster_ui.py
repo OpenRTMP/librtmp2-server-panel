@@ -394,6 +394,21 @@ def test_cluster_health_failure_not_standalone(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.side_effect = Lrtmp2ApiError("health timed out")
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "cluster_id": "cid-1",
+            "quorum": True,
+        }
+        mock_client.cluster_nodes.return_value = [
+            {
+                "id": 1,
+                "name": "node-1",
+                "role": "leader",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+            }
+        ]
 
         import app as app_module
 
@@ -407,6 +422,9 @@ def test_cluster_health_failure_not_standalone(monkeypatch):
         assert r.status_code == 200
         assert b"health timed out" in r.data
         assert b"standalone mode" not in r.data
+        assert b"node-1" in r.data
+        mock_client.cluster_status.assert_called_once()
+        mock_client.cluster_nodes.assert_called_once()
 
 
 def test_cluster_status_failure_still_loads_nodes(monkeypatch):

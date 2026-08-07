@@ -523,16 +523,11 @@ def create_app():
     def cluster_overview():
         flash_error = session.pop("flash_error", None)
         cluster_on, health, detect_error = detect_cluster()
+        api_errors = []
         if detect_error:
-            return render_template(
-                CLUSTER_TEMPLATE,
-                cluster_enabled=False,
-                cluster=None,
-                nodes=[],
-                flash_error=flash_error,
-                api_error=detect_error,
-            )
-        if not cluster_on:
+            api_errors.append(detect_error)
+
+        if not cluster_on and not detect_error:
             return render_template(
                 CLUSTER_TEMPLATE,
                 cluster_enabled=False,
@@ -541,22 +536,28 @@ def create_app():
                 flash_error=flash_error,
                 api_error=None,
             )
-        api_errors = []
+
         cluster = None
         nodes = []
-        try:
-            cluster = client.cluster_status()
-        except Lrtmp2ApiError as exc:
-            api_errors.append(str(exc))
-            cluster = (health or {}).get("cluster")
-        try:
-            nodes = client.cluster_nodes() or []
-        except Lrtmp2ApiError as exc:
-            api_errors.append(str(exc))
+        if cluster_on or detect_error:
+            try:
+                cluster = client.cluster_status()
+            except Lrtmp2ApiError as exc:
+                api_errors.append(str(exc))
+                cluster = (health or {}).get("cluster")
+            try:
+                nodes = client.cluster_nodes() or []
+            except Lrtmp2ApiError as exc:
+                api_errors.append(str(exc))
+
+        cluster_enabled = cluster_on
+        if not cluster_on and detect_error:
+            cluster_enabled = bool(cluster) or bool(nodes)
+
         api_error = "; ".join(api_errors) if api_errors else None
         return render_template(
             CLUSTER_TEMPLATE,
-            cluster_enabled=True,
+            cluster_enabled=cluster_enabled,
             cluster=cluster,
             nodes=nodes,
             flash_error=flash_error,
