@@ -552,7 +552,10 @@ def create_app():
 
         cluster_enabled = cluster_on
         if not cluster_on and detect_error:
-            cluster_enabled = bool(cluster) or bool(nodes)
+            if isinstance(cluster, dict) and "enabled" in cluster:
+                cluster_enabled = bool(cluster.get("enabled"))
+            else:
+                cluster_enabled = bool(cluster) or bool(nodes)
 
         api_error = "; ".join(api_errors) if api_errors else None
         return render_template(
