@@ -122,6 +122,21 @@ function loadStats(streamId) {
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
+            const cluster = data.cluster || {};
+            const ownerNode = cluster.owner_node_id;
+            const relayMbps = Number(cluster.relay_mbps);
+            const playersByNode = cluster.players_by_node || {};
+            const playerByNodeRows = Object.keys(playersByNode)
+                .map((nid) => {
+                    const count = Number(playersByNode[nid]);
+                    return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
+                })
+                .join('');
+            const clusterRows = (ownerNode !== undefined && ownerNode !== null)
+                ? `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${escapeHtml(ownerNode)}</strong></div>
+                   <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${Number.isFinite(relayMbps) ? relayMbps.toFixed(1) : '0.0'} Mbps</strong></div>
+                   ${playerByNodeRows}`
+                : '';
             const playerRows = (data.players || [])
                 .map((pl, index) => {
                     const plRtt = Number(pl.rtt_ms);
@@ -164,6 +179,7 @@ function loadStats(streamId) {
                             <p>Players:</p>
                             <strong>${Number.isFinite(players) ? players : 0}</strong>
                         </div>
+                        ${clusterRows}
                         ${playerRows}
                     </div>
                 </div>

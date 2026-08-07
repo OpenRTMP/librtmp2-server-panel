@@ -7,6 +7,10 @@
     <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
 </form>
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
+{% if cluster_enabled %}
+<a href="{{ url_for('cluster_overview') }}" class="btn btn-outline-info mb-3">Cluster</a>
+<span class="badge bg-info mb-3">Cluster mode</span>
+{% endif %}
 
 {% if rtmps_enabled %}
 <span class="badge bg-success mb-3">RTMPS enabled</span>
@@ -101,6 +105,34 @@
                 </form>
                 <br>
 
+                {% if cluster_enabled and stream.get('cluster') %}
+                <h5>Cluster placement</h5>
+                <div class="mb-3 p-2 bg-dark bg-opacity-50 rounded">
+                    <div class="row g-2">
+                        <div class="col-md-4 col-6">
+                            <p>Owner node:</p>
+                            <strong>{{ stream.cluster.get('owner_node_id') if stream.cluster.get('owner_node_id') is not none else 'none' }}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Ownership epoch:</p>
+                            <strong>{{ stream.cluster.get('epoch') if stream.cluster.get('epoch') is not none else 'n/a' }}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Subscribed nodes:</p>
+                            <strong>{{ stream.cluster.get('subscribed_nodes')|join(', ') if stream.cluster.get('subscribed_nodes') else 'none' }}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Standby nodes:</p>
+                            <strong>{{ stream.cluster.get('standby_nodes')|join(', ') if stream.cluster.get('standby_nodes') else 'none' }}</strong>
+                        </div>
+                        <div class="col-md-4 col-6">
+                            <p>Cluster players:</p>
+                            <strong>{{ stream.cluster.get('cluster_players') if stream.cluster.get('cluster_players') is not none else 'n/a' }}</strong>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+
                 <h5>Stats</h5>
                 <strong>Stats URL:</strong>
                 <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.stats_url }}"
@@ -109,7 +141,8 @@
                 </span>
                 <span class="copy-feedback"></span>
 
-                <div id="stats-{{ stream.id }}" data-stream-id="{{ stream.id }}">
+                <div id="stats-{{ stream.id }}" data-stream-id="{{ stream.id }}"
+                     {% if cluster_enabled %}data-cluster="1"{% endif %}>
                     <p>Loading stats...</p>
                 </div>
 

@@ -447,10 +447,21 @@ def create_app():
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
+    def detect_cluster():
+        """Return (enabled, health_or_none). Never required for standalone use."""
+        try:
+            health = client.health()
+        except Lrtmp2ApiError:
+            return False, None
+        cluster = health.get("cluster") if isinstance(health, dict) else None
+        enabled = isinstance(cluster, dict) and bool(cluster.get("enabled"))
+        return enabled, health
+
     @app.route("/")
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
+        cluster_on, _health = detect_cluster()
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
@@ -460,16 +471,97 @@ def create_app():
                 api_error=str(exc),
                 flash_error=flash_error,
                 rtmps_enabled=False,
+                cluster_enabled=cluster_on,
             )
         rtmps_on, rtmps_port = rtmps_health()
+        cluster_by_stream = {}
+        if cluster_on:
+            try:
+                for entry in client.cluster_streams() or []:
+                    sid = entry.get("stream_id") or entry.get("id")
+                    if sid:
+                        cluster_by_stream[sid] = entry
+            except Lrtmp2ApiError:
+                cluster_by_stream = {}
         for stream in streams:
             stream.update(build_urls(stream, rtmps_on, rtmps_port))
+            if cluster_on:
+                stream["cluster"] = cluster_by_stream.get(stream.get("id"), {})
         return render_template(
             "index.html",
             streams=streams,
             flash_error=flash_error,
             rtmps_enabled=rtmps_on,
+            cluster_enabled=cluster_on,
         )
+
+    @app.route("/cluster")
+    @login_required
+    def cluster_overview():
+        flash_error = session.pop("flash_error", None)
+        cluster_on, health = detect_cluster()
+        if not cluster_on:
+            return render_template(
+                "cluster.html",
+                cluster_enabled=False,
+                cluster=None,
+                nodes=[],
+                flash_error=flash_error,
+                api_error=None,
+            )
+        api_error = None
+        cluster = None
+        nodes = []
+        try:
+            cluster = client.cluster_status()
+            nodes = client.cluster_nodes() or []
+        except Lrtmp2ApiError as exc:
+            api_error = str(exc)
+            cluster = (health or {}).get("cluster")
+        return render_template(
+            "cluster.html",
+            cluster_enabled=True,
+            cluster=cluster,
+            nodes=nodes,
+            flash_error=flash_error,
+            api_error=api_error,
+        )
+
+    def _cluster_node_action(node_id, action):
+        if not str(node_id).isdigit():
+            session["flash_error"] = "Invalid node ID"
+            return redirect(url_for("cluster_overview"))
+        cluster_on, _ = detect_cluster()
+        if not cluster_on:
+            session["flash_error"] = "Clustering is not enabled on the connected server"
+            return redirect(url_for("index"))
+        try:
+            if action == "drain":
+                client.cluster_drain_node(node_id)
+            elif action == "resume":
+                client.cluster_resume_node(node_id)
+            elif action == "remove":
+                client.cluster_remove_node(node_id)
+            else:
+                session["flash_error"] = "Unknown cluster action"
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+        return redirect(url_for("cluster_overview"))
+
+    @app.route("/cluster/nodes/<node_id>/drain", methods=["POST"])
+    @login_required
+    def cluster_drain_node(node_id):
+        return _cluster_node_action(node_id, "drain")
+
+    @app.route("/cluster/nodes/<node_id>/resume", methods=["POST"])
+    @login_required
+    def cluster_resume_node(node_id):
+        return _cluster_node_action(node_id, "resume")
+
+    @app.route("/cluster/nodes/<node_id>/remove", methods=["POST"])
+    @login_required
+    def cluster_remove_node(node_id):
+        return _cluster_node_action(node_id, "remove")
 
     @app.route("/streams/new", methods=["GET", "POST"])
     @login_required

@@ -13,6 +13,13 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- Optional cluster-aware management UI when the connected `librtmp2-server`
+  reports `cluster.enabled=true` (overview, node list with READY/DRAINING/DOWN/
+  ISOLATED badges, drain/resume/remove actions, stream owner/epoch placement).
+- REST client methods for cluster status, nodes, streams, drain, resume, and
+  remove. Standalone servers remain fully supported without cluster config.
+
 ## [0.1.5] — 2026-07-25
 
 ### Fixed
