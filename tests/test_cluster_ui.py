@@ -507,6 +507,32 @@ def test_cluster_drain_action(monkeypatch):
         mock_client.cluster_drain_node.assert_called_once_with(2)
 
 
+def test_cluster_resume_and_remove_actions(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": True}}
+        mock_client.cluster_status.return_value = {"enabled": True, "quorum": True}
+        mock_client.cluster_nodes.return_value = []
+        mock_client.cluster_resume_node.return_value = {"ok": True}
+        mock_client.cluster_remove_node.return_value = {"ok": True}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/resume", follow_redirects=True)
+        assert r.status_code == 200
+        mock_client.cluster_resume_node.assert_called_once_with(2)
+
+        r = client.post("/cluster/nodes/3/remove", follow_redirects=True)
+        assert r.status_code == 200
+        mock_client.cluster_remove_node.assert_called_once_with(3)
+
+
 def test_cluster_drain_attempts_mutation_when_health_fails(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 

@@ -231,10 +231,11 @@ class Lrtmp2Client:
             "cluster_remove_node",
             headers=self._headers(),
         )
-        if not resp.ok and resp.status_code != 404:
+        # Do not treat a bare 404 as success — pre-cluster servers and missing
+        # routes also 404, which would make Remove look successful while
+        # nothing changed. Drain/resume already surface 404 as errors.
+        if not resp.ok:
             raise _api_error(resp, "cluster_remove_node")
-        if resp.status_code == 404:
-            return None
         if not resp.content:
             return None
         return _parse_json(resp, "cluster_remove_node")

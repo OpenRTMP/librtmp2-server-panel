@@ -69,6 +69,18 @@ def test_cluster_drain_resume_remove():
     assert mock_delete.call_args.args[0].endswith("/api/v1/cluster/nodes/3")
 
 
+def test_cluster_remove_node_surfaces_404():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete:
+        mock_delete.return_value.ok = False
+        mock_delete.return_value.status_code = 404
+        mock_delete.return_value.json.return_value = {
+            "error": {"message": "node not found"}
+        }
+        with pytest.raises(Lrtmp2ApiError, match="node not found"):
+            client.cluster_remove_node(99)
+
+
 def test_cluster_api_error_propagates():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.get") as mock_get:

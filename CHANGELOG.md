@@ -13,7 +13,7 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-08-07
+## [0.2.0] — 2026-08-08
 
 ### Added
 - Optional cluster-aware management UI when the connected `librtmp2-server`

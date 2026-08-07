@@ -50,8 +50,8 @@
         <div class="col-md-4 col-6"><p>Unavailable:</p><strong>{{ c.get('unavailable_nodes') if c.get('unavailable_nodes') is not none else 'n/a' }}</strong></div>
         <div class="col-md-4 col-6"><p>Publishers:</p><strong>{{ load.get('total_publishers') if load.get('total_publishers') is not none else (c.get('total_publishers') if c.get('total_publishers') is not none else 'n/a') }}</strong></div>
         <div class="col-md-4 col-6"><p>Players:</p><strong>{{ load.get('total_players') if load.get('total_players') is not none else (c.get('total_players') if c.get('total_players') is not none else 'n/a') }}</strong></div>
-        <div class="col-md-4 col-6"><p>Ingress:</p><strong>{% set rx = load.get('total_rx_mbps') if load.get('total_rx_mbps') is not none else c.get('total_rx_mbps') %}{% if rx is not none %}{{ '%.1f'|format(rx) }} Mbps{% else %}n/a{% endif %}</strong></div>
-        <div class="col-md-4 col-6"><p>Egress:</p><strong>{% set tx = load.get('total_tx_mbps') if load.get('total_tx_mbps') is not none else c.get('total_tx_mbps') %}{% if tx is not none %}{{ '%.1f'|format(tx) }} Mbps{% else %}n/a{% endif %}</strong></div>
+        <div class="col-md-4 col-6"><p>Ingress:</p><strong>{% set rx = load.get('rx_mbps') if load.get('rx_mbps') is not none else (load.get('total_rx_mbps') if load.get('total_rx_mbps') is not none else c.get('total_rx_mbps')) %}{% if rx is not none %}{{ '%.1f'|format(rx) }} Mbps{% else %}n/a{% endif %}</strong></div>
+        <div class="col-md-4 col-6"><p>Egress:</p><strong>{% set tx = load.get('tx_mbps') if load.get('tx_mbps') is not none else (load.get('total_tx_mbps') if load.get('total_tx_mbps') is not none else c.get('total_tx_mbps')) %}{% if tx is not none %}{{ '%.1f'|format(tx) }} Mbps{% else %}n/a{% endif %}</strong></div>
     </div>
 </div>
 

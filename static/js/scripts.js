@@ -122,13 +122,24 @@ function loadStats(streamId) {
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
-            const cluster = data.cluster || {};
-            const ownerNode = cluster.owner_node_id;
-            const relayRaw = cluster.relay_mbps;
+            // Server puts cluster ownership at the stats root (and may nest a
+            // proxied owner payload under `cluster_proxy`). Older panel code
+            // expected a nested `data.cluster` object that the API never ships.
+            const clusterProxy = (data.cluster_proxy && typeof data.cluster_proxy === 'object')
+                ? data.cluster_proxy
+                : {};
+            const ownerNode = (data.owner_node_id !== undefined)
+                ? data.owner_node_id
+                : clusterProxy.owner_node_id;
+            const relayRaw = (data.relay_mbps !== undefined && data.relay_mbps !== null)
+                ? data.relay_mbps
+                : clusterProxy.relay_mbps;
             const relayMbps = (relayRaw === null || relayRaw === undefined)
                 ? NaN
                 : Number(relayRaw);
-            const playersByNode = cluster.players_by_node || {};
+            const playersByNode = data.players_by_node
+                || clusterProxy.players_by_node
+                || {};
             const playerByNodeRows = Object.keys(playersByNode)
                 .map((nid) => {
                     const count = Number(playersByNode[nid]);
@@ -136,8 +147,11 @@ function loadStats(streamId) {
                 })
                 .join('');
             const clusterRows = (() => {
-                const hasClusterTelemetry = Object.keys(cluster).length > 0;
-                if (!hasClusterTelemetry) {
+                const tagged = data.owner_node_id !== undefined
+                    || data.cluster_proxy !== undefined
+                    || Object.keys(playersByNode).length > 0
+                    || Number.isFinite(relayMbps);
+                if (!tagged) {
                     return '';
                 }
                 const ownerLabel = (ownerNode === undefined || ownerNode === null)
