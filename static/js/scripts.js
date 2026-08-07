@@ -136,13 +136,17 @@ function loadStats(streamId) {
                 })
                 .join('');
             const clusterRows = (() => {
-                if (ownerNode === undefined || ownerNode === null) {
+                const hasClusterTelemetry = Object.keys(cluster).length > 0;
+                if (!hasClusterTelemetry) {
                     return '';
                 }
+                const ownerLabel = (ownerNode === undefined || ownerNode === null)
+                    ? 'unavailable'
+                    : escapeHtml(ownerNode);
                 const relayLabel = Number.isFinite(relayMbps)
                     ? `${relayMbps.toFixed(1)} Mbps`
                     : 'n/a';
-                return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${escapeHtml(ownerNode)}</strong></div>
+                return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${ownerLabel}</strong></div>
                    <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
                    ${playerByNodeRows}`;
             })();
