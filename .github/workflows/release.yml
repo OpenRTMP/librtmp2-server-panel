@@ -13,9 +13,6 @@ on:
         description: 'Version tag to create (e.g. v0.1.5 or v0.1.5.1)'
         required: true
 
-permissions:
-  contents: write
-
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
@@ -24,6 +21,8 @@ jobs:
   verify:
     name: verify before release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,7 +38,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        run: pip install --only-binary :all: -r requirements.txt 'pytest==9.1.1'
 
       - name: Run tests
         env:
@@ -55,6 +54,8 @@ jobs:
     name: build & package
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.ver.outputs.tag }}
       source_sha: ${{ steps.ver.outputs.source_sha }}
@@ -140,7 +141,7 @@ jobs:
             dist/*.sha256
 
       - name: Publish GitHub Release and create tag when missing
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           target_commitish: ${{ steps.ver.outputs.source_sha }}
