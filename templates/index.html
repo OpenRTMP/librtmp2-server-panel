@@ -7,7 +7,14 @@
     <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
 </form>
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
+{% if show_cluster_nav is defined and show_cluster_nav %}
+<a href="{{ url_for('cluster_overview') }}" class="btn btn-outline-info mb-3">Cluster</a>
 {% if cluster_enabled %}
+<span class="badge bg-info mb-3">Cluster mode</span>
+{% elif cluster_status_unknown %}
+<span class="badge bg-warning text-dark mb-3">Cluster status unavailable</span>
+{% endif %}
+{% elif cluster_enabled %}
 <a href="{{ url_for('cluster_overview') }}" class="btn btn-outline-info mb-3">Cluster</a>
 <span class="badge bg-info mb-3">Cluster mode</span>
 {% endif %}

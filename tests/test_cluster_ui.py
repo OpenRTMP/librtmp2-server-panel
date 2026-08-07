@@ -11,6 +11,63 @@ def _login(client):
     )
 
 
+def test_index_lists_streams_before_health(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        call_order = []
+
+        def list_streams():
+            call_order.append("list_streams")
+            raise Lrtmp2ApiError("streams down")
+
+        def health():
+            call_order.append("health")
+            return {"status": "ok", "cluster": {"enabled": False}}
+
+        mock_client.list_streams.side_effect = list_streams
+        mock_client.health.side_effect = health
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"streams down" in r.data
+        assert call_order == ["list_streams"]
+        assert mock_client.health.call_count == 0
+
+
+def test_index_surfaces_cluster_detection_failure(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.list_streams.return_value = []
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"health timeout" in r.data
+        assert b"Cluster status unavailable" in r.data
+        assert b'href="/cluster"' in r.data
+        assert b"Cluster mode" not in r.data
+
+
 def test_index_hides_cluster_ui_when_standalone(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value

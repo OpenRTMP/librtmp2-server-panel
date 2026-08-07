@@ -469,7 +469,8 @@ def create_app():
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
-        cluster_on, health, _detect_error = detect_cluster()
+        # Fail-fast on stream listing before the health probe so an unresponsive
+        # API host does not burn two client timeouts on every page load.
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
@@ -479,11 +480,17 @@ def create_app():
                 api_error=str(exc),
                 flash_error=flash_error,
                 rtmps_enabled=False,
-                cluster_enabled=cluster_on,
+                cluster_enabled=False,
+                cluster_status_unknown=False,
             )
+        cluster_on, health, detect_error = detect_cluster()
         rtmps_on, rtmps_port = rtmps_from_health(health)
         cluster_by_stream = {}
-        api_error = None
+        api_error = detect_error
+        # Health outage must not look like confirmed standalone: keep Cluster
+        # nav reachable and surface the detection failure.
+        cluster_status_unknown = bool(detect_error)
+        show_cluster = cluster_on or cluster_status_unknown
         if cluster_on:
             try:
                 for entry in client.cluster_streams() or []:
@@ -491,7 +498,7 @@ def create_app():
                     if sid:
                         cluster_by_stream[sid] = entry
             except Lrtmp2ApiError as exc:
-                api_error = str(exc)
+                api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
                 cluster_by_stream = {}
         for stream in streams:
             stream.update(build_urls(stream, rtmps_on, rtmps_port))
@@ -504,6 +511,8 @@ def create_app():
             flash_error=flash_error,
             rtmps_enabled=rtmps_on,
             cluster_enabled=cluster_on,
+            cluster_status_unknown=cluster_status_unknown,
+            show_cluster_nav=show_cluster,
         )
 
     @app.route("/cluster", methods=["GET"])
