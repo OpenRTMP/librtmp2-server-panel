@@ -13,12 +13,42 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-07
+
 ### Added
 - Optional cluster-aware management UI when the connected `librtmp2-server`
   reports `cluster.enabled=true` (overview, node list with READY/DRAINING/DOWN/
   ISOLATED badges, drain/resume/remove actions, stream owner/epoch placement).
 - REST client methods for cluster status, nodes, streams, drain, resume, and
   remove. Standalone servers remain fully supported without cluster config.
+
+### Fixed
+- Health probe failures are no longer treated as confirmed standalone mode:
+  Cluster navigation stays available and detection errors are surfaced instead
+  of silently hiding cluster UI.
+- Index lists streams before probing health so an unresponsive API host does
+  not burn two client timeouts on every page load; stream-listing failures keep
+  Cluster discoverable when cluster APIs may still work.
+- Cluster overview fetches status and nodes independently so one failing call
+  does not drop the other payload.
+- Quorum display distinguishes unknown/unavailable status from confirmed
+  quorum loss.
+- Drain / resume / remove no longer require a prior successful health probe;
+  mutations run first and only reject when health confirms clustering is off.
+- Node IDs are parsed with the same integer validation the API client uses.
+- Index reuses the already-fetched health payload for RTMPS flags instead of
+  issuing a second health request.
+- Stream-placement (`/api/v1/cluster/streams`) failures are surfaced to
+  operators instead of being swallowed.
+- Aggregate cluster metrics are read from the normalized `status.load` object.
+- Live stats keep cluster metric rows when the stream owner is unavailable
+  (owner shown as unavailable; relay / `players_by_node` still rendered).
+- Null / missing relay bandwidth is shown as unknown (`n/a`) instead of a
+  misleading zero.
+
+### Changed
+- Integration CI always checks out `librtmp2-server` `main` (no same-named
+  feature-branch coupling).
 
 ## [0.1.5] — 2026-07-25
 
@@ -157,7 +187,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.2...v0.1.3
