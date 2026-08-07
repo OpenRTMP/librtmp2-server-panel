@@ -25,7 +25,9 @@
 {% set c = cluster or {} %}
 {% set load = c.get('load') if c.get('load') is mapping else {} %}
 <div class="mb-3">
-    {% if c.get('quorum') %}
+    {% if c.get('quorum') is none %}
+    <span class="badge bg-secondary">Quorum unknown</span>
+    {% elif c.get('quorum') %}
     <span class="badge bg-success">Quorum OK</span>
     {% else %}
     <span class="badge bg-danger">Quorum lost</span>

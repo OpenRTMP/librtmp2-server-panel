@@ -88,6 +88,48 @@ def test_index_shows_cluster_nav_and_stream_owner(monkeypatch):
         assert b"Ownership epoch" in r.data
         assert b"18" in r.data
         assert b"Owner node" in r.data
+        # detect_cluster health reused for RTMPS — no second /health probe
+        assert mock_client.health.call_count == 1
+
+
+def test_index_surfaces_cluster_streams_error(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "status": "ok",
+            "rtmps_enabled": False,
+            "cluster": {"enabled": True, "quorum": True},
+        }
+        mock_client.list_streams.return_value = [
+            {
+                "id": "stream42",
+                "name": "Camera",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "players": [],
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
+        mock_client.cluster_streams.side_effect = Lrtmp2ApiError("cluster_streams failed")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"cluster_streams failed" in r.data
+        assert b"Camera" in r.data
+        assert b"Cluster mode" in r.data
 
 
 def test_cluster_overview_standalone_message(monkeypatch):
@@ -237,6 +279,32 @@ def test_cluster_overview_quorum_lost(monkeypatch):
         assert b"Quorum lost" in r.data
 
 
+def test_cluster_overview_quorum_unknown_when_absent(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": True}}
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "state": "ready",
+            "leader_id": 1,
+        }
+        mock_client.cluster_nodes.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"Quorum unknown" in r.data
+        assert b"Quorum lost" not in r.data
+        assert b"Quorum OK" not in r.data
+
+
 def test_cluster_api_error_on_overview(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 
@@ -336,6 +404,49 @@ def test_cluster_drain_action(monkeypatch):
         r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
         assert r.status_code == 200
         mock_client.cluster_drain_node.assert_called_once_with(2)
+
+
+def test_cluster_drain_attempts_mutation_when_health_fails(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timed out")
+        mock_client.cluster_drain_node.return_value = {"ok": True}
+        mock_client.cluster_status.return_value = {"enabled": True, "quorum": True}
+        mock_client.cluster_nodes.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
+        assert r.status_code == 200
+        mock_client.cluster_drain_node.assert_called_once_with(2)
+
+
+def test_cluster_drain_skipped_when_cluster_disabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": False}}
+        mock_client.list_streams.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
+        assert r.status_code == 200
+        assert b"Clustering is not enabled" in r.data
+        mock_client.cluster_drain_node.assert_not_called()
 
 
 def test_cluster_invalid_node_id_redirects(monkeypatch):

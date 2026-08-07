@@ -124,7 +124,10 @@ function loadStats(streamId) {
             const players = Number((data.summary || {}).players);
             const cluster = data.cluster || {};
             const ownerNode = cluster.owner_node_id;
-            const relayMbps = Number(cluster.relay_mbps);
+            const relayRaw = cluster.relay_mbps;
+            const relayMbps = (relayRaw === null || relayRaw === undefined)
+                ? NaN
+                : Number(relayRaw);
             const playersByNode = cluster.players_by_node || {};
             const playerByNodeRows = Object.keys(playersByNode)
                 .map((nid) => {
@@ -138,7 +141,7 @@ function loadStats(streamId) {
                 }
                 const relayLabel = Number.isFinite(relayMbps)
                     ? `${relayMbps.toFixed(1)} Mbps`
-                    : '0.0 Mbps';
+                    : 'n/a';
                 return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${escapeHtml(ownerNode)}</strong></div>
                    <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
                    ${playerByNodeRows}`;

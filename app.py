@@ -22,6 +22,7 @@ APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
 MIN_ACCESS_KEY_LEN = 32
+CLUSTER_TEMPLATE = "cluster.html"
 
 ACCESS_KEY_HELP = (
     f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
@@ -317,24 +318,27 @@ def create_app():
         except SessionBackendUnavailable:
             return True
 
-    def rtmps_health():
-        """Return RTMPS availability and the public RTMPS port to advertise.
+    def rtmps_from_health(health):
+        """Derive RTMPS flags from an already-fetched /health payload.
 
-        RTMPS enablement is read live from /api/v1/health, but URLs must use
-        the panel's public port config first. That preserves Docker/NAT/reverse
-        proxy mappings such as public 443 -> server bind 1936. The server's
-        reported bind port is only used as a fallback when the public config is
-        empty or missing.
+        URLs must use the panel's public port config first. That preserves
+        Docker/NAT/reverse proxy mappings such as public 443 -> server bind
+        1936. The server's reported bind port is only used as a fallback when
+        the public config is empty or missing.
         """
         configured_port = str(app.config.get("LRTMP2_RTMPS_PORT") or "")
-        try:
-            health = client.health()
-        except Lrtmp2ApiError:
-            return False, configured_port or "1936"
-        if not health.get("rtmps_enabled"):
+        if not isinstance(health, dict) or not health.get("rtmps_enabled"):
             return False, configured_port or "1936"
         reported_port = str(health.get("rtmps_port") or "")
         return True, configured_port or reported_port or "1936"
+
+    def rtmps_health():
+        """Fetch /health and return RTMPS availability plus public port."""
+        try:
+            health = client.health()
+        except Lrtmp2ApiError:
+            return rtmps_from_health(None)
+        return rtmps_from_health(health)
 
     def build_urls(stream, rtmps_on, rtmps_port):
         domain = _format_url_host(app.config["LRTMP2_DOMAIN"])
@@ -465,7 +469,7 @@ def create_app():
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
-        cluster_on, _health, _detect_error = detect_cluster()
+        cluster_on, health, _detect_error = detect_cluster()
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
@@ -477,15 +481,17 @@ def create_app():
                 rtmps_enabled=False,
                 cluster_enabled=cluster_on,
             )
-        rtmps_on, rtmps_port = rtmps_health()
+        rtmps_on, rtmps_port = rtmps_from_health(health)
         cluster_by_stream = {}
+        api_error = None
         if cluster_on:
             try:
                 for entry in client.cluster_streams() or []:
                     sid = entry.get("stream_id") or entry.get("id")
                     if sid:
                         cluster_by_stream[sid] = entry
-            except Lrtmp2ApiError:
+            except Lrtmp2ApiError as exc:
+                api_error = str(exc)
                 cluster_by_stream = {}
         for stream in streams:
             stream.update(build_urls(stream, rtmps_on, rtmps_port))
@@ -494,6 +500,7 @@ def create_app():
         return render_template(
             "index.html",
             streams=streams,
+            api_error=api_error,
             flash_error=flash_error,
             rtmps_enabled=rtmps_on,
             cluster_enabled=cluster_on,
@@ -506,7 +513,7 @@ def create_app():
         cluster_on, health, detect_error = detect_cluster()
         if detect_error:
             return render_template(
-                "cluster.html",
+                CLUSTER_TEMPLATE,
                 cluster_enabled=False,
                 cluster=None,
                 nodes=[],
@@ -515,7 +522,7 @@ def create_app():
             )
         if not cluster_on:
             return render_template(
-                "cluster.html",
+                CLUSTER_TEMPLATE,
                 cluster_enabled=False,
                 cluster=None,
                 nodes=[],
@@ -536,7 +543,7 @@ def create_app():
             api_errors.append(str(exc))
         api_error = "; ".join(api_errors) if api_errors else None
         return render_template(
-            "cluster.html",
+            CLUSTER_TEMPLATE,
             cluster_enabled=True,
             cluster=cluster,
             nodes=nodes,
@@ -551,10 +558,9 @@ def create_app():
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
         cluster_on, _, detect_error = detect_cluster()
-        if detect_error:
-            session["flash_error"] = detect_error
-            return redirect(url_for("cluster_overview"))
-        if not cluster_on:
+        # Only gate when health succeeded and confirmed cluster is off.
+        # Health probe failures must not block the mutation API call.
+        if not detect_error and not cluster_on:
             session["flash_error"] = "Clustering is not enabled on the connected server"
             return redirect(url_for("index"))
         try:
