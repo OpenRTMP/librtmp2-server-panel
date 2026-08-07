@@ -474,6 +474,8 @@ def create_app():
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
+            # Keep Cluster discoverable when streams fail but cluster APIs may
+            # still work — same unknown-state pattern as health-detection failure.
             return render_template(
                 "index.html",
                 streams=[],
@@ -481,7 +483,8 @@ def create_app():
                 flash_error=flash_error,
                 rtmps_enabled=False,
                 cluster_enabled=False,
-                cluster_status_unknown=False,
+                cluster_status_unknown=True,
+                show_cluster_nav=True,
             )
         cluster_on, health, detect_error = detect_cluster()
         rtmps_on, rtmps_port = rtmps_from_health(health)
@@ -566,12 +569,8 @@ def create_app():
         except (TypeError, ValueError):
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
-        cluster_on, _, detect_error = detect_cluster()
-        # Only gate when health succeeded and confirmed cluster is off.
-        # Health probe failures must not block the mutation API call.
-        if not detect_error and not cluster_on:
-            session["flash_error"] = "Clustering is not enabled on the connected server"
-            return redirect(url_for("index"))
+        # Call the mutation endpoint directly — do not burn a health-probe
+        # timeout before drain/resume/remove when health is stalled.
         try:
             if action == "drain":
                 client.cluster_drain_node(parsed_id)

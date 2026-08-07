@@ -42,6 +42,8 @@ def test_index_lists_streams_before_health(monkeypatch):
         assert b"streams down" in r.data
         assert call_order == ["list_streams"]
         assert mock_client.health.call_count == 0
+        assert b'href="/cluster"' in r.data
+        assert b"Cluster status unavailable" in r.data
 
 
 def test_index_surfaces_cluster_detection_failure(monkeypatch):
@@ -481,16 +483,20 @@ def test_cluster_drain_attempts_mutation_when_health_fails(monkeypatch):
         client = application.test_client()
         _login(client)
 
-        r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
-        assert r.status_code == 200
+        r = client.post("/cluster/nodes/2/drain", follow_redirects=False)
+        assert r.status_code in (302, 303)
         mock_client.cluster_drain_node.assert_called_once_with(2)
+        # Mutation must not wait on a health probe (redirect target may probe).
+        assert mock_client.health.call_count == 0
 
 
-def test_cluster_drain_skipped_when_cluster_disabled(monkeypatch):
+def test_cluster_drain_calls_api_even_when_health_says_standalone(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"cluster": {"enabled": False}}
-        mock_client.list_streams.return_value = []
+        mock_client.cluster_drain_node.side_effect = Lrtmp2ApiError("clustering disabled")
 
         import app as app_module
 
@@ -502,8 +508,41 @@ def test_cluster_drain_skipped_when_cluster_disabled(monkeypatch):
 
         r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
         assert r.status_code == 200
-        assert b"Clustering is not enabled" in r.data
-        mock_client.cluster_drain_node.assert_not_called()
+        mock_client.cluster_drain_node.assert_called_once_with(2)
+        assert b"clustering disabled" in r.data
+
+
+def test_cluster_overview_reads_load_object_metrics(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": True}}
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "quorum": True,
+            "cluster_id": "c1",
+            "load": {
+                "total_publishers": 12,
+                "total_players": 34,
+                "total_rx_mbps": 1.5,
+                "total_tx_mbps": 2.5,
+            },
+        }
+        mock_client.cluster_nodes.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b">12<" in r.data
+        assert b">34<" in r.data
+        assert b"1.5 Mbps" in r.data
+        assert b"2.5 Mbps" in r.data
 
 
 def test_cluster_invalid_node_id_redirects(monkeypatch):
