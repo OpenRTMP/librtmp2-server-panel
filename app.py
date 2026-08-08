@@ -14,6 +14,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
+
+_cluster_enabled_from_health = Lrtmp2Client.cluster_enabled_from_health
 from session_store import SessionBackendUnavailable, create_session_store
 
 
@@ -461,7 +463,7 @@ def create_app():
             health = client.health()
         except Lrtmp2ApiError as exc:
             return False, None, str(exc)
-        enabled = Lrtmp2Client.cluster_enabled_from_health(health)
+        enabled = _cluster_enabled_from_health(health)
         return enabled, health, None
 
     @app.route("/")

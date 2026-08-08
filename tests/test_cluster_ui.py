@@ -462,9 +462,9 @@ def test_cluster_status_failure_still_loads_nodes(monkeypatch):
         mock_client.cluster_status.side_effect = Lrtmp2ApiError("cluster_status failed")
         mock_client.cluster_nodes.return_value = [
             {
-                "id": 1,
-                "name": "node-1",
-                "role": "leader",
+                "id": 2,
+                "name": "node-2",
+                "role": "follower",
                 "voter": True,
                 "state": "ready",
                 "healthy": True,
@@ -482,7 +482,7 @@ def test_cluster_status_failure_still_loads_nodes(monkeypatch):
         r = client.get("/cluster")
         assert r.status_code == 200
         assert b"cluster_status failed" in r.data
-        assert b"node-1" in r.data
+        assert b"node-2" in r.data
         assert b"Drain" in r.data
 
 
