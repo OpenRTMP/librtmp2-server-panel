@@ -53,6 +53,7 @@ def test_index_surfaces_cluster_detection_failure(monkeypatch):
         mock_client = mock_client_cls.return_value
         mock_client.list_streams.return_value = []
         mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_streams.side_effect = Lrtmp2ApiError("cluster_streams down")
 
         import app as app_module
 
@@ -65,9 +66,59 @@ def test_index_surfaces_cluster_detection_failure(monkeypatch):
         r = client.get("/")
         assert r.status_code == 200
         assert b"health timeout" in r.data
+        assert b"cluster_streams down" in r.data
         assert b"Cluster status unavailable" in r.data
         assert b'href="/cluster"' in r.data
         assert b"Cluster mode" not in r.data
+
+
+def test_index_loads_placement_when_health_unknown(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.list_streams.return_value = [
+            {
+                "id": "stream42",
+                "name": "Camera",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "players": [],
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
+        mock_client.cluster_streams.return_value = [
+            {
+                "stream_id": "stream42",
+                "owner_node_id": 1,
+                "epoch": 18,
+                "subscribed_nodes": [2],
+                "standby_nodes": [],
+                "cluster_players": 3,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"health timeout" in r.data
+        assert b"Cluster mode" in r.data
+        assert b"Cluster status unavailable" not in r.data
+        assert b"Ownership epoch" in r.data
+        assert b"18" in r.data
+        assert b'data-cluster="1"' in r.data
+        assert mock_client.cluster_streams.call_count == 1
 
 
 def test_index_hides_cluster_ui_when_standalone(monkeypatch):

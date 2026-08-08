@@ -500,12 +500,17 @@ def create_app():
         # nav reachable and surface the detection failure.
         cluster_status_unknown = bool(detect_error)
         show_cluster = cluster_on or cluster_status_unknown
-        if cluster_on:
+        # Probe placement when health is unknown too — cluster/streams may still
+        # be healthy (same partial-outage pattern as the cluster overview).
+        if cluster_on or cluster_status_unknown:
             try:
                 for entry in client.cluster_streams() or []:
                     sid = entry.get("stream_id") or entry.get("id")
                     if sid:
                         cluster_by_stream[sid] = entry
+                if cluster_status_unknown:
+                    cluster_on = True
+                    cluster_status_unknown = False
             except Lrtmp2ApiError as exc:
                 api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
                 cluster_by_stream = {}

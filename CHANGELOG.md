@@ -51,6 +51,10 @@ only begin at a future `1.0.0`.
   that result on a transient second failure.
 - Remove stays available for `down` / `isolated` / `leaving` nodes; only
   Drain and Resume are gated by node state.
+- Index still loads stream placement (`/api/v1/cluster/streams`) when the
+  health probe fails and treats a successful response as confirmed cluster
+  mode, so owner/epoch and live cluster stats stay available during that
+  partial outage.
 
 ### Changed
 - Integration CI always checks out `librtmp2-server` `main` (no same-named
