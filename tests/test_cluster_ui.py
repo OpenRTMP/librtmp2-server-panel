@@ -252,6 +252,33 @@ def test_cluster_overview_health_on_status_disabled(monkeypatch):
         assert b"standalone mode" in r.data
 
 
+def test_cluster_node_action_rejects_non_positive_id(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "status": "ok",
+            "cluster": {"enabled": True, "quorum": True},
+        }
+        mock_client.cluster_status.return_value = {"enabled": True}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post(
+            "/cluster/nodes/0/drain",
+            data={"csrf_token": _csrf_token(client)},
+            follow_redirects=True,
+        )
+        assert r.status_code == 200
+        assert b"Invalid node ID" in r.data
+        mock_client.cluster_drain_node.assert_not_called()
+
+
 def test_cluster_overview_renders_nodes_and_states(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value

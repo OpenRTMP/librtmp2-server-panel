@@ -625,16 +625,19 @@ def create_app():
 
     @app.route("/cluster/nodes/<node_id>/drain", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_drain_node(node_id):
         return _cluster_node_action(node_id, "drain")
 
     @app.route("/cluster/nodes/<node_id>/resume", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_resume_node(node_id):
         return _cluster_node_action(node_id, "resume")
 
     @app.route("/cluster/nodes/<node_id>/remove", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_remove_node(node_id):
         return _cluster_node_action(node_id, "remove")
 
