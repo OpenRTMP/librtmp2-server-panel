@@ -17,21 +17,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Checkout librtmp2-server (HA branch, then main)
-        run: |
-          set -euo pipefail
-          # Prefer the matching HA feature branch so cluster UI/API paths are
-          # exercised against a cluster-capable server; fall back to main.
-          for ref in cursor/optional-ha-clustering main; do
-            if git clone --depth 1 --branch "$ref" \
-              https://github.com/OpenRTMP/librtmp2-server.git librtmp2-server; then
-              echo "Using librtmp2-server @$ref ($(git -C librtmp2-server rev-parse --short HEAD))"
-              exit 0
-            fi
-            rm -rf librtmp2-server
-          done
-          echo "Failed to checkout librtmp2-server" >&2
-          exit 1
+      - name: Checkout librtmp2-server
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRTMP/librtmp2-server
+          ref: main
+          path: librtmp2-server
+          persist-credentials: false
 
       - name: Start librtmp2-server from source
         id: server_stack

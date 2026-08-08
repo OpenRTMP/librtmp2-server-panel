@@ -533,11 +533,13 @@ def create_app():
         if detect_error:
             api_errors.append(detect_error)
 
+        cluster = None
         if not cluster_on and not detect_error:
             try:
                 status = client.cluster_status()
                 if isinstance(status, dict) and status.get("enabled"):
                     cluster_on = True
+                    cluster = status
                     api_errors.append(
                         "Health probe reports standalone but cluster API is enabled."
                     )
@@ -560,14 +562,14 @@ def create_app():
                     api_error=None,
                 )
 
-        cluster = None
         nodes = []
         if cluster_on or detect_error:
-            try:
-                cluster = client.cluster_status()
-            except Lrtmp2ApiError as exc:
-                api_errors.append(str(exc))
-                cluster = (health or {}).get("cluster")
+            if cluster is None:
+                try:
+                    cluster = client.cluster_status()
+                except Lrtmp2ApiError as exc:
+                    api_errors.append(str(exc))
+                    cluster = (health or {}).get("cluster")
             try:
                 nodes = client.cluster_nodes() or []
             except Lrtmp2ApiError as exc:
@@ -595,14 +597,6 @@ def create_app():
             parsed_id = int(str(node_id), 10)
         except (TypeError, ValueError):
             session["flash_error"] = "Invalid node ID"
-            return redirect(url_for("cluster_overview"))
-        try:
-            status = client.cluster_status()
-            if not (isinstance(status, dict) and status.get("enabled")):
-                session["flash_error"] = "Cluster mutations are unavailable while cluster mode is disabled."
-                return redirect(url_for("cluster_overview"))
-        except Lrtmp2ApiError as exc:
-            session["flash_error"] = str(exc)
             return redirect(url_for("cluster_overview"))
         try:
             if action == "drain":

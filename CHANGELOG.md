@@ -33,8 +33,9 @@ only begin at a future `1.0.0`.
   does not drop the other payload.
 - Quorum display distinguishes unknown/unavailable status from confirmed
   quorum loss.
-- Drain / resume / remove no longer require a prior successful health probe;
-  mutations run first and only reject when health confirms clustering is off.
+- Drain / resume / remove call the mutation endpoint directly instead of
+  gating on a separate cluster-status probe; the server's own response is now
+  the sole authority on whether the action is rejected.
 - Node IDs are parsed with the same integer validation the API client uses.
 - Index reuses the already-fetched health payload for RTMPS flags instead of
   issuing a second health request.
@@ -45,6 +46,11 @@ only begin at a future `1.0.0`.
   (owner shown as unavailable; relay / `players_by_node` still rendered).
 - Null / missing relay bandwidth is shown as unknown (`n/a`) instead of a
   misleading zero.
+- Cluster overview reuses the `cluster_status()` response that already
+  confirmed cluster mode is enabled instead of re-querying it and discarding
+  that result on a transient second failure.
+- Remove stays available for `down` / `isolated` / `leaving` nodes; only
+  Drain and Resume are gated by node state.
 
 ### Changed
 - Integration CI always checks out `librtmp2-server` `main` (no same-named

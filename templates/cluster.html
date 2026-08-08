@@ -104,6 +104,8 @@
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-success">Resume</button>
                     </form>
+                    {% endif %}
+                    {% if nrole != 'leader' %}
                     <form method="post" action="{{ url_for('cluster_remove_node', node_id=node.id) }}"
                           class="cluster-remove-form" data-node-id="{{ node.get('id') }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

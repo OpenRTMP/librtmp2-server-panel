@@ -562,10 +562,15 @@ def test_cluster_drain_attempts_mutation_when_health_fails(monkeypatch):
 
 
 def test_cluster_drain_rejects_when_cluster_status_disabled(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"cluster": {"enabled": False}}
         mock_client.cluster_status.return_value = {"enabled": False}
+        mock_client.cluster_drain_node.side_effect = Lrtmp2ApiError(
+            "cluster_drain_node failed: cluster mode is disabled"
+        )
 
         import app as app_module
 
@@ -577,8 +582,11 @@ def test_cluster_drain_rejects_when_cluster_status_disabled(monkeypatch):
 
         r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
         assert r.status_code == 200
-        mock_client.cluster_drain_node.assert_not_called()
-        assert b"Cluster mutations are unavailable" in r.data
+        # The mutation endpoint itself is the authority on whether cluster mode
+        # is enabled — it must be called directly rather than gated on a
+        # separate status probe that can time out independently.
+        mock_client.cluster_drain_node.assert_called_once_with(2)
+        assert b"cluster mode is disabled" in r.data
 
 
 def test_cluster_overview_requires_login(monkeypatch):
