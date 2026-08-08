@@ -138,7 +138,7 @@ function loadStats(streamId) {
             const clusterProxy = (data.cluster_proxy && typeof data.cluster_proxy === 'object')
                 ? data.cluster_proxy
                 : {};
-            const ownerNode = (data.owner_node_id !== undefined)
+            const ownerNode = (data.owner_node_id !== undefined && data.owner_node_id !== null)
                 ? data.owner_node_id
                 : clusterProxy.owner_node_id;
             const relayRaw = (data.relay_mbps !== undefined && data.relay_mbps !== null)

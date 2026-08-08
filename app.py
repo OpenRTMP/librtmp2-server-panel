@@ -580,12 +580,16 @@ def create_app():
             except Lrtmp2ApiError as exc:
                 api_errors.append(str(exc))
 
-        cluster_enabled = cluster_on
-        if not cluster_on and detect_error:
-            if isinstance(cluster, dict) and "enabled" in cluster:
-                cluster_enabled = bool(cluster.get("enabled"))
-            else:
-                cluster_enabled = bool(cluster) or bool(nodes)
+        # Prefer the authoritative /cluster status `enabled` flag over the
+        # earlier health probe (health may be stale if clustering was just
+        # disabled). Only fall back to presence heuristics when health failed
+        # and the status payload has no explicit enabled field.
+        if isinstance(cluster, dict) and "enabled" in cluster:
+            cluster_enabled = bool(cluster.get("enabled"))
+        elif not cluster_on and detect_error:
+            cluster_enabled = bool(cluster) or bool(nodes)
+        else:
+            cluster_enabled = cluster_on
 
         api_error = "; ".join(api_errors) if api_errors else None
         return render_template(

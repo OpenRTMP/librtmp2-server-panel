@@ -502,6 +502,40 @@ def test_cluster_health_failure_with_explicitly_disabled_status(monkeypatch):
         assert b"standalone mode" not in r.data
 
 
+def test_cluster_honors_disabled_status_over_health(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "cluster": {"enabled": True, "quorum": True, "leader_id": 1}
+        }
+        mock_client.cluster_status.return_value = {"enabled": False}
+        mock_client.cluster_nodes.return_value = [
+            {
+                "id": 1,
+                "name": "node-1",
+                "role": "follower",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"standalone mode" in r.data
+        assert b"Quorum" not in r.data
+        assert b"Drain" not in r.data
+        assert b"node-1" not in r.data
+
+
 def test_cluster_status_failure_still_loads_nodes(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 

@@ -55,6 +55,10 @@ only begin at a future `1.0.0`.
   health probe fails and treats a successful response as confirmed cluster
   mode, so owner/epoch and live cluster stats stay available during that
   partial outage.
+- Cluster overview honors an authoritative `cluster_status().enabled=false`
+  even when the earlier health probe still reported clustering enabled.
+- Live stats fall back to `cluster_proxy.owner_node_id` when the root
+  `owner_node_id` is JSON `null`, matching the existing relay normalization.
 
 ### Changed
 - Integration CI always checks out `librtmp2-server` `main` (no same-named
