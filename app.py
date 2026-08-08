@@ -545,19 +545,21 @@ def create_app():
                     return render_template(
                         CLUSTER_TEMPLATE,
                         cluster_enabled=False,
+                        cluster_api_disabled=False,
                         cluster=None,
                         nodes=[],
                         flash_error=flash_error,
                         api_error=None,
                     )
-            except Lrtmp2ApiError:
+            except Lrtmp2ApiError as exc:
                 return render_template(
                     CLUSTER_TEMPLATE,
                     cluster_enabled=False,
+                    cluster_api_disabled=False,
                     cluster=None,
                     nodes=[],
                     flash_error=flash_error,
-                    api_error=None,
+                    api_error=str(exc),
                 )
 
         cluster = None
@@ -574,9 +576,17 @@ def create_app():
                 api_errors.append(str(exc))
 
         cluster_enabled = cluster_on
-        if not cluster_on and detect_error:
+        cluster_api_disabled = False
+        if cluster_on:
             if isinstance(cluster, dict) and "enabled" in cluster:
                 cluster_enabled = bool(cluster.get("enabled"))
+                if not cluster_enabled:
+                    cluster_api_disabled = True
+        elif detect_error:
+            if isinstance(cluster, dict) and "enabled" in cluster:
+                cluster_enabled = bool(cluster.get("enabled"))
+                if not cluster_enabled:
+                    cluster_api_disabled = True
             else:
                 cluster_enabled = bool(cluster) or bool(nodes)
 
@@ -584,6 +594,7 @@ def create_app():
         return render_template(
             CLUSTER_TEMPLATE,
             cluster_enabled=cluster_enabled,
+            cluster_api_disabled=cluster_api_disabled,
             cluster=cluster,
             nodes=nodes,
             flash_error=flash_error,
@@ -594,6 +605,9 @@ def create_app():
         try:
             parsed_id = int(str(node_id), 10)
         except (TypeError, ValueError):
+            session["flash_error"] = "Invalid node ID"
+            return redirect(url_for("cluster_overview"))
+        if parsed_id <= 0:
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
         try:
@@ -619,16 +633,19 @@ def create_app():
 
     @app.route("/cluster/nodes/<node_id>/drain", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_drain_node(node_id):
         return _cluster_node_action(node_id, "drain")
 
     @app.route("/cluster/nodes/<node_id>/resume", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_resume_node(node_id):
         return _cluster_node_action(node_id, "resume")
 
     @app.route("/cluster/nodes/<node_id>/remove", methods=["POST"])
     @login_required
+    @limiter.limit("20 per minute")
     def cluster_remove_node(node_id):
         return _cluster_node_action(node_id, "remove")
 

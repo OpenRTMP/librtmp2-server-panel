@@ -15,7 +15,14 @@
 <div class="alert alert-danger">{{ api_error }}</div>
 {% endif %}
 
-{% if not cluster_enabled and not (api_error is defined and api_error) %}
+{% if cluster_api_disabled is defined and cluster_api_disabled %}
+<div class="alert alert-warning">
+    The connected <code>librtmp2-server</code> reports cluster mode in
+    <code>/api/v1/health</code>, but <code>/api/v1/cluster/status</code> has
+    <code>enabled=false</code>. Cluster overview and mutations are unavailable
+    until the cluster API is enabled on the server.
+</div>
+{% elif not cluster_enabled and not (api_error is defined and api_error) %}
 <div class="alert alert-secondary">
     The connected <code>librtmp2-server</code> is running in standalone mode.
     Cluster overview is unavailable. The panel does not participate in Raft and
@@ -96,14 +103,18 @@
                     {% set nstate = (node.get('state') or 'unknown')|lower %}
                     {% set nrole = (node.get('role') or '')|lower %}
                     {% if nstate not in ['down', 'isolated', 'leaving'] and nrole != 'leader' %}
+                    {% if nstate not in ['draining'] %}
                     <form method="post" action="{{ url_for('cluster_drain_node', node_id=node.id) }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-warning">Drain</button>
                     </form>
+                    {% endif %}
+                    {% if nstate in ['draining', 'down'] %}
                     <form method="post" action="{{ url_for('cluster_resume_node', node_id=node.id) }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-success">Resume</button>
                     </form>
+                    {% endif %}
                     <form method="post" action="{{ url_for('cluster_remove_node', node_id=node.id) }}"
                           class="cluster-remove-form" data-node-id="{{ node.get('id') }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
