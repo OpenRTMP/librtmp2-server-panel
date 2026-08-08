@@ -464,7 +464,10 @@ def test_cluster_status_failure_still_loads_nodes(monkeypatch):
             {
                 "id": 1,
                 "name": "node-1",
-                "role": "leader",
+                # "follower", not "leader": the template hides drain/resume/
+                # remove actions for the leader node, and this test checks
+                # that those actions render for a normal member.
+                "role": "follower",
                 "voter": True,
                 "state": "ready",
                 "healthy": True,

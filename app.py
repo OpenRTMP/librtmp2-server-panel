@@ -16,6 +16,13 @@ from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 from session_store import SessionBackendUnavailable, create_session_store
 
+# Captured at import time so tests that `patch("app.Lrtmp2Client")` to mock
+# the API client (the pattern used throughout this test suite) don't also
+# replace this static, data-only helper with a MagicMock — an unconfigured
+# MagicMock call is truthy, which would make every cluster-enabled check
+# below always report "enabled" regardless of the mocked health payload.
+_cluster_enabled_from_health = Lrtmp2Client.cluster_enabled_from_health
+
 
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
@@ -461,7 +468,7 @@ def create_app():
             health = client.health()
         except Lrtmp2ApiError as exc:
             return False, None, str(exc)
-        enabled = Lrtmp2Client.cluster_enabled_from_health(health)
+        enabled = _cluster_enabled_from_health(health)
         return enabled, health, None
 
     @app.route("/")
