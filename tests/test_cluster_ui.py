@@ -1,7 +1,7 @@
 import os
 from unittest.mock import patch
 
-from flask_test_utils import configure_testing_app
+from flask_test_utils import configure_testing_app, csrf_token_for_client
 
 
 def _login(client):
@@ -249,7 +249,8 @@ def test_cluster_overview_health_on_status_disabled(monkeypatch):
 
         r = client.get("/cluster")
         assert r.status_code == 200
-        assert b"standalone mode" in r.data
+        assert b"enabled=false" in r.data
+        assert b"standalone mode" not in r.data
 
 
 def test_cluster_node_action_rejects_non_positive_id(monkeypatch):
@@ -271,7 +272,7 @@ def test_cluster_node_action_rejects_non_positive_id(monkeypatch):
 
         r = client.post(
             "/cluster/nodes/0/drain",
-            data={"csrf_token": _csrf_token(client)},
+            data={"csrf_token": csrf_token_for_client(client)},
             follow_redirects=True,
         )
         assert r.status_code == 200
@@ -680,6 +681,68 @@ def test_cluster_drain_requires_csrf_when_enabled(monkeypatch):
         r = client.post("/cluster/nodes/2/drain")
         assert r.status_code == 400
         mock_client.cluster_drain_node.assert_not_called()
+
+
+def test_cluster_resume_requires_csrf_when_enabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.cluster_status.return_value = {"enabled": True}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = True
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/resume")
+        assert r.status_code == 400
+        mock_client.cluster_resume_node.assert_not_called()
+
+
+def test_cluster_remove_requires_csrf_when_enabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.cluster_status.return_value = {"enabled": True}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = True
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/3/remove")
+        assert r.status_code == 400
+        mock_client.cluster_remove_node.assert_not_called()
+
+
+def test_cluster_resume_requires_login(monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+    application = app_module.create_app()
+    application.config["TESTING"] = True
+    client = application.test_client()
+    r = client.post("/cluster/nodes/2/resume")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
+
+
+def test_cluster_remove_requires_login(monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+    application = app_module.create_app()
+    application.config["TESTING"] = True
+    client = application.test_client()
+    r = client.post("/cluster/nodes/3/remove")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
 
 
 def test_cluster_drain_calls_api_even_when_health_says_standalone(monkeypatch):

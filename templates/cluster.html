@@ -15,7 +15,14 @@
 <div class="alert alert-danger">{{ api_error }}</div>
 {% endif %}
 
-{% if not cluster_enabled and not (api_error is defined and api_error) %}
+{% if cluster_api_disabled is defined and cluster_api_disabled %}
+<div class="alert alert-warning">
+    The connected <code>librtmp2-server</code> reports cluster mode in
+    <code>/api/v1/health</code>, but <code>/api/v1/cluster/status</code> has
+    <code>enabled=false</code>. Cluster overview and mutations are unavailable
+    until the cluster API is enabled on the server.
+</div>
+{% elif not cluster_enabled and not (api_error is defined and api_error) %}
 <div class="alert alert-secondary">
     The connected <code>librtmp2-server</code> is running in standalone mode.
     Cluster overview is unavailable. The panel does not participate in Raft and

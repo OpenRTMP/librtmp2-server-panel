@@ -545,6 +545,7 @@ def create_app():
                     return render_template(
                         CLUSTER_TEMPLATE,
                         cluster_enabled=False,
+                        cluster_api_disabled=False,
                         cluster=None,
                         nodes=[],
                         flash_error=flash_error,
@@ -554,6 +555,7 @@ def create_app():
                 return render_template(
                     CLUSTER_TEMPLATE,
                     cluster_enabled=False,
+                    cluster_api_disabled=False,
                     cluster=None,
                     nodes=[],
                     flash_error=flash_error,
@@ -574,12 +576,17 @@ def create_app():
                 api_errors.append(str(exc))
 
         cluster_enabled = cluster_on
+        cluster_api_disabled = False
         if cluster_on:
             if isinstance(cluster, dict) and "enabled" in cluster:
                 cluster_enabled = bool(cluster.get("enabled"))
+                if not cluster_enabled:
+                    cluster_api_disabled = True
         elif detect_error:
             if isinstance(cluster, dict) and "enabled" in cluster:
                 cluster_enabled = bool(cluster.get("enabled"))
+                if not cluster_enabled:
+                    cluster_api_disabled = True
             else:
                 cluster_enabled = bool(cluster) or bool(nodes)
 
@@ -587,6 +594,7 @@ def create_app():
         return render_template(
             CLUSTER_TEMPLATE,
             cluster_enabled=cluster_enabled,
+            cluster_api_disabled=cluster_api_disabled,
             cluster=cluster,
             nodes=nodes,
             flash_error=flash_error,
