@@ -461,8 +461,7 @@ def create_app():
             health = client.health()
         except Lrtmp2ApiError as exc:
             return False, None, str(exc)
-        cluster = health.get("cluster") if isinstance(health, dict) else None
-        enabled = isinstance(cluster, dict) and bool(cluster.get("enabled"))
+        enabled = Lrtmp2Client.cluster_enabled_from_health(health)
         return enabled, health, None
 
     @app.route("/")
@@ -528,14 +527,31 @@ def create_app():
             api_errors.append(detect_error)
 
         if not cluster_on and not detect_error:
-            return render_template(
-                CLUSTER_TEMPLATE,
-                cluster_enabled=False,
-                cluster=None,
-                nodes=[],
-                flash_error=flash_error,
-                api_error=None,
-            )
+            try:
+                status = client.cluster_status()
+                if isinstance(status, dict) and status.get("enabled"):
+                    cluster_on = True
+                    api_errors.append(
+                        "Health probe reports standalone but cluster API is enabled."
+                    )
+                else:
+                    return render_template(
+                        CLUSTER_TEMPLATE,
+                        cluster_enabled=False,
+                        cluster=None,
+                        nodes=[],
+                        flash_error=flash_error,
+                        api_error=None,
+                    )
+            except Lrtmp2ApiError:
+                return render_template(
+                    CLUSTER_TEMPLATE,
+                    cluster_enabled=False,
+                    cluster=None,
+                    nodes=[],
+                    flash_error=flash_error,
+                    api_error=None,
+                )
 
         cluster = None
         nodes = []
@@ -573,8 +589,14 @@ def create_app():
         except (TypeError, ValueError):
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
-        # Call the mutation endpoint directly — do not burn a health-probe
-        # timeout before drain/resume/remove when health is stalled.
+        try:
+            status = client.cluster_status()
+            if not (isinstance(status, dict) and status.get("enabled")):
+                session["flash_error"] = "Cluster mutations are unavailable while cluster mode is disabled."
+                return redirect(url_for("cluster_overview"))
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+            return redirect(url_for("cluster_overview"))
         try:
             if action == "drain":
                 client.cluster_drain_node(parsed_id)

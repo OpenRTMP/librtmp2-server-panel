@@ -93,6 +93,9 @@
                     <div class="col-md-4 col-6"><p>Last heartbeat:</p><strong>{{ node.get('last_heartbeat') or 'n/a' }}</strong></div>
                 </div>
                 <div class="d-flex flex-wrap gap-2">
+                    {% set nstate = (node.get('state') or 'unknown')|lower %}
+                    {% set nrole = (node.get('role') or '')|lower %}
+                    {% if nstate not in ['down', 'isolated', 'leaving'] and nrole != 'leader' %}
                     <form method="post" action="{{ url_for('cluster_drain_node', node_id=node.id) }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-warning">Drain</button>
@@ -102,10 +105,11 @@
                         <button type="submit" class="btn btn-sm btn-outline-success">Resume</button>
                     </form>
                     <form method="post" action="{{ url_for('cluster_remove_node', node_id=node.id) }}"
-                          onsubmit="return confirm('Remove node {{ node.get('id') }} from the cluster? This cannot be undone from the panel.');">
+                          class="cluster-remove-form" data-node-id="{{ node.get('id') }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                     </form>
+                    {% endif %}
                 </div>
             </div>
         </div>

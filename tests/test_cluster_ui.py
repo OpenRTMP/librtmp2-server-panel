@@ -558,13 +558,65 @@ def test_cluster_drain_attempts_mutation_when_health_fails(monkeypatch):
         assert mock_client.health.call_count == 0
 
 
+def test_cluster_drain_rejects_when_cluster_status_disabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"cluster": {"enabled": False}}
+        mock_client.cluster_status.return_value = {"enabled": False}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
+        assert r.status_code == 200
+        mock_client.cluster_drain_node.assert_not_called()
+        assert b"Cluster mutations are unavailable" in r.data
+
+
+def test_cluster_overview_requires_login(monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+    application = app_module.create_app()
+    application.config["TESTING"] = True
+    client = application.test_client()
+    r = client.get("/cluster")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
+
+
+def test_cluster_drain_requires_csrf_when_enabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.cluster_status.return_value = {"enabled": True}
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = True
+        client = application.test_client()
+        _login(client)
+
+        r = client.post("/cluster/nodes/2/drain")
+        assert r.status_code == 400
+        mock_client.cluster_drain_node.assert_not_called()
+
+
 def test_cluster_drain_calls_api_even_when_health_says_standalone(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"cluster": {"enabled": False}}
-        mock_client.cluster_drain_node.side_effect = Lrtmp2ApiError("clustering disabled")
+        mock_client.cluster_status.return_value = {"enabled": True, "quorum": True}
+        mock_client.cluster_drain_node.return_value = {"ok": True}
 
         import app as app_module
 
@@ -577,7 +629,6 @@ def test_cluster_drain_calls_api_even_when_health_says_standalone(monkeypatch):
         r = client.post("/cluster/nodes/2/drain", follow_redirects=True)
         assert r.status_code == 200
         mock_client.cluster_drain_node.assert_called_once_with(2)
-        assert b"clustering disabled" in r.data
 
 
 def test_cluster_overview_reads_load_object_metrics(monkeypatch):

@@ -1,5 +1,14 @@
 document.addEventListener('DOMContentLoaded', function () {
     initializeStats();
+    document.querySelectorAll('.cluster-remove-form').forEach((form) => {
+        form.addEventListener('submit', (event) => {
+            const nodeId = form.getAttribute('data-node-id') || '';
+            const message = `Remove node ${nodeId} from the cluster? This cannot be undone from the panel.`;
+            if (!window.confirm(message)) {
+                event.preventDefault();
+            }
+        });
+    });
 });
 
 async function copyToClipboard(element) {
@@ -122,6 +131,7 @@ function loadStats(streamId) {
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
+            const clusterEnabled = statsContainer.getAttribute('data-cluster') === '1';
             // Server puts cluster ownership at the stats root (and may nest a
             // proxied owner payload under `cluster_proxy`). Older panel code
             // expected a nested `data.cluster` object that the API never ships.
@@ -147,6 +157,9 @@ function loadStats(streamId) {
                 })
                 .join('');
             const clusterRows = (() => {
+                if (!clusterEnabled) {
+                    return '';
+                }
                 const tagged = data.owner_node_id !== undefined
                     || data.cluster_proxy !== undefined
                     || Object.keys(playersByNode).length > 0
