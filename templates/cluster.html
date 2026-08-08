@@ -1,0 +1,125 @@
+{% extends 'base.html' %}
+{% block title %}Cluster — librtmp2 Panel{% endblock %}
+{% block content %}
+<h1>Cluster</h1>
+<a href="{{ url_for('index') }}" class="btn btn-outline-light mb-3">Back to Streams</a>
+<form method="post" action="{{ url_for('logout') }}" class="d-inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
+</form>
+
+{% if flash_error is defined and flash_error %}
+<div class="alert alert-danger">{{ flash_error }}</div>
+{% endif %}
+{% if api_error is defined and api_error %}
+<div class="alert alert-danger">{{ api_error }}</div>
+{% endif %}
+
+{% if not cluster_enabled and not (api_error is defined and api_error) %}
+<div class="alert alert-secondary">
+    The connected <code>librtmp2-server</code> is running in standalone mode.
+    Cluster overview is unavailable. The panel does not participate in Raft and
+    is not required for cluster availability.
+</div>
+{% elif cluster_enabled %}
+{% set c = cluster or {} %}
+{% set load = c.get('load') if c.get('load') is mapping else {} %}
+<div class="mb-3">
+    {% if c.get('quorum') is none %}
+    <span class="badge bg-secondary">Quorum unknown</span>
+    {% elif c.get('quorum') %}
+    <span class="badge bg-success">Quorum OK</span>
+    {% else %}
+    <span class="badge bg-danger">Quorum lost</span>
+    {% endif %}
+    {% set state = (c.get('state') or 'unknown')|upper %}
+    <span class="badge cluster-state-{{ (c.get('state') or 'unknown')|lower }}">{{ state }}</span>
+    <span class="badge bg-secondary">Role: {{ c.get('role') or 'n/a' }}</span>
+</div>
+
+<div class="mt-2 mb-4 p-3 bg-dark bg-opacity-50 rounded">
+    <h5 class="mb-3">Cluster status</h5>
+    <div class="row g-2">
+        <div class="col-md-4 col-6"><p>Cluster ID:</p><strong>{{ c.get('cluster_id') or 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>This node:</p><strong>{{ c.get('node_name') or c.get('node_id') or 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Leader:</p><strong>{{ c.get('leader_id') if c.get('leader_id') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Term:</p><strong>{{ c.get('term') if c.get('term') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Voters:</p><strong>{{ c.get('voter_count') if c.get('voter_count') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Learners:</p><strong>{{ c.get('learner_count') if c.get('learner_count') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Healthy nodes:</p><strong>{{ c.get('healthy_nodes') if c.get('healthy_nodes') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Unavailable:</p><strong>{{ c.get('unavailable_nodes') if c.get('unavailable_nodes') is not none else 'n/a' }}</strong></div>
+        <div class="col-md-4 col-6"><p>Publishers:</p><strong>{{ load.get('total_publishers') if load.get('total_publishers') is not none else (c.get('total_publishers') if c.get('total_publishers') is not none else 'n/a') }}</strong></div>
+        <div class="col-md-4 col-6"><p>Players:</p><strong>{{ load.get('total_players') if load.get('total_players') is not none else (c.get('total_players') if c.get('total_players') is not none else 'n/a') }}</strong></div>
+        <div class="col-md-4 col-6"><p>Ingress:</p><strong>{% set rx = load.get('rx_mbps') if load.get('rx_mbps') is not none else (load.get('total_rx_mbps') if load.get('total_rx_mbps') is not none else c.get('total_rx_mbps')) %}{% if rx is not none %}{{ '%.1f'|format(rx) }} Mbps{% else %}n/a{% endif %}</strong></div>
+        <div class="col-md-4 col-6"><p>Egress:</p><strong>{% set tx = load.get('tx_mbps') if load.get('tx_mbps') is not none else (load.get('total_tx_mbps') if load.get('total_tx_mbps') is not none else c.get('total_tx_mbps')) %}{% if tx is not none %}{{ '%.1f'|format(tx) }} Mbps{% else %}n/a{% endif %}</strong></div>
+    </div>
+</div>
+
+<h5 class="mb-3">Nodes</h5>
+{% if nodes %}
+<div class="accordion accordion-flush" id="nodeAccordion">
+    {% for node in nodes %}
+    {% set nstate = (node.get('state') or 'unknown')|lower %}
+    <div class="accordion-item bg-dark">
+        <h2 class="accordion-header" id="nodeHeading{{ loop.index }}">
+            <button class="accordion-button collapsed bg-dark text-light" type="button" data-bs-toggle="collapse"
+                data-bs-target="#nodeCollapse{{ loop.index }}">
+                <strong>{{ node.get('name') or ('node-' ~ node.get('id')) }}</strong>
+                &nbsp;<span class="text-muted">(id {{ node.get('id') }})</span>
+                &nbsp;<span class="badge cluster-state-{{ nstate }}">{{ nstate|upper }}</span>
+                {% if node.get('role') %}
+                &nbsp;<span class="badge bg-secondary">{{ node.get('role') }}</span>
+                {% endif %}
+            </button>
+        </h2>
+        <div id="nodeCollapse{{ loop.index }}" class="accordion-collapse collapse" data-bs-parent="#nodeAccordion">
+            <div class="accordion-body">
+                <div class="row g-2 mb-3">
+                    <div class="col-md-4 col-6"><p>Voter:</p><strong>{{ 'yes' if node.get('voter') else 'no (learner)' }}</strong></div>
+                    <div class="col-md-4 col-6"><p>Healthy:</p><strong>{{ 'yes' if node.get('healthy') else 'no' }}</strong></div>
+                    <div class="col-md-4 col-6"><p>RX:</p><strong>{% if node.get('rx_mbps') is not none %}{{ '%.1f'|format(node.get('rx_mbps')) }} Mbps{% else %}n/a{% endif %}</strong></div>
+                    <div class="col-md-4 col-6"><p>TX:</p><strong>{% if node.get('tx_mbps') is not none %}{{ '%.1f'|format(node.get('tx_mbps')) }} Mbps{% else %}n/a{% endif %}</strong></div>
+                    <div class="col-md-4 col-6"><p>Capacity:</p><strong>{% if node.get('capacity_mbps') is not none %}{{ node.get('capacity_mbps') }} Mbps{% else %}n/a{% endif %}</strong></div>
+                    <div class="col-md-4 col-6">
+                        <p>Utilization:</p>
+                        <strong>
+                        {% if node.get('capacity_mbps') and node.get('tx_mbps') is not none and node.get('capacity_mbps') > 0 %}
+                        {{ '%.0f'|format((node.get('tx_mbps') / node.get('capacity_mbps')) * 100) }}%
+                        {% else %}n/a{% endif %}
+                        </strong>
+                    </div>
+                    <div class="col-md-4 col-6"><p>Publishers:</p><strong>{{ node.get('publishers') if node.get('publishers') is not none else 'n/a' }}</strong></div>
+                    <div class="col-md-4 col-6"><p>Players:</p><strong>{{ node.get('players') if node.get('players') is not none else 'n/a' }}</strong></div>
+                    <div class="col-md-4 col-6"><p>Last heartbeat:</p><strong>{{ node.get('last_heartbeat') or 'n/a' }}</strong></div>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                    {% set nstate = (node.get('state') or 'unknown')|lower %}
+                    {% set nrole = (node.get('role') or '')|lower %}
+                    {% if nstate not in ['down', 'isolated', 'leaving'] and nrole != 'leader' %}
+                    <form method="post" action="{{ url_for('cluster_drain_node', node_id=node.id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-outline-warning">Drain</button>
+                    </form>
+                    <form method="post" action="{{ url_for('cluster_resume_node', node_id=node.id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-outline-success">Resume</button>
+                    </form>
+                    {% endif %}
+                    {% if nrole != 'leader' %}
+                    <form method="post" action="{{ url_for('cluster_remove_node', node_id=node.id) }}"
+                          class="cluster-remove-form" data-node-id="{{ node.get('id') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<p class="text-muted">No nodes reported.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

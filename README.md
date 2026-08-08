@@ -169,6 +169,44 @@ python3 app.py
 - Blurred key display with explicit copy actions
 - Login protection, CSRF protection, rate limiting, and encrypted key storage
 - RTMP and conditional RTMPS URL generation based on live server health data
+- Optional cluster overview when the connected server enables clustering
+
+## Cluster-aware operation
+
+The panel remains a thin REST client. It does **not** participate in Raft and is
+**not** required for cluster availability.
+
+### Standalone (default)
+
+If `/api/v1/health` reports no cluster block, or `cluster.enabled` is `false`,
+the panel behaves exactly as before. Cluster navigation stays hidden.
+
+Configure a single `LRTMP2_API_URL` as usual. No cluster-specific panel settings
+are required.
+
+### Cluster mode
+
+When health reports `cluster.enabled=true`, the panel shows:
+
+- A **Cluster** page with quorum status, leader, voters/learners, totals, and
+  per-node READY / DRAINING / DOWN / ISOLATED state
+- Node actions **Drain**, **Resume**, and **Remove** (Remove asks for confirmation;
+  the server remains authoritative for quorum safety)
+- Per-stream placement: owner node, ownership epoch, subscribed/standby nodes,
+  cluster player count
+- Aggregate cluster fields in live stats when the server provides them
+
+Connect the panel to **any healthy synchronized node**. The server forwards
+durable admin mutations internally; you do not need one panel URL per node.
+
+### Node failure notes
+
+- If the configured API node becomes unreachable, the panel shows the same clear
+  API errors as in standalone mode.
+- A Raft leader change does not require panel reconfiguration.
+- Publisher ownership is a server concept: the panel only displays it. Hard
+  owner failure still requires the publisher client to reconnect to the public
+  RTMP endpoint.
 
 ## Support and contributing
 

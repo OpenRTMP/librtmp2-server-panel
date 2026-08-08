@@ -16,12 +16,20 @@ from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
 from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
 from session_store import SessionBackendUnavailable, create_session_store
 
+# Captured at import time so tests that `patch("app.Lrtmp2Client")` to mock
+# the API client (the pattern used throughout this test suite) don't also
+# replace this static, data-only helper with a MagicMock — an unconfigured
+# MagicMock call is truthy, which would make every cluster-enabled check
+# below always report "enabled" regardless of the mocked health payload.
+_cluster_enabled_from_health = Lrtmp2Client.cluster_enabled_from_health
+
 
 STREAM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
 MIN_ACCESS_KEY_LEN = 32
+CLUSTER_TEMPLATE = "cluster.html"
 
 ACCESS_KEY_HELP = (
     f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
@@ -317,24 +325,27 @@ def create_app():
         except SessionBackendUnavailable:
             return True
 
-    def rtmps_health():
-        """Return RTMPS availability and the public RTMPS port to advertise.
+    def rtmps_from_health(health):
+        """Derive RTMPS flags from an already-fetched /health payload.
 
-        RTMPS enablement is read live from /api/v1/health, but URLs must use
-        the panel's public port config first. That preserves Docker/NAT/reverse
-        proxy mappings such as public 443 -> server bind 1936. The server's
-        reported bind port is only used as a fallback when the public config is
-        empty or missing.
+        URLs must use the panel's public port config first. That preserves
+        Docker/NAT/reverse proxy mappings such as public 443 -> server bind
+        1936. The server's reported bind port is only used as a fallback when
+        the public config is empty or missing.
         """
         configured_port = str(app.config.get("LRTMP2_RTMPS_PORT") or "")
-        try:
-            health = client.health()
-        except Lrtmp2ApiError:
-            return False, configured_port or "1936"
-        if not health.get("rtmps_enabled"):
+        if not isinstance(health, dict) or not health.get("rtmps_enabled"):
             return False, configured_port or "1936"
         reported_port = str(health.get("rtmps_port") or "")
         return True, configured_port or reported_port or "1936"
+
+    def rtmps_health():
+        """Fetch /health and return RTMPS availability plus public port."""
+        try:
+            health = client.health()
+        except Lrtmp2ApiError:
+            return rtmps_from_health(None)
+        return rtmps_from_health(health)
 
     def build_urls(stream, rtmps_on, rtmps_port):
         domain = _format_url_host(app.config["LRTMP2_DOMAIN"])
@@ -447,29 +458,182 @@ def create_app():
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
+    def detect_cluster():
+        """Return (enabled, health_or_none, detect_error_or_none).
+
+        Health failures are not treated as standalone — callers must surface
+        ``detect_error`` separately from a confirmed ``cluster.enabled=false``.
+        """
+        try:
+            health = client.health()
+        except Lrtmp2ApiError as exc:
+            return False, None, str(exc)
+        enabled = _cluster_enabled_from_health(health)
+        return enabled, health, None
+
     @app.route("/")
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
+        # Fail-fast on stream listing before the health probe so an unresponsive
+        # API host does not burn two client timeouts on every page load.
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
+            # Keep Cluster discoverable when streams fail but cluster APIs may
+            # still work — same unknown-state pattern as health-detection failure.
             return render_template(
                 "index.html",
                 streams=[],
                 api_error=str(exc),
                 flash_error=flash_error,
                 rtmps_enabled=False,
+                cluster_enabled=False,
+                cluster_status_unknown=True,
+                show_cluster_nav=True,
             )
-        rtmps_on, rtmps_port = rtmps_health()
+        cluster_on, health, detect_error = detect_cluster()
+        rtmps_on, rtmps_port = rtmps_from_health(health)
+        cluster_by_stream = {}
+        api_error = detect_error
+        # Health outage must not look like confirmed standalone: keep Cluster
+        # nav reachable and surface the detection failure.
+        cluster_status_unknown = bool(detect_error)
+        show_cluster = cluster_on or cluster_status_unknown
+        # Probe placement when health is unknown too — cluster/streams may still
+        # be healthy (same partial-outage pattern as the cluster overview).
+        if cluster_on or cluster_status_unknown:
+            try:
+                for entry in client.cluster_streams() or []:
+                    sid = entry.get("stream_id") or entry.get("id")
+                    if sid:
+                        cluster_by_stream[sid] = entry
+                if cluster_status_unknown:
+                    cluster_on = True
+                    cluster_status_unknown = False
+            except Lrtmp2ApiError as exc:
+                api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
+                cluster_by_stream = {}
         for stream in streams:
             stream.update(build_urls(stream, rtmps_on, rtmps_port))
+            if cluster_on:
+                stream["cluster"] = cluster_by_stream.get(stream.get("id"), {})
         return render_template(
             "index.html",
             streams=streams,
+            api_error=api_error,
             flash_error=flash_error,
             rtmps_enabled=rtmps_on,
+            cluster_enabled=cluster_on,
+            cluster_status_unknown=cluster_status_unknown,
+            show_cluster_nav=show_cluster,
         )
+
+    @app.route("/cluster", methods=["GET"])
+    @login_required
+    def cluster_overview():
+        flash_error = session.pop("flash_error", None)
+        cluster_on, health, detect_error = detect_cluster()
+        api_errors = []
+        if detect_error:
+            api_errors.append(detect_error)
+
+        cluster = None
+        if not cluster_on and not detect_error:
+            try:
+                status = client.cluster_status()
+                if isinstance(status, dict) and status.get("enabled"):
+                    cluster_on = True
+                    cluster = status
+                    api_errors.append(
+                        "Health probe reports standalone but cluster API is enabled."
+                    )
+                else:
+                    return render_template(
+                        CLUSTER_TEMPLATE,
+                        cluster_enabled=False,
+                        cluster=None,
+                        nodes=[],
+                        flash_error=flash_error,
+                        api_error=None,
+                    )
+            except Lrtmp2ApiError:
+                return render_template(
+                    CLUSTER_TEMPLATE,
+                    cluster_enabled=False,
+                    cluster=None,
+                    nodes=[],
+                    flash_error=flash_error,
+                    api_error=None,
+                )
+
+        nodes = []
+        if cluster_on or detect_error:
+            if cluster is None:
+                try:
+                    cluster = client.cluster_status()
+                except Lrtmp2ApiError as exc:
+                    api_errors.append(str(exc))
+                    cluster = (health or {}).get("cluster")
+            try:
+                nodes = client.cluster_nodes() or []
+            except Lrtmp2ApiError as exc:
+                api_errors.append(str(exc))
+
+        # Prefer the authoritative /cluster status `enabled` flag over the
+        # earlier health probe (health may be stale if clustering was just
+        # disabled). Only fall back to presence heuristics when health failed
+        # and the status payload has no explicit enabled field.
+        if isinstance(cluster, dict) and "enabled" in cluster:
+            cluster_enabled = bool(cluster.get("enabled"))
+        elif not cluster_on and detect_error:
+            cluster_enabled = bool(cluster) or bool(nodes)
+        else:
+            cluster_enabled = cluster_on
+
+        api_error = "; ".join(api_errors) if api_errors else None
+        return render_template(
+            CLUSTER_TEMPLATE,
+            cluster_enabled=cluster_enabled,
+            cluster=cluster,
+            nodes=nodes,
+            flash_error=flash_error,
+            api_error=api_error,
+        )
+
+    def _cluster_node_action(node_id, action):
+        try:
+            parsed_id = int(str(node_id), 10)
+        except (TypeError, ValueError):
+            session["flash_error"] = "Invalid node ID"
+            return redirect(url_for("cluster_overview"))
+        try:
+            if action == "drain":
+                client.cluster_drain_node(parsed_id)
+            elif action == "resume":
+                client.cluster_resume_node(parsed_id)
+            elif action == "remove":
+                client.cluster_remove_node(parsed_id)
+            else:
+                session["flash_error"] = "Unknown cluster action"
+        except Lrtmp2ApiError as exc:
+            session["flash_error"] = str(exc)
+        return redirect(url_for("cluster_overview"))
+
+    @app.route("/cluster/nodes/<node_id>/drain", methods=["POST"])
+    @login_required
+    def cluster_drain_node(node_id):
+        return _cluster_node_action(node_id, "drain")
+
+    @app.route("/cluster/nodes/<node_id>/resume", methods=["POST"])
+    @login_required
+    def cluster_resume_node(node_id):
+        return _cluster_node_action(node_id, "resume")
+
+    @app.route("/cluster/nodes/<node_id>/remove", methods=["POST"])
+    @login_required
+    def cluster_remove_node(node_id):
+        return _cluster_node_action(node_id, "remove")
 
     @app.route("/streams/new", methods=["GET", "POST"])
     @login_required

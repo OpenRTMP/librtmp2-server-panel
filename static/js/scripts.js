@@ -1,5 +1,14 @@
 document.addEventListener('DOMContentLoaded', function () {
     initializeStats();
+    document.querySelectorAll('.cluster-remove-form').forEach((form) => {
+        form.addEventListener('submit', (event) => {
+            const nodeId = form.getAttribute('data-node-id') || '';
+            const message = `Remove node ${nodeId} from the cluster? This cannot be undone from the panel.`;
+            if (!window.confirm(message)) {
+                event.preventDefault();
+            }
+        });
+    });
 });
 
 async function copyToClipboard(element) {
@@ -122,6 +131,52 @@ function loadStats(streamId) {
             const height = Number(video.height);
             const fps = Number(video.fps);
             const players = Number((data.summary || {}).players);
+            const clusterEnabled = statsContainer.getAttribute('data-cluster') === '1';
+            // Server puts cluster ownership at the stats root (and may nest a
+            // proxied owner payload under `cluster_proxy`). Older panel code
+            // expected a nested `data.cluster` object that the API never ships.
+            const clusterProxy = (data.cluster_proxy && typeof data.cluster_proxy === 'object')
+                ? data.cluster_proxy
+                : {};
+            const ownerNode = (data.owner_node_id !== undefined && data.owner_node_id !== null)
+                ? data.owner_node_id
+                : clusterProxy.owner_node_id;
+            const relayRaw = (data.relay_mbps !== undefined && data.relay_mbps !== null)
+                ? data.relay_mbps
+                : clusterProxy.relay_mbps;
+            const relayMbps = (relayRaw === null || relayRaw === undefined)
+                ? NaN
+                : Number(relayRaw);
+            const playersByNode = data.players_by_node
+                || clusterProxy.players_by_node
+                || {};
+            const playerByNodeRows = Object.keys(playersByNode)
+                .map((nid) => {
+                    const count = Number(playersByNode[nid]);
+                    return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
+                })
+                .join('');
+            const clusterRows = (() => {
+                if (!clusterEnabled) {
+                    return '';
+                }
+                const tagged = data.owner_node_id !== undefined
+                    || data.cluster_proxy !== undefined
+                    || Object.keys(playersByNode).length > 0
+                    || Number.isFinite(relayMbps);
+                if (!tagged) {
+                    return '';
+                }
+                const ownerLabel = (ownerNode === undefined || ownerNode === null)
+                    ? 'unavailable'
+                    : escapeHtml(ownerNode);
+                const relayLabel = Number.isFinite(relayMbps)
+                    ? `${relayMbps.toFixed(1)} Mbps`
+                    : 'n/a';
+                return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${ownerLabel}</strong></div>
+                   <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
+                   ${playerByNodeRows}`;
+            })();
             const playerRows = (data.players || [])
                 .map((pl, index) => {
                     const plRtt = Number(pl.rtt_ms);
@@ -164,6 +219,7 @@ function loadStats(streamId) {
                             <p>Players:</p>
                             <strong>${Number.isFinite(players) ? players : 0}</strong>
                         </div>
+                        ${clusterRows}
                         ${playerRows}
                     </div>
                 </div>
