@@ -1,17 +1,28 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-07-15
+Last scanned: lrtmp2_client.py — 2026-08-08
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-08 lrtmp2_client.py pass)
+
+- No critical bugs found. Full review of all eight client methods
+  (`health`, `list_streams`, `create_stream`, `delete_stream`, `create_player`,
+  `delete_player`, `stream_stats`, `stream_stats_by_id`) and every `app.py`
+  call site. Verified: `delete_stream` 202 polling (35s default, raises when
+  stream still listed); network/JSON errors wrapped as `Lrtmp2ApiError`;
+  path segments URL-encoded; Bearer token only in `Authorization` header;
+  per-call timeouts; no shared mutable request state; `stream_stats()` unused
+  by panel (uses `stream_stats_by_id` with Bearer auth).
 
 ## Findings (2026-07-15 app.py pass)
 
