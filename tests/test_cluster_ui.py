@@ -209,6 +209,49 @@ def test_cluster_overview_standalone_message(monkeypatch):
         assert b"standalone mode" in r.data
 
 
+def test_cluster_overview_status_error_not_standalone(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"status": "ok", "cluster": {"enabled": False}}
+        mock_client.cluster_status.side_effect = Lrtmp2ApiError("cluster_status failed")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"cluster_status failed" in r.data
+        assert b"standalone mode" not in r.data
+
+
+def test_cluster_overview_health_on_status_disabled(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "status": "ok",
+            "cluster": {"enabled": True, "quorum": True},
+        }
+        mock_client.cluster_status.return_value = {"enabled": False}
+        mock_client.cluster_nodes.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"standalone mode" in r.data
+
+
 def test_cluster_overview_renders_nodes_and_states(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value

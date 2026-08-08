@@ -96,14 +96,18 @@
                     {% set nstate = (node.get('state') or 'unknown')|lower %}
                     {% set nrole = (node.get('role') or '')|lower %}
                     {% if nstate not in ['down', 'isolated', 'leaving'] and nrole != 'leader' %}
+                    {% if nstate not in ['draining'] %}
                     <form method="post" action="{{ url_for('cluster_drain_node', node_id=node.id) }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-warning">Drain</button>
                     </form>
+                    {% endif %}
+                    {% if nstate in ['draining', 'down'] %}
                     <form method="post" action="{{ url_for('cluster_resume_node', node_id=node.id) }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-success">Resume</button>
                     </form>
+                    {% endif %}
                     <form method="post" action="{{ url_for('cluster_remove_node', node_id=node.id) }}"
                           class="cluster-remove-form" data-node-id="{{ node.get('id') }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

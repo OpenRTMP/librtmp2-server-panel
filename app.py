@@ -550,14 +550,14 @@ def create_app():
                         flash_error=flash_error,
                         api_error=None,
                     )
-            except Lrtmp2ApiError:
+            except Lrtmp2ApiError as exc:
                 return render_template(
                     CLUSTER_TEMPLATE,
                     cluster_enabled=False,
                     cluster=None,
                     nodes=[],
                     flash_error=flash_error,
-                    api_error=None,
+                    api_error=str(exc),
                 )
 
         cluster = None
@@ -574,7 +574,10 @@ def create_app():
                 api_errors.append(str(exc))
 
         cluster_enabled = cluster_on
-        if not cluster_on and detect_error:
+        if cluster_on:
+            if isinstance(cluster, dict) and "enabled" in cluster:
+                cluster_enabled = bool(cluster.get("enabled"))
+        elif detect_error:
             if isinstance(cluster, dict) and "enabled" in cluster:
                 cluster_enabled = bool(cluster.get("enabled"))
             else:
@@ -594,6 +597,9 @@ def create_app():
         try:
             parsed_id = int(str(node_id), 10)
         except (TypeError, ValueError):
+            session["flash_error"] = "Invalid node ID"
+            return redirect(url_for("cluster_overview"))
+        if parsed_id <= 0:
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
         try:
