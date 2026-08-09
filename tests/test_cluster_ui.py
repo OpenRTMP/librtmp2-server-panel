@@ -210,6 +210,8 @@ def test_cluster_overview_standalone_message(monkeypatch):
 
 
 def test_cluster_overview_status_error_not_standalone(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"status": "ok", "cluster": {"enabled": False}}
@@ -360,6 +362,19 @@ def test_cluster_overview_renders_nodes_and_states(monkeypatch):
                 "publishers": 0,
                 "players": 0,
             },
+            {
+                "id": 5,
+                "name": "node-5",
+                "role": "follower",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+                "rx_mbps": 5.0,
+                "tx_mbps": 10.0,
+                "capacity_mbps": 1000,
+                "publishers": 1,
+                "players": 2,
+            },
         ]
 
         import app as app_module
@@ -379,6 +394,7 @@ def test_cluster_overview_renders_nodes_and_states(monkeypatch):
         assert b"DRAINING" in r.data
         assert b"DOWN" in r.data
         assert b"ISOLATED" in r.data
+        assert b"node-5" in r.data
         assert b"Drain" in r.data
         assert b"Resume" in r.data
         assert b"Remove" in r.data
@@ -726,7 +742,7 @@ def test_cluster_resume_requires_login(monkeypatch):
 
     monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
     application = app_module.create_app()
-    application.config["TESTING"] = True
+    configure_testing_app(application)
     client = application.test_client()
     r = client.post("/cluster/nodes/2/resume")
     assert r.status_code == 302
@@ -738,7 +754,7 @@ def test_cluster_remove_requires_login(monkeypatch):
 
     monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
     application = app_module.create_app()
-    application.config["TESTING"] = True
+    configure_testing_app(application)
     client = application.test_client()
     r = client.post("/cluster/nodes/3/remove")
     assert r.status_code == 302
