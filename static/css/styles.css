@@ -52,3 +52,24 @@ body.dark {
     margin-top: 0.5rem;
     margin-bottom: 0.5rem;
 }
+.cluster-state-ready {
+    background-color: #198754 !important;
+}
+.cluster-state-draining {
+    background-color: #fd7e14 !important;
+}
+.cluster-state-down {
+    background-color: #dc3545 !important;
+}
+.cluster-state-isolated {
+    background-color: #6f42c1 !important;
+}
+.cluster-state-joining,
+.cluster-state-learner,
+.cluster-state-leaving {
+    background-color: #0dcaf0 !important;
+    color: #111 !important;
+}
+.cluster-state-unknown {
+    background-color: #6c757d !important;
+}

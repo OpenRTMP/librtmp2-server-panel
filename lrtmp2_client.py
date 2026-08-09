@@ -182,3 +182,73 @@ class Lrtmp2Client:
             "stream_stats_by_id",
             headers=self._headers(),
         )
+
+    def cluster_status(self):
+        """Cluster overview. Raises if the server has no cluster API."""
+        return self._request_json(
+            requests.get,
+            f"{self.base_url}/api/v1/cluster",
+            "cluster_status",
+            headers=self._headers(),
+        )
+
+    def cluster_nodes(self):
+        return self._request_json(
+            requests.get,
+            f"{self.base_url}/api/v1/cluster/nodes",
+            "cluster_nodes",
+            headers=self._headers(),
+        )
+
+    def cluster_streams(self):
+        return self._request_json(
+            requests.get,
+            f"{self.base_url}/api/v1/cluster/streams",
+            "cluster_streams",
+            headers=self._headers(),
+        )
+
+    def cluster_drain_node(self, node_id):
+        return self._request_json(
+            requests.post,
+            f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}/drain",
+            "cluster_drain_node",
+            headers=self._headers(),
+        )
+
+    def cluster_resume_node(self, node_id):
+        return self._request_json(
+            requests.post,
+            f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}/resume",
+            "cluster_resume_node",
+            headers=self._headers(),
+        )
+
+    def cluster_remove_node(self, node_id):
+        resp = self._request(
+            requests.delete,
+            f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}",
+            "cluster_remove_node",
+            headers=self._headers(),
+        )
+        # Do not treat a bare 404 as success — pre-cluster servers and missing
+        # routes also 404, which would make Remove look successful while
+        # nothing changed. Drain/resume already surface 404 as errors.
+        if not resp.ok:
+            raise _api_error(resp, "cluster_remove_node")
+        if not resp.content:
+            return None
+        return _parse_json(resp, "cluster_remove_node")
+
+    @staticmethod
+    def cluster_enabled_from_health(health):
+        """Detect cluster mode from a health payload.
+
+        Missing or false ``cluster.enabled`` means standalone (backward compatible).
+        """
+        if not isinstance(health, dict):
+            return False
+        cluster = health.get("cluster")
+        if not isinstance(cluster, dict):
+            return False
+        return bool(cluster.get("enabled"))

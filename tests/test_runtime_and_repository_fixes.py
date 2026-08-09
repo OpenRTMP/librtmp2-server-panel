@@ -113,6 +113,12 @@ def test_stats_polling_is_limited_to_visible_stream_and_times_out():
     assert "controller.abort()" in scripts
     assert "clearTimeout(timeoutId)" in scripts
     assert "delete statsContainer.dataset.loading" in scripts
+    assert "relayRaw === null || relayRaw === undefined" in scripts
+    assert "data.owner_node_id !== undefined && data.owner_node_id !== null" in scripts
+    assert "data.cluster_proxy" in scripts
+    assert "data.cluster ||" not in scripts
+    assert "'n/a'" in scripts or '"n/a"' in scripts
+    assert "0.0 Mbps" not in scripts
 
 
 def test_https_csrf_keeps_same_origin_referrer():
