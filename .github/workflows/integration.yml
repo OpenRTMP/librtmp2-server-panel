@@ -22,6 +22,7 @@ jobs:
         with:
           repository: OpenRTMP/librtmp2-server
           # Pin to server PR until Alpine/musl Docker fix lands on main (#151).
+          # Re-check after openssl-libs-static was added for the musl link.
           ref: fix/bug-hunter-cluster-admin-drain
           path: librtmp2-server
           persist-credentials: false
