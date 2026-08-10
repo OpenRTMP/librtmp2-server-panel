@@ -13,7 +13,7 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-08-09
+## [0.1.6] — 2026-08-10
 
 ### Added
 - Optional cluster-aware management UI when the connected `librtmp2-server`
@@ -63,6 +63,7 @@ only begin at a future `1.0.0`.
 ### Changed
 - Integration CI always checks out `librtmp2-server` `main` (no same-named
   feature-branch coupling).
+- Release version `0.1.5` → `0.1.6` (cluster UI + detection fixes).
 
 ## [0.1.5] — 2026-07-25
 
@@ -201,8 +202,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.2.0
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.2...v0.1.3
