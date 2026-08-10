@@ -351,10 +351,10 @@ def create_app():
         domain = _format_url_host(app.config["LRTMP2_DOMAIN"])
         port = app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
-        publish_url = f"rtmp://{domain}:{port}/{app_name}"
+        publish_url = f"rtmp://{domain}:{port}/{app_name}"  # nosonar python:S5332
         players = stream.get("players") or []
         for player in players:
-            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
             if rtmps_on:
                 player["play_url_tls"] = (
                     f"rtmps://{domain}:{rtmps_port}/{app_name}/{player.get('play_key', '')}"
@@ -367,7 +367,7 @@ def create_app():
         urls = {
             "publish_url": publish_url,
             "publish_key": stream.get("publish_key", ""),
-            "play_url": f"rtmp://{domain}:{port}/{app_name}/{first_play_key}",
+            "play_url": f"rtmp://{domain}:{port}/{app_name}/{first_play_key}",  # nosonar python:S5332
             "play_key": first_play_key,
             "rtmps_enabled": rtmps_on,
             "stats_url": (
