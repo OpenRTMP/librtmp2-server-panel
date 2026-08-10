@@ -1,17 +1,31 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-07-15
+Last scanned: lrtmp2_client.py — 2026-08-10
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-10 lrtmp2_client.py pass)
+
+- No critical bugs found. Full pass on all client methods (`health`, `list_streams`,
+  `create_stream`, `delete_stream`, `create_player`, `delete_player`,
+  `stream_stats`, `stream_stats_by_id`, cluster status/nodes/streams/drain/resume/remove,
+  `cluster_enabled_from_health`). Traced caller chains in `app.py` for every method.
+- `delete_stream()` 202 polling: verified against current librtmp2-server source — stream
+  stays in `GET /api/v1/streams` until `finalize_delete_stream` succeeds, so polling
+  on id disappearance is the correct completion signal; 35s client timeout surfaces
+  incomplete deletes as `Lrtmp2ApiError` (conservative vs server's indefinite drain).
+- `cluster_remove_node()` correctly rejects bare 404 (pre-cluster / missing route).
+- Network/JSON/malformed-response paths uniformly raise `Lrtmp2ApiError`; path segments
+  are URL-encoded; Bearer token only in Authorization header.
 
 ## Findings (2026-07-15 app.py pass)
 
