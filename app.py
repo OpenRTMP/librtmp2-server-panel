@@ -475,22 +475,22 @@ def create_app():
     @login_required
     def index():
         flash_error = session.pop("flash_error", None)
-        # Fail-fast on stream listing before the health probe so an unresponsive
-        # API host does not burn two client timeouts on every page load.
         try:
             streams = client.list_streams()
         except Lrtmp2ApiError as exc:
-            # Keep Cluster discoverable when streams fail but cluster APIs may
-            # still work — same unknown-state pattern as health-detection failure.
+            # Resolve cluster via health so confirmed standalone does not keep
+            # a Cluster nav link. Health failure stays "unknown" (nav stays).
+            cluster_on, _, detect_error = detect_cluster()
+            cluster_status_unknown = bool(detect_error)
             return render_template(
                 "index.html",
                 streams=[],
                 api_error=str(exc),
                 flash_error=flash_error,
                 rtmps_enabled=False,
-                cluster_enabled=False,
-                cluster_status_unknown=True,
-                show_cluster_nav=True,
+                cluster_enabled=cluster_on,
+                cluster_status_unknown=cluster_status_unknown,
+                show_cluster_nav=cluster_on or cluster_status_unknown,
             )
         cluster_on, health, detect_error = detect_cluster()
         rtmps_on, rtmps_port = rtmps_from_health(health)
@@ -499,18 +499,23 @@ def create_app():
         # Health outage must not look like confirmed standalone: keep Cluster
         # nav reachable and surface the detection failure.
         cluster_status_unknown = bool(detect_error)
+        # Standalone also serves /cluster/streams (null ownership). Never treat
+        # that endpoint succeeding as proof of cluster mode — ask /cluster.
+        if cluster_status_unknown:
+            try:
+                status = client.cluster_status()
+                if isinstance(status, dict) and "enabled" in status:
+                    cluster_on = bool(status.get("enabled"))
+                    cluster_status_unknown = False
+            except Lrtmp2ApiError as exc:
+                api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
         show_cluster = cluster_on or cluster_status_unknown
-        # Probe placement when health is unknown too — cluster/streams may still
-        # be healthy (same partial-outage pattern as the cluster overview).
-        if cluster_on or cluster_status_unknown:
+        if cluster_on:
             try:
                 for entry in client.cluster_streams() or []:
                     sid = entry.get("stream_id") or entry.get("id")
                     if sid:
                         cluster_by_stream[sid] = entry
-                if cluster_status_unknown:
-                    cluster_on = True
-                    cluster_status_unknown = False
             except Lrtmp2ApiError as exc:
                 api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
                 cluster_by_stream = {}
@@ -557,14 +562,14 @@ def create_app():
                         flash_error=flash_error,
                         api_error=None,
                     )
-            except Lrtmp2ApiError:
+            except Lrtmp2ApiError as exc:
                 return render_template(
                     CLUSTER_TEMPLATE,
                     cluster_enabled=False,
                     cluster=None,
                     nodes=[],
                     flash_error=flash_error,
-                    api_error=None,
+                    api_error=str(exc),
                 )
 
         nodes = []
