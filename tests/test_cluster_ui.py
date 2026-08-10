@@ -40,8 +40,32 @@ def test_index_lists_streams_before_health(monkeypatch):
         r = client.get("/")
         assert r.status_code == 200
         assert b"streams down" in r.data
-        assert call_order == ["list_streams"]
-        assert mock_client.health.call_count == 0
+        assert call_order == ["list_streams", "health"]
+        assert mock_client.health.call_count == 1
+        assert b'href="/cluster"' not in r.data
+        assert b"Cluster status unavailable" not in r.data
+        assert b"Cluster mode" not in r.data
+
+
+def test_index_streams_fail_keeps_cluster_nav_when_health_unknown(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.list_streams.side_effect = Lrtmp2ApiError("streams down")
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"streams down" in r.data
         assert b'href="/cluster"' in r.data
         assert b"Cluster status unavailable" in r.data
 
@@ -53,6 +77,7 @@ def test_index_surfaces_cluster_detection_failure(monkeypatch):
         mock_client = mock_client_cls.return_value
         mock_client.list_streams.return_value = []
         mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_status.side_effect = Lrtmp2ApiError("cluster_status down")
         mock_client.cluster_streams.side_effect = Lrtmp2ApiError("cluster_streams down")
 
         import app as app_module
@@ -66,7 +91,7 @@ def test_index_surfaces_cluster_detection_failure(monkeypatch):
         r = client.get("/")
         assert r.status_code == 200
         assert b"health timeout" in r.data
-        assert b"cluster_streams down" in r.data
+        assert b"cluster_status down" in r.data
         assert b"Cluster status unavailable" in r.data
         assert b'href="/cluster"' in r.data
         assert b"Cluster mode" not in r.data
@@ -78,6 +103,11 @@ def test_index_loads_placement_when_health_unknown(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "cluster_id": "cid-1",
+            "quorum": True,
+        }
         mock_client.list_streams.return_value = [
             {
                 "id": "stream42",
@@ -118,8 +148,58 @@ def test_index_loads_placement_when_health_unknown(monkeypatch):
         assert b"Ownership epoch" in r.data
         assert b"18" in r.data
         assert b'data-cluster="1"' in r.data
+        assert mock_client.cluster_status.call_count == 1
         assert mock_client.cluster_streams.call_count == 1
 
+
+def test_index_health_unknown_standalone_cluster_streams_not_cluster_mode(monkeypatch):
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_status.return_value = {"enabled": False}
+        mock_client.list_streams.return_value = [
+            {
+                "id": "stream42",
+                "name": "Camera",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "players": [],
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
+        # Standalone servers still return local rows from /cluster/streams.
+        mock_client.cluster_streams.return_value = [
+            {
+                "stream_id": "stream42",
+                "owner_node_id": None,
+                "epoch": None,
+                "subscribed_nodes": [],
+                "standby_nodes": [],
+                "cluster_players": 0,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"health timeout" in r.data
+        assert b"Cluster mode" not in r.data
+        assert b"Ownership epoch" not in r.data
+        assert b'data-cluster="1"' not in r.data
+        assert mock_client.cluster_streams.call_count == 0
+        assert b'href="/cluster"' not in r.data
 
 def test_index_hides_cluster_ui_when_standalone(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
