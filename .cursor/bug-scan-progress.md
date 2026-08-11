@@ -1,17 +1,39 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-07-15
+Last scanned: lrtmp2_client.py — 2026-08-11
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-11 lrtmp2_client.py pass)
+
+- No critical bugs found. Re-reviewed all client methods (`health`,
+  `list_streams`, `create_stream`, `delete_stream`, `create_player`,
+  `delete_player`, `stream_stats`, `stream_stats_by_id`, cluster
+  drain/resume/remove/status/nodes/streams) and every `app.py` call site
+  (all catch `Lrtmp2ApiError`; stream/player IDs validated before API calls;
+  cluster node IDs parsed as integers in `_cluster_node_action`).
+- `delete_stream()` 202 polling (35s default), `_request`/`_request_json`
+  network+JSON error wrapping, URL-encoding of path segments, Bearer-only auth,
+  and `cluster_remove_node` not treating bare 404 as success remain correct.
+- Reviewed but not a bug: `wait_timeout=35` is shorter than librtmp2-server's
+  current 300s RTMP drain cap — deletes of long-lived live sessions can surface
+  a spurious "still present" error while the server is still draining in the
+  background (stream is disabled server-side). This is a false failure (safer
+  than false success) and cannot be extended to 300s without raising Gunicorn
+  `--timeout` (currently 60s). Stale docstring still says "30s" server drain;
+  not changed in this pass.
+- Reviewed but not a bug: `stream_stats()` is unused by `app.py` (panel uses
+  authenticated `stream_stats_by_id`); `health()` sends Bearer token though
+  the endpoint is public; no shared mutable client state across workers.
 
 ## Findings (2026-07-15 app.py pass)
 
