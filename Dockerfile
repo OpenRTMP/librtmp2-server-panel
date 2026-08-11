@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apk add --no-cache gcc musl-dev libffi-dev openssl-dev rust cargo
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --only-binary :all: --prefix=/install -r requirements.txt
 
 FROM python:alpine
 
@@ -16,7 +16,9 @@ WORKDIR /app
 RUN apk add --no-cache libffi openssl
 
 COPY --from=builder /install /usr/local
-COPY . .
+COPY app.py config.py lrtmp2_client.py session_store.py ./
+COPY templates templates/
+COPY static static/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN version="${APP_VERSION:-development}" && \
