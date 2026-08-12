@@ -42,7 +42,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install dependencies
-        run: pip install --only-binary :all: -r requirements.txt 'pytest==9.1.1'
+        run: "pip install --only-binary :all: -r requirements.txt 'pytest==9.1.1'"
 
       - name: Run integration tests against live server
         env:
