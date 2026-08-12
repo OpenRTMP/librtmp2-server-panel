@@ -345,6 +345,23 @@ def test_config_rejects_memory_ratelimit_with_gunicorn_argv_workers(monkeypatch)
         _forget_config_module()
 
 
+def test_config_rejects_redis_cluster_ratelimit_with_multiple_workers(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-redis-cluster-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-redis-cluster-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-redis-cluster-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "redis+cluster://redis:6379/0")
+    monkeypatch.setenv("GUNICORN_CMD_ARGS", "--bind=0.0.0.0:8000 --workers=3")
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
 def test_config_accepts_long_password_when_login_enabled(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-placeholder-check")
     monkeypatch.setenv("PASSWORD", "valid-test-password-for-placeholder-check")

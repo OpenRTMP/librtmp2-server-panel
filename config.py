@@ -4,6 +4,8 @@ import re
 import sys
 from datetime import timedelta
 
+from session_store import shared_session_store_supported
+
 _INSECURE_DEFAULTS = frozenset(
     {
         "change-me-to-a-random-value",
@@ -277,13 +279,23 @@ def _validate_config():
         or RATELIMIT_MEMORY_URI
     )
     worker_count = _detect_worker_count()
-    if worker_count > 1 and ratelimit_uri == RATELIMIT_MEMORY_URI:
-        _emit_config_error(
-            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and bypasses "
-            "login rate limits with multiple Gunicorn workers. Set a shared backend "
-            "(e.g. redis://redis:6379/0) or run with a single worker."
-        )
-        had_error = True
+    if worker_count > 1:
+        if not shared_session_store_supported(ratelimit_uri):
+            if ratelimit_uri == RATELIMIT_MEMORY_URI:
+                _emit_config_error(
+                    f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and "
+                    "bypasses login rate limits with multiple Gunicorn workers. Set a shared "
+                    "backend (e.g. redis://redis:6379/0) or run with a single worker."
+                )
+            else:
+                _emit_config_error(
+                    "RATELIMIT_STORAGE_URI cannot back shared panel sessions across "
+                    "multiple Gunicorn workers. Use redis://, rediss://, or redis+unix://. "
+                    "Schemes such as redis+cluster:// and redis+sentinel:// are supported "
+                    "by the rate limiter only; the panel would otherwise fall back to "
+                    "per-worker in-memory sessions, breaking logout and session rotation."
+                )
+            had_error = True
 
     if _is_insecure_secret(os.environ.get("LRTMP2_API_TOKEN")):
         _emit_config_error(
