@@ -235,8 +235,9 @@ function loadStats(streamId) {
 }
 
 function formatUptime(seconds) {
-    if (!seconds || seconds < 0) return '00:00:00';
-    seconds = Math.floor(seconds);
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return '00:00:00';
+    seconds = Math.floor(value);
     const days = Math.floor(seconds / 86400);
     const hours = Math.floor((seconds % 86400) / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
