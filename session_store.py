@@ -6,6 +6,22 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 _REDIS_SCHEMES = frozenset({"redis", "rediss"})
+_REDIS_UNIX_SCHEMES = frozenset({"redis+unix", "valkey+unix"})
+_SHARED_SESSION_SCHEMES = _REDIS_SCHEMES | _REDIS_UNIX_SCHEMES
+
+
+def shared_session_store_supported(storage_uri):
+    """Return True when the URI can back sessions across Gunicorn workers."""
+    return urlparse(storage_uri).scheme in _SHARED_SESSION_SCHEMES
+
+
+def _normalize_redis_url(storage_uri):
+    """Match limits' redis+unix handling so redis.from_url accepts the URI."""
+    scheme = urlparse(storage_uri).scheme
+    if scheme in _REDIS_UNIX_SCHEMES:
+        prefix = scheme.split("+", 1)[0]
+        return storage_uri.replace(f"{prefix}+unix", "unix", 1)
+    return storage_uri
 _REVOKE_SESSION_SCRIPT = """
 local active = redis.call("GET", KEYS[1])
 if active == ARGV[1] then
@@ -67,7 +83,7 @@ class RedisSessionStore:
 
         self._redis_error = redis.exceptions.RedisError
         self._client = redis.from_url(
-            storage_uri,
+            _normalize_redis_url(storage_uri),
             socket_timeout=2,
             socket_connect_timeout=2,
         )
@@ -141,6 +157,6 @@ class RedisSessionStore:
 
 def create_session_store(storage_uri):
     scheme = urlparse(storage_uri).scheme
-    if scheme in _REDIS_SCHEMES:
+    if scheme in _SHARED_SESSION_SCHEMES:
         return RedisSessionStore(storage_uri)
     return MemorySessionStore()

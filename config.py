@@ -4,6 +4,8 @@ import re
 import sys
 from datetime import timedelta
 
+from session_store import shared_session_store_supported
+
 _INSECURE_DEFAULTS = frozenset(
     {
         "change-me-to-a-random-value",
@@ -240,6 +242,30 @@ def _detect_worker_count() -> int:
     return count
 
 
+def _ratelimit_storage_error():
+    """Return a startup error when the limiter URI cannot share panel sessions."""
+    ratelimit_uri = (
+        os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI).strip()
+        or RATELIMIT_MEMORY_URI
+    )
+    worker_count = _detect_worker_count()
+    if worker_count <= 1 or shared_session_store_supported(ratelimit_uri):
+        return None
+    if ratelimit_uri == RATELIMIT_MEMORY_URI:
+        return (
+            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and "
+            "bypasses login rate limits with multiple Gunicorn workers. Set a shared "
+            "backend (e.g. redis://redis:6379/0) or run with a single worker."
+        )
+    return (
+        "RATELIMIT_STORAGE_URI cannot back shared panel sessions across "
+        "multiple Gunicorn workers. Use redis://, rediss://, or redis+unix://. "
+        "Schemes such as redis+cluster:// and redis+sentinel:// are supported "
+        "by the rate limiter only; the panel would otherwise fall back to "
+        "per-worker in-memory sessions, breaking logout and session rotation."
+    )
+
+
 def _validate_config():
     """Fail fast on insecure or missing configuration at startup."""
     had_error = False
@@ -272,17 +298,9 @@ def _validate_config():
         )
         had_error = True
 
-    ratelimit_uri = (
-        os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI).strip()
-        or RATELIMIT_MEMORY_URI
-    )
-    worker_count = _detect_worker_count()
-    if worker_count > 1 and ratelimit_uri == RATELIMIT_MEMORY_URI:
-        _emit_config_error(
-            f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and bypasses "
-            "login rate limits with multiple Gunicorn workers. Set a shared backend "
-            "(e.g. redis://redis:6379/0) or run with a single worker."
-        )
+    ratelimit_error = _ratelimit_storage_error()
+    if ratelimit_error:
+        _emit_config_error(ratelimit_error)
         had_error = True
 
     if _is_insecure_secret(os.environ.get("LRTMP2_API_TOKEN")):

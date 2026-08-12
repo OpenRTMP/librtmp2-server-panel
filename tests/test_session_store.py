@@ -9,6 +9,7 @@ from session_store import (
     RedisSessionStore,
     SessionBackendUnavailable,
     create_session_store,
+    shared_session_store_supported,
 )
 
 
@@ -169,3 +170,23 @@ def test_create_session_store_selects_backend_from_uri_scheme():
     with patch("session_store.RedisSessionStore") as redis_store_cls:
         assert create_session_store("redis://redis:6379/0") is redis_store_cls.return_value
         assert create_session_store("rediss://redis:6379/0") is redis_store_cls.return_value
+        assert create_session_store("redis+unix:///var/run/redis.sock") is redis_store_cls.return_value
+
+
+def test_shared_session_store_supported_rejects_cluster_and_sentinel_uris():
+    assert shared_session_store_supported("redis://redis:6379/0") is True
+    assert shared_session_store_supported("rediss://redis:6379/0") is True
+    assert shared_session_store_supported("redis+unix:///var/run/redis.sock") is True
+    assert shared_session_store_supported("redis+cluster://redis:6379/0") is False
+    assert shared_session_store_supported("redis+sentinel://redis:6379/0") is False
+    assert shared_session_store_supported("memory://") is False
+
+
+def test_redis_store_normalizes_unix_socket_uri():
+    _store, client, redis_module = _make_redis_store("redis+unix:///var/run/redis.sock")
+
+    redis_module.from_url.assert_called_once_with(
+        "unix:///var/run/redis.sock",
+        socket_timeout=2,
+        socket_connect_timeout=2,
+    )
