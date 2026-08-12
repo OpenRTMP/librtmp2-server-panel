@@ -8,6 +8,11 @@ class Lrtmp2ApiError(Exception):
     pass
 
 
+# librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs).
+# The panel must outlast that window when polling list_streams after HTTP 202.
+DELETE_STREAM_DRAIN_WAIT_SECONDS = 305
+
+
 def _api_error(resp, operation):
     """Return a user-safe error; log details only in the exception message prefix."""
     msg = f"{operation} failed (HTTP {resp.status_code})"
@@ -110,16 +115,22 @@ class Lrtmp2Client:
             json=payload,
         )
 
-    def delete_stream(self, stream_id, wait_timeout=35, poll_interval=0.5):
+    def delete_stream(
+        self,
+        stream_id,
+        wait_timeout=DELETE_STREAM_DRAIN_WAIT_SECONDS,
+        poll_interval=0.5,
+    ):
         """Delete a stream. librtmp2-server may accept the request with `202`
         and finish the delete asynchronously (draining active RTMP sessions
         first) — poll until the stream actually disappears from the list so
         callers can rely on the stream being gone once this returns, rather
-        than racing the background delete. librtmp2-server waits up to 30s for
-        active RTMP sessions to drain before giving up, so the default
-        wait_timeout is 35s. If the stream is still listed after that window,
-        raises Lrtmp2ApiError so the panel can surface the incomplete delete
-        instead of silently redirecting while the stream remains.
+        than racing the background delete. librtmp2-server waits up to 300s for
+        active RTMP sessions to drain before abandoning local roles and
+        finalizing, so the default wait_timeout is 305s. If the stream is
+        still listed after that window, raises Lrtmp2ApiError so the panel can
+        surface the incomplete delete instead of silently redirecting while the
+        stream remains.
         """
         resp = self._request(
             requests.delete,

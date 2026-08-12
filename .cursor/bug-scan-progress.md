@@ -1,17 +1,38 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-07-15
+Last scanned: lrtmp2_client.py — 2026-08-12
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-12 lrtmp2_client.py pass)
+
+- **Bug (fixed):** `delete_stream()` default `wait_timeout=35` was sized for an
+  obsolete 30s librtmp2-server RTMP drain window. Current server
+  `DELETE_DRAIN_TIMEOUT` is **300s** (`librtmp2-server` `src/http.rs`): during
+  drain the stream stays in `GET /api/v1/streams` with `enabled=false` until
+  finalize. Scenario: operator deletes a live stream with long-lived RTMP
+  sessions; server returns HTTP 202 and keeps draining; after 35s the panel
+  raises `Lrtmp2ApiError` ("stream is still present…") even though the delete
+  is still progressing normally on the server for up to five more minutes.
+  Impact: false failure during incident response — operator believes the revoke
+  failed and may stop monitoring while publish/play keys remain valid until
+  drain completes. Fixed by defaulting `wait_timeout` to 305s
+  (`DELETE_STREAM_DRAIN_WAIT_SECONDS`) and raising the Docker Gunicorn
+  `--timeout` to 330s so the synchronous delete route can outlast the server
+  drain.
+- Reviewed but not a bug: network/JSON errors wrapped as `Lrtmp2ApiError`;
+  path segments URL-encoded; Bearer token only in Authorization header;
+  `delete_stream` 202 polling until stream disappears; `cluster_remove_node`
+  surfaces 404; per-call timeouts; no shared mutable request state.
 
 ## Findings (2026-07-15 app.py pass)
 

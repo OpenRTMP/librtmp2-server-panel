@@ -19,7 +19,7 @@ def test_container_uses_threaded_gunicorn_for_long_running_deletes():
     assert command[0] == "gunicorn"
     assert command[command.index("--worker-class") + 1] == "gthread"
     assert command[command.index("--threads") + 1] == "4"
-    assert command[command.index("--timeout") + 1] == "60"
+    assert command[command.index("--timeout") + 1] == "330"
 
 
 def test_delete_stream_logs_api_failure(monkeypatch):
