@@ -3,7 +3,11 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+from lrtmp2_client import (
+    DELETE_STREAM_DRAIN_WAIT_SECONDS,
+    Lrtmp2ApiError,
+    Lrtmp2Client,
+)
 
 
 def test_health_sends_bearer_token():
@@ -41,6 +45,14 @@ def test_create_player_posts_optional_fields():
     payload = mock_post.call_args.kwargs["json"]
     assert payload["name"] == "Guest"
     assert payload["play_key"] == "play_key_with_sufficient_length_here01"
+
+
+def test_delete_stream_default_wait_matches_server_drain_window():
+    import inspect
+
+    sig = inspect.signature(Lrtmp2Client.delete_stream)
+    assert sig.parameters["wait_timeout"].default == DELETE_STREAM_DRAIN_WAIT_SECONDS
+    assert DELETE_STREAM_DRAIN_WAIT_SECONDS == 305
 
 
 def test_delete_stream_treats_404_as_success():
