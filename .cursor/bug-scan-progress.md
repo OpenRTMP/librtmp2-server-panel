@@ -1,17 +1,35 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-13
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-13 config.py pass)
+
+- No critical bugs found. Full pass on startup validation (`_validate_config`),
+  `REQUIRE_LOGIN` / `ALLOW_INSECURE_NO_LOGIN` fail-closed parsing,
+  `SECRET_KEY`/`PASSWORD`/`LRTMP2_API_TOKEN` placeholder and length checks,
+  `SESSION_COOKIE_SECURE` auto-detection (`PANEL_PUBLIC_URL`, explicit override,
+  `TRUSTED_PROXY_COUNT`), `TRUSTED_PROXY_IPS` requirement when proxy count > 0,
+  `client_ip_for_rate_limit` caller chain (spoofed XFF from untrusted direct
+  clients falls back to TCP peer), multi-worker `RATELIMIT_STORAGE_URI` vs
+  `shared_session_store_supported` / `_detect_worker_count` (Gunicorn argv,
+  `GUNICORN_CMD_ARGS`, `WEB_CONCURRENCY`), and stats rate-limit env parsing.
+- Reviewed but not a bug: operator-controlled `LRTMP2_*` URL/domain values;
+  `valkey://` / cluster/sentinel URIs rejected for multi-worker session sharing;
+  Docker default Gunicorn CMD is single-worker `gthread` (memory:// only safe
+  for dev); `SESSION_COOKIE_SECURE` auto-true behind trusted proxies assumes
+  HTTPS termination (documented); weak one-char `LRTMP2_API_TOKEN` passes
+  (operator-controlled).
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
