@@ -133,9 +133,17 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
     return None
 
 
+def _normalize_streams_list(streams):
+    """Return a list of stream dicts; tolerate malformed API payloads."""
+    if isinstance(streams, list):
+        return [item for item in streams if isinstance(item, dict)]
+    return []
+
+
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
     trusted_proxy_count = app.config["TRUSTED_PROXY_COUNT"]
     if trusted_proxy_count:
@@ -352,7 +360,11 @@ def create_app():
         port = app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
         publish_url = f"rtmp://{domain}:{port}/{app_name}"  # nosonar python:S5332
-        players = stream.get("players") or []
+        raw_players = stream.get("players")
+        if not isinstance(raw_players, list):
+            raw_players = []
+        players = [dict(player) for player in raw_players if isinstance(player, dict)]
+        stream["players"] = players
         for player in players:
             player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
             if rtmps_on:
@@ -476,7 +488,7 @@ def create_app():
     def index():
         flash_error = session.pop("flash_error", None)
         try:
-            streams = client.list_streams()
+            streams = _normalize_streams_list(client.list_streams())
         except Lrtmp2ApiError as exc:
             # Resolve cluster via health so confirmed standalone does not keep
             # a Cluster nav link. Health failure stays "unknown" (nav stays).
@@ -696,7 +708,11 @@ def create_app():
                         play_key=play_key,
                         stats_key=stats_key,
                     )
-                    return redirect(url_for("stream_created", stream_id=result["id"]))
+                    created_id = result.get("id") if isinstance(result, dict) else None
+                    if not created_id:
+                        error = "Server returned an invalid create-stream response."
+                    else:
+                        return redirect(url_for("stream_created", stream_id=created_id))
                 except Lrtmp2ApiError as exc:
                     error = str(exc)
         return render_template(
@@ -712,7 +728,7 @@ def create_app():
         if not _is_valid_stream_id(stream_id):
             return redirect(url_for("index"))
         try:
-            streams = client.list_streams()
+            streams = _normalize_streams_list(client.list_streams())
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
             return redirect(url_for("index"))
