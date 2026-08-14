@@ -1,17 +1,35 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-14
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-14 config.py pass)
+
+- No critical bugs found. Re-reviewed startup validation (`SECRET_KEY` length,
+  `REQUIRE_LOGIN` strict parsing, `ALLOW_INSECURE_NO_LOGIN` fail-closed via
+  `_bool`, placeholder rejection), multi-worker `RATELIMIT_STORAGE_URI` checks
+  (`memory://` and unsupported Redis cluster/sentinel schemes vs
+  `shared_session_store_supported`), `TRUSTED_PROXY_IPS` requirement when
+  `TRUSTED_PROXY_COUNT > 0`, `client_ip_for_rate_limit` caller chain in
+  `app.py` (spoofed XFF ignored unless direct peer is in trusted networks),
+  and `SESSION_COOKIE_SECURE` auto-detection (`PANEL_PUBLIC_URL`,
+  `TRUSTED_PROXY_COUNT`).
+- Reviewed but not a bug: `LRTMP2_API_TOKEN` has no minimum length (operator
+  must generate a strong token; server enforces its own policy); broad
+  `TRUSTED_PROXY_IPS` CIDRs allow XFF trust from any host in range that can
+  reach port 8000 directly (documented deployment constraint); gunicorn workers
+  declared only in a config file (not argv/env) are not detected — docker
+  image uses single worker with `gthread`.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
