@@ -1,17 +1,37 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-15
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-15 config.py pass)
+
+- No critical bugs found. Re-reviewed startup validation (`SECRET_KEY` length,
+  placeholder rejection, `REQUIRE_LOGIN`/`ALLOW_INSECURE_NO_LOGIN` fail-closed
+  parsing, password length when login enabled), `SESSION_COOKIE_SECURE`
+  auto-detection (`PANEL_PUBLIC_URL` scheme, explicit override, proxy-count
+  fallback), `TRUSTED_PROXY_COUNT`/`TRUSTED_PROXY_IPS` coupling,
+  `_ratelimit_storage_error()` multi-worker checks (memory://, redis+cluster://,
+  unsupported session URI schemes), and `client_ip_for_rate_limit()` caller
+  chain in `app.py` (`_PreserveDirectRemoteAddr` + ProxyFix + limiter key).
+- Reviewed but not a bug: `client_ip_for_rate_limit()` returns
+  `get_remote_address()` when `TRUSTED_PROXY_COUNT=0` (equivalent to the
+  preserved direct peer without ProxyFix); login rate-limit bypass via spoofed
+  `X-Forwarded-For` requires a direct TCP peer inside `TRUSTED_PROXY_IPS` while
+  `TRUSTED_PROXY_COUNT>0` (documented deployment constraint); broad CIDRs in
+  `TRUSTED_PROXY_IPS` widen that blast radius but are operator-controlled;
+  `LRTMP2_*` URL/domain values and `USERNAME` are operator-controlled with no
+  end-user input path; `_detect_worker_count()` lower-bounds at 1 so `--workers
+  0` cannot silently disable multi-worker session checks.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
