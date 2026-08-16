@@ -1,17 +1,38 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-16
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-16 config.py pass)
+
+- No critical bugs found. Re-traced `_validate_config()` fail-fast paths
+  (`SECRET_KEY` length/placeholders, `REQUIRE_LOGIN`/`ALLOW_INSECURE_NO_LOGIN`
+  parsing, weak `PASSWORD`, `LRTMP2_API_TOKEN`, multi-worker
+  `RATELIMIT_STORAGE_URI` vs `shared_session_store_supported()`), `client_ip_for_rate_limit()`
+  with `app.py` `ProxyFix` + `_PreserveDirectRemoteAddr` ordering, and
+  `SESSION_COOKIE_SECURE` auto-detection (`PANEL_PUBLIC_URL`, explicit env,
+  `TRUSTED_PROXY_COUNT`). Startup rejects `TRUSTED_PROXY_COUNT > 0` without
+  `TRUSTED_PROXY_IPS` so direct clients cannot spoof XFF to bypass per-IP
+  limits.
+- Reviewed but not a bug: default Docker Gunicorn is one `gthread` worker
+  (four threads) so `worker_count <= 1` allows `memory://` only for true
+  single-process dev; compose defaults to `redis://`. `SESSION_COOKIE_SECURE`
+  defaults to `True` when `TRUSTED_PROXY_COUNT > 0` without `PANEL_PUBLIC_URL`
+  — intentional for TLS-terminated reverse proxies; operators serving plain HTTP
+  should set `PANEL_PUBLIC_URL=http://…` or `SESSION_COOKIE_SECURE=False`.
+  `LRTMP2_*` URL/domain values remain operator-controlled (no user-input SSRF
+  vector in config). `USERNAME` empty string bypasses the `"admin"` default via
+  `os.environ.get` semantics — misconfiguration only.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
