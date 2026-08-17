@@ -1,17 +1,38 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-17
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-17 config.py pass)
+
+- No critical bugs found. Reviewed `_validate_config()` fail-fast paths
+  (SECRET_KEY length/placeholders, `REQUIRE_LOGIN` typo rejection,
+  `ALLOW_INSECURE_NO_LOGIN` gate, PASSWORD minimum, `LRTMP2_API_TOKEN`,
+  `TRUSTED_PROXY_COUNT`/`TRUSTED_PROXY_IPS` coupling, `SESSION_COOKIE_SECURE`
+  parsing), `_ratelimit_storage_error()` multi-worker/session-store URI
+  alignment (`shared_session_store_supported` vs Flask-Limiter schemes),
+  `_detect_worker_count()` (env vars, `GUNICORN_CMD_ARGS`, argv `-w` forms),
+  `client_ip_for_rate_limit()` caller chain in `app.py` (direct TCP peer
+  preserved before ProxyFix; spoofed XFF ignored unless proxy IP is trusted),
+  and `Config` class defaults (`PANEL_PUBLIC_URL`/`TRUSTED_PROXY_COUNT` secure
+  cookie auto-detection, stats rate-limit bounds).
+- Reviewed but not a bug: blank/whitespace `RATELIMIT_STORAGE_URI` is
+  normalized to `memory://` during validation but stored verbatim on
+  `Config.RATELIMIT_STORAGE_URI` — inconsistent yet single-worker-only and
+  still uses in-memory session store; `valkey://` (non-unix) rejected for
+  multi-worker session sharing by design; `SESSION_COOKIE_SECURE=True` when
+  `TRUSTED_PROXY_COUNT>0` without `PANEL_PUBLIC_URL` is intentional (operators
+  must set `SESSION_COOKIE_SECURE=False` for plain HTTP).
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
