@@ -1,17 +1,31 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-18
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-18 config.py pass)
+
+- No critical bugs found. Re-validated `_validate_config()` fail-closed paths
+  (`REQUIRE_LOGIN` strict parsing, `ALLOW_INSECURE_NO_LOGIN` ack,
+  `SECRET_KEY`/`PASSWORD`/`LRTMP2_API_TOKEN` placeholder and length checks),
+  `_ratelimit_storage_error()` multi-worker + unsupported Redis session URI
+  rejection (`memory://`, `redis+cluster://`, `redis+sentinel://`),
+  `TRUSTED_PROXY_IPS` required when `TRUSTED_PROXY_COUNT > 0`,
+  `client_ip_for_rate_limit()` trusted-network gating (spoofed XFF ignored for
+  direct clients), and `SESSION_COOKIE_SECURE` auto-detection /
+  unrecognized-value rejection. Caller chains in `app.py` (ProxyFix,
+  `_PreserveDirectRemoteAddr`, limiter `storage_options` socket timeouts) match
+  config intent.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
