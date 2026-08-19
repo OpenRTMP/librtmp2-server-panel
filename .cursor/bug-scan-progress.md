@@ -1,17 +1,34 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-19
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-19 config.py pass)
+
+- No critical bugs found. Re-reviewed all startup validation paths
+  (`SECRET_KEY`/`PASSWORD`/`LRTMP2_API_TOKEN`, `REQUIRE_LOGIN` strict parsing,
+  `ALLOW_INSECURE_NO_LOGIN` gate, multi-worker `RATELIMIT_STORAGE_URI` vs
+  `shared_session_store_supported()`, `TRUSTED_PROXY_COUNT` +
+  `TRUSTED_PROXY_IPS` coupling, `SESSION_COOKIE_SECURE` auto-detection) and
+  traced `client_ip_for_rate_limit()` through `app.py`'s
+  `_PreserveDirectRemoteAddr` + optional `ProxyFix` caller chain.
+- Reviewed but not a bug: `client_ip_for_rate_limit()` returns
+  `forwarded_addr` when `TRUSTED_PROXY_COUNT=0` — safe because `ProxyFix` is
+  disabled so `get_remote_address()` equals the TCP peer; IPv4-mapped proxy
+  addresses (e.g. `::ffff:172.18.0.x`) not matching `TRUSTED_PROXY_IPS` CIDRs
+  collapse per-client rate limits to the proxy IP bucket (overly restrictive,
+  not a bypass); `_detect_worker_count()` is best-effort; `LRTMP2_*` URL/domain
+  values and short `LRTMP2_API_TOKEN` are operator-controlled.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
