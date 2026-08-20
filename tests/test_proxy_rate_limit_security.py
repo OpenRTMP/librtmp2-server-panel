@@ -27,6 +27,24 @@ def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
     assert client_ip == "198.51.100.25"
 
 
+@pytest.mark.parametrize("trusted_proxy_ips", ["0.0.0.0/0", "::/0"])
+def test_config_rejects_universal_trusted_proxy_ips(monkeypatch, trusted_proxy_ips):
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
+    monkeypatch.setenv("PASSWORD", "test-password-for-ci-only")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "test-api-token-for-ci-only")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("TRUSTED_PROXY_COUNT", "1")
+    monkeypatch.setenv("TRUSTED_PROXY_IPS", trusted_proxy_ips)
+
+    import importlib
+    import sys
+
+    sys.modules.pop("config", None)
+    with pytest.raises(SystemExit) as exc:
+        importlib.import_module("config")
+    assert exc.value.code == 1
+
+
 def test_config_requires_trusted_proxy_ips_when_proxy_count_enabled(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
     monkeypatch.setenv("PASSWORD", "test-password-for-ci-only")

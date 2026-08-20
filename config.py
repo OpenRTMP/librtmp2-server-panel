@@ -89,6 +89,11 @@ def _parse_optional_bool(value):
     return None
 
 
+def _is_universal_proxy_network(network):
+    """Return True for CIDR ranges that match every address on that IP version."""
+    return network.prefixlen == 0
+
+
 def _parse_trusted_proxy_networks(value):
     """Parse TRUSTED_PROXY_IPS into ip_network objects (IPs or CIDR ranges)."""
     if value is None:
@@ -103,16 +108,25 @@ def _parse_trusted_proxy_networks(value):
             continue
         try:
             if "/" in entry:
-                networks.append(ipaddress.ip_network(entry, strict=False))
+                network = ipaddress.ip_network(entry, strict=False)
             else:
                 parsed = ipaddress.ip_address(entry)
                 prefix = 128 if parsed.version == 6 else 32
-                networks.append(ipaddress.ip_network(f"{parsed}/{prefix}", strict=False))
+                network = ipaddress.ip_network(f"{parsed}/{prefix}", strict=False)
         except ValueError:
             _emit_config_error(
                 "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
             )
             sys.exit(1)
+        if _is_universal_proxy_network(network):
+            _emit_config_error(
+                "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
+                "not a catch-all such as 0.0.0.0/0 or ::/0. Universal ranges "
+                "treat every direct client as a trusted proxy and allow "
+                "X-Forwarded-For spoofing to bypass per-IP rate limits."
+            )
+            sys.exit(1)
+        networks.append(network)
     return networks
 
 
