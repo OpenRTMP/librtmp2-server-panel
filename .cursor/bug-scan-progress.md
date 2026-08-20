@@ -1,17 +1,39 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-08-12
+Last scanned: config.py — 2026-08-20
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-20 config.py pass)
+
+- **Bug (fixed):** `TRUSTED_PROXY_IPS=0.0.0.0/0` or `::/0` was accepted at
+  startup. `client_ip_for_rate_limit()` treats the direct TCP peer as a trusted
+  proxy when it falls inside `TRUSTED_PROXY_NETWORKS`, then buckets rate limits
+  by the forwarded `X-Forwarded-For` address. A catch-all CIDR matches every
+  direct client, including attackers who reach port 8000 without going through
+  the real reverse proxy. Scenario: operator sets `TRUSTED_PROXY_COUNT=1` with
+  `TRUSTED_PROXY_IPS=0.0.0.0/0` (or `::/0`) thinking it means "trust all
+  proxies"; attacker connects directly with `X-Forwarded-For: 1.2.3.4` and
+  rotates spoofed IPs to bypass the 5/min `/login` rate limit. Impact: login
+  brute-force protection bypass — the safeguard added in `10131b0` is voided by
+  this misconfiguration. Fixed by rejecting universal (`/0`) networks in
+  `_parse_trusted_proxy_networks()`.
+- Reviewed but not a bug: `_parse_require_login()` / `_parse_optional_bool()`
+  fail closed on typos; `SECRET_KEY` min length and placeholder rejection;
+  `ALLOW_INSECURE_NO_LOGIN` requires explicit true token; multi-worker
+  `RATELIMIT_STORAGE_URI` vs session-store scheme validation; worker detection
+  from env/argv; `SESSION_COOKIE_SECURE` auto-detect from `PANEL_PUBLIC_URL` /
+  `TRUSTED_PROXY_COUNT`; `client_ip_for_rate_limit()` trusted-proxy pinning;
+  operator-controlled `LRTMP2_*` URLs without user-input SSRF vector.
 
 ## Findings (2026-08-12 lrtmp2_client.py pass)
 
