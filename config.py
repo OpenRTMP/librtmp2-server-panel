@@ -25,6 +25,7 @@ _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _bool(value, default=False):
@@ -227,10 +228,28 @@ def _static_int_from_ast(node):
     return None
 
 
+def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
+    """Return a gunicorn config path only when it resolves inside the app root."""
+    if not config_path or "\0" in config_path:
+        return None
+    try:
+        candidate = Path(config_path)
+        resolved = (
+            (_PROJECT_ROOT / candidate).resolve()
+            if not candidate.is_absolute()
+            else candidate.resolve()
+        )
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file() or not resolved.is_relative_to(_PROJECT_ROOT):
+        return None
+    return resolved
+
+
 def _workers_from_gunicorn_config_path(config_path):
     """Parse a literal ``workers = N`` assignment from a gunicorn config file."""
-    path = Path(config_path)
-    if not path.is_file():
+    path = _resolve_gunicorn_config_path(config_path)
+    if path is None:
         return 1
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
