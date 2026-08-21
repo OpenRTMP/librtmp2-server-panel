@@ -1,17 +1,33 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-08-20
+Last scanned: templates/ — 2026-08-21
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
-(`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
-below — checkboxes just hadn't been ticked.)
+## Findings (2026-08-21 templates/ pass)
+
+- No critical bugs found. All six templates reviewed end-to-end with caller
+  chains in `app.py`: every POST form includes `csrf_token`; no `|safe` /
+  `Markup` / `{% autoescape false %}`; user/API-derived strings rendered via
+  Jinja auto-escaping in body and quoted attribute contexts (`data-url`,
+  `value="{{ form.* }}"`, stream/player/cluster fields). `Referrer-Policy:
+  no-referrer` is set on HTML responses via `set_security_headers` (stats URLs
+  embed keys in query strings). Destructive actions are POST-only behind
+  `@login_required`. Inline `onclick="copyToClipboard(this)"` handlers read
+  secrets from escaped `data-url` attributes, not interpolated script context.
+- Reviewed but not a bug: `base.html` meta `referrer=same-origin` coexists with
+  the stricter `no-referrer` response header (intentional per
+  `test_https_csrf_keeps_same_origin_referrer`); API stream fields not
+  re-validated on index render rely on Jinja escaping (compromised backend could
+  still serve malformed data, but no template-side HTML/JS breakout found);
+  `blur-text` hides keys visually but they remain in page source by design for
+  authenticated operators.
 
 ## Findings (2026-08-20 config.py pass)
 
