@@ -1,8 +1,10 @@
+import ast
 import ipaddress
 import os
 import re
 import sys
 from datetime import timedelta
+from pathlib import Path
 
 from session_store import shared_session_store_supported
 
@@ -90,8 +92,10 @@ def _parse_optional_bool(value):
 
 
 def _is_universal_proxy_network(network):
-    """Return True for CIDR ranges that match every address on that IP version."""
-    return network.prefixlen == 0
+    """Return True for overly broad CIDR ranges used to trust every client IP."""
+    # Reject /0 and /1: two /1 ranges can cover all of IPv4 or IPv6 while
+    # evading an exact /0 check (for example 0.0.0.0/1,128.0.0.0/1).
+    return network.prefixlen <= 1
 
 
 def _parse_trusted_proxy_networks(value):
@@ -121,9 +125,9 @@ def _parse_trusted_proxy_networks(value):
         if _is_universal_proxy_network(network):
             _emit_config_error(
                 "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
-                "not a catch-all such as 0.0.0.0/0 or ::/0. Universal ranges "
-                "treat every direct client as a trusted proxy and allow "
-                "X-Forwarded-For spoofing to bypass per-IP rate limits."
+                "not catch-all ranges such as 0.0.0.0/0, 0.0.0.0/1, or ::/0. "
+                "Overly broad ranges treat direct clients as trusted proxies and "
+                "allow X-Forwarded-For spoofing to bypass per-IP rate limits."
             )
             sys.exit(1)
         networks.append(network)
@@ -216,6 +220,53 @@ def _emit_config_error(message: str) -> None:
     sys.stderr.write("\n")
 
 
+def _static_int_from_ast(node):
+    """Return an integer literal from a gunicorn config assignment, if static."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    return None
+
+
+def _workers_from_gunicorn_config_path(config_path):
+    """Parse a literal ``workers = N`` assignment from a gunicorn config file."""
+    path = Path(config_path)
+    if not path.is_file():
+        return 1
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError):
+        return 1
+    count = 1
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "workers"
+            for target in node.targets
+        ):
+            continue
+        value = _static_int_from_ast(node.value)
+        if value is not None and value >= 1:
+            count = max(count, value)
+    return count
+
+
+def _workers_from_gunicorn_config_flag(tokens: list[str]) -> int:
+    """Parse ``-c/--config`` paths from a token list and read worker counts."""
+    count = 1
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-c", "--config") and i + 1 < len(tokens):
+            count = max(count, _workers_from_gunicorn_config_path(tokens[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("--config="):
+            count = max(count, _workers_from_gunicorn_config_path(tok.split("=", 1)[1]))
+        i += 1
+    return count
+
+
 def _workers_from_command_tokens(tokens: list[str]) -> int:
     """Parse Gunicorn `-w` / `--workers` flags from a token list."""
     count = 1
@@ -252,7 +303,12 @@ def _detect_worker_count() -> int:
     for match in re.finditer(r"(?:--workers|-w)(?:=(\d+)| ?(\d+))", cmd_args):
         value = match.group(1) or match.group(2)
         count = max(count, int(value))
+    if cmd_args:
+        cmd_tokens = cmd_args.split()
+        count = max(count, _workers_from_command_tokens(cmd_tokens))
+        count = max(count, _workers_from_gunicorn_config_flag(cmd_tokens))
     count = max(count, _workers_from_command_tokens(sys.argv))
+    count = max(count, _workers_from_gunicorn_config_flag(sys.argv))
     return count
 
 
