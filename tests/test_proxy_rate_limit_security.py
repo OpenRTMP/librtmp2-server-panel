@@ -27,7 +27,7 @@ def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
     assert client_ip == "198.51.100.25"
 
 
-@pytest.mark.parametrize("trusted_proxy_ips", ["0.0.0.0/0", "::/0"])
+@pytest.mark.parametrize("trusted_proxy_ips", ["0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1"])
 def test_config_rejects_universal_trusted_proxy_ips(monkeypatch, trusted_proxy_ips):
     monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
     monkeypatch.setenv("PASSWORD", "test-password-for-ci-only")

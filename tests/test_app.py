@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -208,6 +209,60 @@ def test_config_rejects_require_login_false_without_ack(monkeypatch):
         assert exc.value.code == 1
     finally:
         _forget_config_module()
+
+
+def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(
+    monkeypatch,
+):
+    config_file = (
+        Path(__file__).resolve().parent / "fixtures" / "gunicorn_workers3.conf.py"
+    )
+
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-config-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-config-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-config-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
+def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch):
+    config_file = (
+        Path(__file__).resolve().parent / "fixtures" / "gunicorn_workers5.conf.py"
+    )
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "--config", str(config_file), "app:app"],
+    )
+    assert config._detect_worker_count() == 5
+
+
+def test_workers_from_gunicorn_config_path_rejects_outside_project_root(monkeypatch):
+    import config
+
+    assert config._workers_from_gunicorn_config_path("/etc/passwd") == 1
+    assert config._workers_from_gunicorn_config_path("../../etc/passwd") == 1
 
 
 def test_config_rejects_memory_ratelimit_with_gunicorn_cmd_args_workers(monkeypatch):
