@@ -459,7 +459,10 @@ def create_app():
 
     @app.after_request
     def set_security_headers(response):
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # Match templates/base.html meta referrer policy. Browsers prefer the HTTP
+        # header over the meta tag; no-referrer would omit Referer on same-origin
+        # form POSTs and break WTF_CSRF_SSL_STRICT on HTTPS deployments.
+        response.headers.setdefault("Referrer-Policy", "same-origin")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
