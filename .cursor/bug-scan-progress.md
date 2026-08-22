@@ -1,17 +1,35 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-08-20
+Last scanned: templates/ — 2026-08-22
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-08-22 templates/ pass)
+
+- **Bug (fixed):** `set_security_headers()` set HTTP `Referrer-Policy:
+  no-referrer` while `templates/base.html` sets `<meta name="referrer"
+  content="same-origin">` for Flask-WTF strict CSRF on HTTPS. Browsers prefer
+  the HTTP header over the meta tag, so same-origin form POSTs (login, logout,
+  stream CRUD, cluster actions) sent no `Referer` on HTTPS deployments where
+  `WTF_CSRF_SSL_STRICT` is enabled (default). Scenario: operator deploys with
+  `PANEL_PUBLIC_URL=https://…` and logs in via the panel UI; every POST returns
+  HTTP 400 "The referrer header is missing." Impact: admin panel unusable on
+  HTTPS — cannot log in or perform any mutating action. Fixed by aligning the
+  response header with `same-origin` (cross-origin navigations still omit the
+  referrer, so stats keys in copied URLs are not leaked to third-party sites).
+- Reviewed but not a bug: all POST forms include `csrf_token`; Jinja autoescape
+  on API/user-derived strings (`stream.name`, `api_error`, form repopulation);
+  no `|safe` filters; stats URLs in attributes escaped; `Referrer-Policy`
+  meta/header now consistent.
 
 ## Findings (2026-08-20 config.py pass)
 
