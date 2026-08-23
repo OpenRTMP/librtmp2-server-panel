@@ -362,6 +362,53 @@ def test_config_rejects_redis_cluster_ratelimit_with_multiple_workers(monkeypatc
         _forget_config_module()
 
 
+def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch, tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "bind = '0.0.0.0:8000'\nworkers = 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+    assert config._detect_worker_count() == 5
+
+
+def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 3\n", encoding="utf-8")
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-config-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-config-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-config-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
 def test_config_accepts_long_password_when_login_enabled(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-placeholder-check")
     monkeypatch.setenv("PASSWORD", "valid-test-password-for-placeholder-check")

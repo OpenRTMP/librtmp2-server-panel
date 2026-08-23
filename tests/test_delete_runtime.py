@@ -54,3 +54,31 @@ def test_delete_stream_logs_api_failure(monkeypatch):
             expected_tag,
             mock_client.delete_stream.side_effect,
         )
+
+
+def test_delete_stream_rejects_when_drain_slots_are_exhausted(monkeypatch):
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {"rtmps_enabled": False}
+        mock_client.list_streams.return_value = []
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        client.post(
+            "/login",
+            data={"username": "admin", "password": os.environ["PASSWORD"]},
+        )
+
+        with patch.object(app_module._stream_delete_drain_slots, "acquire", return_value=False):
+            response = client.post("/streams/slow/delete")
+
+        assert response.status_code == 302
+        mock_client.delete_stream.assert_not_called()
+        with client.session_transaction() as sess:
+            assert "Too many stream deletions are already in progress" in (
+                sess.get("flash_error") or ""
+            )

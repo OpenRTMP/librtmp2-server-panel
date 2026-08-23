@@ -3,6 +3,7 @@ import hmac
 import ipaddress
 import re
 import secrets
+import threading
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -36,6 +37,12 @@ ACCESS_KEY_HELP = (
     "underscores, or hyphens."
 )
 DIRECT_REMOTE_ADDR_KEY = "openrtmp.direct_remote_addr"
+# Gunicorn's default Docker CMD uses gthread with four threads. Each draining
+# delete can block a thread for up to DELETE_STREAM_DRAIN_WAIT_SECONDS while
+# polling librtmp2-server, so cap concurrent drain operations and leave worker
+# threads available for login, navigation, and stats polling.
+MAX_CONCURRENT_STREAM_DELETE_DRAINS = 2
+_stream_delete_drain_slots = threading.BoundedSemaphore(MAX_CONCURRENT_STREAM_DELETE_DRAINS)
 
 
 class _PreserveDirectRemoteAddr:
@@ -787,7 +794,16 @@ def create_app():
             session["flash_error"] = "Invalid stream ID"
             return redirect(url_for("index"))
         try:
-            client.delete_stream(stream_id)
+            if not _stream_delete_drain_slots.acquire(blocking=False):
+                session["flash_error"] = (
+                    "Too many stream deletions are already in progress. "
+                    "Please wait and try again."
+                )
+                return redirect(url_for("index"))
+            try:
+                client.delete_stream(stream_id)
+            finally:
+                _stream_delete_drain_slots.release()
         except Lrtmp2ApiError as exc:
             # Log a keyed correlation tag instead of the raw user-controlled
             # stream_id (SonarCloud pythonsecurity:S5145). Stream IDs can be

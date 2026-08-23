@@ -1,8 +1,10 @@
 import ipaddress
 import os
 import re
+import shlex
 import sys
 from datetime import timedelta
+from pathlib import Path
 
 from session_store import shared_session_store_supported
 
@@ -89,9 +91,18 @@ def _parse_optional_bool(value):
     return None
 
 
-def _is_universal_proxy_network(network):
-    """Return True for CIDR ranges that match every address on that IP version."""
-    return network.prefixlen == 0
+_MIN_TRUSTED_PROXY_PREFIXLEN = {
+    4: 2,  # reject /0 and /1 (split catch-alls that cover all of IPv4)
+    6: 2,  # reject ::/0 and ::/1 (split catch-alls that cover all of IPv6)
+}
+
+
+def _is_overly_broad_proxy_network(network):
+    """Return True for CIDR ranges broad enough to trust arbitrary clients."""
+    min_prefix = _MIN_TRUSTED_PROXY_PREFIXLEN.get(network.version)
+    if min_prefix is None:
+        return False
+    return network.prefixlen < min_prefix
 
 
 def _parse_trusted_proxy_networks(value):
@@ -118,12 +129,12 @@ def _parse_trusted_proxy_networks(value):
                 "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
             )
             sys.exit(1)
-        if _is_universal_proxy_network(network):
+        if _is_overly_broad_proxy_network(network):
             _emit_config_error(
                 "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
-                "not a catch-all such as 0.0.0.0/0 or ::/0. Universal ranges "
-                "treat every direct client as a trusted proxy and allow "
-                "X-Forwarded-For spoofing to bypass per-IP rate limits."
+                "not catch-all networks such as 0.0.0.0/0, 0.0.0.0/1, or ::/0. "
+                "Overly broad ranges treat every direct client as a trusted proxy "
+                "and allow X-Forwarded-For spoofing to bypass per-IP rate limits."
             )
             sys.exit(1)
         networks.append(network)
@@ -241,6 +252,35 @@ def _workers_from_command_tokens(tokens: list[str]) -> int:
     return count
 
 
+def _gunicorn_config_paths_from_tokens(tokens: list[str]) -> list[str]:
+    """Return config file paths from Gunicorn `-c` / `--config` flags."""
+    paths = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-c", "--config"):
+            if i + 1 < len(tokens):
+                paths.append(tokens[i + 1])
+                i += 2
+                continue
+        elif tok.startswith("--config="):
+            paths.append(tok.split("=", 1)[1])
+        i += 1
+    return paths
+
+
+def _workers_from_gunicorn_config_file(config_path: str) -> int:
+    """Best-effort parse of literal ``workers = N`` from a Gunicorn config file."""
+    try:
+        content = Path(config_path).read_text(encoding="utf-8")
+    except OSError:
+        return 1
+    match = re.search(r"^\s*workers\s*=\s*(\d+)\s*(?:#.*)?$", content, re.MULTILINE)
+    if match:
+        return int(match.group(1))
+    return 1
+
+
 def _detect_worker_count() -> int:
     """Best-effort worker count for multi-process Gunicorn deployments."""
     count = 1
@@ -253,6 +293,11 @@ def _detect_worker_count() -> int:
         value = match.group(1) or match.group(2)
         count = max(count, int(value))
     count = max(count, _workers_from_command_tokens(sys.argv))
+    config_tokens = list(sys.argv)
+    if cmd_args.strip():
+        config_tokens.extend(shlex.split(cmd_args))
+    for config_path in _gunicorn_config_paths_from_tokens(config_tokens):
+        count = max(count, _workers_from_gunicorn_config_file(config_path))
     return count
 
 
