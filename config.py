@@ -1,3 +1,4 @@
+import ast
 import ipaddress
 import os
 import re
@@ -25,6 +26,7 @@ _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _bool(value, default=False):
@@ -252,33 +254,69 @@ def _workers_from_command_tokens(tokens: list[str]) -> int:
     return count
 
 
-def _gunicorn_config_paths_from_tokens(tokens: list[str]) -> list[str]:
-    """Return config file paths from Gunicorn `-c` / `--config` flags."""
-    paths = []
+def _static_int_from_ast(node):
+    """Return an integer literal from a gunicorn config assignment, if static."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    return None
+
+
+def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
+    """Return a gunicorn config path only when it resolves inside the app root."""
+    if not config_path or "\0" in config_path:
+        return None
+    try:
+        candidate = Path(config_path)
+        resolved = (
+            (_PROJECT_ROOT / candidate).resolve()
+            if not candidate.is_absolute()
+            else candidate.resolve()
+        )
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file() or not resolved.is_relative_to(_PROJECT_ROOT):
+        return None
+    return resolved
+
+
+def _workers_from_gunicorn_config_path(config_path: str) -> int:
+    """Parse a literal ``workers = N`` assignment from a gunicorn config file."""
+    path = _resolve_gunicorn_config_path(config_path)
+    if path is None:
+        return 1
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError):
+        return 1
+    count = 1
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "workers"
+            for target in node.targets
+        ):
+            continue
+        value = _static_int_from_ast(node.value)
+        if value is not None and value >= 1:
+            count = max(count, value)
+    return count
+
+
+def _workers_from_gunicorn_config_flag(tokens: list[str]) -> int:
+    """Parse ``-c/--config`` paths from a token list and read worker counts."""
+    count = 1
     i = 0
     while i < len(tokens):
         tok = tokens[i]
-        if tok in ("-c", "--config"):
-            if i + 1 < len(tokens):
-                paths.append(tokens[i + 1])
-                i += 2
-                continue
-        elif tok.startswith("--config="):
-            paths.append(tok.split("=", 1)[1])
+        if tok in ("-c", "--config") and i + 1 < len(tokens):
+            count = max(count, _workers_from_gunicorn_config_path(tokens[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("--config="):
+            count = max(count, _workers_from_gunicorn_config_path(tok.split("=", 1)[1]))
         i += 1
-    return paths
-
-
-def _workers_from_gunicorn_config_file(config_path: str) -> int:
-    """Best-effort parse of literal ``workers = N`` from a Gunicorn config file."""
-    try:
-        content = Path(config_path).read_text(encoding="utf-8")
-    except OSError:
-        return 1
-    match = re.search(r"^\s*workers\s*=\s*(\d+)\s*(?:#.*)?$", content, re.MULTILINE)
-    if match:
-        return int(match.group(1))
-    return 1
+    return count
 
 
 def _detect_worker_count() -> int:
@@ -292,12 +330,12 @@ def _detect_worker_count() -> int:
     for match in re.finditer(r"(?:--workers|-w)(?:=(\d+)| ?(\d+))", cmd_args):
         value = match.group(1) or match.group(2)
         count = max(count, int(value))
-    count = max(count, _workers_from_command_tokens(sys.argv))
-    config_tokens = list(sys.argv)
     if cmd_args.strip():
-        config_tokens.extend(shlex.split(cmd_args))
-    for config_path in _gunicorn_config_paths_from_tokens(config_tokens):
-        count = max(count, _workers_from_gunicorn_config_file(config_path))
+        cmd_tokens = shlex.split(cmd_args)
+        count = max(count, _workers_from_command_tokens(cmd_tokens))
+        count = max(count, _workers_from_gunicorn_config_flag(cmd_tokens))
+    count = max(count, _workers_from_command_tokens(sys.argv))
+    count = max(count, _workers_from_gunicorn_config_flag(sys.argv))
     return count
 
 
