@@ -121,46 +121,51 @@ def _proxy_networks_cover_entire_address_space(networks):
     return False
 
 
+def _parse_trusted_proxy_entry(entry):
+    """Parse and validate one TRUSTED_PROXY_IPS entry."""
+    try:
+        if "/" in entry:
+            network = ipaddress.ip_network(entry, strict=False)
+        else:
+            parsed = ipaddress.ip_address(entry)
+            prefix = 128 if parsed.version == 6 else 32
+            network = ipaddress.ip_network(f"{parsed}/{prefix}", strict=False)
+    except ValueError:
+        _emit_config_error(
+            "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
+        )
+        sys.exit(1)
+
+    if _is_overly_broad_proxy_network(network):
+        _emit_config_error(
+            "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
+            "not catch-all networks such as 0.0.0.0/0, 0.0.0.0/1, or ::/0. "
+            "Overly broad ranges treat every direct client as a trusted proxy "
+            "and allow X-Forwarded-For spoofing to bypass per-IP rate limits."
+        )
+        sys.exit(1)
+    return network
+
+
+def _validate_trusted_proxy_union(networks):
+    """Reject trusted proxy networks whose union covers an entire IP version."""
+    if not _proxy_networks_cover_entire_address_space(networks):
+        return
+    _emit_config_error(
+        "TRUSTED_PROXY_IPS must not collectively cover the entire IPv4 or IPv6 "
+        "address space. Trusting every direct client allows X-Forwarded-For "
+        "spoofing to bypass per-IP rate limits."
+    )
+    sys.exit(1)
+
+
 def _parse_trusted_proxy_networks(value):
     """Parse TRUSTED_PROXY_IPS into ip_network objects (IPs or CIDR ranges)."""
     if value is None:
         return []
-    stripped = str(value).strip()
-    if not stripped:
-        return []
-    networks = []
-    for token in stripped.split(","):
-        entry = token.strip()
-        if not entry:
-            continue
-        try:
-            if "/" in entry:
-                network = ipaddress.ip_network(entry, strict=False)
-            else:
-                parsed = ipaddress.ip_address(entry)
-                prefix = 128 if parsed.version == 6 else 32
-                network = ipaddress.ip_network(f"{parsed}/{prefix}", strict=False)
-        except ValueError:
-            _emit_config_error(
-                "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
-            )
-            sys.exit(1)
-        if _is_overly_broad_proxy_network(network):
-            _emit_config_error(
-                "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
-                "not catch-all networks such as 0.0.0.0/0, 0.0.0.0/1, or ::/0. "
-                "Overly broad ranges treat every direct client as a trusted proxy "
-                "and allow X-Forwarded-For spoofing to bypass per-IP rate limits."
-            )
-            sys.exit(1)
-        networks.append(network)
-    if _proxy_networks_cover_entire_address_space(networks):
-        _emit_config_error(
-            "TRUSTED_PROXY_IPS must not collectively cover the entire IPv4 or IPv6 "
-            "address space. Trusting every direct client allows X-Forwarded-For "
-            "spoofing to bypass per-IP rate limits."
-        )
-        sys.exit(1)
+    entries = (token.strip() for token in str(value).split(","))
+    networks = [_parse_trusted_proxy_entry(entry) for entry in entries if entry]
+    _validate_trusted_proxy_union(networks)
     return networks
 
 
@@ -300,43 +305,59 @@ def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
     return resolved
 
 
-def _workers_from_gunicorn_config_path(config_path: str) -> int:
-    """Parse the effective literal ``workers = N`` from a Gunicorn config file."""
-    path = _resolve_gunicorn_config_path(config_path)
-    if path is None:
-        return 1
+def _worker_assignment_value(node):
+    """Return whether node assigns workers and its static value when available."""
+    if isinstance(node, ast.Assign):
+        targets_workers = any(
+            isinstance(target, ast.Name) and target.id == "workers"
+            for target in node.targets
+        )
+        if not targets_workers:
+            return False, None
+        return True, _static_int_from_ast(node.value)
+
+    if (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "workers"
+    ):
+        return True, _static_int_from_ast(node.value)
+
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "workers"
+    ):
+        return True, None
+
+    return False, None
+
+
+def _parse_gunicorn_config_tree(path):
+    """Parse a Gunicorn config file into an AST, or return None if unreadable."""
     try:
         # The path comes only from Gunicorn's process startup arguments/environment,
         # not from an HTTP request. Service-managed absolute configs (for example
         # /etc/gunicorn.conf.py) must be inspected to enforce multi-worker guards.
         source = path.read_text(encoding="utf-8")  # NOSONAR pythonsecurity:S8707
-        tree = ast.parse(source, filename=str(path))
+        return ast.parse(source, filename=str(path))
     except (OSError, UnicodeError, SyntaxError):
+        return None
+
+
+def _workers_from_gunicorn_config_path(config_path: str) -> int:
+    """Parse the effective literal ``workers = N`` from a Gunicorn config file."""
+    path = _resolve_gunicorn_config_path(config_path)
+    if path is None:
         return 1
+    tree = _parse_gunicorn_config_tree(path)
+    if tree is None:
+        return 1
+
     count = 1
     for node in tree.body:
-        if isinstance(node, ast.Assign):
-            if not any(
-                isinstance(target, ast.Name) and target.id == "workers"
-                for target in node.targets
-            ):
-                continue
-            value = _static_int_from_ast(node.value)
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "workers"
-        ):
-            value = _static_int_from_ast(node.value)
-        elif (
-            isinstance(node, ast.AugAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "workers"
-        ):
-            # A dynamic top-level mutation makes the effective value unknown.
-            count = 1
-            continue
-        else:
+        assigns_workers, value = _worker_assignment_value(node)
+        if not assigns_workers:
             continue
         # Gunicorn executes config files in order, so a later top-level assignment
         # overrides an earlier one. Dynamic assignments are deliberately treated as
