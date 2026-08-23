@@ -107,6 +107,20 @@ def _is_overly_broad_proxy_network(network):
     return network.prefixlen < min_prefix
 
 
+def _proxy_networks_cover_entire_address_space(networks):
+    """Return True when the configured union covers all of IPv4 or all of IPv6."""
+    for version in (4, 6):
+        same_version = [network for network in networks if network.version == version]
+        if not same_version:
+            continue
+        if any(
+            network.prefixlen == 0
+            for network in ipaddress.collapse_addresses(same_version)
+        ):
+            return True
+    return False
+
+
 def _parse_trusted_proxy_networks(value):
     """Parse TRUSTED_PROXY_IPS into ip_network objects (IPs or CIDR ranges)."""
     if value is None:
@@ -140,6 +154,13 @@ def _parse_trusted_proxy_networks(value):
             )
             sys.exit(1)
         networks.append(network)
+    if _proxy_networks_cover_entire_address_space(networks):
+        _emit_config_error(
+            "TRUSTED_PROXY_IPS must not collectively cover the entire IPv4 or IPv6 "
+            "address space. Trusting every direct client allows X-Forwarded-For "
+            "spoofing to bypass per-IP rate limits."
+        )
+        sys.exit(1)
     return networks
 
 
@@ -262,7 +283,7 @@ def _static_int_from_ast(node):
 
 
 def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
-    """Return a gunicorn config path only when it resolves inside the app root."""
+    """Return the exact Gunicorn config path when it resolves to a regular file."""
     if not config_path or "\0" in config_path:
         return None
     try:
@@ -274,32 +295,53 @@ def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
         )
     except (OSError, RuntimeError):
         return None
-    if not resolved.is_file() or not resolved.is_relative_to(_PROJECT_ROOT):
+    if not resolved.is_file():
         return None
     return resolved
 
 
 def _workers_from_gunicorn_config_path(config_path: str) -> int:
-    """Parse a literal ``workers = N`` assignment from a gunicorn config file."""
+    """Parse the effective literal ``workers = N`` from a Gunicorn config file."""
     path = _resolve_gunicorn_config_path(config_path)
     if path is None:
         return 1
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # The path comes only from Gunicorn's process startup arguments/environment,
+        # not from an HTTP request. Service-managed absolute configs (for example
+        # /etc/gunicorn.conf.py) must be inspected to enforce multi-worker guards.
+        source = path.read_text(encoding="utf-8")  # NOSONAR pythonsecurity:S8707
+        tree = ast.parse(source, filename=str(path))
     except (OSError, UnicodeError, SyntaxError):
         return 1
     count = 1
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "workers"
-            for target in node.targets
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if not any(
+                isinstance(target, ast.Name) and target.id == "workers"
+                for target in node.targets
+            ):
+                continue
+            value = _static_int_from_ast(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "workers"
         ):
+            value = _static_int_from_ast(node.value)
+        elif (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "workers"
+        ):
+            # A dynamic top-level mutation makes the effective value unknown.
+            count = 1
             continue
-        value = _static_int_from_ast(node.value)
-        if value is not None and value >= 1:
-            count = max(count, value)
+        else:
+            continue
+        # Gunicorn executes config files in order, so a later top-level assignment
+        # overrides an earlier one. Dynamic assignments are deliberately treated as
+        # unknown rather than retaining a stale higher literal.
+        count = value if value is not None and value >= 1 else 1
     return count
 
 
