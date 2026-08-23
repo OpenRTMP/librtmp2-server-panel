@@ -1,8 +1,11 @@
+import ast
 import ipaddress
 import os
 import re
+import shlex
 import sys
 from datetime import timedelta
+from pathlib import Path
 
 from session_store import shared_session_store_supported
 
@@ -23,6 +26,7 @@ _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _bool(value, default=False):
@@ -89,44 +93,79 @@ def _parse_optional_bool(value):
     return None
 
 
-def _is_universal_proxy_network(network):
-    """Return True for CIDR ranges that match every address on that IP version."""
-    return network.prefixlen == 0
+_MIN_TRUSTED_PROXY_PREFIXLEN = {
+    4: 2,  # reject /0 and /1 (split catch-alls that cover all of IPv4)
+    6: 2,  # reject ::/0 and ::/1 (split catch-alls that cover all of IPv6)
+}
+
+
+def _is_overly_broad_proxy_network(network):
+    """Return True for CIDR ranges broad enough to trust arbitrary clients."""
+    min_prefix = _MIN_TRUSTED_PROXY_PREFIXLEN.get(network.version)
+    if min_prefix is None:
+        return False
+    return network.prefixlen < min_prefix
+
+
+def _proxy_networks_cover_entire_address_space(networks):
+    """Return True when the configured union covers all of IPv4 or all of IPv6."""
+    for version in (4, 6):
+        same_version = [network for network in networks if network.version == version]
+        if not same_version:
+            continue
+        if any(
+            network.prefixlen == 0
+            for network in ipaddress.collapse_addresses(same_version)
+        ):
+            return True
+    return False
+
+
+def _parse_trusted_proxy_entry(entry):
+    """Parse and validate one TRUSTED_PROXY_IPS entry."""
+    try:
+        if "/" in entry:
+            network = ipaddress.ip_network(entry, strict=False)
+        else:
+            parsed = ipaddress.ip_address(entry)
+            prefix = 128 if parsed.version == 6 else 32
+            network = ipaddress.ip_network(f"{parsed}/{prefix}", strict=False)
+    except ValueError:
+        _emit_config_error(
+            "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
+        )
+        sys.exit(1)
+
+    if _is_overly_broad_proxy_network(network):
+        _emit_config_error(
+            "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
+            "not catch-all networks such as 0.0.0.0/0, 0.0.0.0/1, or ::/0. "
+            "Overly broad ranges treat every direct client as a trusted proxy "
+            "and allow X-Forwarded-For spoofing to bypass per-IP rate limits."
+        )
+        sys.exit(1)
+    return network
+
+
+def _validate_trusted_proxy_union(networks):
+    """Reject trusted proxy networks whose union covers an entire IP version."""
+    if not _proxy_networks_cover_entire_address_space(networks):
+        return
+    _emit_config_error(
+        "TRUSTED_PROXY_IPS must not collectively cover the entire IPv4 or IPv6 "
+        "address space. Trusting every direct client allows X-Forwarded-For "
+        "spoofing to bypass per-IP rate limits."
+    )
+    sys.exit(1)
 
 
 def _parse_trusted_proxy_networks(value):
     """Parse TRUSTED_PROXY_IPS into ip_network objects (IPs or CIDR ranges)."""
     if value is None:
         return []
-    stripped = str(value).strip()
-    if not stripped:
-        return []
-    networks = []
-    for token in stripped.split(","):
-        entry = token.strip()
-        if not entry:
-            continue
-        try:
-            if "/" in entry:
-                network = ipaddress.ip_network(entry, strict=False)
-            else:
-                parsed = ipaddress.ip_address(entry)
-                prefix = 128 if parsed.version == 6 else 32
-                network = ipaddress.ip_network(f"{parsed}/{prefix}", strict=False)
-        except ValueError:
-            _emit_config_error(
-                "TRUSTED_PROXY_IPS contains an invalid IP address or CIDR range."
-            )
-            sys.exit(1)
-        if _is_universal_proxy_network(network):
-            _emit_config_error(
-                "TRUSTED_PROXY_IPS must list specific proxy IPs or CIDR ranges, "
-                "not a catch-all such as 0.0.0.0/0 or ::/0. Universal ranges "
-                "treat every direct client as a trusted proxy and allow "
-                "X-Forwarded-For spoofing to bypass per-IP rate limits."
-            )
-            sys.exit(1)
-        networks.append(network)
+    entries = (token.strip() for token in str(value).split(","))
+    networks = [_parse_trusted_proxy_entry(entry) for entry in entries if entry]
+    _validate_trusted_proxy_union(networks)
     return networks
 
 
@@ -241,6 +280,108 @@ def _workers_from_command_tokens(tokens: list[str]) -> int:
     return count
 
 
+def _static_int_from_ast(node):
+    """Return an integer literal from a gunicorn config assignment, if static."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    return None
+
+
+def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
+    """Return the exact Gunicorn config path when it resolves to a regular file."""
+    if not config_path or "\0" in config_path:
+        return None
+    try:
+        candidate = Path(config_path)
+        resolved = (
+            (_PROJECT_ROOT / candidate).resolve()
+            if not candidate.is_absolute()
+            else candidate.resolve()
+        )
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _worker_assignment_value(node):
+    """Return whether node assigns workers and its static value when available."""
+    if isinstance(node, ast.Assign):
+        targets_workers = any(
+            isinstance(target, ast.Name) and target.id == "workers"
+            for target in node.targets
+        )
+        if not targets_workers:
+            return False, None
+        return True, _static_int_from_ast(node.value)
+
+    if (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "workers"
+    ):
+        return True, _static_int_from_ast(node.value)
+
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "workers"
+    ):
+        return True, None
+
+    return False, None
+
+
+def _parse_gunicorn_config_tree(path):
+    """Parse a Gunicorn config file into an AST, or return None if unreadable."""
+    try:
+        # The path comes only from Gunicorn's process startup arguments/environment,
+        # not from an HTTP request. Service-managed absolute configs (for example
+        # /etc/gunicorn.conf.py) must be inspected to enforce multi-worker guards.
+        source = path.read_text(encoding="utf-8")  # NOSONAR pythonsecurity:S8707
+        return ast.parse(source, filename=str(path))
+    except (OSError, UnicodeError, SyntaxError):
+        return None
+
+
+def _workers_from_gunicorn_config_path(config_path: str) -> int:
+    """Parse the effective literal ``workers = N`` from a Gunicorn config file."""
+    path = _resolve_gunicorn_config_path(config_path)
+    if path is None:
+        return 1
+    tree = _parse_gunicorn_config_tree(path)
+    if tree is None:
+        return 1
+
+    count = 1
+    for node in tree.body:
+        assigns_workers, value = _worker_assignment_value(node)
+        if not assigns_workers:
+            continue
+        # Gunicorn executes config files in order, so a later top-level assignment
+        # overrides an earlier one. Dynamic assignments are deliberately treated as
+        # unknown rather than retaining a stale higher literal.
+        count = value if value is not None and value >= 1 else 1
+    return count
+
+
+def _workers_from_gunicorn_config_flag(tokens: list[str]) -> int:
+    """Parse ``-c/--config`` paths from a token list and read worker counts."""
+    count = 1
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-c", "--config") and i + 1 < len(tokens):
+            count = max(count, _workers_from_gunicorn_config_path(tokens[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("--config="):
+            count = max(count, _workers_from_gunicorn_config_path(tok.split("=", 1)[1]))
+        i += 1
+    return count
+
+
 def _detect_worker_count() -> int:
     """Best-effort worker count for multi-process Gunicorn deployments."""
     count = 1
@@ -252,7 +393,12 @@ def _detect_worker_count() -> int:
     for match in re.finditer(r"(?:--workers|-w)(?:=(\d+)| ?(\d+))", cmd_args):
         value = match.group(1) or match.group(2)
         count = max(count, int(value))
+    if cmd_args.strip():
+        cmd_tokens = shlex.split(cmd_args)
+        count = max(count, _workers_from_command_tokens(cmd_tokens))
+        count = max(count, _workers_from_gunicorn_config_flag(cmd_tokens))
     count = max(count, _workers_from_command_tokens(sys.argv))
+    count = max(count, _workers_from_gunicorn_config_flag(sys.argv))
     return count
 
 

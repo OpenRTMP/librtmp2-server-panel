@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,9 @@ os.environ["PASSWORD"] = "test-password-for-ci-only"
 
 def _forget_config_module():
     sys.modules.pop("config", None)
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_session_cookie_secure_defaults_false(monkeypatch):
@@ -359,6 +363,57 @@ def test_config_rejects_redis_cluster_ratelimit_with_multiple_workers(monkeypatc
             importlib.import_module("config")
         assert exc.value.code == 1
     finally:
+        _forget_config_module()
+
+
+def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch):
+    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_workers_test.conf.py"
+    config_file.write_text(
+        "bind = '0.0.0.0:8000'\nworkers = 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+    try:
+        assert config._detect_worker_count() == 5
+    finally:
+        config_file.unlink(missing_ok=True)
+
+
+def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(
+    monkeypatch,
+):
+    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_workers_test.conf.py"
+    config_file.write_text("workers = 3\n", encoding="utf-8")
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-config-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-config-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-config-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        config_file.unlink(missing_ok=True)
         _forget_config_module()
 
 
