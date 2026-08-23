@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -73,8 +74,46 @@ def test_security_headers_on_html_responses():
         assert r.headers.get("X-Frame-Options") == "DENY"
         assert r.headers.get("Content-Security-Policy") == "frame-ancestors 'none'"
         assert r.headers.get("X-Content-Type-Options") == "nosniff"
-        assert r.headers.get("Referrer-Policy") == "no-referrer"
+        assert r.headers.get("Referrer-Policy") == "same-origin"
         assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_https_login_with_csrf_enabled_and_referrer(monkeypatch):
+    """HTTPS form POSTs need a Referer when WTF_CSRF_SSL_STRICT is on.
+
+    Browsers omit Referer when the document policy is no-referrer; same-origin
+    (set in base.html and set_security_headers) keeps same-origin POST referrers.
+    """
+    with patch("app.Lrtmp2Client"):
+        import app as app_module
+
+        application = app_module.create_app()
+        application.config["TESTING"] = True
+        application.config["WTF_CSRF_ENABLED"] = True
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        login_page = client.get("/login", base_url="https://localhost")
+        assert login_page.headers.get("Referrer-Policy") == "same-origin"
+        token_match = re.search(
+            r'name="csrf_token" value="([^"]+)"',
+            login_page.data.decode(),
+        )
+        assert token_match is not None
+        csrf_token = token_match.group(1)
+
+        response = client.post(
+            "/login",
+            data={
+                "csrf_token": csrf_token,
+                "username": "admin",
+                "password": os.environ["PASSWORD"],
+            },
+            base_url="https://localhost",
+            headers={"Referer": "https://localhost/login"},
+        )
+        assert response.status_code == 302
+        assert "/login" not in response.headers["Location"]
 
 
 def test_cache_control_no_store_on_json_responses(app_client):
