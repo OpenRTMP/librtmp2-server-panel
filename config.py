@@ -345,46 +345,59 @@ def _parse_gunicorn_config_tree(path):
         return None
 
 
-def _workers_from_gunicorn_config_path(config_path: str) -> int:
-    """Parse the effective literal ``workers = N`` from a Gunicorn config file."""
+def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
+    """Parse worker count and whether the effective assignment is dynamic."""
     path = _resolve_gunicorn_config_path(config_path)
     if path is None:
-        return 1
+        return 1, False
     tree = _parse_gunicorn_config_tree(path)
     if tree is None:
-        return 1
+        return 1, False
 
     count = 1
+    dynamic = False
     for node in tree.body:
         assigns_workers, value = _worker_assignment_value(node)
         if not assigns_workers:
             continue
         # Gunicorn executes config files in order, so a later top-level assignment
-        # overrides an earlier one. Dynamic assignments are deliberately treated as
-        # unknown rather than retaining a stale higher literal.
-        count = value if value is not None and value >= 1 else 1
-    return count
+        # overrides an earlier one. Dynamic assignments cannot be verified at startup.
+        if value is not None and value >= 1:
+            count = value
+            dynamic = False
+        else:
+            count = 1
+            dynamic = True
+    return count, dynamic
 
 
-def _workers_from_gunicorn_config_flag(tokens: list[str]) -> int:
+def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
     """Parse ``-c/--config`` paths from a token list and read worker counts."""
     count = 1
+    dynamic = False
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok in ("-c", "--config") and i + 1 < len(tokens):
-            count = max(count, _workers_from_gunicorn_config_path(tokens[i + 1]))
+            config_count, config_dynamic = _workers_from_gunicorn_config_path(tokens[i + 1])
+            count = max(count, config_count)
+            dynamic = dynamic or config_dynamic
             i += 2
             continue
         if tok.startswith("--config="):
-            count = max(count, _workers_from_gunicorn_config_path(tok.split("=", 1)[1]))
+            config_count, config_dynamic = _workers_from_gunicorn_config_path(
+                tok.split("=", 1)[1]
+            )
+            count = max(count, config_count)
+            dynamic = dynamic or config_dynamic
         i += 1
-    return count
+    return count, dynamic
 
 
-def _detect_worker_count() -> int:
-    """Best-effort worker count for multi-process Gunicorn deployments."""
+def _detect_worker_settings() -> tuple[int, bool]:
+    """Best-effort worker count and dynamic-config flag for Gunicorn deployments."""
     count = 1
+    dynamic = False
     for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
         raw = os.environ.get(env_key, "").strip()
         if raw.isdigit():
@@ -396,9 +409,19 @@ def _detect_worker_count() -> int:
     if cmd_args.strip():
         cmd_tokens = shlex.split(cmd_args)
         count = max(count, _workers_from_command_tokens(cmd_tokens))
-        count = max(count, _workers_from_gunicorn_config_flag(cmd_tokens))
+        config_count, config_dynamic = _workers_from_gunicorn_config_flag(cmd_tokens)
+        count = max(count, config_count)
+        dynamic = dynamic or config_dynamic
     count = max(count, _workers_from_command_tokens(sys.argv))
-    count = max(count, _workers_from_gunicorn_config_flag(sys.argv))
+    config_count, config_dynamic = _workers_from_gunicorn_config_flag(sys.argv)
+    count = max(count, config_count)
+    dynamic = dynamic or config_dynamic
+    return count, dynamic
+
+
+def _detect_worker_count() -> int:
+    """Best-effort worker count for multi-process Gunicorn deployments."""
+    count, _dynamic = _detect_worker_settings()
     return count
 
 
@@ -408,10 +431,20 @@ def _ratelimit_storage_error():
         os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI).strip()
         or RATELIMIT_MEMORY_URI
     )
-    worker_count = _detect_worker_count()
-    if worker_count <= 1 or shared_session_store_supported(ratelimit_uri):
+    worker_count, dynamic_workers_config = _detect_worker_settings()
+    needs_shared_backend = worker_count > 1 or dynamic_workers_config
+    if not needs_shared_backend or shared_session_store_supported(ratelimit_uri):
         return None
     if ratelimit_uri == RATELIMIT_MEMORY_URI:
+        if dynamic_workers_config:
+            return (
+                "The Gunicorn config file sets workers using a dynamic expression "
+                "(for example workers = multiprocessing.cpu_count()). Startup cannot "
+                f"verify a single-worker deployment, so {RATELIMIT_MEMORY_URI} would "
+                "bypass login rate limits across worker processes. Set a static "
+                "workers = N in the config file, configure WEB_CONCURRENCY, or use a "
+                "shared backend such as redis://redis:6379/0."
+            )
         return (
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and "
             "bypasses login rate limits with multiple Gunicorn workers. Set a shared "
