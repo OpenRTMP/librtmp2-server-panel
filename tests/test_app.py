@@ -22,6 +22,43 @@ def _forget_config_module():
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _assert_config_import_with_gunicorn_file(
+    monkeypatch,
+    *,
+    config_content: str,
+    ratelimit_uri: str = "memory://",
+    expect_exit: bool = True,
+):
+    """Import config with a temporary Gunicorn config file on sys.argv."""
+    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_config_import_test.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-config-check")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-config-check")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-config-check")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", ratelimit_uri)
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    _forget_config_module()
+    try:
+        if expect_exit:
+            with pytest.raises(SystemExit) as exc:
+                importlib.import_module("config")
+            assert exc.value.code == 1
+        else:
+            importlib.import_module("config")
+    finally:
+        config_file.unlink(missing_ok=True)
+        _forget_config_module()
+
+
 def test_session_cookie_secure_defaults_false(monkeypatch):
     monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
     import importlib
@@ -388,95 +425,28 @@ def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch):
         config_file.unlink(missing_ok=True)
 
 
-def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(
-    monkeypatch,
-):
-    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_workers_test.conf.py"
-    config_file.write_text("workers = 3\n", encoding="utf-8")
-    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-config-check")
-    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-config-check")
-    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-config-check")
-    monkeypatch.setenv("REQUIRE_LOGIN", "true")
-    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
-    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gunicorn", "-c", str(config_file), "app:app"],
+def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(monkeypatch, config_content="workers = 3\n")
+
+
+def test_config_rejects_memory_ratelimit_with_dynamic_gunicorn_config_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "import multiprocessing\nworkers = multiprocessing.cpu_count() * 2 + 1\n"
+        ),
     )
 
-    _forget_config_module()
-    try:
-        with pytest.raises(SystemExit) as exc:
-            importlib.import_module("config")
-        assert exc.value.code == 1
-    finally:
-        config_file.unlink(missing_ok=True)
-        _forget_config_module()
 
-
-def test_config_rejects_memory_ratelimit_with_dynamic_gunicorn_config_workers(
-    monkeypatch,
-):
-    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_dynamic_workers_test.conf.py"
-    config_file.write_text(
-        "import multiprocessing\nworkers = multiprocessing.cpu_count() * 2 + 1\n",
-        encoding="utf-8",
+def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "import multiprocessing\nworkers = multiprocessing.cpu_count() * 2 + 1\n"
+        ),
+        ratelimit_uri="redis://redis:6379/0",
+        expect_exit=False,
     )
-    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("REQUIRE_LOGIN", "true")
-    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
-    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gunicorn", "-c", str(config_file), "app:app"],
-    )
-
-    _forget_config_module()
-    try:
-        with pytest.raises(SystemExit) as exc:
-            importlib.import_module("config")
-        assert exc.value.code == 1
-    finally:
-        config_file.unlink(missing_ok=True)
-        _forget_config_module()
-
-
-def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(
-    monkeypatch,
-):
-    config_file = _PROJECT_ROOT / "tests" / "_gunicorn_dynamic_workers_test.conf.py"
-    config_file.write_text(
-        "import multiprocessing\nworkers = multiprocessing.cpu_count() * 2 + 1\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("PASSWORD", "valid-test-password-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-gunicorn-dynamic-check")
-    monkeypatch.setenv("REQUIRE_LOGIN", "true")
-    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "redis://redis:6379/0")
-    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gunicorn", "-c", str(config_file), "app:app"],
-    )
-
-    _forget_config_module()
-    try:
-        importlib.import_module("config")
-    finally:
-        config_file.unlink(missing_ok=True)
-        _forget_config_module()
 
 
 def test_config_accepts_long_password_when_login_enabled(monkeypatch):
