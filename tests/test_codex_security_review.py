@@ -27,7 +27,7 @@ def test_reads_service_managed_gunicorn_config_outside_project_root(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text("workers = 4\n", encoding="utf-8")
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == 4
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, False)
 
 
 def test_gunicorn_config_uses_last_top_level_workers_assignment(tmp_path):
@@ -42,7 +42,7 @@ def test_gunicorn_config_uses_last_top_level_workers_assignment(tmp_path):
         encoding="utf-8",
     )
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == 1
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
 def test_gunicorn_config_dynamic_final_override_is_unknown(tmp_path):
@@ -52,4 +52,4 @@ def test_gunicorn_config_dynamic_final_override_is_unknown(tmp_path):
         encoding="utf-8",
     )
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == 1
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
