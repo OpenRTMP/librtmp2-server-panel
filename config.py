@@ -345,6 +345,55 @@ def _parse_gunicorn_config_tree(path):
         return None
 
 
+def _scan_gunicorn_config_workers(tree):
+    """Return worker count and dynamic flag from a gunicorn config module AST.
+
+    Top-level ``workers = N`` literals are treated as static. Assignments inside
+    compound statements (``if``/``for``/``while``/``with``/``try``), augmented
+    assignments, or non-literal expressions cannot be verified at import time and
+    are treated as dynamic so multi-worker deployments fail closed unless a
+    shared rate-limit/session backend is configured.
+    """
+    count = 1
+    dynamic = False
+    found = False
+
+    def walk_statements(statements, *, in_compound):
+        nonlocal count, dynamic, found
+        for node in statements:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+
+            assigns_workers, value = _worker_assignment_value(node)
+            if assigns_workers:
+                found = True
+                if in_compound or value is None or value < 1:
+                    dynamic = True
+                elif not dynamic:
+                    count = value
+
+            if isinstance(node, ast.If):
+                walk_statements(node.body, in_compound=True)
+                walk_statements(node.orelse, in_compound=True)
+            elif isinstance(node, ast.For):
+                walk_statements(node.body, in_compound=True)
+            elif isinstance(node, ast.While):
+                walk_statements(node.body, in_compound=True)
+            elif isinstance(node, ast.With):
+                walk_statements(node.body, in_compound=True)
+            elif isinstance(node, ast.Try):
+                walk_statements(node.body, in_compound=True)
+                for handler in node.handlers:
+                    walk_statements(handler.body, in_compound=True)
+                walk_statements(node.orelse, in_compound=True)
+                walk_statements(node.finalbody, in_compound=True)
+
+    walk_statements(tree.body, in_compound=False)
+    if not found:
+        return 1, False
+    return count, dynamic
+
+
 def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
     """Parse worker count and whether the effective assignment is dynamic."""
     path = _resolve_gunicorn_config_path(config_path)
@@ -353,22 +402,7 @@ def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
     tree = _parse_gunicorn_config_tree(path)
     if tree is None:
         return 1, False
-
-    count = 1
-    dynamic = False
-    for node in tree.body:
-        assigns_workers, value = _worker_assignment_value(node)
-        if not assigns_workers:
-            continue
-        # Gunicorn executes config files in order, so a later top-level assignment
-        # overrides an earlier one. Dynamic assignments cannot be verified at startup.
-        if value is not None and value >= 1:
-            count = value
-            dynamic = False
-        else:
-            count = 1
-            dynamic = True
-    return count, dynamic
+    return _scan_gunicorn_config_workers(tree)
 
 
 def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
@@ -438,12 +472,13 @@ def _ratelimit_storage_error():
     if ratelimit_uri == RATELIMIT_MEMORY_URI:
         if dynamic_workers_config:
             return (
-                "The Gunicorn config file sets workers using a dynamic expression "
-                "(for example workers = multiprocessing.cpu_count()). Startup cannot "
-                f"verify a single-worker deployment, so {RATELIMIT_MEMORY_URI} would "
-                "bypass login rate limits across worker processes. Set a static "
-                "workers = N in the config file, configure WEB_CONCURRENCY, or use a "
-                "shared backend such as redis://redis:6379/0."
+                "The Gunicorn config file sets workers using a dynamic or conditional "
+                "assignment (for example workers = multiprocessing.cpu_count() or "
+                "workers = N inside an if/for block). Startup cannot verify a "
+                f"single-worker deployment, so {RATELIMIT_MEMORY_URI} would bypass "
+                "login rate limits across worker processes. Set a single static "
+                "top-level workers = N in the config file, configure WEB_CONCURRENCY, "
+                "or use a shared backend such as redis://redis:6379/0."
             )
         return (
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and "
