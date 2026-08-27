@@ -438,6 +438,19 @@ def test_config_rejects_memory_ratelimit_with_dynamic_gunicorn_config_workers(mo
     )
 
 
+def test_config_rejects_memory_ratelimit_with_conditional_gunicorn_config_workers(
+    monkeypatch,
+):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "bind = '0.0.0.0:8000'\n"
+            "if True:\n"
+            "    workers = 4\n"
+        ),
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,

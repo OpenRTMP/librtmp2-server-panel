@@ -30,7 +30,7 @@ def test_reads_service_managed_gunicorn_config_outside_project_root(tmp_path):
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, False)
 
 
-def test_gunicorn_config_uses_last_top_level_workers_assignment(tmp_path):
+def test_gunicorn_config_compound_assignment_makes_later_static_unknown(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
         "workers = 4\n"
@@ -42,7 +42,26 @@ def test_gunicorn_config_uses_last_top_level_workers_assignment(tmp_path):
         encoding="utf-8",
     )
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, True)
+
+
+def test_gunicorn_config_conditional_workers_assignment_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "bind = '0.0.0.0:8000'\n"
+        "if True:\n"
+        "    workers = 4\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_top_level_workers_literal_is_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 4\n", encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, False)
 
 
 def test_gunicorn_config_dynamic_final_override_is_unknown(tmp_path):
@@ -52,4 +71,4 @@ def test_gunicorn_config_dynamic_final_override_is_unknown(tmp_path):
         encoding="utf-8",
     )
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, True)
