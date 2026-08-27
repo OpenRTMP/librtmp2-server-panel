@@ -345,6 +345,53 @@ def _parse_gunicorn_config_tree(path):
         return None
 
 
+class _GunicornWorkersScanState:
+    """Mutable scan state for gunicorn config worker assignments."""
+
+    count = 1
+    dynamic = False
+    found = False
+
+    def record_workers_assignment(self, value, *, in_compound: bool) -> None:
+        self.found = True
+        if in_compound or value is None or value < 1:
+            self.dynamic = True
+        elif not self.dynamic:
+            self.count = value
+
+
+def _compound_statement_blocks(node):
+    """Yield statement lists from compound statement bodies."""
+    if isinstance(node, ast.If):
+        yield node.body
+        yield node.orelse
+    elif isinstance(node, ast.For):
+        yield node.body
+    elif isinstance(node, ast.While):
+        yield node.body
+    elif isinstance(node, ast.With):
+        yield node.body
+    elif isinstance(node, ast.Try):
+        yield node.body
+        for handler in node.handlers:
+            yield handler.body
+        yield node.orelse
+        yield node.finalbody
+
+
+def _walk_gunicorn_workers_statements(statements, state, *, in_compound: bool) -> None:
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+
+        assigns_workers, value = _worker_assignment_value(node)
+        if assigns_workers:
+            state.record_workers_assignment(value, in_compound=in_compound)
+
+        for block in _compound_statement_blocks(node):
+            _walk_gunicorn_workers_statements(block, state, in_compound=True)
+
+
 def _scan_gunicorn_config_workers(tree):
     """Return worker count and dynamic flag from a gunicorn config module AST.
 
@@ -354,44 +401,11 @@ def _scan_gunicorn_config_workers(tree):
     are treated as dynamic so multi-worker deployments fail closed unless a
     shared rate-limit/session backend is configured.
     """
-    count = 1
-    dynamic = False
-    found = False
-
-    def walk_statements(statements, *, in_compound):
-        nonlocal count, dynamic, found
-        for node in statements:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-
-            assigns_workers, value = _worker_assignment_value(node)
-            if assigns_workers:
-                found = True
-                if in_compound or value is None or value < 1:
-                    dynamic = True
-                elif not dynamic:
-                    count = value
-
-            if isinstance(node, ast.If):
-                walk_statements(node.body, in_compound=True)
-                walk_statements(node.orelse, in_compound=True)
-            elif isinstance(node, ast.For):
-                walk_statements(node.body, in_compound=True)
-            elif isinstance(node, ast.While):
-                walk_statements(node.body, in_compound=True)
-            elif isinstance(node, ast.With):
-                walk_statements(node.body, in_compound=True)
-            elif isinstance(node, ast.Try):
-                walk_statements(node.body, in_compound=True)
-                for handler in node.handlers:
-                    walk_statements(handler.body, in_compound=True)
-                walk_statements(node.orelse, in_compound=True)
-                walk_statements(node.finalbody, in_compound=True)
-
-    walk_statements(tree.body, in_compound=False)
-    if not found:
+    state = _GunicornWorkersScanState()
+    _walk_gunicorn_workers_statements(tree.body, state, in_compound=False)
+    if not state.found:
         return 1, False
-    return count, dynamic
+    return state.count, state.dynamic
 
 
 def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
