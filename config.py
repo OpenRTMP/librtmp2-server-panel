@@ -392,6 +392,18 @@ def _walk_gunicorn_workers_statements(statements, state, *, in_compound: bool) -
             _walk_gunicorn_workers_statements(block, state, in_compound=True)
 
 
+_GUNICORN_RUNTIME_HOOK_NAMES = frozenset({"configure", "on_starting"})
+
+
+def _gunicorn_config_has_runtime_hooks(tree):
+    """Return True when the config defines hooks that can mutate workers at runtime."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _GUNICORN_RUNTIME_HOOK_NAMES:
+                return True
+    return False
+
+
 def _scan_gunicorn_config_workers(tree):
     """Return worker count and dynamic flag from a gunicorn config module AST.
 
@@ -402,9 +414,12 @@ def _scan_gunicorn_config_workers(tree):
     shared rate-limit/session backend is configured.
     """
     state = _GunicornWorkersScanState()
+    runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
     _walk_gunicorn_workers_statements(tree.body, state, in_compound=False)
+    if runtime_hooks:
+        state.dynamic = True
     if not state.found:
-        return 1, False
+        return 1, state.dynamic
     return state.count, state.dynamic
 
 

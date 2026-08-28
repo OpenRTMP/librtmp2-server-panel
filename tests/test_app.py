@@ -451,6 +451,17 @@ def test_config_rejects_memory_ratelimit_with_conditional_gunicorn_config_worker
     )
 
 
+def test_config_rejects_memory_ratelimit_with_gunicorn_configure_hook(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "def configure(server):\n"
+            "    server.cfg.workers = 8\n"
+        ),
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,
