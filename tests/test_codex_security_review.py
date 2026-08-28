@@ -72,3 +72,27 @@ def test_gunicorn_config_dynamic_final_override_is_unknown(tmp_path):
     )
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (4, True)
+
+
+def test_gunicorn_config_configure_hook_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def configure(server):\n"
+        "    server.cfg.workers = 8\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def on_starting(server):\n"
+        "    server.cfg.workers = 8\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
