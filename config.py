@@ -404,6 +404,57 @@ def _gunicorn_config_has_runtime_hooks(tree):
     return False
 
 
+def _ast_subscript_is_workers_key(node):
+    """Return True when an AST subscript refers to the workers setting name."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    key = node.slice
+    if isinstance(key, ast.Constant) and key.value == "workers":
+        return True
+    return (
+        isinstance(key, ast.Index)
+        and isinstance(key.value, ast.Constant)
+        and key.value.value == "workers"
+    )
+
+
+def _gunicorn_config_has_runtime_exec(tree):
+    """Return True when the config executes code that can hide worker mutations."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in {"exec", "eval"}:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr in {"exec", "eval"}:
+            return True
+    return False
+
+
+def _gunicorn_config_has_indirect_workers_mutation(tree):
+    """Return True for setattr/globals()[...] style workers mutations."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.target is not None:
+            targets = [node.target]
+        else:
+            targets = []
+        for target in targets:
+            if _ast_subscript_is_workers_key(target):
+                return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "workers"
+        ):
+            return True
+    return False
+
+
 def _scan_gunicorn_config_workers(tree):
     """Return worker count and dynamic flag from a gunicorn config module AST.
 
@@ -416,7 +467,11 @@ def _scan_gunicorn_config_workers(tree):
     state = _GunicornWorkersScanState()
     runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
     _walk_gunicorn_workers_statements(tree.body, state, in_compound=False)
-    if runtime_hooks:
+    if (
+        runtime_hooks
+        or _gunicorn_config_has_runtime_exec(tree)
+        or _gunicorn_config_has_indirect_workers_mutation(tree)
+    ):
         state.dynamic = True
     if not state.found:
         return 1, state.dynamic

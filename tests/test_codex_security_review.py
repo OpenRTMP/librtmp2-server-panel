@@ -96,3 +96,37 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
     )
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_globals_workers_mutation_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "globals()['workers'] = 8\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_exec_workers_mutation_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "exec(\"workers = 8\")\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_setattr_workers_mutation_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import sys\n"
+        "setattr(sys.modules[__name__], 'workers', 8)\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
