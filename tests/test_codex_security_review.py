@@ -96,3 +96,23 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
     )
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\na, workers = 1, 8\n",
+        "workers = 1\nfor workers in [8]:\n    pass\n",
+        "workers = 1\nglobals()['workers'] = 8\n",
+        "workers = 1\nexec('workers = 8')\n",
+        "workers = 1\n(lambda: globals().update(workers=8))()\n",
+        "workers = 1\nimport sys\nsetattr(sys.modules[__name__], 'workers', 8)\n",
+    ],
+)
+def test_gunicorn_config_import_time_worker_mutations_are_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

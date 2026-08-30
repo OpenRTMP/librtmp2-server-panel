@@ -305,29 +305,66 @@ def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
     return resolved
 
 
+def _assign_target_binds_workers(target):
+    """Return True when an assignment target binds the gunicorn ``workers`` name."""
+    if isinstance(target, ast.Name):
+        return target.id == "workers"
+    if isinstance(target, ast.Tuple):
+        return any(_assign_target_binds_workers(element) for element in target.elts)
+    if isinstance(target, ast.Subscript):
+        slice_node = target.slice
+        if isinstance(slice_node, ast.Constant) and slice_node.value == "workers":
+            return True
+    return False
+
+
+def _node_references_globals(node):
+    """Return True when an AST subtree calls ``globals()``."""
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "globals"
+        ):
+            return True
+    return False
+
+
+def _is_dynamic_worker_mutation_call(node):
+    """Return True for module-level calls that can mutate ``workers`` at import."""
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    if isinstance(call.func, ast.Lambda):
+        return True
+    if isinstance(call.func, ast.Name) and call.func.id in ("exec", "eval", "setattr"):
+        return True
+    if isinstance(call.func, ast.Attribute) and call.func.attr == "update":
+        for keyword in call.keywords:
+            if keyword.arg == "workers":
+                return True
+    return _node_references_globals(node)
+
+
 def _worker_assignment_value(node):
     """Return whether node assigns workers and its static value when available."""
     if isinstance(node, ast.Assign):
-        targets_workers = any(
-            isinstance(target, ast.Name) and target.id == "workers"
-            for target in node.targets
-        )
-        if not targets_workers:
+        if not any(_assign_target_binds_workers(target) for target in node.targets):
             return False, None
-        return True, _static_int_from_ast(node.value)
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "workers"
+        ):
+            return True, _static_int_from_ast(node.value)
+        return True, None
 
-    if (
-        isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "workers"
-    ):
-        return True, _static_int_from_ast(node.value)
+    if isinstance(node, ast.AnnAssign) and _assign_target_binds_workers(node.target):
+        if isinstance(node.target, ast.Name) and node.target.id == "workers":
+            return True, _static_int_from_ast(node.value)
+        return True, None
 
-    if (
-        isinstance(node, ast.AugAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "workers"
-    ):
+    if isinstance(node, ast.AugAssign) and _assign_target_binds_workers(node.target):
         return True, None
 
     return False, None
@@ -383,6 +420,19 @@ def _walk_gunicorn_workers_statements(statements, state, *, in_compound: bool) -
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+
+        if (
+            not in_compound
+            and isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "workers"
+        ):
+            state.found = True
+            state.dynamic = True
+
+        if not in_compound and _is_dynamic_worker_mutation_call(node):
+            state.found = True
+            state.dynamic = True
 
         assigns_workers, value = _worker_assignment_value(node)
         if assigns_workers:

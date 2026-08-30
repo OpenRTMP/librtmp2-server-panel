@@ -462,6 +462,13 @@ def test_config_rejects_memory_ratelimit_with_gunicorn_configure_hook(monkeypatc
     )
 
 
+def test_config_rejects_memory_ratelimit_with_gunicorn_tuple_unpack_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content="workers = 1\na, workers = 1, 8\n",
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,
