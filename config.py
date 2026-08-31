@@ -305,32 +305,109 @@ def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
     return resolved
 
 
+def _target_assigns_workers(node):
+    """Return True when an assignment target binds the ``workers`` name."""
+    if isinstance(node, ast.Name):
+        return node.id == "workers"
+    if isinstance(node, ast.Tuple):
+        return any(_target_assigns_workers(element) for element in node.elts)
+    if isinstance(node, ast.List):
+        return any(_target_assigns_workers(element) for element in node.elts)
+    if isinstance(node, ast.Starred):
+        return _target_assigns_workers(node.value)
+    return False
+
+
+def _globals_workers_subscript(node):
+    """Return True for ``globals()['workers']``-style subscript targets."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    if not isinstance(node.value, ast.Call):
+        return False
+    func = node.value.func
+    if not isinstance(func, ast.Name) or func.id != "globals":
+        return False
+    slice_node = node.slice
+    if isinstance(slice_node, ast.Constant):
+        return slice_node.value == "workers"
+    return False
+
+
 def _worker_assignment_value(node):
     """Return whether node assigns workers and its static value when available."""
     if isinstance(node, ast.Assign):
         targets_workers = any(
-            isinstance(target, ast.Name) and target.id == "workers"
+            _target_assigns_workers(target) or _globals_workers_subscript(target)
             for target in node.targets
         )
         if not targets_workers:
             return False, None
         return True, _static_int_from_ast(node.value)
 
-    if (
-        isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "workers"
+    if isinstance(node, ast.AnnAssign) and node.target and (
+        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
     ):
         return True, _static_int_from_ast(node.value)
 
-    if (
-        isinstance(node, ast.AugAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "workers"
+    if isinstance(node, ast.AugAssign) and (
+        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
     ):
         return True, None
 
+    if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
+        return True, _static_int_from_ast(node.value)
+
     return False, None
+
+
+def _is_dynamic_workers_mutation(node):
+    """Return True for import-time mutations the AST scan cannot treat as static."""
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+        if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
+            return True
+        if (
+            isinstance(call.func, ast.Name)
+            and call.func.id == "setattr"
+            and len(call.args) >= 2
+            and isinstance(call.args[1], ast.Constant)
+            and call.args[1].value == "workers"
+        ):
+            return True
+
+    if isinstance(node, ast.Assign):
+        return any(_globals_workers_subscript(target) for target in node.targets)
+
+    return False
+
+
+def _function_mutates_global_workers(func_node):
+    """Return True when a function assigns to ``global workers``."""
+    has_global_workers = any(
+        isinstance(child, ast.Global) and "workers" in child.names
+        for child in func_node.body
+    )
+    if not has_global_workers:
+        return False
+    return any(_worker_assignment_value(stmt)[0] for stmt in func_node.body)
+
+
+def _call_invokes_function(call_node, func_names):
+    """Return True when ``call_node`` invokes one of ``func_names``."""
+    func = call_node.func
+    if isinstance(func, ast.Name):
+        return func.id in func_names
+    return False
+
+
+def _collect_global_workers_mutators(tree):
+    """Return function names that mutate ``global workers`` when called."""
+    mutators = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _function_mutates_global_workers(node):
+                mutators.add(node.name)
+    return mutators
 
 
 def _parse_gunicorn_config_tree(path):
@@ -379,20 +456,65 @@ def _compound_statement_blocks(node):
         yield node.finalbody
 
 
-def _walk_gunicorn_workers_statements(statements, state, *, in_compound: bool) -> None:
+def _walk_gunicorn_workers_statements(
+    statements,
+    state,
+    *,
+    in_compound: bool,
+    global_workers_mutators=None,
+) -> None:
+    if global_workers_mutators is None:
+        global_workers_mutators = set()
+
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+
+        if isinstance(node, ast.For) and _target_assigns_workers(node.target):
+            state.dynamic = True
+
+        if _is_dynamic_workers_mutation(node):
+            state.dynamic = True
+
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.NamedExpr):
+            walrus = node.value
+            if _target_assigns_workers(walrus.target):
+                state.dynamic = True
+                state.record_workers_assignment(
+                    _static_int_from_ast(walrus.value),
+                    in_compound=in_compound,
+                )
+
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and _call_invokes_function(node.value, global_workers_mutators)
+        ):
+            state.dynamic = True
 
         assigns_workers, value = _worker_assignment_value(node)
         if assigns_workers:
             state.record_workers_assignment(value, in_compound=in_compound)
 
         for block in _compound_statement_blocks(node):
-            _walk_gunicorn_workers_statements(block, state, in_compound=True)
+            _walk_gunicorn_workers_statements(
+                block,
+                state,
+                in_compound=True,
+                global_workers_mutators=global_workers_mutators,
+            )
 
 
-_GUNICORN_RUNTIME_HOOK_NAMES = frozenset({"configure", "on_starting"})
+_GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
+    {
+        "configure",
+        "on_starting",
+        "when_ready",
+        "post_fork",
+        "pre_exec",
+        "on_reload",
+    }
+)
 
 
 def _gunicorn_config_has_runtime_hooks(tree):
@@ -415,7 +537,13 @@ def _scan_gunicorn_config_workers(tree):
     """
     state = _GunicornWorkersScanState()
     runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
-    _walk_gunicorn_workers_statements(tree.body, state, in_compound=False)
+    global_workers_mutators = _collect_global_workers_mutators(tree)
+    _walk_gunicorn_workers_statements(
+        tree.body,
+        state,
+        in_compound=False,
+        global_workers_mutators=global_workers_mutators,
+    )
     if runtime_hooks:
         state.dynamic = True
     if not state.found:
