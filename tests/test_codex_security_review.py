@@ -107,6 +107,11 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
         "workers = 1\ndef set_workers():\n    global workers\n    workers = 8\nset_workers()\n",
         "workers = 1\nglobals()['workers'] = 8\n",
         "workers = 1\nexec('workers = 8')\n",
+        "g = globals()\ng['workers'] = 4\n",
+        "globals().update({'workers': 4})\n",
+        "workers = 1\nmatch 1:\n    case 1:\n        workers = 4\n",
+        "m = __import__('sys').modules[__name__].__dict__\nm['workers'] = 4\n",
+        "workers = 1\n[globals().__setitem__('workers', 4)]\n",
     ],
 )
 def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, config_content):
