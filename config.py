@@ -318,18 +318,80 @@ def _target_assigns_workers(node):
     return False
 
 
-def _globals_workers_subscript(node):
-    """Return True for ``globals()['workers']``-style subscript targets."""
+def _subscript_slice_is_workers(node):
+    """Return True when a subscript uses the literal ``'workers'`` key."""
     if not isinstance(node, ast.Subscript):
-        return False
-    if not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    if not isinstance(func, ast.Name) or func.id != "globals":
         return False
     slice_node = node.slice
     if isinstance(slice_node, ast.Constant):
         return slice_node.value == "workers"
+    return False
+
+
+def _globals_workers_subscript(node):
+    """Return True for ``globals()['workers']``-style subscript targets."""
+    if not _subscript_slice_is_workers(node):
+        return False
+    if not isinstance(node.value, ast.Call):
+        return False
+    func = node.value.func
+    return isinstance(func, ast.Name) and func.id == "globals"
+
+
+def _dict_literal_sets_workers(node):
+    """Return True when a dict literal contains a ``workers`` key."""
+    if not isinstance(node, ast.Dict):
+        return False
+    return any(
+        isinstance(key, ast.Constant) and key.value == "workers"
+        for key in node.keys
+    )
+
+
+def _call_is_globals_workers_update(call):
+    """Return True for ``globals().update({...})`` that sets ``workers``."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Call):
+        return False
+    func = receiver.func
+    if not isinstance(func, ast.Name) or func.id != "globals":
+        return False
+    for arg in call.args:
+        if _dict_literal_sets_workers(arg):
+            return True
+    for keyword in call.keywords:
+        if keyword.arg == "workers":
+            return True
+        if _dict_literal_sets_workers(keyword.value):
+            return True
+    return False
+
+
+def _call_sets_workers_via_setitem(call):
+    """Return True for ``__setitem__('workers', ...)`` style mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__setitem__":
+        return False
+    if not call.args:
+        return False
+    key = call.args[0]
+    return isinstance(key, ast.Constant) and key.value == "workers"
+
+
+def _expression_mutates_workers(expr):
+    """Return True when an expression statement mutates ``workers`` indirectly."""
+    if isinstance(expr, ast.Call):
+        return _call_is_globals_workers_update(expr) or _call_sets_workers_via_setitem(expr)
+    if isinstance(expr, ast.List):
+        return any(
+            isinstance(elt, ast.Call) and _call_sets_workers_via_setitem(elt)
+            for elt in expr.elts
+        )
     return False
 
 
@@ -362,21 +424,28 @@ def _worker_assignment_value(node):
 
 def _is_dynamic_workers_mutation(node):
     """Return True for import-time mutations the AST scan cannot treat as static."""
-    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-        call = node.value
-        if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
+    if isinstance(node, ast.Expr):
+        if _expression_mutates_workers(node.value):
             return True
-        if (
-            isinstance(call.func, ast.Name)
-            and call.func.id == "setattr"
-            and len(call.args) >= 2
-            and isinstance(call.args[1], ast.Constant)
-            and call.args[1].value == "workers"
-        ):
-            return True
+        if isinstance(node.value, ast.Call):
+            call = node.value
+            if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
+                return True
+            if (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "setattr"
+                and len(call.args) >= 2
+                and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == "workers"
+            ):
+                return True
 
     if isinstance(node, ast.Assign):
-        return any(_globals_workers_subscript(target) for target in node.targets)
+        return any(
+            _globals_workers_subscript(target)
+            or _subscript_slice_is_workers(target)
+            for target in node.targets
+        )
 
     return False
 
@@ -454,6 +523,9 @@ def _compound_statement_blocks(node):
             yield handler.body
         yield node.orelse
         yield node.finalbody
+    elif isinstance(node, ast.Match):
+        for case in node.cases:
+            yield case.body
 
 
 def _walk_gunicorn_workers_statements(
