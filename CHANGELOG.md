@@ -13,6 +13,44 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-09-03
+
+### Security
+- Startup validation of a referenced Gunicorn config's `workers` setting now
+  detects indirect mutations — dict subscripts, `globals().update()`,
+  match/case bodies, `__setitem__`, list/tuple unpacking, walrus
+  expressions, for-loop rebinding, `exec`/`setattr`, import-time helper
+  calls, and `configure()`/`on_starting()` hooks — so a dynamic worker count
+  can no longer slip past the check and enable the `memory://` rate-limiter
+  storage banned for multi-worker deployments.
+- `TRUSTED_PROXY_IPS` rejects universal catch-all CIDRs (`0.0.0.0/0`,
+  `::/0`, and `/1` ranges), which previously made every direct TCP peer
+  look like a trusted proxy.
+- Multi-worker deployments reject unsupported Redis session/rate-limiter
+  URIs (`redis+cluster://`, `redis+unix://`) that `Flask-Limiter` accepts
+  but that don't provide real cross-worker coordination.
+- HTTPS `Referrer-Policy` response header aligned to `same-origin` (browsers
+  prefer it over the template meta tag); the previous `no-referrer` header
+  dropped `Referer` on same-origin form POSTs and broke
+  `WTF_CSRF_SSL_STRICT` on HTTPS deployments.
+
+### Fixed
+- `delete_stream` client polling window aligned to the server's 300s
+  (`DELETE_DRAIN_TIMEOUT`) async drain instead of the previous 35s, so
+  operators deleting live streams no longer see a false failure while the
+  server is still draining.
+- Panel hardened against malformed upstream API responses: stream
+  list/create responses are validated, request body size is capped, API
+  player dicts are no longer mutated in place, and stats uptime formatting
+  is guarded.
+- CI/release supply-chain hardening: GitHub Actions pinned to full commit
+  SHAs, locked `--only-binary` pip installs in CI/Docker, release workflow
+  write permissions scoped to the package job, and Docker build context
+  narrowed from `COPY . .` to explicit paths plus `.dockerignore`.
+
+### Changed
+- Changelog version `0.1.6` → `0.1.7`.
+
 ## [0.1.6] — 2026-08-10
 
 ### Added
@@ -202,7 +240,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.3...v0.1.4
