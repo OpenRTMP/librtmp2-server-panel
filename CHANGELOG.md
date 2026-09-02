@@ -13,7 +13,7 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
-## [0.1.7] — 2026-09-02
+## [0.1.7] — 2026-09-03
 
 ### Security
 - Startup validation of a referenced Gunicorn config's `workers` setting now
