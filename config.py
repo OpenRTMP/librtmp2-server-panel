@@ -400,7 +400,10 @@ def _import_from_binds_workers(node):
     """Return True when an import statement may define ``workers`` indirectly."""
     if not isinstance(node, ast.ImportFrom):
         return False
-    return any(alias.name in {"workers", "*"} for alias in node.names)
+    return any(
+        alias.name == "*" or (alias.asname or alias.name) == "workers"
+        for alias in node.names
+    )
 
 
 def _expression_mutates_workers(expr):
