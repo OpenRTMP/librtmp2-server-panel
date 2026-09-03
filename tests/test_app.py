@@ -462,6 +462,29 @@ def test_config_rejects_memory_ratelimit_with_gunicorn_configure_hook(monkeypatc
     )
 
 
+def test_config_rejects_memory_ratelimit_with_imported_gunicorn_workers(monkeypatch):
+    settings_file = _PROJECT_ROOT / "tests" / "_gunicorn_worker_settings.py"
+    settings_file.write_text("workers = 4\n", encoding="utf-8")
+    try:
+        _assert_config_import_with_gunicorn_file(
+            monkeypatch,
+            config_content="from _gunicorn_worker_settings import workers\n",
+        )
+    finally:
+        settings_file.unlink(missing_ok=True)
+
+
+def test_config_rejects_memory_ratelimit_with_object_setattr_gunicorn_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "import sys\n"
+            'object.__setattr__(sys.modules[__name__], "workers", 8)\n'
+        ),
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,

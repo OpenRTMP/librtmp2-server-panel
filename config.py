@@ -383,6 +383,29 @@ def _call_sets_workers_via_setitem(call):
     return isinstance(key, ast.Constant) and key.value == "workers"
 
 
+def _call_sets_workers_attribute(call):
+    """Return True for setattr/object.__setattr__ calls that bind ``workers``."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    key = call.args[1]
+    if not isinstance(key, ast.Constant) or key.value != "workers":
+        return False
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "setattr":
+        return True
+    return isinstance(func, ast.Attribute) and func.attr == "__setattr__"
+
+
+def _import_from_binds_workers(node):
+    """Return True when an import statement may define ``workers`` indirectly."""
+    if not isinstance(node, ast.ImportFrom):
+        return False
+    return any(
+        alias.name == "*" or (alias.asname or alias.name) == "workers"
+        for alias in node.names
+    )
+
+
 def _expression_mutates_workers(expr):
     """Return True when an expression statement mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Call):
@@ -431,13 +454,7 @@ def _is_dynamic_workers_mutation(node):
             call = node.value
             if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
                 return True
-            if (
-                isinstance(call.func, ast.Name)
-                and call.func.id == "setattr"
-                and len(call.args) >= 2
-                and isinstance(call.args[1], ast.Constant)
-                and call.args[1].value == "workers"
-            ):
+            if _call_sets_workers_attribute(call):
                 return True
 
     if isinstance(node, ast.Assign):
@@ -546,6 +563,9 @@ def _walk_gunicorn_workers_statements(
             state.dynamic = True
 
         if _is_dynamic_workers_mutation(node):
+            state.dynamic = True
+
+        if _import_from_binds_workers(node):
             state.dynamic = True
 
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.NamedExpr):
