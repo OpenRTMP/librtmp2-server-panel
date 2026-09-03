@@ -113,14 +113,27 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
         "m = __import__('sys').modules[__name__].__dict__\nm['workers'] = 4\n",
         "workers = 1\n[globals().__setitem__('workers', 4)]\n",
         "from worker_settings import workers\n",
+        "from worker_settings import worker_count as workers\n",
         "from settings import *\n",
         "workers = 1\nimport sys\nobject.__setattr__(sys.modules[__name__], 'workers', 8)\n",
     ],
 )
 def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, config_content):
     config_file = tmp_path / "gunicorn.conf.py"
-    (tmp_path / "worker_settings.py").write_text("workers = 4\n", encoding="utf-8")
+    (tmp_path / "worker_settings.py").write_text(
+        "workers = 4\nworker_count = 4\n", encoding="utf-8"
+    )
     (tmp_path / "settings.py").write_text("workers = 4\n", encoding="utf-8")
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_import_aliased_away_from_workers_is_not_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from worker_settings import workers as default_workers\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
