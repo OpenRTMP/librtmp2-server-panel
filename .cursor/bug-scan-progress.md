@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: templates/ — 2026-08-22
+Last scanned: static/js/ — 2026-09-03
 
 ## Module checklist
 
@@ -8,10 +8,25 @@ Last scanned: templates/ — 2026-08-22
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
 - [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-09-03 static/js/ pass)
+
+- No critical bugs found. Re-scanned `scripts.js` end-to-end: all API-derived
+  strings (`data.error`, `video.codec`, node IDs, player labels) pass through
+  `escapeHtml()` before `innerHTML`; numeric fields coerced with `Number()` /
+  `Number.isFinite()`; stats polling limited to visible accordion panels and
+  skips when `document.hidden`; in-flight requests guarded by `dataset.loading`
+  with 10s `AbortController` timeout; `streamId` URL-encoded in fetch path and
+  sourced from server-validated `data-stream-id` (`STREAM_ID_RE`); same-origin
+  fetch sends session cookie for `@login_required` stats route; per-IP/per-stream
+  rate limits (600/25 per minute defaults) cover 3s poll interval; cluster
+  remove confirm uses plain `window.confirm` (no HTML); `formatUptime` hardened
+  against non-numeric API values. Vendor `bootstrap.bundle.min.js` not audited
+  (third-party).
 
 ## Findings (2026-08-22 templates/ pass)
 
