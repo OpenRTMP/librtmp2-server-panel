@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: templates/ — 2026-08-22
+Last scanned: static/js/ — 2026-09-04
 
 ## Module checklist
 
@@ -8,10 +8,33 @@ Last scanned: templates/ — 2026-08-22
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
 - [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-09-04 static/js/ pass)
+
+- No critical bugs found. Reviewed `scripts.js` end-to-end (custom code;
+  `bootstrap.bundle.min.js` is vendored/minified — not audited line-by-line):
+  `loadStats()` uses `encodeURIComponent(streamId)`; all API-derived strings
+  inserted via `innerHTML` pass through `escapeHtml()` (`data.error`,
+  `video.codec`, `owner_node_id`, `players_by_node` keys, player labels);
+  numeric fields coerced with `Number()` / `Number.isFinite()` before
+  interpolation; `formatUptime()` guards non-finite input (post-#123). Stats
+  polling limited to visible accordion panels and non-hidden tabs; in-flight
+  guard (`dataset.loading`) plus 10s `AbortController` timeout prevent
+  overlap/stall. `fetch()` is same-origin (session cookie sent;
+  `@login_required` on route). Per-stream (25/min) and per-IP (600/min) rate
+  limits in `app.py` accommodate 3s polling (~20/min/stream) with modest
+  headroom for `visibilitychange` / accordion events. `copyToClipboard` reads
+  operator-rendered `data-url` attributes (Jinja auto-escaped). Cluster remove
+  confirm uses integer-validated `data-node-id` (no injection path).
+- Reviewed but not critical: transient HTTP 429/502/abort shows "Stats not
+  available" until the next successful poll (self-recovers); ≥31 simultaneously
+  expanded streams can brush the default per-IP cap (configurable via
+  `STATS_RATE_LIMIT_PER_IP`); `setInterval` is not cleared on tab hide
+  (no-op when `document.hidden`).
 
 ## Findings (2026-08-22 templates/ pass)
 
