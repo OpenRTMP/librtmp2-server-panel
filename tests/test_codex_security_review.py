@@ -119,6 +119,9 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
         "workers = 1\n(lambda g: g.__setitem__('workers', 4))(globals())\n",
         "workers = 1\nimport operator\noperator.setitem(globals(), 'workers', 4)\n",
         "workers = 1\ngetattr(globals(), '__setitem__')('workers', 4)\n",
+        "workers = 1\nimport operator\n(operator.setitem(globals(), 'workers', 4),)\n",
+        "workers = 1\nimport operator as op\nop.setitem(globals(), 'workers', 4)\n",
+        "workers = 1\nfrom operator import setitem as put\nput(globals(), 'workers', 4)\n",
     ],
 )
 def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, config_content):
@@ -130,6 +133,19 @@ def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, con
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_gunicorn_config_operator_setitem_on_other_mapping_is_not_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import operator\n"
+        "settings = {}\n"
+        "operator.setitem(settings, 'workers', 4)\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
 def test_gunicorn_config_import_aliased_away_from_workers_is_not_dynamic(tmp_path):
