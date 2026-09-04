@@ -371,6 +371,10 @@ def _call_is_globals_workers_update(call):
     return False
 
 
+def _constant_is_workers(node):
+    return isinstance(node, ast.Constant) and node.value == "workers"
+
+
 def _call_sets_workers_via_setitem(call):
     """Return True for ``__setitem__('workers', ...)`` style mutations."""
     if not isinstance(call, ast.Call):
@@ -379,8 +383,62 @@ def _call_sets_workers_via_setitem(call):
         return False
     if not call.args:
         return False
-    key = call.args[0]
-    return isinstance(key, ast.Constant) and key.value == "workers"
+    return _constant_is_workers(call.args[0])
+
+
+def _call_is_operator_setitem_workers(call):
+    """Return True for ``operator.setitem(globals(), 'workers', ...)`` mutations."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Attribute) or func.attr != "setitem":
+        return False
+    if not isinstance(func.value, ast.Name) or func.value.id != "operator":
+        return False
+    return _constant_is_workers(call.args[1])
+
+
+def _call_is_getattr_setitem_workers(call):
+    """Return True for ``getattr(globals(), '__setitem__')('workers', ...)``."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    attr = func.args[1]
+    if not isinstance(attr, ast.Constant) or attr.value != "__setitem__":
+        return False
+    return _constant_is_workers(call.args[0])
+
+
+def _lambda_mutates_workers(lambda_node):
+    """Return True when a lambda body assigns ``workers`` via setitem helpers."""
+    if not isinstance(lambda_node, ast.Lambda):
+        return False
+    body = lambda_node.body
+    if not isinstance(body, ast.Call):
+        return False
+    return (
+        _call_sets_workers_via_setitem(body)
+        or _call_is_operator_setitem_workers(body)
+        or _call_is_getattr_setitem_workers(body)
+    )
+
+
+def _call_mutates_workers_via_indirection(call):
+    """Return True for indirect import-time ``workers`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if (
+        _call_sets_workers_via_setitem(call)
+        or _call_is_operator_setitem_workers(call)
+        or _call_is_getattr_setitem_workers(call)
+        or _call_sets_workers_attribute(call)
+    ):
+        return True
+    return isinstance(call.func, ast.Lambda) and _lambda_mutates_workers(call.func)
 
 
 def _call_sets_workers_attribute(call):
@@ -409,10 +467,13 @@ def _import_from_binds_workers(node):
 def _expression_mutates_workers(expr):
     """Return True when an expression statement mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Call):
-        return _call_is_globals_workers_update(expr) or _call_sets_workers_via_setitem(expr)
+        return (
+            _call_is_globals_workers_update(expr)
+            or _call_mutates_workers_via_indirection(expr)
+        )
     if isinstance(expr, ast.List):
         return any(
-            isinstance(elt, ast.Call) and _call_sets_workers_via_setitem(elt)
+            isinstance(elt, ast.Call) and _call_mutates_workers_via_indirection(elt)
             for elt in expr.elts
         )
     return False
@@ -454,7 +515,7 @@ def _is_dynamic_workers_mutation(node):
             call = node.value
             if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
                 return True
-            if _call_sets_workers_attribute(call):
+            if _call_mutates_workers_via_indirection(call):
                 return True
 
     if isinstance(node, ast.Assign):

@@ -116,6 +116,9 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
         "from worker_settings import worker_count as workers\n",
         "from settings import *\n",
         "workers = 1\nimport sys\nobject.__setattr__(sys.modules[__name__], 'workers', 8)\n",
+        "workers = 1\n(lambda g: g.__setitem__('workers', 4))(globals())\n",
+        "workers = 1\nimport operator\noperator.setitem(globals(), 'workers', 4)\n",
+        "workers = 1\ngetattr(globals(), '__setitem__')('workers', 4)\n",
     ],
 )
 def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, config_content):
