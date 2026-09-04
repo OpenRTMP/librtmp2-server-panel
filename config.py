@@ -328,14 +328,20 @@ def _subscript_slice_is_workers(node):
     return False
 
 
+def _is_globals_call(node):
+    """Return True for a direct ``globals()`` call."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "globals"
+        and not node.args
+        and not node.keywords
+    )
+
+
 def _globals_workers_subscript(node):
     """Return True for ``globals()['workers']``-style subscript targets."""
-    if not _subscript_slice_is_workers(node):
-        return False
-    if not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return isinstance(func, ast.Name) and func.id == "globals"
+    return _subscript_slice_is_workers(node) and _is_globals_call(node.value)
 
 
 def _dict_literal_sets_workers(node):
@@ -354,11 +360,7 @@ def _call_is_globals_workers_update(call):
         return False
     if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
         return False
-    receiver = call.func.value
-    if not isinstance(receiver, ast.Call):
-        return False
-    func = receiver.func
-    if not isinstance(func, ast.Name) or func.id != "globals":
+    if not _is_globals_call(call.func.value):
         return False
     for arg in call.args:
         if _dict_literal_sets_workers(arg):
@@ -371,6 +373,10 @@ def _call_is_globals_workers_update(call):
     return False
 
 
+def _constant_is_workers(node):
+    return isinstance(node, ast.Constant) and node.value == "workers"
+
+
 def _call_sets_workers_via_setitem(call):
     """Return True for ``__setitem__('workers', ...)`` style mutations."""
     if not isinstance(call, ast.Call):
@@ -379,8 +385,79 @@ def _call_sets_workers_via_setitem(call):
         return False
     if not call.args:
         return False
-    key = call.args[0]
-    return isinstance(key, ast.Constant) and key.value == "workers"
+    return _constant_is_workers(call.args[0])
+
+
+def _call_is_operator_setitem_workers(call, operator_bindings):
+    """Return True for imported ``operator.setitem(globals(), 'workers', ...)``."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not _is_globals_call(call.args[0]) or not _constant_is_workers(call.args[1]):
+        return False
+
+    module_aliases, setitem_aliases = operator_bindings
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "setitem":
+        return (
+            isinstance(func.value, ast.Name)
+            and func.value.id in module_aliases
+        )
+    return isinstance(func, ast.Name) and func.id in setitem_aliases
+
+
+def _call_is_getattr_setitem_workers(call):
+    """Return True for ``getattr(globals(), '__setitem__')('workers', ...)``."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    if not _is_globals_call(func.args[0]):
+        return False
+    attr = func.args[1]
+    if not isinstance(attr, ast.Constant) or attr.value != "__setitem__":
+        return False
+    return _constant_is_workers(call.args[0])
+
+
+def _expression_mutates_workers(expr, operator_bindings):
+    """Return True when an evaluated expression mutates ``workers`` indirectly."""
+    if isinstance(expr, ast.Lambda):
+        return False
+    if isinstance(expr, ast.Call) and (
+        _call_is_globals_workers_update(expr)
+        or _call_mutates_workers_via_indirection(expr, operator_bindings)
+    ):
+        return True
+    return any(
+        _expression_mutates_workers(child, operator_bindings)
+        for child in ast.iter_child_nodes(expr)
+    )
+
+
+def _lambda_mutates_workers(lambda_node, operator_bindings):
+    """Return True when an invoked lambda body mutates ``workers`` indirectly."""
+    return isinstance(lambda_node, ast.Lambda) and _expression_mutates_workers(
+        lambda_node.body, operator_bindings
+    )
+
+
+def _call_mutates_workers_via_indirection(call, operator_bindings):
+    """Return True for indirect import-time ``workers`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if (
+        _call_sets_workers_via_setitem(call)
+        or _call_is_operator_setitem_workers(call, operator_bindings)
+        or _call_is_getattr_setitem_workers(call)
+        or _call_sets_workers_attribute(call)
+    ):
+        return True
+    return isinstance(call.func, ast.Lambda) and _lambda_mutates_workers(
+        call.func, operator_bindings
+    )
 
 
 def _call_sets_workers_attribute(call):
@@ -404,18 +481,6 @@ def _import_from_binds_workers(node):
         alias.name == "*" or (alias.asname or alias.name) == "workers"
         for alias in node.names
     )
-
-
-def _expression_mutates_workers(expr):
-    """Return True when an expression statement mutates ``workers`` indirectly."""
-    if isinstance(expr, ast.Call):
-        return _call_is_globals_workers_update(expr) or _call_sets_workers_via_setitem(expr)
-    if isinstance(expr, ast.List):
-        return any(
-            isinstance(elt, ast.Call) and _call_sets_workers_via_setitem(elt)
-            for elt in expr.elts
-        )
-    return False
 
 
 def _worker_assignment_value(node):
@@ -445,16 +510,16 @@ def _worker_assignment_value(node):
     return False, None
 
 
-def _is_dynamic_workers_mutation(node):
+def _is_dynamic_workers_mutation(node, operator_bindings):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if isinstance(node, ast.Expr):
-        if _expression_mutates_workers(node.value):
+        if _expression_mutates_workers(node.value, operator_bindings):
             return True
         if isinstance(node.value, ast.Call):
             call = node.value
             if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
                 return True
-            if _call_sets_workers_attribute(call):
+            if _call_mutates_workers_via_indirection(call, operator_bindings):
                 return True
 
     if isinstance(node, ast.Assign):
@@ -545,15 +610,42 @@ def _compound_statement_blocks(node):
             yield case.body
 
 
+def _collect_operator_setitem_bindings(tree):
+    """Collect module-level aliases that bind ``operator`` or its ``setitem``."""
+    module_aliases = set()
+    setitem_aliases = set()
+
+    def visit(statements):
+        for node in statements:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "operator":
+                        module_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module == "operator":
+                for alias in node.names:
+                    if alias.name == "setitem":
+                        setitem_aliases.add(alias.asname or alias.name)
+            for block in _compound_statement_blocks(node):
+                visit(block)
+
+    visit(tree.body)
+    return module_aliases, setitem_aliases
+
+
 def _walk_gunicorn_workers_statements(
     statements,
     state,
     *,
     in_compound: bool,
     global_workers_mutators=None,
+    operator_bindings=None,
 ) -> None:
     if global_workers_mutators is None:
         global_workers_mutators = set()
+    if operator_bindings is None:
+        operator_bindings = (set(), set())
 
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -562,7 +654,7 @@ def _walk_gunicorn_workers_statements(
         if isinstance(node, ast.For) and _target_assigns_workers(node.target):
             state.dynamic = True
 
-        if _is_dynamic_workers_mutation(node):
+        if _is_dynamic_workers_mutation(node, operator_bindings):
             state.dynamic = True
 
         if _import_from_binds_workers(node):
@@ -594,6 +686,7 @@ def _walk_gunicorn_workers_statements(
                 state,
                 in_compound=True,
                 global_workers_mutators=global_workers_mutators,
+                operator_bindings=operator_bindings,
             )
 
 
@@ -630,11 +723,13 @@ def _scan_gunicorn_config_workers(tree):
     state = _GunicornWorkersScanState()
     runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
     global_workers_mutators = _collect_global_workers_mutators(tree)
+    operator_bindings = _collect_operator_setitem_bindings(tree)
     _walk_gunicorn_workers_statements(
         tree.body,
         state,
         in_compound=False,
         global_workers_mutators=global_workers_mutators,
+        operator_bindings=operator_bindings,
     )
     if runtime_hooks:
         state.dynamic = True
