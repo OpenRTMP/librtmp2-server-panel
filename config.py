@@ -510,6 +510,13 @@ def _worker_assignment_value(node):
     return False, None
 
 
+def _indirect_workers_assignment_target(node):
+    """Return True when an assignment target may mutate a ``workers`` binding indirectly."""
+    return _subscript_slice_is_workers(node) or (
+        isinstance(node, ast.Attribute) and node.attr == "workers"
+    )
+
+
 def _is_dynamic_workers_mutation(node, operator_bindings):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if isinstance(node, ast.Expr):
@@ -523,24 +530,113 @@ def _is_dynamic_workers_mutation(node, operator_bindings):
                 return True
 
     if isinstance(node, ast.Assign):
-        return any(
-            _globals_workers_subscript(target)
-            or _subscript_slice_is_workers(target)
-            for target in node.targets
-        )
+        return any(_indirect_workers_assignment_target(target) for target in node.targets)
+
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return _indirect_workers_assignment_target(node.target)
 
     return False
 
 
-def _function_mutates_global_workers(func_node):
-    """Return True when a function assigns to ``global workers``."""
-    has_global_workers = any(
-        isinstance(child, ast.Global) and "workers" in child.names
-        for child in func_node.body
-    )
-    if not has_global_workers:
+def _statements_declare_global_workers(statements):
+    """Return True when this function scope declares ``global workers``."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Global) and "workers" in node.names:
+            return True
+        for block in _compound_statement_blocks(node):
+            if _statements_declare_global_workers(block):
+                return True
+    return False
+
+
+def _expression_invokes_function(expr, func_names):
+    """Return True when an evaluated expression invokes a named helper."""
+    if not func_names or isinstance(expr, ast.Lambda):
         return False
-    return any(_worker_assignment_value(stmt)[0] for stmt in func_node.body)
+    if isinstance(expr, ast.Call):
+        if _call_invokes_function(expr, func_names):
+            return True
+        if isinstance(expr.func, ast.Lambda) and _expression_invokes_function(
+            expr.func.body, func_names
+        ):
+            return True
+    return any(
+        _expression_invokes_function(child, func_names)
+        for child in ast.iter_child_nodes(expr)
+    )
+
+
+def _statement_invokes_function(node, func_names):
+    """Return True when expressions evaluated by this statement invoke a helper."""
+    if not func_names:
+        return False
+    return any(
+        isinstance(child, ast.expr)
+        and _expression_invokes_function(child, func_names)
+        for child in ast.iter_child_nodes(node)
+    )
+
+
+def _statement_mutates_workers(
+    node,
+    operator_bindings,
+    *,
+    global_workers,
+    mutator_names,
+):
+    """Return True when one statement may mutate the module ``workers`` binding."""
+    if _statement_invokes_function(node, mutator_names):
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    if _is_dynamic_workers_mutation(node, operator_bindings):
+        return True
+    assigns_workers, _ = _worker_assignment_value(node)
+    if global_workers and assigns_workers:
+        return True
+    return any(
+        _statements_mutate_workers(
+            block,
+            operator_bindings,
+            global_workers=global_workers,
+            mutator_names=mutator_names,
+        )
+        for block in _compound_statement_blocks(node)
+    )
+
+
+def _statements_mutate_workers(
+    statements,
+    operator_bindings,
+    *,
+    global_workers=False,
+    mutator_names=None,
+):
+    """Return True when statements may mutate the module ``workers`` binding."""
+    if mutator_names is None:
+        mutator_names = set()
+    return any(
+        _statement_mutates_workers(
+            node,
+            operator_bindings,
+            global_workers=global_workers,
+            mutator_names=mutator_names,
+        )
+        for node in statements
+    )
+
+
+def _function_mutates_workers(func_node, operator_bindings, mutator_names=None):
+    """Return True when a function may mutate the module ``workers`` binding."""
+    has_global_workers = _statements_declare_global_workers(func_node.body)
+    return _statements_mutate_workers(
+        func_node.body,
+        operator_bindings,
+        global_workers=has_global_workers,
+        mutator_names=mutator_names,
+    )
 
 
 def _call_invokes_function(call_node, func_names):
@@ -551,13 +647,23 @@ def _call_invokes_function(call_node, func_names):
     return False
 
 
-def _collect_global_workers_mutators(tree):
-    """Return function names that mutate ``global workers`` when called."""
+def _collect_import_time_workers_mutators(tree, operator_bindings):
+    """Return function names that may mutate ``workers`` when called at import time."""
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     mutators = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _function_mutates_global_workers(node):
-                mutators.add(node.name)
+    changed = True
+    while changed:
+        changed = False
+        for name, node in functions.items():
+            if name in mutators:
+                continue
+            if _function_mutates_workers(node, operator_bindings, mutators):
+                mutators.add(name)
+                changed = True
     return mutators
 
 
@@ -648,6 +754,9 @@ def _walk_gunicorn_workers_statements(
         operator_bindings = (set(), set())
 
     for node in statements:
+        if _statement_invokes_function(node, global_workers_mutators):
+            state.dynamic = True
+
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
 
@@ -668,13 +777,6 @@ def _walk_gunicorn_workers_statements(
                     _static_int_from_ast(walrus.value),
                     in_compound=in_compound,
                 )
-
-        if (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and _call_invokes_function(node.value, global_workers_mutators)
-        ):
-            state.dynamic = True
 
         assigns_workers, value = _worker_assignment_value(node)
         if assigns_workers:
@@ -722,13 +824,15 @@ def _scan_gunicorn_config_workers(tree):
     """
     state = _GunicornWorkersScanState()
     runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
-    global_workers_mutators = _collect_global_workers_mutators(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    import_time_workers_mutators = _collect_import_time_workers_mutators(
+        tree, operator_bindings
+    )
     _walk_gunicorn_workers_statements(
         tree.body,
         state,
         in_compound=False,
-        global_workers_mutators=global_workers_mutators,
+        global_workers_mutators=import_time_workers_mutators,
         operator_bindings=operator_bindings,
     )
     if runtime_hooks:

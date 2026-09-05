@@ -485,6 +485,19 @@ def test_config_rejects_memory_ratelimit_with_object_setattr_gunicorn_workers(mo
     )
 
 
+def test_config_rejects_memory_ratelimit_with_module_dict_workers_bump(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "import sys\n"
+            "def _bump():\n"
+            "    sys.modules[__name__].__dict__['workers'] = 8\n"
+            "_bump()\n"
+        ),
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,
