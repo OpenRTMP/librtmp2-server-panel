@@ -122,6 +122,14 @@ def test_gunicorn_config_on_starting_hook_is_dynamic(tmp_path):
         "workers = 1\nimport operator\n(operator.setitem(globals(), 'workers', 4),)\n",
         "workers = 1\nimport operator as op\nop.setitem(globals(), 'workers', 4)\n",
         "workers = 1\nfrom operator import setitem as put\nput(globals(), 'workers', 4)\n",
+        "workers = 1\nimport sys\n"
+        "def _bump():\n"
+        "    sys.modules[__name__].__dict__['workers'] = 8\n"
+        "_bump()\n",
+        "workers = 1\nimport sys\n"
+        "def _bump():\n"
+        "    sys.modules[__name__].workers = 8\n"
+        "_bump()\n",
     ],
 )
 def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, config_content):
