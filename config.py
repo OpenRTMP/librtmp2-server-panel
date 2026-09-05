@@ -579,6 +579,34 @@ def _statement_invokes_function(node, func_names):
     )
 
 
+def _statement_mutates_workers(
+    node,
+    operator_bindings,
+    *,
+    global_workers,
+    mutator_names,
+):
+    """Return True when one statement may mutate the module ``workers`` binding."""
+    if _statement_invokes_function(node, mutator_names):
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    if _is_dynamic_workers_mutation(node, operator_bindings):
+        return True
+    assigns_workers, _ = _worker_assignment_value(node)
+    if global_workers and assigns_workers:
+        return True
+    return any(
+        _statements_mutate_workers(
+            block,
+            operator_bindings,
+            global_workers=global_workers,
+            mutator_names=mutator_names,
+        )
+        for block in _compound_statement_blocks(node)
+    )
+
+
 def _statements_mutate_workers(
     statements,
     operator_bindings,
@@ -589,25 +617,15 @@ def _statements_mutate_workers(
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
         mutator_names = set()
-    for node in statements:
-        if _statement_invokes_function(node, mutator_names):
-            return True
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if _is_dynamic_workers_mutation(node, operator_bindings):
-            return True
-        assigns_workers, _ = _worker_assignment_value(node)
-        if global_workers and assigns_workers:
-            return True
-        for block in _compound_statement_blocks(node):
-            if _statements_mutate_workers(
-                block,
-                operator_bindings,
-                global_workers=global_workers,
-                mutator_names=mutator_names,
-            ):
-                return True
-    return False
+    return any(
+        _statement_mutates_workers(
+            node,
+            operator_bindings,
+            global_workers=global_workers,
+            mutator_names=mutator_names,
+        )
+        for node in statements
+    )
 
 
 def _function_mutates_workers(func_node, operator_bindings, mutator_names=None):
