@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: templates/ — 2026-08-22
+Last scanned: static/js/ — 2026-09-05
 
 ## Module checklist
 
@@ -8,10 +8,27 @@ Last scanned: templates/ — 2026-08-22
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
 - [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-09-05 static/js/ pass)
+
+- No critical bugs found. Re-reviewed `scripts.js` end-to-end: all API-derived
+  strings inserted via `innerHTML` pass through `escapeHtml()` (`data.error`,
+  `video.codec`, `owner_node_id`, `players_by_node` keys); numeric fields are
+  coerced with `Number()`/`Number.isFinite()` before interpolation; `streamId`
+  comes from server-rendered `data-stream-id` (Jinja auto-escaped, validated by
+  `STREAM_ID_RE` on the stats route) and is URL-encoded in fetch paths;
+  `formatUptime()` rejects non-finite input; polling is scoped to visible
+  accordion panels and skips hidden tabs (`document.hidden`), with in-flight
+  dedup (`dataset.loading`), 10s abort timeout, and per-IP/per-stream rate
+  limits (defaults 600/25 per minute vs 20 polls/min per expanded stream) on
+  the auth-gated `/streams/<id>/stats.json` route; `copyToClipboard()` reads
+  operator/server-built URLs from `data-url` attributes; cluster-remove confirm
+  uses plain-text `window.confirm`. Vendored `bootstrap.bundle.min.js` not
+  modified — out of scope for custom-code review.
 
 ## Findings (2026-08-22 templates/ pass)
 
