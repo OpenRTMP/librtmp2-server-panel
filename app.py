@@ -845,6 +845,8 @@ def create_app():
         or _stats_per_stream_rate_limit_exempt(),
     )
     def _stream_stats_rate_limit():
+        # Intentionally empty: Flask-Limiter enforces both limits via the decorators
+        # when this before_request hook is invoked; no additional handler logic is needed.
         pass
 
     app.before_request(_stream_stats_rate_limit)
