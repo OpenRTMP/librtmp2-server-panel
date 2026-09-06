@@ -11,6 +11,8 @@ A web control panel for [librtmp2-server](https://github.com/OpenRTMP/librtmp2-s
 - Website: [openrtmp.org](https://openrtmp.org/)
 - Five-minute guide: [openrtmp.org/quickstart/](https://openrtmp.org/quickstart/)
 - Server: [OpenRTMP/librtmp2-server](https://github.com/OpenRTMP/librtmp2-server)
+- Community issues: [OpenRTMP/community](https://github.com/OpenRTMP/community/issues/new/choose)
+- Community discussions: [OpenRTMP/community](https://github.com/OpenRTMP/community/discussions)
 
 ## Start the full stack in five minutes
 
@@ -210,6 +212,6 @@ durable admin mutations internally; you do not need one panel URL per node.
 
 ## Support and contributing
 
-Use [GitHub Issues](https://github.com/OpenRTMP/librtmp2-server-panel/issues) for reproducible bugs and feature requests. General architecture and usage discussions belong in [OpenRTMP Discussions](https://github.com/OpenRTMP/librtmp2/discussions).
+Use [OpenRTMP Community Issues](https://github.com/OpenRTMP/community/issues/new/choose) for reproducible bugs, feature requests, and interoperability problems involving the panel. General architecture, setup, and usage questions belong in [OpenRTMP Community Discussions](https://github.com/OpenRTMP/community/discussions).
 
-Contributions are welcome. Please include reproduction steps, screenshots for UI changes, and tests where practical.
+Pull requests for panel code still belong in this repository. Contributions are welcome; please include reproduction steps, screenshots for UI changes, and tests where practical.
