@@ -825,21 +825,33 @@ def create_app():
     stats_ip_limit = f"{app.config['STATS_RATE_LIMIT_PER_IP']} per minute"
     stats_stream_limit = f"{app.config['STATS_RATE_LIMIT_PER_STREAM']} per minute"
 
-    @app.route("/streams/<stream_id>/stats.json")
-    @login_required
-    # Opt out of default_limits in the limiter middleware; scripts.js polls each
-    # visible stream every 3s and six streams would exceed the global 100/min cap.
-    @limiter.exempt(flags=ExemptionScope.DEFAULT)
+    def _stream_stats_route_rate_limit_exempt():
+        return request.endpoint != "stream_stats"
+
+    # Enforce stats caps in before_request (like login POST) so the view can
+    # opt out of default_limits without @limiter.exempt disabling decorated
+    # limits on the same callable (Flask-Limiter skips decorated limits when
+    # any exemption is registered on that function).
     @limiter.limit(
         stats_ip_limit,
         key_func=_rate_limit_remote_addr,
-        exempt_when=_stats_ip_rate_limit_exempt,
+        exempt_when=lambda: _stream_stats_route_rate_limit_exempt()
+        or _stats_ip_rate_limit_exempt(),
     )
     @limiter.limit(
         stats_stream_limit,
         key_func=_stats_rate_limit_key,
-        exempt_when=_stats_per_stream_rate_limit_exempt,
+        exempt_when=lambda: _stream_stats_route_rate_limit_exempt()
+        or _stats_per_stream_rate_limit_exempt(),
     )
+    def _stream_stats_rate_limit():
+        pass
+
+    app.before_request(_stream_stats_rate_limit)
+
+    @app.route("/streams/<stream_id>/stats.json")
+    @limiter.exempt(flags=ExemptionScope.DEFAULT)
+    @login_required
     def stream_stats(stream_id):
         if not _is_valid_stream_id(stream_id):
             return jsonify({"error": "Invalid stream ID"}), 400
