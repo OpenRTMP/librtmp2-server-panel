@@ -354,13 +354,11 @@ def _dict_literal_sets_workers(node):
     )
 
 
-def _call_is_globals_workers_update(call):
-    """Return True for ``globals().update({...})`` that sets ``workers``."""
+def _call_update_sets_workers(call):
+    """Return True for ``.update({...})`` calls that set ``workers``."""
     if not isinstance(call, ast.Call):
         return False
     if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
-        return False
-    if not _is_globals_call(call.func.value):
         return False
     for arg in call.args:
         if _dict_literal_sets_workers(arg):
@@ -371,6 +369,15 @@ def _call_is_globals_workers_update(call):
         if _dict_literal_sets_workers(keyword.value):
             return True
     return False
+
+
+def _call_is_globals_workers_update(call):
+    """Return True for ``globals().update({...})`` that sets ``workers``."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not _is_globals_call(call.func.value):
+        return False
+    return _call_update_sets_workers(call)
 
 
 def _constant_is_workers(node):
@@ -427,7 +434,7 @@ def _expression_mutates_workers(expr, operator_bindings):
     if isinstance(expr, ast.Lambda):
         return False
     if isinstance(expr, ast.Call) and (
-        _call_is_globals_workers_update(expr)
+        _call_update_sets_workers(expr)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
