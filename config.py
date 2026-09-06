@@ -354,23 +354,140 @@ def _dict_literal_sets_workers(node):
     )
 
 
-def _call_is_globals_workers_update(call):
-    """Return True for ``globals().update({...})`` that sets ``workers``."""
+def _is_current_module_reference(node):
+    """Return True for expressions that resolve to this config module."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    if not isinstance(node.slice, ast.Name) or node.slice.id != "__name__":
+        return False
+    modules = node.value
+    if not isinstance(modules, ast.Attribute) or modules.attr != "modules":
+        return False
+    root = modules.value
+    if isinstance(root, ast.Name) and root.id == "sys":
+        return True
+    return (
+        isinstance(root, ast.Call)
+        and isinstance(root.func, ast.Name)
+        and root.func.id == "__import__"
+        and len(root.args) == 1
+        and isinstance(root.args[0], ast.Constant)
+        and root.args[0].value == "sys"
+        and not root.keywords
+    )
+
+
+def _is_module_namespace_mapping(node, namespace_aliases=None):
+    """Return True for mappings known to be the current module namespace."""
+    if namespace_aliases is None:
+        namespace_aliases = set()
+    if isinstance(node, ast.Name) and node.id in namespace_aliases:
+        return True
+    if _is_globals_call(node):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        return _is_current_module_reference(node.value)
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return False
+    if node.func.id == "vars":
+        return (
+            len(node.args) == 1
+            and not node.keywords
+            and _is_current_module_reference(node.args[0])
+        )
+    if node.func.id == "getattr":
+        return (
+            len(node.args) == 2
+            and not node.keywords
+            and _is_current_module_reference(node.args[0])
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "__dict__"
+        )
+    return False
+
+
+def _update_payload_may_set_workers(call):
+    """Return True when an update payload may assign the ``workers`` key."""
+    for arg in call.args:
+        if isinstance(arg, ast.Dict):
+            if _dict_literal_sets_workers(arg):
+                return True
+            continue
+        # Mapping/call/iterable payloads cannot be proven to omit workers.
+        return True
+    for keyword in call.keywords:
+        if keyword.arg is None or keyword.arg == "workers":
+            return True
+    return False
+
+
+def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
+    """Return True when module namespace ``update`` may change workers."""
     if not isinstance(call, ast.Call):
         return False
     if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
         return False
-    if not _is_globals_call(call.func.value):
+    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
         return False
-    for arg in call.args:
-        if _dict_literal_sets_workers(arg):
-            return True
-    for keyword in call.keywords:
-        if keyword.arg == "workers":
-            return True
-        if _dict_literal_sets_workers(keyword.value):
-            return True
-    return False
+    return _update_payload_may_set_workers(call)
+
+
+def _namespace_assignment_values(node):
+    """Return simple name assignments relevant to namespace alias tracking."""
+    if isinstance(node, ast.Assign):
+        return [
+            (target.id, node.value)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        ]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return [(node.target.id, node.value)]
+    if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+        return [(node.target.id, None)]
+    return []
+
+
+def _record_module_namespace_assignments(statements, assignments):
+    """Collect module-level assignments, including compound statement bodies."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name, value in _namespace_assignment_values(node):
+            assignments.setdefault(name, []).append(value)
+        for block in _compound_statement_blocks(node):
+            _record_module_namespace_assignments(block, assignments)
+
+
+def _values_are_module_namespace_aliases(values, aliases):
+    """Return True when every assignment resolves to the module namespace."""
+    return bool(values) and all(
+        value is not None and _is_module_namespace_mapping(value, aliases)
+        for value in values
+    )
+
+
+def _resolve_module_namespace_aliases(assignments):
+    """Resolve aliases transitively until no additional names can be proven."""
+    aliases = set()
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if _values_are_module_namespace_aliases(assignments[name], aliases)
+        }
+        if not discovered:
+            break
+        aliases.update(discovered)
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _collect_module_namespace_aliases(tree):
+    """Collect names that are always assigned a module namespace mapping."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    return _resolve_module_namespace_aliases(assignments)
 
 
 def _constant_is_workers(node):
@@ -395,7 +512,7 @@ def _call_is_operator_setitem_workers(call, operator_bindings):
     if not _is_globals_call(call.args[0]) or not _constant_is_workers(call.args[1]):
         return False
 
-    module_aliases, setitem_aliases = operator_bindings
+    module_aliases, setitem_aliases = operator_bindings[:2]
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr == "setitem":
         return (
@@ -426,8 +543,9 @@ def _expression_mutates_workers(expr, operator_bindings):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
         return False
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if isinstance(expr, ast.Call) and (
-        _call_is_globals_workers_update(expr)
+        _call_is_module_namespace_workers_update(expr, namespace_aliases)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -519,15 +637,19 @@ def _indirect_workers_assignment_target(node):
 
 def _is_dynamic_workers_mutation(node, operator_bindings):
     """Return True for import-time mutations the AST scan cannot treat as static."""
-    if isinstance(node, ast.Expr):
-        if _expression_mutates_workers(node.value, operator_bindings):
+    if any(
+        isinstance(child, ast.expr)
+        and _expression_mutates_workers(child, operator_bindings)
+        for child in ast.iter_child_nodes(node)
+    ):
+        return True
+
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+        if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
             return True
-        if isinstance(node.value, ast.Call):
-            call = node.value
-            if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
-                return True
-            if _call_mutates_workers_via_indirection(call, operator_bindings):
-                return True
+        if _call_mutates_workers_via_indirection(call, operator_bindings):
+            return True
 
     if isinstance(node, ast.Assign):
         return any(_indirect_workers_assignment_target(target) for target in node.targets)
@@ -717,7 +839,7 @@ def _compound_statement_blocks(node):
 
 
 def _collect_operator_setitem_bindings(tree):
-    """Collect module-level aliases that bind ``operator`` or its ``setitem``."""
+    """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
     setitem_aliases = set()
 
@@ -737,7 +859,8 @@ def _collect_operator_setitem_bindings(tree):
                 visit(block)
 
     visit(tree.body)
-    return module_aliases, setitem_aliases
+    namespace_aliases = _collect_module_namespace_aliases(tree)
+    return module_aliases, setitem_aliases, namespace_aliases
 
 
 def _walk_gunicorn_workers_statements(
