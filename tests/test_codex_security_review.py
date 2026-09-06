@@ -230,3 +230,39 @@ def test_gunicorn_config_import_aliased_away_from_workers_is_not_dynamic(tmp_pat
     )
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport sys\nsys.modules[__name__].__dict__.update(dict(workers=8))\n",
+        "workers = 1\nimport sys\nsys.modules[__name__].__dict__.update([('workers', 8)])\n",
+        "workers = 1\nimport sys\nignored = sys.modules[__name__].__dict__.update({'workers': 8})\n",
+        "workers = 1\nnamespace = globals()\nnamespace.update({'workers': 8})\n",
+    ],
+)
+def test_gunicorn_config_module_namespace_update_payloads_are_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nsettings = {}\nsettings.update({'workers': 4})\n",
+        "workers = 1\nsettings = {}\nignored = settings.update({'workers': 4})\n",
+        "workers = 1\nnamespace = globals()\nnamespace = {}\nnamespace.update({'workers': 4})\n",
+    ],
+)
+def test_gunicorn_config_unrelated_mapping_updates_are_not_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
