@@ -477,6 +477,17 @@ def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
             assert r.status_code == 200
 
 
+def test_stream_stats_json_not_capped_by_default_limit(app_client):
+    """Six streams polling ~20/min must not hit the global 100/min default limit."""
+    client, mock_api = app_client
+    mock_api.stream_stats_by_id.return_value = {"streams": []}
+
+    for i in range(120):
+        stream_id = f"s{(i % 6) + 1}"
+        r = client.get(f"/streams/{stream_id}/stats.json")
+        assert r.status_code == 200
+
+
 def test_stats_ip_rate_limit_returns_429_with_low_limit(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls, patch(
         "app.Config.RATELIMIT_STORAGE_URI", "memory://"

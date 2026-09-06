@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: templates/ — 2026-08-22
+Last scanned: static/js/ — 2026-09-06
 
 ## Module checklist
 
@@ -8,10 +8,30 @@ Last scanned: templates/ — 2026-08-22
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
 - [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
 (`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
 below — checkboxes just hadn't been ticked.)
+
+## Findings (2026-09-06 static/js/ pass)
+
+- **Bug (fixed):** `scripts.js` polls `/streams/<id>/stats.json` every 3s for
+  each expanded accordion (~20/min per stream). Scoped per-IP (600/min) and
+  per-stream (25/min) limits were added on `stream_stats`, but Flask-Limiter
+  still applies `default_limits=["100 per minute"]` via its before_request
+  middleware unless the route opts out with `@limiter.exempt(flags=DEFAULT)`.
+  Scenario: operator expands six or more streams on the index page; combined
+  polling exceeds 100 requests/min; further polls return HTTP 429 and
+  `loadStats()` permanently shows "Stats not available". Impact: live stats
+  broken for typical multi-stream deployments — operators lose bitrate/RTT/player
+  visibility during incident response. Fixed by exempting `stream_stats` from
+  default limits while keeping the dedicated stats IP/stream caps.
+- Reviewed but not a bug: `innerHTML` paths escape API strings (`data.error`,
+  `video.codec`, cluster node IDs) via `escapeHtml()`; numeric fields coerced
+  with `Number()`; `encodeURIComponent(streamId)` in fetch URLs; polling limited
+  to visible accordions and non-hidden tabs; 10s `AbortController` timeout;
+  `copyToClipboard` uses server-rendered `data-url` attributes; cluster remove
+  confirm uses text-only `window.confirm`.
 
 ## Findings (2026-08-22 templates/ pass)
 

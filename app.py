@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 from flask_limiter import Limiter
+from flask_limiter.constants import ExemptionScope
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -826,6 +827,9 @@ def create_app():
 
     @app.route("/streams/<stream_id>/stats.json")
     @login_required
+    # Opt out of default_limits in the limiter middleware; scripts.js polls each
+    # visible stream every 3s and six streams would exceed the global 100/min cap.
+    @limiter.exempt(flags=ExemptionScope.DEFAULT)
     @limiter.limit(
         stats_ip_limit,
         key_func=_rate_limit_remote_addr,
