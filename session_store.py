@@ -109,7 +109,7 @@ class RedisSessionStore:
                 pipe.delete(f"{self._token_prefix}{old_token}")
             pipe.execute()
         except self._redis_error as exc:
-            logger.exception("Failed to persist Redis session for user %s", username)
+            logger.exception("Failed to persist Redis session")
             raise SessionBackendUnavailable(SESSION_BACKEND_UNAVAILABLE) from exc
 
     def is_valid(self, username, token, *, fail_closed=False):
@@ -124,8 +124,7 @@ class RedisSessionStore:
             return bool(self._client.exists(f"{self._token_prefix}{token}"))
         except self._redis_error as exc:
             logger.warning(
-                "Failed to validate Redis session for user %s; denying access",
-                username,
+                "Failed to validate Redis session; denying access",
                 exc_info=True,
             )
             if fail_closed:
@@ -146,7 +145,7 @@ class RedisSessionStore:
                 token,
             )
         except self._redis_error as exc:
-            logger.exception("Failed to revoke Redis session for user %s", username)
+            logger.exception("Failed to revoke Redis session")
             raise SessionBackendUnavailable(SESSION_BACKEND_UNAVAILABLE) from exc
 
 
