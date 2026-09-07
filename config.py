@@ -345,13 +345,17 @@ def _globals_workers_subscript(node):
 
 
 def _dict_literal_sets_workers(node):
-    """Return True when a dict literal contains a ``workers`` key."""
+    """Return True when a dict literal may introduce a ``workers`` key."""
     if not isinstance(node, ast.Dict):
         return False
-    return any(
-        isinstance(key, ast.Constant) and key.value == "workers"
-        for key in node.keys
-    )
+    for key, value in zip(node.keys, node.values):
+        if key is None:
+            if not isinstance(value, ast.Dict) or _dict_literal_sets_workers(value):
+                return True
+            continue
+        if isinstance(key, ast.Constant) and key.value == "workers":
+            return True
+    return False
 
 
 def _dict_merge_payload_may_set_workers(node):
@@ -374,7 +378,11 @@ def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
             return _dict_merge_payload_may_set_workers(node.value)
     if isinstance(node, ast.Assign):
         for target in node.targets:
-            if _is_module_namespace_mapping(target, namespace_aliases):
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "__dict__"
+                and _is_current_module_reference(target.value)
+            ):
                 return _dict_merge_payload_may_set_workers(node.value)
     return False
 
@@ -455,6 +463,19 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
         return False
     return _update_payload_may_set_workers(call)
+
+
+def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
+    """Return True when module namespace ``__ior__`` may change workers."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__ior__":
+        return False
+    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+        return False
+    if not call.args:
+        return False
+    return _dict_merge_payload_may_set_workers(call.args[0])
 
 
 def _namespace_assignment_values(node):
@@ -571,6 +592,7 @@ def _expression_mutates_workers(expr, operator_bindings):
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if isinstance(expr, ast.Call) and (
         _call_is_module_namespace_workers_update(expr, namespace_aliases)
+        or _call_is_module_namespace_workers_ior(expr, namespace_aliases)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
