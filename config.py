@@ -354,6 +354,31 @@ def _dict_literal_sets_workers(node):
     )
 
 
+def _dict_merge_payload_may_set_workers(node):
+    """Return True when a dict-merge RHS may introduce a ``workers`` binding."""
+    if isinstance(node, ast.Dict):
+        return _dict_literal_sets_workers(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return (
+            _dict_merge_payload_may_set_workers(node.left)
+            or _dict_merge_payload_may_set_workers(node.right)
+        )
+    return True
+
+
+def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+    """Return True for ``namespace |= {{...}}`` / ``__dict__ |= {{...}}`` patterns."""
+    if isinstance(node, ast.AugAssign) and isinstance(node.op, ast.BitOr):
+        target = node.target
+        if _is_module_namespace_mapping(target, namespace_aliases):
+            return _dict_merge_payload_may_set_workers(node.value)
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if _is_module_namespace_mapping(target, namespace_aliases):
+                return _dict_merge_payload_may_set_workers(node.value)
+    return False
+
+
 def _is_current_module_reference(node):
     """Return True for expressions that resolve to this config module."""
     if not isinstance(node, ast.Subscript):
@@ -460,9 +485,9 @@ def _record_module_namespace_assignments(statements, assignments):
 
 def _values_are_module_namespace_aliases(values, aliases):
     """Return True when every assignment resolves to the module namespace."""
-    return bool(values) and all(
-        value is not None and _is_module_namespace_mapping(value, aliases)
-        for value in values
+    resolved_values = [value for value in values if value is not None]
+    return bool(resolved_values) and all(
+        _is_module_namespace_mapping(value, aliases) for value in resolved_values
     )
 
 
@@ -637,6 +662,10 @@ def _indirect_workers_assignment_target(node):
 
 def _is_dynamic_workers_mutation(node, operator_bindings):
     """Return True for import-time mutations the AST scan cannot treat as static."""
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+        return True
+
     if any(
         isinstance(child, ast.expr)
         and _expression_mutates_workers(child, operator_bindings)
