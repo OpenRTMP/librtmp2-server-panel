@@ -7,8 +7,10 @@
     {% if error %}
         <div class="alert alert-danger">{{ error }}</div>
     {% endif %}
-    <input type="text" name="username" placeholder="Username" class="form-control mb-3" required autofocus>
-    <input type="password" name="password" placeholder="Password" class="form-control mb-3" required>
+    <label for="username" class="visually-hidden">Username</label>
+    <input id="username" type="text" name="username" placeholder="Username" class="form-control mb-3" required autofocus>
+    <label for="password" class="visually-hidden">Password</label>
+    <input id="password" type="password" name="password" placeholder="Password" class="form-control mb-3" required>
     <button type="submit" class="btn btn-primary w-100">Login</button>
 </form>
 {% endblock %}
