@@ -345,13 +345,46 @@ def _globals_workers_subscript(node):
 
 
 def _dict_literal_sets_workers(node):
-    """Return True when a dict literal contains a ``workers`` key."""
+    """Return True when a dict literal may introduce a ``workers`` key."""
     if not isinstance(node, ast.Dict):
         return False
-    return any(
-        isinstance(key, ast.Constant) and key.value == "workers"
-        for key in node.keys
-    )
+    for key, value in zip(node.keys, node.values):
+        if key is None:
+            if not isinstance(value, ast.Dict) or _dict_literal_sets_workers(value):
+                return True
+            continue
+        if isinstance(key, ast.Constant) and key.value == "workers":
+            return True
+    return False
+
+
+def _dict_merge_payload_may_set_workers(node):
+    """Return True when a dict-merge RHS may introduce a ``workers`` binding."""
+    if isinstance(node, ast.Dict):
+        return _dict_literal_sets_workers(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return (
+            _dict_merge_payload_may_set_workers(node.left)
+            or _dict_merge_payload_may_set_workers(node.right)
+        )
+    return True
+
+
+def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+    """Return True for ``namespace |= {{...}}`` / ``__dict__ |= {{...}}`` patterns."""
+    if isinstance(node, ast.AugAssign) and isinstance(node.op, ast.BitOr):
+        target = node.target
+        if _is_module_namespace_mapping(target, namespace_aliases):
+            return _dict_merge_payload_may_set_workers(node.value)
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "__dict__"
+                and _is_current_module_reference(target.value)
+            ):
+                return _dict_merge_payload_may_set_workers(node.value)
+    return False
 
 
 def _is_current_module_reference(node):
@@ -432,6 +465,19 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     return _update_payload_may_set_workers(call)
 
 
+def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
+    """Return True when module namespace ``__ior__`` may change workers."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__ior__":
+        return False
+    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+        return False
+    if not call.args:
+        return False
+    return _dict_merge_payload_may_set_workers(call.args[0])
+
+
 def _namespace_assignment_values(node):
     """Return simple name assignments relevant to namespace alias tracking."""
     if isinstance(node, ast.Assign):
@@ -460,9 +506,9 @@ def _record_module_namespace_assignments(statements, assignments):
 
 def _values_are_module_namespace_aliases(values, aliases):
     """Return True when every assignment resolves to the module namespace."""
-    return bool(values) and all(
-        value is not None and _is_module_namespace_mapping(value, aliases)
-        for value in values
+    resolved_values = [value for value in values if value is not None]
+    return bool(resolved_values) and all(
+        _is_module_namespace_mapping(value, aliases) for value in resolved_values
     )
 
 
@@ -546,6 +592,7 @@ def _expression_mutates_workers(expr, operator_bindings):
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if isinstance(expr, ast.Call) and (
         _call_is_module_namespace_workers_update(expr, namespace_aliases)
+        or _call_is_module_namespace_workers_ior(expr, namespace_aliases)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -637,6 +684,10 @@ def _indirect_workers_assignment_target(node):
 
 def _is_dynamic_workers_mutation(node, operator_bindings):
     """Return True for import-time mutations the AST scan cannot treat as static."""
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+        return True
+
     if any(
         isinstance(child, ast.expr)
         and _expression_mutates_workers(child, operator_bindings)

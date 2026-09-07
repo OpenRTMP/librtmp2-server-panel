@@ -509,6 +509,40 @@ def test_config_rejects_memory_ratelimit_with_module_dict_update_workers(monkeyp
     )
 
 
+def test_config_rejects_memory_ratelimit_with_module_dict_ior_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "import sys\n"
+            "sys.modules[__name__].__dict__ |= {'workers': 8}\n"
+        ),
+    )
+
+
+def test_config_rejects_memory_ratelimit_with_globals_alias_ior_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "namespace = globals()\n"
+            "namespace |= {'workers': 8}\n"
+        ),
+    )
+
+
+def test_config_rejects_memory_ratelimit_with_module_dict_merge_assign_workers(monkeypatch):
+    _assert_config_import_with_gunicorn_file(
+        monkeypatch,
+        config_content=(
+            "workers = 1\n"
+            "import sys\n"
+            "sys.modules[__name__].__dict__ = "
+            "sys.modules[__name__].__dict__ | {'workers': 8}\n"
+        ),
+    )
+
+
 def test_config_accepts_dynamic_gunicorn_config_with_shared_ratelimit_backend(monkeypatch):
     _assert_config_import_with_gunicorn_file(
         monkeypatch,

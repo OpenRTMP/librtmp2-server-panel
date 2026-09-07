@@ -254,6 +254,23 @@ def test_gunicorn_config_module_namespace_update_payloads_are_dynamic(
 @pytest.mark.parametrize(
     "config_content",
     [
+        "workers = 1\nnamespace = globals()\nnamespace |= {'workers': 4}\n",
+        "workers = 1\nimport sys\nsys.modules[__name__].__dict__ |= {'workers': 4}\n",
+        "workers = 1\nimport sys\nsys.modules[__name__].__dict__ = sys.modules[__name__].__dict__ | {'workers': 4}\n",
+    ],
+)
+def test_gunicorn_config_module_namespace_merge_payloads_are_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
         "workers = 1\nsettings = {}\nsettings.update({'workers': 4})\n",
         "workers = 1\nsettings = {}\nignored = settings.update({'workers': 4})\n",
         "workers = 1\nnamespace = globals()\nnamespace = {}\nnamespace.update({'workers': 4})\n",
