@@ -255,27 +255,35 @@ def _emit_config_error(message: str) -> None:
     sys.stderr.write("\n")
 
 
+def _parse_worker_count(value):
+    """Return a positive integer-looking worker count, or None."""
+    return int(value) if value.isdigit() else None
+
+
+def _worker_count_from_compact_token(token):
+    """Parse --workers=N, -w=N, and -wN forms."""
+    if token.startswith(("--workers=", "-w=")):
+        return _parse_worker_count(token.split("=", 1)[1])
+    if token.startswith("-w") and len(token) > 2:
+        return _parse_worker_count(token[2:])
+    return None
+
+
 def _workers_from_command_tokens(tokens: list[str]) -> int:
     """Parse Gunicorn `-w` / `--workers` flags from a token list."""
     count = 1
     i = 0
     while i < len(tokens):
-        tok = tokens[i]
-        if tok in ("--workers", "-w"):
-            if i + 1 < len(tokens) and tokens[i + 1].isdigit():
-                count = max(count, int(tokens[i + 1]))
+        token = tokens[i]
+        if token in ("--workers", "-w") and i + 1 < len(tokens):
+            parsed = _parse_worker_count(tokens[i + 1])
+            if parsed is not None:
+                count = max(count, parsed)
                 i += 2
                 continue
-        elif tok.startswith("--workers="):
-            value = tok.split("=", 1)[1]
-            if value.isdigit():
-                count = max(count, int(value))
-        elif tok.startswith("-w="):
-            value = tok.split("=", 1)[1]
-            if value.isdigit():
-                count = max(count, int(value))
-        elif tok.startswith("-w") and len(tok) > 2 and tok[2:].isdigit():
-            count = max(count, int(tok[2:]))
+        parsed = _worker_count_from_compact_token(token)
+        if parsed is not None:
+            count = max(count, parsed)
         i += 1
     return count
 
@@ -889,29 +897,81 @@ def _compound_statement_blocks(node):
             yield case.body
 
 
+def _record_operator_import(node, module_aliases, setitem_aliases):
+    """Record operator module/setitem aliases introduced by one statement."""
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.name == "operator":
+                module_aliases.add(alias.asname or alias.name)
+        return
+    if not isinstance(node, ast.ImportFrom) or node.module != "operator":
+        return
+    for alias in node.names:
+        if alias.name == "setitem":
+            setitem_aliases.add(alias.asname or alias.name)
+
+
+def _collect_operator_bindings_from_statements(
+    statements,
+    module_aliases,
+    setitem_aliases,
+):
+    """Walk import-time statements and collect operator aliases."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        _record_operator_import(node, module_aliases, setitem_aliases)
+        for block in _compound_statement_blocks(node):
+            _collect_operator_bindings_from_statements(
+                block,
+                module_aliases,
+                setitem_aliases,
+            )
+
+
 def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
     setitem_aliases = set()
-
-    def visit(statements):
-        for node in statements:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name == "operator":
-                        module_aliases.add(alias.asname or alias.name)
-            elif isinstance(node, ast.ImportFrom) and node.module == "operator":
-                for alias in node.names:
-                    if alias.name == "setitem":
-                        setitem_aliases.add(alias.asname or alias.name)
-            for block in _compound_statement_blocks(node):
-                visit(block)
-
-    visit(tree.body)
+    _collect_operator_bindings_from_statements(
+        tree.body,
+        module_aliases,
+        setitem_aliases,
+    )
     namespace_aliases = _collect_module_namespace_aliases(tree)
     return module_aliases, setitem_aliases, namespace_aliases
+
+
+def _node_has_dynamic_workers_effect(node, global_workers_mutators, operator_bindings):
+    """Return True when one statement makes the worker value non-static."""
+    if _statement_invokes_function(node, global_workers_mutators):
+        return True
+    if isinstance(node, ast.For) and _target_assigns_workers(node.target):
+        return True
+    if _is_dynamic_workers_mutation(node, operator_bindings):
+        return True
+    return _import_from_binds_workers(node)
+
+
+def _record_walrus_workers_assignment(node, state, *, in_compound):
+    """Record a top-level expression using ``workers := ...`` when present."""
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.NamedExpr):
+        return
+    walrus = node.value
+    if not _target_assigns_workers(walrus.target):
+        return
+    state.dynamic = True
+    state.record_workers_assignment(
+        _static_int_from_ast(walrus.value),
+        in_compound=in_compound,
+    )
+
+
+def _record_direct_workers_assignment(node, state, *, in_compound):
+    """Record direct assignments to workers."""
+    assigns_workers, value = _worker_assignment_value(node)
+    if assigns_workers:
+        state.record_workers_assignment(value, in_compound=in_compound)
 
 
 def _walk_gunicorn_workers_statements(
@@ -928,34 +988,16 @@ def _walk_gunicorn_workers_statements(
         operator_bindings = (set(), set())
 
     for node in statements:
-        if _statement_invokes_function(node, global_workers_mutators):
-            state.dynamic = True
-
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-
-        if isinstance(node, ast.For) and _target_assigns_workers(node.target):
+        if _node_has_dynamic_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+        ):
             state.dynamic = True
-
-        if _is_dynamic_workers_mutation(node, operator_bindings):
-            state.dynamic = True
-
-        if _import_from_binds_workers(node):
-            state.dynamic = True
-
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.NamedExpr):
-            walrus = node.value
-            if _target_assigns_workers(walrus.target):
-                state.dynamic = True
-                state.record_workers_assignment(
-                    _static_int_from_ast(walrus.value),
-                    in_compound=in_compound,
-                )
-
-        assigns_workers, value = _worker_assignment_value(node)
-        if assigns_workers:
-            state.record_workers_assignment(value, in_compound=in_compound)
-
+        _record_walrus_workers_assignment(node, state, in_compound=in_compound)
+        _record_direct_workers_assignment(node, state, in_compound=in_compound)
         for block in _compound_statement_blocks(node):
             _walk_gunicorn_workers_statements(
                 block,
