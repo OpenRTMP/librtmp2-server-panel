@@ -103,7 +103,9 @@ function buildClusterRows(clusterEnabled, data, clusterProxy, relayMbps, players
         return '';
     }
 
-    const ownerNode = data.owner_node_id ?? clusterProxy.owner_node_id;
+    const ownerNode = data.owner_node_id !== undefined && data.owner_node_id !== null
+        ? data.owner_node_id
+        : clusterProxy.owner_node_id;
     const ownerLabel = ownerNode === undefined || ownerNode === null
         ? 'unavailable'
         : escapeHtml(ownerNode);
