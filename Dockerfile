@@ -1,27 +1,27 @@
-FROM python:3.14.7-alpine3.24 AS builder
+FROM python:alpine AS builder
 
 WORKDIR /app
 
 RUN apk add --no-cache \
-    cargo=1.96.1-r0 \
-    gcc=15.2.0-r5 \
-    libffi-dev=3.5.2-r1 \
-    musl-dev=1.2.6-r2 \
-    openssl-dev=3.5.8-r0 \
-    rust=1.96.1-r0
+    cargo \
+    gcc \
+    libffi-dev \
+    musl-dev \
+    openssl-dev \
+    rust
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --only-binary :all: --prefix=/install -r requirements.txt
 
-FROM python:3.14.7-alpine3.24
+FROM python:alpine
 
 ARG APP_VERSION=""
 
 WORKDIR /app
 
 RUN apk add --no-cache \
-    libffi=3.5.2-r1 \
-    openssl=3.5.8-r0
+    libffi \
+    openssl
 
 COPY --from=builder /install /usr/local
 COPY app.py config.py lrtmp2_client.py session_store.py ./
