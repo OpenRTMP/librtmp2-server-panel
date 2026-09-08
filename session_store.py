@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 _REDIS_SCHEMES = frozenset({"redis", "rediss"})
 _REDIS_UNIX_SCHEMES = frozenset({"redis+unix", "valkey+unix"})
 _SHARED_SESSION_SCHEMES = _REDIS_SCHEMES | _REDIS_UNIX_SCHEMES
+SESSION_BACKEND_UNAVAILABLE = "Session backend unavailable"
 
 
 def shared_session_store_supported(storage_uri):
@@ -22,6 +23,8 @@ def _normalize_redis_url(storage_uri):
         prefix = scheme.split("+", 1)[0]
         return storage_uri.replace(f"{prefix}+unix", "unix", 1)
     return storage_uri
+
+
 _REVOKE_SESSION_SCRIPT = """
 local active = redis.call("GET", KEYS[1])
 if active == ARGV[1] then
@@ -53,7 +56,7 @@ class MemorySessionStore:
             self._tokens[token] = expiry
             self._active_by_user[username] = token
 
-    def is_valid(self, username, token, *, fail_closed=False):
+    def is_valid(self, username, token):
         with self._lock:
             active = self._active_by_user.get(username)
             if active != token:
@@ -106,12 +109,12 @@ class RedisSessionStore:
                 pipe.delete(f"{self._token_prefix}{old_token}")
             pipe.execute()
         except self._redis_error as exc:
-            logger.error(
+            safe_username = str(username).replace("\r", "_").replace("\n", "_")
+            logger.exception(
                 "Failed to persist Redis session for user %s",
-                username,
-                exc_info=True,
+                safe_username,
             )
-            raise SessionBackendUnavailable("Session backend unavailable") from exc
+            raise SessionBackendUnavailable(SESSION_BACKEND_UNAVAILABLE) from exc
 
     def is_valid(self, username, token, *, fail_closed=False):
         try:
@@ -124,13 +127,14 @@ class RedisSessionStore:
                 return False
             return bool(self._client.exists(f"{self._token_prefix}{token}"))
         except self._redis_error as exc:
+            safe_username = str(username).replace("\r", "_").replace("\n", "_")
             logger.warning(
                 "Failed to validate Redis session for user %s; denying access",
-                username,
+                safe_username,
                 exc_info=True,
             )
             if fail_closed:
-                raise SessionBackendUnavailable("Session backend unavailable") from exc
+                raise SessionBackendUnavailable(SESSION_BACKEND_UNAVAILABLE) from exc
             return False
 
     def revoke(self, username, token):
@@ -147,12 +151,19 @@ class RedisSessionStore:
                 token,
             )
         except self._redis_error as exc:
-            logger.error(
+            safe_username = str(username).replace("\r", "_").replace("\n", "_")
+            logger.exception(
                 "Failed to revoke Redis session for user %s",
-                username,
-                exc_info=True,
+                safe_username,
             )
-            raise SessionBackendUnavailable("Session backend unavailable") from exc
+            raise SessionBackendUnavailable(SESSION_BACKEND_UNAVAILABLE) from exc
+
+
+def session_is_valid(store, username, token, *, fail_closed=False):
+    """Validate a session while keeping the memory-store API free of Redis options."""
+    if isinstance(store, MemorySessionStore):
+        return store.is_valid(username, token)
+    return store.is_valid(username, token, fail_closed=fail_closed)
 
 
 def create_session_store(storage_uri):

@@ -7,7 +7,7 @@ import threading
 from functools import wraps
 from urllib.parse import urlencode
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from flask_limiter import Limiter
 from flask_limiter.constants import ExemptionScope
 from flask_limiter.util import get_remote_address
@@ -15,8 +15,12 @@ from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
-from lrtmp2_client import Lrtmp2Client, Lrtmp2ApiError
-from session_store import SessionBackendUnavailable, create_session_store
+from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+from session_store import (
+    SessionBackendUnavailable,
+    create_session_store,
+    session_is_valid,
+)
 
 # Captured at import time so tests that `patch("app.Lrtmp2Client")` to mock
 # the API client (the pattern used throughout this test suite) don't also
@@ -32,6 +36,9 @@ VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
 MIN_ACCESS_KEY_LEN = 32
 CLUSTER_TEMPLATE = "cluster.html"
+INDEX_HTML = "index.html"
+CREATE_STREAM_HTML = "create_stream.html"
+ERR_INVALID_STREAM_ID = "Invalid stream ID"
 
 ACCESS_KEY_HELP = (
     f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
@@ -114,7 +121,7 @@ def _credential_fingerprint(secret_key, username, password, api_token):
     username/password even if it leaked. CodeQL's weak-sensitive-data-hashing
     query doesn't model HMAC's keyed construction and flags the password
     reaching hashlib.sha256 as if this were a fast, unkeyed password hash.
-  """
+    """
     material = f"{username}\0{password}\0{api_token}"
     return hmac.new(
         secret_key.encode(),
@@ -148,11 +155,12 @@ def _normalize_streams_list(streams):
     return []
 
 
-def create_app():
-    app = Flask(__name__)
-    app.config.from_object(Config)
-    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+def _append_api_error(current, error):
+    text = str(error)
+    return text if current is None else f"{current}; {text}"
 
+
+def _configure_proxy(app):
     trusted_proxy_count = app.config["TRUSTED_PROXY_COUNT"]
     if trusted_proxy_count:
         # Only trust forwarded client IP and scheme information from the exact
@@ -174,53 +182,8 @@ def create_app():
     # address before ProxyFix overwrites REMOTE_ADDR from X-Forwarded-For.
     app.wsgi_app = _PreserveDirectRemoteAddr(app.wsgi_app)
 
-    def _rate_limit_remote_addr():
-        """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
-        direct = request.environ.get(DIRECT_REMOTE_ADDR_KEY) or ""
-        return client_ip_for_rate_limit(
-            direct_addr=direct,
-            forwarded_addr=get_remote_address(),
-            trusted_proxy_count=app.config["TRUSTED_PROXY_COUNT"],
-            trusted_networks=app.config["TRUSTED_PROXY_NETWORKS"],
-        )
 
-    def _stats_rate_limit_key():
-        """Per-stream bucket so polling many streams does not share one global cap."""
-        stream_id = ""
-        if request.view_args:
-            stream_id = request.view_args.get("stream_id", "") or ""
-        return f"{_rate_limit_remote_addr()}:{stream_id}"
-
-    limiter = Limiter(
-        key_func=_rate_limit_remote_addr,
-        app=app,
-        default_limits=["100 per minute"],
-        storage_uri=app.config["RATELIMIT_STORAGE_URI"],
-        # Bound how long a rate-limit check can block on the storage backend.
-        # Without this, a Redis instance that's up but not responding (network
-        # black-hole, overload) hangs every Gunicorn worker indefinitely on
-        # every request (the limiter runs as a before_request hook for all
-        # routes, not just /login), since redis-py's default socket timeout
-        # is None. Ignored by the in-memory backend.
-        storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
-    )
-
-    # Enforce the login POST cap before CSRF validation. Flask-WTF rejects missing
-    # tokens with 400 before the login view runs, so a route-level @limiter.limit
-    # never increments when attackers omit csrf_token. The exemption is evaluated
-    # by Flask-Limiter before quota consumption, so unrelated POST routes do not
-    # deplete the login bucket.
-    @limiter.limit(
-        "5 per minute",
-        methods=["POST"],
-        exempt_when=lambda: request.endpoint != "login",
-    )
-    def _login_post_rate_limit():
-        pass
-
-    app.before_request(_login_post_rate_limit)
-
-    CSRFProtect(app)
+def _configure_security_defaults(app):
     if app.config["RATELIMIT_STORAGE_URI"] == RATELIMIT_MEMORY_URI:
         app.logger.warning(
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process; "
@@ -239,54 +202,116 @@ def create_app():
         PERMANENT_SESSION_LIFETIME=app.config["SESSION_LIFETIME"],
     )
 
-    client = Lrtmp2Client(app.config["LRTMP2_API_URL"], app.config["LRTMP2_API_TOKEN"])
-    session_store = create_session_store(app.config["RATELIMIT_STORAGE_URI"])
 
-    def _session_ttl_seconds():
-        return int(app.permanent_session_lifetime.total_seconds())
+class _PanelRuntime:
+    """Request handlers and helpers bound to one Flask application instance."""
 
-    def _revoke_session_token(*, fail_closed=False):
+    def __init__(self, app):
+        self.app = app
+        self.client = Lrtmp2Client(
+            app.config["LRTMP2_API_URL"],
+            app.config["LRTMP2_API_TOKEN"],
+        )
+        self.session_store = create_session_store(app.config["RATELIMIT_STORAGE_URI"])
+        self.limiter = Limiter(
+            key_func=self._rate_limit_remote_addr,
+            app=app,
+            default_limits=["100 per minute"],
+            storage_uri=app.config["RATELIMIT_STORAGE_URI"],
+            # Bound how long a rate-limit check can block on the storage backend.
+            # Without this, a Redis instance that's up but not responding hangs
+            # every Gunicorn worker indefinitely. Ignored by memory://.
+            storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
+        )
+
+    def register_post_csrf(self):
+        self._register_stats_rate_limits()
+        self.app.after_request(self.set_security_headers)
+        self._register_routes()
+
+    def _rate_limit_remote_addr(self):
+        """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
+        direct = request.environ.get(DIRECT_REMOTE_ADDR_KEY) or ""
+        return client_ip_for_rate_limit(
+            direct_addr=direct,
+            forwarded_addr=get_remote_address(),
+            trusted_proxy_count=self.app.config["TRUSTED_PROXY_COUNT"],
+            trusted_networks=self.app.config["TRUSTED_PROXY_NETWORKS"],
+        )
+
+    def _stats_rate_limit_key(self):
+        """Per-stream bucket so polling many streams does not share one global cap."""
+        stream_id = ""
+        if request.view_args:
+            stream_id = request.view_args.get("stream_id", "") or ""
+        return f"{self._rate_limit_remote_addr()}:{stream_id}"
+
+    @staticmethod
+    def _login_post_rate_limit():
+        # Intentionally empty. Flask-Limiter performs the check in before_request.
+        pass
+
+    def _register_login_rate_limit(self):
+        # Enforce the login POST cap before CSRF validation. Flask-WTF rejects
+        # missing tokens before the login view runs, so a route-level limit would
+        # otherwise not count those attempts.
+        hook = self.limiter.limit(
+            "5 per minute",
+            methods=["POST"],
+            exempt_when=lambda: request.endpoint != "login",
+        )(self._login_post_rate_limit)
+        self.app.before_request(hook)
+
+    def _session_ttl_seconds(self):
+        return int(self.app.permanent_session_lifetime.total_seconds())
+
+    def _revoke_session_token(self, *, fail_closed=False):
         token = session.pop("session_token", None)
         username = session.get("username")
-        if token and username:
-            try:
-                session_store.revoke(username, token)
-            except SessionBackendUnavailable:
-                if fail_closed:
-                    session["session_token"] = token
-                    raise
+        if not token or not username:
+            return
+        try:
+            self.session_store.revoke(username, token)
+        except SessionBackendUnavailable:
+            if fail_closed:
+                session["session_token"] = token
+                raise
 
-    def _establish_logged_in_session():
+    def _establish_logged_in_session(self):
         token = secrets.token_hex(32)
-        username = app.config["USERNAME"]
+        username = self.app.config["USERNAME"]
         # Persist the replacement token before touching the browser session. If
         # Redis is unavailable, the caller can return a controlled 503 while
         # preserving any currently valid login.
-        session_store.replace_user_session(username, token, _session_ttl_seconds())
+        self.session_store.replace_user_session(
+            username,
+            token,
+            self._session_ttl_seconds(),
+        )
         session.clear()
         session.permanent = True
         session["logged_in"] = True
         session["username"] = username
         session["session_token"] = token
         session["credential_fp"] = _credential_fingerprint(
-            app.config["SECRET_KEY"],
+            self.app.config["SECRET_KEY"],
             username,
-            app.config["PASSWORD"],
-            app.config["LRTMP2_API_TOKEN"],
+            self.app.config["PASSWORD"],
+            self.app.config["LRTMP2_API_TOKEN"],
         )
 
-    def _session_is_authenticated(*, fail_closed=False):
+    def _session_is_authenticated(self, *, fail_closed=False):
         if not session.get("logged_in"):
             return False
         expected_fp = _credential_fingerprint(
-            app.config["SECRET_KEY"],
-            app.config["USERNAME"],
-            app.config["PASSWORD"],
-            app.config["LRTMP2_API_TOKEN"],
+            self.app.config["SECRET_KEY"],
+            self.app.config["USERNAME"],
+            self.app.config["PASSWORD"],
+            self.app.config["LRTMP2_API_TOKEN"],
         )
         stored_fp = session.get("credential_fp")
         if not isinstance(stored_fp, str) or not hmac.compare_digest(stored_fp, expected_fp):
-            _revoke_session_token(fail_closed=fail_closed)
+            self._revoke_session_token(fail_closed=fail_closed)
             session.clear()
             return False
         token = session.get("session_token")
@@ -294,78 +319,105 @@ def create_app():
         if not token or not username:
             session.clear()
             return False
-        if not session_store.is_valid(username, token, fail_closed=True):
-            _revoke_session_token(fail_closed=fail_closed)
+        if not session_is_valid(
+            self.session_store,
+            username,
+            token,
+            fail_closed=True,
+        ):
+            self._revoke_session_token(fail_closed=fail_closed)
             session.clear()
             return False
         return True
 
-    def login_required(view_func):
+    def login_required(self, view_func):
         @wraps(view_func)
         def wrapped(*args, **kwargs):
-            if app.config["REQUIRE_LOGIN"]:
-                try:
-                    if not _session_is_authenticated():
-                        return redirect(url_for("login"))
-                except SessionBackendUnavailable:
-                    app.logger.error(
-                        "Session backend unavailable during auth check",
-                        exc_info=True,
-                    )
-                    return (
-                        "Authentication service temporarily unavailable. "
-                        "Please try again.",
-                        503,
-                    )
+            if not self.app.config["REQUIRE_LOGIN"]:
+                return view_func(*args, **kwargs)
+            try:
+                if not self._session_is_authenticated():
+                    return redirect(url_for("login"))
+            except SessionBackendUnavailable:
+                self.app.logger.exception(
+                    "Session backend unavailable during auth check"
+                )
+                return (
+                    "Authentication service temporarily unavailable. "
+                    "Please try again.",
+                    503,
+                )
             return view_func(*args, **kwargs)
+
         return wrapped
 
-    def _stats_per_stream_rate_limit_exempt():
-        if app.config["REQUIRE_LOGIN"]:
+    def _stats_per_stream_rate_limit_exempt(self):
+        if self.app.config["REQUIRE_LOGIN"]:
             try:
-                if not _session_is_authenticated():
+                if not self._session_is_authenticated():
                     return True
             except SessionBackendUnavailable:
                 return True
-        if request.view_args:
-            raw = request.view_args.get("stream_id", "") or ""
-            if not _is_valid_stream_id(raw):
-                return True
-        return False
+        if not request.view_args:
+            return False
+        raw = request.view_args.get("stream_id", "") or ""
+        return not _is_valid_stream_id(raw)
 
-    def _stats_ip_rate_limit_exempt():
-        if not app.config["REQUIRE_LOGIN"]:
+    def _stats_ip_rate_limit_exempt(self):
+        if not self.app.config["REQUIRE_LOGIN"]:
             return False
         try:
-            return not _session_is_authenticated()
+            return not self._session_is_authenticated()
         except SessionBackendUnavailable:
             return True
 
-    def rtmps_from_health(health):
-        """Derive RTMPS flags from an already-fetched /health payload.
+    @staticmethod
+    def _stream_stats_route_rate_limit_exempt():
+        return request.endpoint != "stream_stats"
 
-        URLs must use the panel's public port config first. That preserves
-        Docker/NAT/reverse proxy mappings such as public 443 -> server bind
-        1936. The server's reported bind port is only used as a fallback when
-        the public config is empty or missing.
-        """
-        configured_port = str(app.config.get("LRTMP2_RTMPS_PORT") or "")
+    @staticmethod
+    def _stream_stats_rate_limit():
+        # Intentionally empty: Flask-Limiter enforces both limits via decorators.
+        pass
+
+    def _register_stats_rate_limits(self):
+        stats_ip_limit = f"{self.app.config['STATS_RATE_LIMIT_PER_IP']} per minute"
+        stats_stream_limit = (
+            f"{self.app.config['STATS_RATE_LIMIT_PER_STREAM']} per minute"
+        )
+        hook = self.limiter.limit(
+            stats_stream_limit,
+            key_func=self._stats_rate_limit_key,
+            exempt_when=lambda: self._stream_stats_route_rate_limit_exempt()
+            or self._stats_per_stream_rate_limit_exempt(),
+        )(self._stream_stats_rate_limit)
+        hook = self.limiter.limit(
+            stats_ip_limit,
+            key_func=self._rate_limit_remote_addr,
+            exempt_when=lambda: self._stream_stats_route_rate_limit_exempt()
+            or self._stats_ip_rate_limit_exempt(),
+        )(hook)
+        self.app.before_request(hook)
+
+    def rtmps_from_health(self, health):
+        """Derive RTMPS flags from an already-fetched /health payload."""
+        configured_port = str(self.app.config.get("LRTMP2_RTMPS_PORT") or "")
         if not isinstance(health, dict) or not health.get("rtmps_enabled"):
             return False, configured_port or "1936"
         reported_port = str(health.get("rtmps_port") or "")
         return True, configured_port or reported_port or "1936"
 
-    def rtmps_health():
+    def rtmps_health(self):
         """Fetch /health and return RTMPS availability plus public port."""
         try:
-            health = client.health()
+            health = self.client.health()
         except Lrtmp2ApiError:
-            return rtmps_from_health(None)
-        return rtmps_from_health(health)
+            return self.rtmps_from_health(None)
+        return self.rtmps_from_health(health)
 
-    def build_urls(stream, rtmps_on, rtmps_port):
-        domain = _format_url_host(app.config["LRTMP2_DOMAIN"])
-        port = app.config["LRTMP2_RTMP_PORT"]
+    def build_urls(self, stream, rtmps_on, rtmps_port):
+        domain = _format_url_host(self.app.config["LRTMP2_DOMAIN"])
+        port = self.app.config["LRTMP2_RTMP_PORT"]
         app_name = stream["app"]
         publish_url = f"rtmp://{domain}:{port}/{app_name}"  # nosonar python:S5332
         raw_players = stream.get("players")
@@ -373,17 +425,8 @@ def create_app():
             raw_players = []
         players = [dict(player) for player in raw_players if isinstance(player, dict)]
         stream["players"] = players
-        for player in players:
-            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
-            if rtmps_on:
-                player["play_url_tls"] = (
-                    f"rtmps://{domain}:{rtmps_port}/{app_name}/{player.get('play_key', '')}"
-                )
-        first_play_key = ""
-        if players:
-            first_play_key = players[0].get("play_key", "")
-        elif stream.get("play_key"):
-            first_play_key = stream["play_key"]
+        self._add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port)
+        first_play_key = self._first_play_key(stream, players)
         urls = {
             "publish_url": publish_url,
             "publish_key": stream.get("publish_key", ""),
@@ -391,70 +434,64 @@ def create_app():
             "play_key": first_play_key,
             "rtmps_enabled": rtmps_on,
             "stats_url": (
-                f"{app.config['LRTMP2_STATS_URL']}/stats?"
+                f"{self.app.config['LRTMP2_STATS_URL']}/stats?"
                 f"{urlencode({'key': stream.get('stats_key', '')})}"
             ),
         }
         if rtmps_on:
             urls["publish_url_tls"] = f"rtmps://{domain}:{rtmps_port}/{app_name}"
-            urls["play_url_tls"] = f"rtmps://{domain}:{rtmps_port}/{app_name}/{first_play_key}"
+            urls["play_url_tls"] = (
+                f"rtmps://{domain}:{rtmps_port}/{app_name}/{first_play_key}"
+            )
         return urls
 
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
+    @staticmethod
+    def _add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port):
+        for player in players:
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
+            if rtmps_on:
+                player["play_url_tls"] = (
+                    f"rtmps://{domain}:{rtmps_port}/{app_name}/"
+                    f"{player.get('play_key', '')}"
+                )
+
+    @staticmethod
+    def _first_play_key(stream, players):
+        if players:
+            return players[0].get("play_key", "")
+        return stream.get("play_key", "") or ""
+
+    def login(self):
         error = None
         if request.method == "POST":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            user_ok = hmac.compare_digest(username, app.config["USERNAME"])
-            pass_ok = hmac.compare_digest(password, app.config["PASSWORD"])
+            user_ok = hmac.compare_digest(username, self.app.config["USERNAME"])
+            pass_ok = hmac.compare_digest(password, self.app.config["PASSWORD"])
             if user_ok and pass_ok:
-                try:
-                    _establish_logged_in_session()
-                except SessionBackendUnavailable:
-                    app.logger.exception(
-                        "Session backend unavailable during login"
-                    )
-                    error = "Authentication service temporarily unavailable. Please try again."
-                    return render_template("login.html", error=error), 503
-                return redirect(url_for("index"))
+                return self._complete_login()
             error = "Invalid credentials"
         return render_template("login.html", error=error)
 
-    @app.route("/logout", methods=["POST"])
-    def logout():
+    def _complete_login(self):
         try:
-            if app.config["REQUIRE_LOGIN"] and not _session_is_authenticated(
-                fail_closed=True
-            ):
-                return redirect(url_for("login"))
+            self._establish_logged_in_session()
         except SessionBackendUnavailable:
-            username = session.get("username")
-            app.logger.error(
-                "Session backend unavailable during logout validation for user %s",
-                username,
-                exc_info=True,
-            )
-            error = (
-                "Could not complete logout because the authentication service "
-                "is temporarily unavailable. Your session is still active; "
-                "please try again."
-            )
-            return render_template(
-                "index.html",
-                streams=[],
-                api_error=None,
-                flash_error=error,
-                rtmps_enabled=False,
-            ), 503
+            self.app.logger.exception("Session backend unavailable during login")
+            error = "Authentication service temporarily unavailable. Please try again."
+            return render_template("login.html", error=error), 503
+        return redirect(url_for("index"))
 
+    def logout(self):
+        validation_error = self._validate_logout_session()
+        if validation_error is not None:
+            return validation_error
         try:
-            _revoke_session_token(fail_closed=True)
+            self._revoke_session_token(fail_closed=True)
         except SessionBackendUnavailable:
-            app.logger.error(
+            self.app.logger.exception(
                 "Session backend unavailable during logout for user %s",
                 session.get("username"),
-                exc_info=True,
             )
             session["flash_error"] = (
                 "Could not complete logout because the authentication service "
@@ -465,7 +502,33 @@ def create_app():
         session.clear()
         return redirect(url_for("login"))
 
-    @app.after_request
+    def _validate_logout_session(self):
+        try:
+            if self.app.config["REQUIRE_LOGIN"] and not self._session_is_authenticated(
+                fail_closed=True
+            ):
+                return redirect(url_for("login"))
+        except SessionBackendUnavailable:
+            username = session.get("username")
+            self.app.logger.exception(
+                "Session backend unavailable during logout validation for user %s",
+                username,
+            )
+            error = (
+                "Could not complete logout because the authentication service "
+                "is temporarily unavailable. Your session is still active; "
+                "please try again."
+            )
+            return render_template(
+                INDEX_HTML,
+                streams=[],
+                api_error=None,
+                flash_error=error,
+                rtmps_enabled=False,
+            ), 503
+        return None
+
+    @staticmethod
     def set_security_headers(response):
         # Match templates/base.html meta referrer policy. Browsers prefer the HTTP
         # header over the meta tag; no-referrer would omit Referer on same-origin
@@ -481,321 +544,391 @@ def create_app():
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    def detect_cluster():
-        """Return (enabled, health_or_none, detect_error_or_none).
-
-        Health failures are not treated as standalone — callers must surface
-        ``detect_error`` separately from a confirmed ``cluster.enabled=false``.
-        """
+    def detect_cluster(self):
+        """Return (enabled, health_or_none, detect_error_or_none)."""
         try:
-            health = client.health()
+            health = self.client.health()
         except Lrtmp2ApiError as exc:
             return False, None, str(exc)
-        enabled = _cluster_enabled_from_health(health)
-        return enabled, health, None
+        return _cluster_enabled_from_health(health), health, None
 
-    @app.route("/")
-    @login_required
-    def index():
+    def index(self):
         flash_error = session.pop("flash_error", None)
         try:
-            streams = _normalize_streams_list(client.list_streams())
+            streams = _normalize_streams_list(self.client.list_streams())
         except Lrtmp2ApiError as exc:
-            # Resolve cluster via health so confirmed standalone does not keep
-            # a Cluster nav link. Health failure stays "unknown" (nav stays).
-            cluster_on, _, detect_error = detect_cluster()
-            cluster_status_unknown = bool(detect_error)
-            return render_template(
-                "index.html",
-                streams=[],
-                api_error=str(exc),
-                flash_error=flash_error,
-                rtmps_enabled=False,
-                cluster_enabled=cluster_on,
-                cluster_status_unknown=cluster_status_unknown,
-                show_cluster_nav=cluster_on or cluster_status_unknown,
-            )
-        cluster_on, health, detect_error = detect_cluster()
-        rtmps_on, rtmps_port = rtmps_from_health(health)
-        cluster_by_stream = {}
-        api_error = detect_error
-        # Health outage must not look like confirmed standalone: keep Cluster
-        # nav reachable and surface the detection failure.
-        cluster_status_unknown = bool(detect_error)
-        # Standalone also serves /cluster/streams (null ownership). Never treat
-        # that endpoint succeeding as proof of cluster mode — ask /cluster.
-        if cluster_status_unknown:
-            try:
-                status = client.cluster_status()
-                if isinstance(status, dict) and "enabled" in status:
-                    cluster_on = bool(status.get("enabled"))
-                    cluster_status_unknown = False
-            except Lrtmp2ApiError as exc:
-                api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
-        show_cluster = cluster_on or cluster_status_unknown
-        if cluster_on:
-            try:
-                for entry in client.cluster_streams() or []:
-                    sid = entry.get("stream_id") or entry.get("id")
-                    if sid:
-                        cluster_by_stream[sid] = entry
-            except Lrtmp2ApiError as exc:
-                api_error = str(exc) if api_error is None else f"{api_error}; {exc}"
-                cluster_by_stream = {}
-        for stream in streams:
-            stream.update(build_urls(stream, rtmps_on, rtmps_port))
-            if cluster_on:
-                stream["cluster"] = cluster_by_stream.get(stream.get("id"), {})
+            return self._render_index_api_failure(flash_error, exc)
+
+        cluster_on, health, detect_error = self.detect_cluster()
+        rtmps_on, rtmps_port = self.rtmps_from_health(health)
+        cluster_on, cluster_status_unknown, api_error = self._resolve_cluster_status(
+            cluster_on,
+            detect_error,
+        )
+        cluster_by_stream, api_error = self._load_cluster_stream_map(
+            cluster_on,
+            api_error,
+        )
+        self._decorate_streams(
+            streams,
+            rtmps_on,
+            rtmps_port,
+            cluster_on,
+            cluster_by_stream,
+        )
         return render_template(
-            "index.html",
+            INDEX_HTML,
             streams=streams,
             api_error=api_error,
             flash_error=flash_error,
             rtmps_enabled=rtmps_on,
             cluster_enabled=cluster_on,
             cluster_status_unknown=cluster_status_unknown,
-            show_cluster_nav=show_cluster,
+            show_cluster_nav=cluster_on or cluster_status_unknown,
         )
 
-    @app.route("/cluster", methods=["GET"])
-    @login_required
-    def cluster_overview():
+    def _render_index_api_failure(self, flash_error, exc):
+        # Resolve cluster via health so confirmed standalone does not keep a
+        # Cluster nav link. Health failure stays "unknown" (nav stays).
+        cluster_on, _, detect_error = self.detect_cluster()
+        cluster_status_unknown = bool(detect_error)
+        return render_template(
+            INDEX_HTML,
+            streams=[],
+            api_error=str(exc),
+            flash_error=flash_error,
+            rtmps_enabled=False,
+            cluster_enabled=cluster_on,
+            cluster_status_unknown=cluster_status_unknown,
+            show_cluster_nav=cluster_on or cluster_status_unknown,
+        )
+
+    def _resolve_cluster_status(self, cluster_on, detect_error):
+        api_error = detect_error
+        cluster_status_unknown = bool(detect_error)
+        if not cluster_status_unknown:
+            return cluster_on, False, api_error
+        try:
+            status = self.client.cluster_status()
+        except Lrtmp2ApiError as exc:
+            return cluster_on, True, _append_api_error(api_error, exc)
+        if isinstance(status, dict) and "enabled" in status:
+            return bool(status.get("enabled")), False, api_error
+        return cluster_on, True, api_error
+
+    def _load_cluster_stream_map(self, cluster_on, api_error):
+        if not cluster_on:
+            return {}, api_error
+        try:
+            entries = self.client.cluster_streams() or []
+        except Lrtmp2ApiError as exc:
+            return {}, _append_api_error(api_error, exc)
+        cluster_by_stream = {}
+        for entry in entries:
+            sid = entry.get("stream_id") or entry.get("id")
+            if sid:
+                cluster_by_stream[sid] = entry
+        return cluster_by_stream, api_error
+
+    def _decorate_streams(
+        self,
+        streams,
+        rtmps_on,
+        rtmps_port,
+        cluster_on,
+        cluster_by_stream,
+    ):
+        for stream in streams:
+            stream.update(self.build_urls(stream, rtmps_on, rtmps_port))
+            if cluster_on:
+                stream["cluster"] = cluster_by_stream.get(stream.get("id"), {})
+
+    def cluster_overview(self):
         flash_error = session.pop("flash_error", None)
-        cluster_on, health, detect_error = detect_cluster()
-        api_errors = []
-        if detect_error:
-            api_errors.append(detect_error)
-
-        cluster = None
-        if not cluster_on and not detect_error:
-            try:
-                status = client.cluster_status()
-                if isinstance(status, dict) and status.get("enabled"):
-                    cluster_on = True
-                    cluster = status
-                    api_errors.append(
-                        "Health probe reports standalone but cluster API is enabled."
-                    )
-                else:
-                    return render_template(
-                        CLUSTER_TEMPLATE,
-                        cluster_enabled=False,
-                        cluster=None,
-                        nodes=[],
-                        flash_error=flash_error,
-                        api_error=None,
-                    )
-            except Lrtmp2ApiError as exc:
-                return render_template(
-                    CLUSTER_TEMPLATE,
-                    cluster_enabled=False,
-                    cluster=None,
-                    nodes=[],
-                    flash_error=flash_error,
-                    api_error=str(exc),
-                )
-
-        nodes = []
-        if cluster_on or detect_error:
-            if cluster is None:
-                try:
-                    cluster = client.cluster_status()
-                except Lrtmp2ApiError as exc:
-                    api_errors.append(str(exc))
-                    cluster = (health or {}).get("cluster")
-            try:
-                nodes = client.cluster_nodes() or []
-            except Lrtmp2ApiError as exc:
-                api_errors.append(str(exc))
-
-        # Prefer the authoritative /cluster status `enabled` flag over the
-        # earlier health probe (health may be stale if clustering was just
-        # disabled). Only fall back to presence heuristics when health failed
-        # and the status payload has no explicit enabled field.
-        if isinstance(cluster, dict) and "enabled" in cluster:
-            cluster_enabled = bool(cluster.get("enabled"))
-        elif not cluster_on and detect_error:
-            cluster_enabled = bool(cluster) or bool(nodes)
-        else:
-            cluster_enabled = cluster_on
-
-        api_error = "; ".join(api_errors) if api_errors else None
+        cluster_on, health, detect_error = self.detect_cluster()
+        api_errors = [detect_error] if detect_error else []
+        cluster, early_response, cluster_on = self._verify_cluster_status(
+            cluster_on,
+            detect_error,
+            flash_error,
+            api_errors,
+        )
+        if early_response is not None:
+            return early_response
+        cluster, nodes = self._load_cluster_details(
+            cluster_on,
+            detect_error,
+            health,
+            cluster,
+            api_errors,
+        )
+        cluster_enabled = self._resolve_cluster_enabled(
+            cluster,
+            nodes,
+            cluster_on,
+            detect_error,
+        )
         return render_template(
             CLUSTER_TEMPLATE,
             cluster_enabled=cluster_enabled,
             cluster=cluster,
             nodes=nodes,
             flash_error=flash_error,
-            api_error=api_error,
+            api_error="; ".join(api_errors) if api_errors else None,
         )
 
-    def _cluster_node_action(node_id, action):
+    def _verify_cluster_status(
+        self,
+        cluster_on,
+        detect_error,
+        flash_error,
+        api_errors,
+    ):
+        if cluster_on or detect_error:
+            return None, None, cluster_on
+        try:
+            status = self.client.cluster_status()
+        except Lrtmp2ApiError as exc:
+            response = render_template(
+                CLUSTER_TEMPLATE,
+                cluster_enabled=False,
+                cluster=None,
+                nodes=[],
+                flash_error=flash_error,
+                api_error=str(exc),
+            )
+            return None, response, cluster_on
+        if isinstance(status, dict) and status.get("enabled"):
+            api_errors.append(
+                "Health probe reports standalone but cluster API is enabled."
+            )
+            return status, None, True
+        response = render_template(
+            CLUSTER_TEMPLATE,
+            cluster_enabled=False,
+            cluster=None,
+            nodes=[],
+            flash_error=flash_error,
+            api_error=None,
+        )
+        return None, response, cluster_on
+
+    def _load_cluster_details(
+        self,
+        cluster_on,
+        detect_error,
+        health,
+        cluster,
+        api_errors,
+    ):
+        if not (cluster_on or detect_error):
+            return cluster, []
+        if cluster is None:
+            cluster = self._load_cluster_status(health, api_errors)
+        try:
+            nodes = self.client.cluster_nodes() or []
+        except Lrtmp2ApiError as exc:
+            api_errors.append(str(exc))
+            nodes = []
+        return cluster, nodes
+
+    def _load_cluster_status(self, health, api_errors):
+        try:
+            return self.client.cluster_status()
+        except Lrtmp2ApiError as exc:
+            api_errors.append(str(exc))
+            return (health or {}).get("cluster")
+
+    @staticmethod
+    def _resolve_cluster_enabled(cluster, nodes, cluster_on, detect_error):
+        if isinstance(cluster, dict) and "enabled" in cluster:
+            return bool(cluster.get("enabled"))
+        if not cluster_on and detect_error:
+            return bool(cluster) or bool(nodes)
+        return cluster_on
+
+    def _cluster_node_action(self, node_id, action):
         try:
             parsed_id = int(str(node_id), 10)
         except (TypeError, ValueError):
             session["flash_error"] = "Invalid node ID"
             return redirect(url_for("cluster_overview"))
         try:
-            if action == "drain":
-                client.cluster_drain_node(parsed_id)
-            elif action == "resume":
-                client.cluster_resume_node(parsed_id)
-            elif action == "remove":
-                client.cluster_remove_node(parsed_id)
-            else:
+            action_map = {
+                "drain": self.client.cluster_drain_node,
+                "resume": self.client.cluster_resume_node,
+                "remove": self.client.cluster_remove_node,
+            }
+            handler = action_map.get(action)
+            if handler is None:
                 session["flash_error"] = "Unknown cluster action"
+            else:
+                handler(parsed_id)
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("cluster_overview"))
 
-    @app.route("/cluster/nodes/<node_id>/drain", methods=["POST"])
-    @login_required
-    def cluster_drain_node(node_id):
-        return _cluster_node_action(node_id, "drain")
+    def cluster_drain_node(self, node_id):
+        return self._cluster_node_action(node_id, "drain")
 
-    @app.route("/cluster/nodes/<node_id>/resume", methods=["POST"])
-    @login_required
-    def cluster_resume_node(node_id):
-        return _cluster_node_action(node_id, "resume")
+    def cluster_resume_node(self, node_id):
+        return self._cluster_node_action(node_id, "resume")
 
-    @app.route("/cluster/nodes/<node_id>/remove", methods=["POST"])
-    @login_required
-    def cluster_remove_node(node_id):
-        return _cluster_node_action(node_id, "remove")
+    def cluster_remove_node(self, node_id):
+        return self._cluster_node_action(node_id, "remove")
 
-    @app.route("/streams/new", methods=["GET", "POST"])
-    @login_required
-    def create_stream():
-        error = None
-        form = {
+    def create_stream(self):
+        form = self._default_stream_form()
+        if request.method != "POST":
+            return render_template(CREATE_STREAM_HTML, error=None, form=form)
+
+        values, form = self._submitted_stream_form()
+        error = self._stream_form_error(values)
+        if error:
+            return render_template(CREATE_STREAM_HTML, error=error, form=form)
+
+        created_id, error = self._create_stream(values)
+        if created_id:
+            return redirect(url_for("stream_created", stream_id=created_id))
+        return render_template(CREATE_STREAM_HTML, error=error, form=form)
+
+    def _default_stream_form(self):
+        return {
             "id": "",
             "name": "",
-            "app": app.config["LRTMP2_APP"],
+            "app": self.app.config["LRTMP2_APP"],
             "publish_key": "",
             "play_key": "",
             "stats_key": "",
         }
-        if request.method == "POST":
-            stream_id = (request.form.get("id") or secrets.token_hex(8)).strip()
-            name = (request.form.get("name") or stream_id).strip()
-            app_name = (request.form.get("app") or app.config["LRTMP2_APP"]).strip()
-            publish_key = _optional_form_value(request.form.get("publish_key"))
-            play_key = _optional_form_value(request.form.get("play_key"))
-            stats_key = _optional_form_value(request.form.get("stats_key"))
-            form = {
-                "id": request.form.get("id", "").strip(),
-                "name": request.form.get("name", "").strip(),
-                "app": app_name,
-                "publish_key": publish_key or "",
-                "play_key": play_key or "",
-                "stats_key": stats_key or "",
-            }
-            if not _is_valid_stream_id(stream_id):
-                error = (
-                    "Stream ID must be 1-63 characters and use only letters, "
-                    "numbers, dots, underscores, or hyphens."
-                )
-            elif not _is_valid_app_name(app_name):
-                error = (
-                    "RTMP app must be 1-63 characters and use only letters, "
-                    "numbers, dots, underscores, or hyphens."
-                )
-            elif not _is_valid_display_name(name):
-                error = (
-                    "Name must be 1-128 characters and must not contain "
-                    "control characters."
-                )
-            elif (key_error := _validate_optional_access_keys(
-                publish_key, play_key, stats_key
-            )):
-                error = key_error
-            else:
-                try:
-                    result = client.create_stream(
-                        stream_id,
-                        name,
-                        app_name,
-                        publish_key=publish_key,
-                        play_key=play_key,
-                        stats_key=stats_key,
-                    )
-                    created_id = result.get("id") if isinstance(result, dict) else None
-                    if not created_id:
-                        error = "Server returned an invalid create-stream response."
-                    else:
-                        return redirect(url_for("stream_created", stream_id=created_id))
-                except Lrtmp2ApiError as exc:
-                    error = str(exc)
-        return render_template(
-            "create_stream.html",
-            error=error,
-            form=form,
+
+    def _submitted_stream_form(self):
+        stream_id = (request.form.get("id") or secrets.token_hex(8)).strip()
+        name = (request.form.get("name") or stream_id).strip()
+        app_name = (
+            request.form.get("app") or self.app.config["LRTMP2_APP"]
+        ).strip()
+        publish_key = _optional_form_value(request.form.get("publish_key"))
+        play_key = _optional_form_value(request.form.get("play_key"))
+        stats_key = _optional_form_value(request.form.get("stats_key"))
+        values = {
+            "stream_id": stream_id,
+            "name": name,
+            "app_name": app_name,
+            "publish_key": publish_key,
+            "play_key": play_key,
+            "stats_key": stats_key,
+        }
+        form = {
+            "id": request.form.get("id", "").strip(),
+            "name": request.form.get("name", "").strip(),
+            "app": app_name,
+            "publish_key": publish_key or "",
+            "play_key": play_key or "",
+            "stats_key": stats_key or "",
+        }
+        return values, form
+
+    @staticmethod
+    def _stream_form_error(values):
+        if not _is_valid_stream_id(values["stream_id"]):
+            return (
+                "Stream ID must be 1-63 characters and use only letters, "
+                "numbers, dots, underscores, or hyphens."
+            )
+        if not _is_valid_app_name(values["app_name"]):
+            return (
+                "RTMP app must be 1-63 characters and use only letters, "
+                "numbers, dots, underscores, or hyphens."
+            )
+        if not _is_valid_display_name(values["name"]):
+            return (
+                "Name must be 1-128 characters and must not contain "
+                "control characters."
+            )
+        return _validate_optional_access_keys(
+            values["publish_key"],
+            values["play_key"],
+            values["stats_key"],
         )
 
-    @app.route("/streams/created")
-    @login_required
-    def stream_created():
+    def _create_stream(self, values):
+        try:
+            result = self.client.create_stream(
+                values["stream_id"],
+                values["name"],
+                values["app_name"],
+                publish_key=values["publish_key"],
+                play_key=values["play_key"],
+                stats_key=values["stats_key"],
+            )
+        except Lrtmp2ApiError as exc:
+            return None, str(exc)
+        created_id = result.get("id") if isinstance(result, dict) else None
+        if not created_id:
+            return None, "Server returned an invalid create-stream response."
+        return created_id, None
+
+    def stream_created(self):
         stream_id = request.args.get("stream_id", "")
         if not _is_valid_stream_id(stream_id):
             return redirect(url_for("index"))
         try:
-            streams = _normalize_streams_list(client.list_streams())
+            streams = _normalize_streams_list(self.client.list_streams())
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
             return redirect(url_for("index"))
-        stream = next((s for s in streams if s.get("id") == stream_id), None)
+        stream = next((item for item in streams if item.get("id") == stream_id), None)
         if not stream:
             session["flash_error"] = (
                 f"Stream '{stream_id}' was created but is not listed yet. "
                 "Check the overview."
             )
             return redirect(url_for("index"))
-        rtmps_on, rtmps_port = rtmps_health()
-        stream = dict(stream, **build_urls(stream, rtmps_on, rtmps_port))
+        rtmps_on, rtmps_port = self.rtmps_health()
+        stream = dict(stream, **self.build_urls(stream, rtmps_on, rtmps_port))
         return render_template("stream_created.html", stream=stream)
 
-    @app.route("/streams/<stream_id>/players/new", methods=["POST"])
-    @login_required
-    def add_player(stream_id):
+    def add_player(self, stream_id):
         if not _is_valid_stream_id(stream_id):
-            session["flash_error"] = "Invalid stream ID"
+            session["flash_error"] = ERR_INVALID_STREAM_ID
             return redirect(url_for("index"))
         name = (request.form.get("name") or "").strip() or None
         play_key = _optional_form_value(request.form.get("play_key"))
-        if name is not None and not _is_valid_display_name(name):
-            session["flash_error"] = (
-                "Name must be 1-128 characters and must not contain control characters."
-            )
-            return redirect(url_for("index"))
-        if play_key is not None and not _is_valid_access_key(play_key):
-            session["flash_error"] = f"play_key: {ACCESS_KEY_HELP}"
+        error = self._player_form_error(name, play_key)
+        if error:
+            session["flash_error"] = error
             return redirect(url_for("index"))
         try:
-            client.create_player(stream_id, name=name, play_key=play_key)
+            self.client.create_player(stream_id, name=name, play_key=play_key)
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
-    @app.route("/streams/<stream_id>/players/<player_id>/delete", methods=["POST"])
-    @login_required
-    def delete_player(stream_id, player_id):
+    @staticmethod
+    def _player_form_error(name, play_key):
+        if name is not None and not _is_valid_display_name(name):
+            return "Name must be 1-128 characters and must not contain control characters."
+        if play_key is not None and not _is_valid_access_key(play_key):
+            return f"play_key: {ACCESS_KEY_HELP}"
+        return None
+
+    def delete_player(self, stream_id, player_id):
         if not _is_valid_stream_id(stream_id):
-            session["flash_error"] = "Invalid stream ID"
+            session["flash_error"] = ERR_INVALID_STREAM_ID
             return redirect(url_for("index"))
         if not _is_valid_viewer_id(player_id):
             session["flash_error"] = "Invalid player ID"
             return redirect(url_for("index"))
         try:
-            client.delete_player(stream_id, player_id)
+            self.client.delete_player(stream_id, player_id)
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
 
-    @app.route("/streams/<stream_id>/delete", methods=["POST"])
-    @login_required
-    def delete_stream(stream_id):
+    def delete_stream(self, stream_id):
         if not _is_valid_stream_id(stream_id):
-            session["flash_error"] = "Invalid stream ID"
+            session["flash_error"] = ERR_INVALID_STREAM_ID
             return redirect(url_for("index"))
         try:
             if not _stream_delete_drain_slots.acquire(blocking=False):
@@ -805,63 +938,133 @@ def create_app():
                 )
                 return redirect(url_for("index"))
             try:
-                client.delete_stream(stream_id)
+                self.client.delete_stream(stream_id)
             finally:
                 _stream_delete_drain_slots.release()
         except Lrtmp2ApiError as exc:
-            # Log a keyed correlation tag instead of the raw user-controlled
-            # stream_id (SonarCloud pythonsecurity:S5145). Stream IDs can be
-            # low-entropy/user-chosen, so an unkeyed hash would let anyone
-            # with log access recompute tags for candidate IDs; keying with
-            # SECRET_KEY (server-only) prevents that while still letting ops
-            # correlate failures to a specific stream.
-            stream_tag = hmac.new(
-                app.config["SECRET_KEY"].encode(), stream_id.encode(), hashlib.sha256
-            ).hexdigest()[:12]
-            app.logger.warning("Delete stream failed (stream_tag=%s): %s", stream_tag, exc)
-            session["flash_error"] = str(exc)
+            self._handle_delete_stream_error(stream_id, exc)
         return redirect(url_for("index"))
 
-    stats_ip_limit = f"{app.config['STATS_RATE_LIMIT_PER_IP']} per minute"
-    stats_stream_limit = f"{app.config['STATS_RATE_LIMIT_PER_STREAM']} per minute"
+    def _handle_delete_stream_error(self, stream_id, exc):
+        # Log a keyed correlation tag instead of the raw user-controlled
+        # stream_id (SonarCloud pythonsecurity:S5145).
+        stream_tag = hmac.new(
+            self.app.config["SECRET_KEY"].encode(),
+            stream_id.encode(),
+            hashlib.sha256,
+        ).hexdigest()[:12]
+        self.app.logger.warning(
+            "Delete stream failed (stream_tag=%s): %s",
+            stream_tag,
+            exc,
+        )
+        session["flash_error"] = str(exc)
 
-    def _stream_stats_route_rate_limit_exempt():
-        return request.endpoint != "stream_stats"
-
-    # Enforce stats caps in before_request (like login POST) so the view can
-    # opt out of default_limits without @limiter.exempt disabling decorated
-    # limits on the same callable (Flask-Limiter skips decorated limits when
-    # any exemption is registered on that function).
-    @limiter.limit(
-        stats_ip_limit,
-        key_func=_rate_limit_remote_addr,
-        exempt_when=lambda: _stream_stats_route_rate_limit_exempt()
-        or _stats_ip_rate_limit_exempt(),
-    )
-    @limiter.limit(
-        stats_stream_limit,
-        key_func=_stats_rate_limit_key,
-        exempt_when=lambda: _stream_stats_route_rate_limit_exempt()
-        or _stats_per_stream_rate_limit_exempt(),
-    )
-    def _stream_stats_rate_limit():
-        # Intentionally empty: Flask-Limiter enforces both limits via the decorators
-        # when this before_request hook is invoked; no additional handler logic is needed.
-        pass
-
-    app.before_request(_stream_stats_rate_limit)
-
-    @app.route("/streams/<stream_id>/stats.json")
-    @limiter.exempt(flags=ExemptionScope.DEFAULT)
-    @login_required
-    def stream_stats(stream_id):
+    def stream_stats(self, stream_id):
         if not _is_valid_stream_id(stream_id):
-            return jsonify({"error": "Invalid stream ID"}), 400
+            return jsonify({"error": ERR_INVALID_STREAM_ID}), 400
         try:
-            return jsonify(client.stream_stats_by_id(stream_id))
+            return jsonify(self.client.stream_stats_by_id(stream_id))
         except Lrtmp2ApiError:
             return jsonify({"error": "Failed to fetch stats"}), 502
 
+    def _add_protected_rule(self, rule, endpoint, view_func, methods):
+        self.app.add_url_rule(
+            rule,
+            endpoint=endpoint,
+            view_func=self.login_required(view_func),
+            methods=methods,
+        )
+
+    def _register_routes(self):
+        self.app.add_url_rule(
+            "/login",
+            endpoint="login",
+            view_func=self.login,
+            methods=["GET", "POST"],
+        )
+        self.app.add_url_rule(
+            "/logout",
+            endpoint="logout",
+            view_func=self.logout,
+            methods=["POST"],
+        )
+        self._add_protected_rule("/", "index", self.index, ["GET"])
+        self._add_protected_rule(
+            "/cluster",
+            "cluster_overview",
+            self.cluster_overview,
+            ["GET"],
+        )
+        self._add_protected_rule(
+            "/cluster/nodes/<node_id>/drain",
+            "cluster_drain_node",
+            self.cluster_drain_node,
+            ["POST"],
+        )
+        self._add_protected_rule(
+            "/cluster/nodes/<node_id>/resume",
+            "cluster_resume_node",
+            self.cluster_resume_node,
+            ["POST"],
+        )
+        self._add_protected_rule(
+            "/cluster/nodes/<node_id>/remove",
+            "cluster_remove_node",
+            self.cluster_remove_node,
+            ["POST"],
+        )
+        self._add_protected_rule(
+            "/streams/new",
+            "create_stream",
+            self.create_stream,
+            ["GET", "POST"],
+        )
+        self._add_protected_rule(
+            "/streams/created",
+            "stream_created",
+            self.stream_created,
+            ["GET"],
+        )
+        self._add_protected_rule(
+            "/streams/<stream_id>/players/new",
+            "add_player",
+            self.add_player,
+            ["POST"],
+        )
+        self._add_protected_rule(
+            "/streams/<stream_id>/players/<player_id>/delete",
+            "delete_player",
+            self.delete_player,
+            ["POST"],
+        )
+        self._add_protected_rule(
+            "/streams/<stream_id>/delete",
+            "delete_stream",
+            self.delete_stream,
+            ["POST"],
+        )
+
+        stats_view = self.login_required(self.stream_stats)
+        stats_view = self.limiter.exempt(flags=ExemptionScope.DEFAULT)(stats_view)
+        self.app.add_url_rule(
+            "/streams/<stream_id>/stats.json",
+            endpoint="stream_stats",
+            view_func=stats_view,
+            methods=["GET"],
+        )
+
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+    _configure_proxy(app)
+    _configure_security_defaults(app)
+    runtime = _PanelRuntime(app)
+    runtime._register_login_rate_limit()
+    CSRFProtect(app)
+    runtime.register_post_csrf()
     return app
 
 

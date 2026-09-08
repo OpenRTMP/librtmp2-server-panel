@@ -19,7 +19,13 @@ body.dark {
     -webkit-user-select: none;
     user-select: none;
     padding: 2px 4px;
+    border: 0;
     border-radius: 4px;
+    background: none;
+    color: inherit;
+    font: inherit;
+    line-height: inherit;
+    text-align: left;
     display: inline-block;
 }
 .blur-text:focus,

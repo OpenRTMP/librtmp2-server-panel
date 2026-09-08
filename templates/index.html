@@ -47,24 +47,21 @@
             <div class="accordion-body">
                 <h5>Publish</h5>
                 <strong>Server URL (RTMP):</strong>
-                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url }}"
-                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                <button type="button" class="blur-text" data-url="{{ stream.publish_url }}" onclick="copyToClipboard(this)">
                     {{ stream.publish_url }}
-                </span>
+                </button>
                 <span class="copy-feedback"></span><br>
                 {% if stream.publish_url_tls %}
                 <strong>Server URL (RTMPS):</strong>
-                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url_tls }}"
-                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                <button type="button" class="blur-text" data-url="{{ stream.publish_url_tls }}" onclick="copyToClipboard(this)">
                     {{ stream.publish_url_tls }}
-                </span>
+                </button>
                 <span class="copy-feedback"></span><br>
                 {% endif %}
                 <strong>Stream Key:</strong>
-                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_key }}"
-                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                <button type="button" class="blur-text" data-url="{{ stream.publish_key }}" onclick="copyToClipboard(this)">
                     {{ stream.publish_key }}
-                </span>
+                </button>
                 <span class="copy-feedback"></span><br><br>
 
                 <h5>Play</h5>
@@ -72,24 +69,21 @@
                 <div class="mb-3 border-bottom border-secondary pb-3">
                     <strong>{{ player.name }}</strong><br>
                     <strong>Play URL (RTMP):</strong>
-                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
-                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                    <button type="button" class="blur-text" data-url="{{ player.play_url }}" onclick="copyToClipboard(this)">
                         {{ player.play_url }}
-                    </span>
+                    </button>
                     <span class="copy-feedback"></span><br>
                     {% if player.play_url_tls %}
                     <strong>Play URL (RTMPS):</strong>
-                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url_tls }}"
-                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                    <button type="button" class="blur-text" data-url="{{ player.play_url_tls }}" onclick="copyToClipboard(this)">
                         {{ player.play_url_tls }}
-                    </span>
+                    </button>
                     <span class="copy-feedback"></span><br>
                     {% endif %}
                     <strong>Play Key:</strong>
-                    <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
-                          onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                    <button type="button" class="blur-text" data-url="{{ player.play_key }}" onclick="copyToClipboard(this)">
                         {{ player.play_key }}
-                    </span>
+                    </button>
                     <span class="copy-feedback"></span>
                     {% if stream.get('players')|length > 1 %}
                     <form method="post" action="{{ url_for('delete_player', stream_id=stream.id, player_id=player.id) }}" class="mt-2">
@@ -103,11 +97,13 @@
                 {% endfor %}
                 <form method="post" action="{{ url_for('add_player', stream_id=stream.id) }}" class="mt-2">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <label for="player-name-{{ stream.id }}" class="visually-hidden">Player name</label>
                     <div class="input-group mb-2">
-                        <input type="text" class="form-control" name="name" placeholder="Player name (optional)">
+                        <input id="player-name-{{ stream.id }}" type="text" class="form-control" name="name" placeholder="Player name (optional)">
                         <button type="submit" class="btn btn-outline-success">Add Player</button>
                     </div>
-                    <input type="text" class="form-control form-control-sm" name="play_key"
+                    <label for="player-key-{{ stream.id }}" class="visually-hidden">Custom play key</label>
+                    <input id="player-key-{{ stream.id }}" type="text" class="form-control form-control-sm" name="play_key"
                            placeholder="Custom play key (optional)" autocomplete="off">
                 </form>
                 <br>
@@ -142,10 +138,9 @@
 
                 <h5>Stats</h5>
                 <strong>Stats URL:</strong>
-                <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.stats_url }}"
-                      onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+                <button type="button" class="blur-text" data-url="{{ stream.stats_url }}" onclick="copyToClipboard(this)">
                     {{ stream.stats_url }}
-                </span>
+                </button>
                 <span class="copy-feedback"></span>
 
                 <div id="stats-{{ stream.id }}" data-stream-id="{{ stream.id }}"
