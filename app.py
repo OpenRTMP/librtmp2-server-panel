@@ -37,6 +37,7 @@ DISPLAY_NAME_MAX_LEN = 128
 MIN_ACCESS_KEY_LEN = 32
 CLUSTER_TEMPLATE = "cluster.html"
 INDEX_HTML = "index.html"
+CREATE_STREAM_HTML = "create_stream.html"
 ERR_INVALID_STREAM_ID = "Invalid stream ID"
 
 ACCESS_KEY_HELP = (
@@ -223,9 +224,7 @@ class _PanelRuntime:
             storage_options={"socket_timeout": 2, "socket_connect_timeout": 2},
         )
 
-    def register(self):
-        self._register_login_rate_limit()
-        CSRFProtect(self.app)
+    def register_post_csrf(self):
         self._register_stats_rate_limits()
         self.app.after_request(self.set_security_headers)
         self._register_routes()
@@ -449,9 +448,7 @@ class _PanelRuntime:
     @staticmethod
     def _add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port):
         for player in players:
-            player["play_url"] = (
-                f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"
-            )  # nosonar python:S5332
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
             if rtmps_on:
                 player["play_url_tls"] = (
                     f"rtmps://{domain}:{rtmps_port}/{app_name}/"
@@ -783,17 +780,17 @@ class _PanelRuntime:
     def create_stream(self):
         form = self._default_stream_form()
         if request.method != "POST":
-            return render_template("create_stream.html", error=None, form=form)
+            return render_template(CREATE_STREAM_HTML, error=None, form=form)
 
         values, form = self._submitted_stream_form()
         error = self._stream_form_error(values)
         if error:
-            return render_template("create_stream.html", error=error, form=form)
+            return render_template(CREATE_STREAM_HTML, error=error, form=form)
 
         created_id, error = self._create_stream(values)
         if created_id:
             return redirect(url_for("stream_created", stream_id=created_id))
-        return render_template("create_stream.html", error=error, form=form)
+        return render_template(CREATE_STREAM_HTML, error=error, form=form)
 
     def _default_stream_form(self):
         return {
@@ -1065,7 +1062,9 @@ def create_app():
     _configure_proxy(app)
     _configure_security_defaults(app)
     runtime = _PanelRuntime(app)
-    runtime.register()
+    runtime._register_login_rate_limit()
+    CSRFProtect(app)
+    runtime.register_post_csrf()
     return app
 
 
