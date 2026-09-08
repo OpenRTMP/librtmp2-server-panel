@@ -424,6 +424,8 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
         namespace_aliases = set()
     if isinstance(node, ast.Name) and node.id in namespace_aliases:
         return True
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        return _is_module_namespace_mapping(node.value, namespace_aliases)
     if _is_globals_call(node):
         return True
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
@@ -486,18 +488,37 @@ def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     return _dict_merge_payload_may_set_workers(call.args[0])
 
 
+def _namedexpr_assignment_values(expr):
+    """Return evaluated walrus name/value pairs, excluding lambda scopes."""
+    if isinstance(expr, ast.Lambda):
+        return []
+    values = []
+    if isinstance(expr, ast.NamedExpr) and isinstance(expr.target, ast.Name):
+        values.append((expr.target.id, expr.value))
+    for child in ast.iter_child_nodes(expr):
+        values.extend(_namedexpr_assignment_values(child))
+    return values
+
+
 def _namespace_assignment_values(node):
     """Return simple name assignments relevant to namespace alias tracking."""
     if isinstance(node, ast.Assign):
-        return [
+        values = [
             (target.id, node.value)
             for target in node.targets
             if isinstance(target, ast.Name)
         ]
+        values.extend(_namedexpr_assignment_values(node.value))
+        return values
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-        return [(node.target.id, node.value)]
+        values = [(node.target.id, node.value)]
+        if node.value is not None:
+            values.extend(_namedexpr_assignment_values(node.value))
+        return values
     if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-        return [(node.target.id, None)]
+        return [(node.target.id, None), *_namedexpr_assignment_values(node.value)]
+    if isinstance(node, ast.Expr):
+        return _namedexpr_assignment_values(node.value)
     return []
 
 
@@ -593,14 +614,181 @@ def _call_is_getattr_setitem_workers(call):
     return _constant_is_workers(call.args[0])
 
 
+_NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
+
+
+def _unpack_operator_bindings(operator_bindings):
+    """Return operator/functools aliases and module namespace aliases."""
+    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
+    setitem_aliases = operator_bindings[1] if len(operator_bindings) > 1 else set()
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    ior_aliases = operator_bindings[3] if len(operator_bindings) > 3 else set()
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    return (
+        module_aliases,
+        setitem_aliases,
+        namespace_aliases,
+        ior_aliases,
+        partial_aliases,
+    )
+
+
+def _call_is_dynamic_exec_eval(call):
+    """Return True for direct built-ins or ``__import__('builtins')`` calls."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if isinstance(func, ast.Name) and func.id in {"exec", "eval"}:
+        return True
+    if not isinstance(func, ast.Attribute) or func.attr not in {"exec", "eval"}:
+        return False
+    owner = func.value
+    return (
+        isinstance(owner, ast.Call)
+        and isinstance(owner.func, ast.Name)
+        and owner.func.id == "__import__"
+        and len(owner.args) == 1
+        and isinstance(owner.args[0], ast.Constant)
+        and owner.args[0].value == "builtins"
+        and not owner.keywords
+    )
+
+
+def _attribute_is_namespace_setitem(node, namespace_aliases=None):
+    """Return True for a module namespace ``__setitem__`` attribute."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__setitem__"
+        and _is_module_namespace_mapping(node.value, namespace_aliases)
+    )
+
+
+def _getattr_namespace_mutator_method(func, namespace_aliases=None):
+    """Return a recognized mutator name from ``getattr(namespace, ...)``."""
+    if not isinstance(func, ast.Call):
+        return None
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return None
+    if len(func.args) < 2 or not _is_module_namespace_mapping(
+        func.args[0], namespace_aliases
+    ):
+        return None
+    key = func.args[1]
+    if not isinstance(key, ast.Constant) or key.value not in _NAMESPACE_GETATTR_METHODS:
+        return None
+    return key.value
+
+
+def _namespace_mutator_call_may_set_workers(method, call):
+    """Return True when the namespace mutator call may bind workers."""
+    if method == "update":
+        return _update_payload_may_set_workers(call)
+    if method == "__ior__":
+        return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
+    if method == "__setitem__":
+        return len(call.args) >= 2 and _constant_is_workers(call.args[0])
+    return False
+
+
+def _call_is_getattr_namespace_workers_mutation(
+    call,
+    namespace_aliases=None,
+    mutator_aliases=None,
+):
+    """Return True for direct or saved ``getattr(namespace, ...)`` mutators."""
+    if not isinstance(call, ast.Call):
+        return False
+    method = None
+    if isinstance(call.func, ast.Name) and mutator_aliases:
+        method = mutator_aliases.get(call.func.id)
+    if method is None:
+        method = _getattr_namespace_mutator_method(call.func, namespace_aliases)
+    return method is not None and _namespace_mutator_call_may_set_workers(
+        method, call
+    )
+
+
+def _collect_namespace_mutator_aliases(tree, namespace_aliases):
+    """Collect names that are always bound to one namespace mutator."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = {}
+    for name, values in assignments.items():
+        methods = [
+            _getattr_namespace_mutator_method(value, namespace_aliases)
+            if value is not None
+            else None
+            for value in values
+        ]
+        if methods and methods[0] is not None and all(
+            method == methods[0] for method in methods
+        ):
+            aliases[name] = methods[0]
+    return aliases
+
+
+def _call_is_operator_namespace_ior(call, operator_bindings):
+    """Return True for ``operator.ior(globals(), {'workers': ...})`` style calls."""
+    module_aliases, _, namespace_aliases, ior_aliases, _ = _unpack_operator_bindings(
+        operator_bindings
+    )
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    func = call.func
+    if isinstance(func, ast.Name):
+        if func.id not in ior_aliases:
+            return False
+    elif isinstance(func, ast.Attribute) and func.attr in {"ior", "__ior__"}:
+        if not isinstance(func.value, ast.Name) or func.value.id not in module_aliases:
+            return False
+    else:
+        return False
+    if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
+        return False
+    return _dict_merge_payload_may_set_workers(call.args[1])
+
+
+def _call_is_partial_bound_workers_setitem(call, operator_bindings):
+    """Return True for ``partial(namespace.__setitem__, 'workers')(value)``."""
+    _, _, namespace_aliases, _, partial_aliases = _unpack_operator_bindings(
+        operator_bindings
+    )
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call):
+        return False
+    partial_func = func.func
+    if isinstance(partial_func, ast.Name):
+        is_partial = partial_func.id in partial_aliases
+    else:
+        is_partial = (
+            isinstance(partial_func, ast.Attribute)
+            and partial_func.attr == "partial"
+            and isinstance(partial_func.value, ast.Name)
+            and partial_func.value.id in partial_aliases
+        )
+    if not is_partial or len(func.args) < 2:
+        return False
+    if not _attribute_is_namespace_setitem(func.args[0], namespace_aliases):
+        return False
+    return _constant_is_workers(func.args[1])
+
+
 def _expression_mutates_workers(expr, operator_bindings):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
         return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     if isinstance(expr, ast.Call) and (
         _call_is_module_namespace_workers_update(expr, namespace_aliases)
         or _call_is_module_namespace_workers_ior(expr, namespace_aliases)
+        or _call_is_getattr_namespace_workers_mutation(
+            expr, namespace_aliases, mutator_aliases
+        )
+        or _call_is_operator_namespace_ior(expr, operator_bindings)
+        or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -705,7 +893,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings):
 
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         call = node.value
-        if isinstance(call.func, ast.Name) and call.func.id in {"exec", "eval"}:
+        if _call_is_dynamic_exec_eval(call):
             return True
         if _call_mutates_workers_via_indirection(call, operator_bindings):
             return True
@@ -897,35 +1085,70 @@ def _compound_statement_blocks(node):
             yield case.body
 
 
-def _record_operator_import(node, module_aliases, setitem_aliases):
-    """Record operator module/setitem aliases introduced by one statement."""
+def _record_relevant_import_aliases(names, destinations):
+    """Record matching import aliases into their destination sets."""
+    for alias in names:
+        destination = destinations.get(alias.name)
+        if destination is not None:
+            destination.add(alias.asname or alias.name)
+
+
+def _record_operator_import(
+    node,
+    module_aliases,
+    setitem_aliases,
+    ior_aliases,
+    partial_aliases,
+):
+    """Record operator/functools aliases introduced by one statement."""
     if isinstance(node, ast.Import):
-        for alias in node.names:
-            if alias.name == "operator":
-                module_aliases.add(alias.asname or alias.name)
+        _record_relevant_import_aliases(
+            node.names,
+            {
+                "operator": module_aliases,
+                "functools": partial_aliases,
+            },
+        )
         return
-    if not isinstance(node, ast.ImportFrom) or node.module != "operator":
+    if not isinstance(node, ast.ImportFrom):
         return
-    for alias in node.names:
-        if alias.name == "setitem":
-            setitem_aliases.add(alias.asname or alias.name)
+    destinations = {
+        "operator": {
+            "setitem": setitem_aliases,
+            "ior": ior_aliases,
+        },
+        "functools": {"partial": partial_aliases},
+    }.get(node.module)
+    if destinations is None:
+        return
+    _record_relevant_import_aliases(node.names, destinations)
 
 
 def _collect_operator_bindings_from_statements(
     statements,
     module_aliases,
     setitem_aliases,
+    ior_aliases,
+    partial_aliases,
 ):
-    """Walk import-time statements and collect operator aliases."""
+    """Walk import-time statements and collect operator/functools aliases."""
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        _record_operator_import(node, module_aliases, setitem_aliases)
+        _record_operator_import(
+            node,
+            module_aliases,
+            setitem_aliases,
+            ior_aliases,
+            partial_aliases,
+        )
         for block in _compound_statement_blocks(node):
             _collect_operator_bindings_from_statements(
                 block,
                 module_aliases,
                 setitem_aliases,
+                ior_aliases,
+                partial_aliases,
             )
 
 
@@ -933,13 +1156,25 @@ def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
     setitem_aliases = set()
+    ior_aliases = set()
+    partial_aliases = set()
     _collect_operator_bindings_from_statements(
         tree.body,
         module_aliases,
         setitem_aliases,
+        ior_aliases,
+        partial_aliases,
     )
     namespace_aliases = _collect_module_namespace_aliases(tree)
-    return module_aliases, setitem_aliases, namespace_aliases
+    mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
+    return (
+        module_aliases,
+        setitem_aliases,
+        namespace_aliases,
+        ior_aliases,
+        partial_aliases,
+        mutator_aliases,
+    )
 
 
 def _node_has_dynamic_workers_effect(node, global_workers_mutators, operator_bindings):
