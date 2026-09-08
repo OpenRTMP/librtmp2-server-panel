@@ -2,7 +2,7 @@ document.addEventListener('DOMContentLoaded', function () {
     initializeStats();
     document.querySelectorAll('.cluster-remove-form').forEach((form) => {
         form.addEventListener('submit', (event) => {
-            const nodeId = form.getAttribute('data-node-id') || '';
+            const nodeId = form.dataset.nodeId || '';
             const message = `Remove node ${nodeId} from the cluster? This cannot be undone from the panel.`;
             if (!window.confirm(message)) {
                 event.preventDefault();
@@ -12,29 +12,13 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 
 async function copyToClipboard(element) {
-    const text = element.getAttribute('data-url');
+    const text = element.dataset.url || '';
     try {
         await navigator.clipboard.writeText(text);
         showCopyFeedback(element, 'Copied');
     } catch (err) {
-        copyToClipboardFallback(text, element);
-    }
-}
-
-function copyToClipboardFallback(text, element) {
-    const textArea = document.createElement('textarea');
-    textArea.value = text;
-    textArea.style.cssText = 'position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:none;outline:none;box-shadow:none;background:transparent;opacity:0;';
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    try {
-        const successful = document.execCommand('copy');
-        showCopyFeedback(element, successful ? 'Copied' : 'Copy failed');
-    } catch (err) {
+        console.warn('Clipboard write failed', err);
         showCopyFeedback(element, 'Copy failed');
-    } finally {
-        document.body.removeChild(textArea);
     }
 }
 
@@ -87,11 +71,142 @@ function initializeStats() {
 
 function escapeHtml(value) {
     return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+function getClusterProxy(data) {
+    return typeof data?.cluster_proxy === 'object' ? (data.cluster_proxy ?? {}) : {};
+}
+
+function buildPlayersByNodeRows(playersByNode) {
+    return Object.keys(playersByNode)
+        .map((nid) => {
+            const count = Number(playersByNode[nid]);
+            return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
+        })
+        .join('');
+}
+
+function buildClusterRows(clusterEnabled, data, clusterProxy, relayMbps, playersByNode) {
+    if (!clusterEnabled) {
+        return '';
+    }
+    const tagged = data.owner_node_id !== undefined
+        || data.cluster_proxy !== undefined
+        || Object.keys(playersByNode).length > 0
+        || Number.isFinite(relayMbps);
+    if (!tagged) {
+        return '';
+    }
+
+    const ownerNode = data.owner_node_id !== undefined && data.owner_node_id !== null
+        ? data.owner_node_id
+        : clusterProxy.owner_node_id;
+    const ownerLabel = ownerNode === undefined || ownerNode === null
+        ? 'unavailable'
+        : escapeHtml(ownerNode);
+    const relayLabel = Number.isFinite(relayMbps)
+        ? `${relayMbps.toFixed(1)} Mbps`
+        : 'n/a';
+    const playerByNodeRows = buildPlayersByNodeRows(playersByNode);
+
+    return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${ownerLabel}</strong></div>
+       <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
+       ${playerByNodeRows}`;
+}
+
+function buildPlayerRows(players) {
+    return players
+        .map((pl, index) => {
+            const plRtt = Number(pl.rtt_ms);
+            if (!Number.isFinite(plRtt) || plRtt <= 0) {
+                return '';
+            }
+            const label = players.length > 1 ? `Player ${index + 1} RTT` : 'Player RTT';
+            return `<div class="col-md-4 col-6"><p>${escapeHtml(label)}:</p><strong>${plRtt.toFixed(1)} ms</strong></div>`;
+        })
+        .join('');
+}
+
+function renderStats(statsContainer, data) {
+    if (data.error) {
+        statsContainer.innerHTML = `<p class="text-danger">${escapeHtml(data.error)}</p>`;
+        return;
+    }
+
+    const streams = Array.isArray(data.streams) ? data.streams : [];
+    if (streams.length === 0) {
+        statsContainer.innerHTML = '<p class="text-muted"><em>Stream offline</em></p>';
+        return;
+    }
+
+    const stream = streams[0];
+    const video = stream.video || {};
+    const bitrate = Number(stream.bitrate_kbps);
+    const rtt = Number(stream.rtt_ms);
+    const width = Number(video.width);
+    const height = Number(video.height);
+    const fps = Number(video.fps);
+    const players = Number((data.summary || {}).players);
+    const clusterEnabled = statsContainer.dataset.cluster === '1';
+    const clusterProxy = getClusterProxy(data);
+    const relayRaw = data.relay_mbps ?? clusterProxy.relay_mbps;
+    const relayMbps = relayRaw === null || relayRaw === undefined
+        ? Number.NaN
+        : Number(relayRaw);
+    const playersByNode = data.players_by_node
+        || clusterProxy.players_by_node
+        || {};
+    const clusterRows = buildClusterRows(
+        clusterEnabled,
+        data,
+        clusterProxy,
+        relayMbps,
+        playersByNode,
+    );
+    const playerRows = buildPlayerRows(Array.isArray(data.players) ? data.players : []);
+
+    statsContainer.innerHTML = `
+        <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
+            <h6 class="mb-2">Stream Statistics</h6>
+            <div class="row g-2">
+                <div class="col-md-4 col-6">
+                    <p>Bitrate:</p>
+                    <strong>${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>Publisher RTT:</p>
+                    <strong>${Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a'}</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>Uptime:</p>
+                    <strong>${formatUptime(stream.uptime || 0)}</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>Codec:</p>
+                    <strong>${escapeHtml(video.codec || 'n/a')}</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>Resolution:</p>
+                    <strong>${Number.isFinite(width) ? width : 0}x${Number.isFinite(height) ? height : 0}</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>FPS:</p>
+                    <strong>${Number.isFinite(fps) ? fps : 0}</strong>
+                </div>
+                <div class="col-md-4 col-6">
+                    <p>Players:</p>
+                    <strong>${Number.isFinite(players) ? players : 0}</strong>
+                </div>
+                ${clusterRows}
+                ${playerRows}
+            </div>
+        </div>
+    `;
 }
 
 function loadStats(streamId) {
@@ -113,120 +228,10 @@ function loadStats(streamId) {
             }
             return response.json();
         })
-        .then(data => {
-            if (data.error) {
-                statsContainer.innerHTML = `<p class="text-danger">${escapeHtml(data.error)}</p>`;
-                return;
-            }
-            const streams = data.streams || [];
-            if (streams.length === 0) {
-                statsContainer.innerHTML = `<p class="text-muted"><em>Stream offline</em></p>`;
-                return;
-            }
-            const s = streams[0];
-            const video = s.video || {};
-            const bitrate = Number(s.bitrate_kbps);
-            const rtt = Number(s.rtt_ms);
-            const width = Number(video.width);
-            const height = Number(video.height);
-            const fps = Number(video.fps);
-            const players = Number((data.summary || {}).players);
-            const clusterEnabled = statsContainer.getAttribute('data-cluster') === '1';
-            // Server puts cluster ownership at the stats root (and may nest a
-            // proxied owner payload under `cluster_proxy`). Older panel code
-            // expected a nested `data.cluster` object that the API never ships.
-            const clusterProxy = (data.cluster_proxy && typeof data.cluster_proxy === 'object')
-                ? data.cluster_proxy
-                : {};
-            const ownerNode = (data.owner_node_id !== undefined && data.owner_node_id !== null)
-                ? data.owner_node_id
-                : clusterProxy.owner_node_id;
-            const relayRaw = (data.relay_mbps !== undefined && data.relay_mbps !== null)
-                ? data.relay_mbps
-                : clusterProxy.relay_mbps;
-            const relayMbps = (relayRaw === null || relayRaw === undefined)
-                ? NaN
-                : Number(relayRaw);
-            const playersByNode = data.players_by_node
-                || clusterProxy.players_by_node
-                || {};
-            const playerByNodeRows = Object.keys(playersByNode)
-                .map((nid) => {
-                    const count = Number(playersByNode[nid]);
-                    return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
-                })
-                .join('');
-            const clusterRows = (() => {
-                if (!clusterEnabled) {
-                    return '';
-                }
-                const tagged = data.owner_node_id !== undefined
-                    || data.cluster_proxy !== undefined
-                    || Object.keys(playersByNode).length > 0
-                    || Number.isFinite(relayMbps);
-                if (!tagged) {
-                    return '';
-                }
-                const ownerLabel = (ownerNode === undefined || ownerNode === null)
-                    ? 'unavailable'
-                    : escapeHtml(ownerNode);
-                const relayLabel = Number.isFinite(relayMbps)
-                    ? `${relayMbps.toFixed(1)} Mbps`
-                    : 'n/a';
-                return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${ownerLabel}</strong></div>
-                   <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
-                   ${playerByNodeRows}`;
-            })();
-            const playerRows = (data.players || [])
-                .map((pl, index) => {
-                    const plRtt = Number(pl.rtt_ms);
-                    if (!Number.isFinite(plRtt) || plRtt <= 0) {
-                        return '';
-                    }
-                    const label = data.players.length > 1 ? `Player ${index + 1} RTT` : 'Player RTT';
-                    return `<div class="col-md-4 col-6"><p>${escapeHtml(label)}:</p><strong>${plRtt.toFixed(1)} ms</strong></div>`;
-                })
-                .join('');
-            statsContainer.innerHTML = `
-                <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
-                    <h6 class="mb-2">Stream Statistics</h6>
-                    <div class="row g-2">
-                        <div class="col-md-4 col-6">
-                            <p>Bitrate:</p>
-                            <strong>${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>Publisher RTT:</p>
-                            <strong>${Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a'}</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>Uptime:</p>
-                            <strong>${formatUptime(s.uptime || 0)}</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>Codec:</p>
-                            <strong>${escapeHtml(video.codec || 'n/a')}</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>Resolution:</p>
-                            <strong>${Number.isFinite(width) ? width : 0}x${Number.isFinite(height) ? height : 0}</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>FPS:</p>
-                            <strong>${Number.isFinite(fps) ? fps : 0}</strong>
-                        </div>
-                        <div class="col-md-4 col-6">
-                            <p>Players:</p>
-                            <strong>${Number.isFinite(players) ? players : 0}</strong>
-                        </div>
-                        ${clusterRows}
-                        ${playerRows}
-                    </div>
-                </div>
-            `;
-        })
-        .catch(() => {
-            statsContainer.innerHTML = `<p><em>Stats not available</em></p>`;
+        .then(data => renderStats(statsContainer, data))
+        .catch((err) => {
+            console.warn('Stats request failed', err);
+            statsContainer.innerHTML = '<p><em>Stats not available</em></p>';
         })
         .finally(() => {
             clearTimeout(timeoutId);

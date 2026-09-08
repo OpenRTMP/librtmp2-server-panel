@@ -13,26 +13,23 @@
 
     <h5 class="mt-4">Publish</h5>
     <p><strong>Server URL (RTMP):</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ stream.publish_url }}" onclick="copyToClipboard(this)">
             {{ stream.publish_url }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
     {% if stream.publish_url_tls %}
     <p><strong>Server URL (RTMPS):</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_url_tls }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ stream.publish_url_tls }}" onclick="copyToClipboard(this)">
             {{ stream.publish_url_tls }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
     {% endif %}
     <p><strong>Stream Key:</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.publish_key }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ stream.publish_key }}" onclick="copyToClipboard(this)">
             {{ stream.publish_key }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
 
@@ -40,36 +37,32 @@
     {% for player in stream.get('players', []) %}
     <p><strong>{{ player.name }}</strong></p>
     <p><strong>Play URL (RTMP):</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ player.play_url }}" onclick="copyToClipboard(this)">
             {{ player.play_url }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
     {% if player.play_url_tls %}
     <p><strong>Play URL (RTMPS):</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_url_tls }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ player.play_url_tls }}" onclick="copyToClipboard(this)">
             {{ player.play_url_tls }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
     {% endif %}
     <p><strong>Play Key:</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ player.play_key }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ player.play_key }}" onclick="copyToClipboard(this)">
             {{ player.play_key }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
     {% endfor %}
 
     <h5 class="mt-4">Stats</h5>
     <p><strong>Stats URL:</strong>
-        <span class="blur-text" tabindex="0" role="button" data-url="{{ stream.stats_url }}"
-              onclick="copyToClipboard(this)" onkeyup="if(event.key==='Enter') copyToClipboard(this)">
+        <button type="button" class="blur-text" data-url="{{ stream.stats_url }}" onclick="copyToClipboard(this)">
             {{ stream.stats_url }}
-        </span>
+        </button>
         <span class="copy-feedback"></span>
     </p>
 

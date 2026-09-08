@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from flask import request
+from flask_test_utils import configure_testing_app
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-ci-validation-only-32chars")
 os.environ.setdefault("PASSWORD", "test-password-for-ci-only")
@@ -39,7 +40,7 @@ def _proxy_test_client(proxy_count, trusted_proxy_ips="127.0.0.1"):
     ), patch.object(app_module.Config, "SESSION_COOKIE_SECURE", False):
         application = app_module.create_app()
 
-    application.config.update(TESTING=True, WTF_CSRF_ENABLED=False)
+    configure_testing_app(application)
 
     @application.get("/_test/request-info")
     def request_info():
