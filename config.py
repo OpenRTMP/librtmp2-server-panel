@@ -1085,6 +1085,14 @@ def _compound_statement_blocks(node):
             yield case.body
 
 
+def _record_relevant_import_aliases(names, destinations):
+    """Record matching import aliases into their destination sets."""
+    for alias in names:
+        destination = destinations.get(alias.name)
+        if destination is not None:
+            destination.add(alias.asname or alias.name)
+
+
 def _record_operator_import(
     node,
     module_aliases,
@@ -1094,24 +1102,26 @@ def _record_operator_import(
 ):
     """Record operator/functools aliases introduced by one statement."""
     if isinstance(node, ast.Import):
-        for alias in node.names:
-            if alias.name == "operator":
-                module_aliases.add(alias.asname or alias.name)
-            elif alias.name == "functools":
-                partial_aliases.add(alias.asname or alias.name)
+        _record_relevant_import_aliases(
+            node.names,
+            {
+                "operator": module_aliases,
+                "functools": partial_aliases,
+            },
+        )
         return
     if not isinstance(node, ast.ImportFrom):
         return
-    if node.module == "operator":
-        for alias in node.names:
-            if alias.name == "setitem":
-                setitem_aliases.add(alias.asname or alias.name)
-            elif alias.name == "ior":
-                ior_aliases.add(alias.asname or alias.name)
-    elif node.module == "functools":
-        for alias in node.names:
-            if alias.name == "partial":
-                partial_aliases.add(alias.asname or alias.name)
+    destinations = {
+        "operator": {
+            "setitem": setitem_aliases,
+            "ior": ior_aliases,
+        },
+        "functools": {"partial": partial_aliases},
+    }.get(node.module)
+    if destinations is None:
+        return
+    _record_relevant_import_aliases(node.names, destinations)
 
 
 def _collect_operator_bindings_from_statements(
