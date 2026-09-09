@@ -361,7 +361,10 @@ def _dict_literal_sets_workers(node):
             if not isinstance(value, ast.Dict) or _dict_literal_sets_workers(value):
                 return True
             continue
-        if isinstance(key, ast.Constant) and key.value == "workers":
+        if not isinstance(key, ast.Constant):
+            # A computed key cannot be proven different from ``workers``.
+            return True
+        if key.value == "workers":
             return True
     return False
 
@@ -488,8 +491,12 @@ def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     return _dict_merge_payload_may_set_workers(call.args[0])
 
 
-def _is_dict_type_update_callable(func):
-    """Return True for ``dict.update`` or ``getattr(dict, 'update')``."""
+def _is_dict_type_update_callable(func, aliases=None):
+    """Return True for ``dict.update`` or a proven alias of it."""
+    if aliases is None:
+        aliases = set()
+    if isinstance(func, ast.Name):
+        return func.id in aliases
     if isinstance(func, ast.Attribute):
         return (
             func.attr == "update"
@@ -508,11 +515,42 @@ def _is_dict_type_update_callable(func):
     )
 
 
-def _call_is_dict_type_update_on_module_namespace(call, namespace_aliases=None):
+def _values_are_dict_update_aliases(values, aliases):
+    """Return True when every assignment resolves to unbound ``dict.update``."""
+    resolved_values = [value for value in values if value is not None]
+    return bool(resolved_values) and all(
+        _is_dict_type_update_callable(value, aliases) for value in resolved_values
+    )
+
+
+def _collect_dict_update_aliases(tree):
+    """Collect transitive aliases that are always bound to ``dict.update``."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if _values_are_dict_update_aliases(assignments[name], aliases)
+        }
+        if not discovered:
+            break
+        aliases.update(discovered)
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _call_is_dict_type_update_on_module_namespace(
+    call,
+    namespace_aliases=None,
+    update_aliases=None,
+):
     """Return True for ``dict.update(globals(), ...)`` style mutations."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
-    if not _is_dict_type_update_callable(call.func):
+    if not _is_dict_type_update_callable(call.func, update_aliases):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
         return False
@@ -529,15 +567,24 @@ def _methodcaller_method_name(call):
     return None
 
 
-def _is_operator_methodcaller_factory(call, module_aliases):
+def _is_operator_methodcaller_factory(call, module_aliases, methodcaller_aliases):
     """Return True for an imported ``operator.methodcaller(...)`` factory call."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in methodcaller_aliases
     return (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "methodcaller"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id in module_aliases
+        isinstance(func, ast.Attribute)
+        and func.attr == "methodcaller"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in module_aliases
     )
+
+
+def _key_may_be_workers(node):
+    """Return True unless a literal key is provably different from ``workers``."""
+    return not isinstance(node, ast.Constant) or node.value == "workers"
 
 
 def _call_is_operator_methodcaller_on_module_namespace(
@@ -549,8 +596,13 @@ def _call_is_operator_methodcaller_on_module_namespace(
     if not isinstance(call, ast.Call) or not call.args:
         return False
     module_aliases, _, _, _, _ = _unpack_operator_bindings(operator_bindings)
+    methodcaller_aliases = operator_bindings[6] if len(operator_bindings) > 6 else set()
     factory = call.func
-    if not _is_operator_methodcaller_factory(factory, module_aliases):
+    if not _is_operator_methodcaller_factory(
+        factory,
+        module_aliases,
+        methodcaller_aliases,
+    ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
         return False
@@ -561,6 +613,8 @@ def _call_is_operator_methodcaller_on_module_namespace(
         return len(factory.args) >= 2 and _dict_merge_payload_may_set_workers(
             factory.args[1]
         )
+    if method == "__setitem__":
+        return len(factory.args) >= 3 and _key_may_be_workers(factory.args[1])
     return method is None
 
 
@@ -886,12 +940,17 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     if not isinstance(call, ast.Call):
         return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
     if (
         _call_sets_workers_via_setitem(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
         or _call_sets_workers_attribute(call)
-        or _call_is_dict_type_update_on_module_namespace(call, namespace_aliases)
+        or _call_is_dict_type_update_on_module_namespace(
+            call,
+            namespace_aliases,
+            dict_update_aliases,
+        )
         or _call_is_operator_methodcaller_on_module_namespace(
             call,
             operator_bindings,
@@ -1182,6 +1241,7 @@ def _record_operator_import(
     setitem_aliases,
     ior_aliases,
     partial_aliases,
+    methodcaller_aliases,
 ):
     """Record operator/functools aliases introduced by one statement."""
     if isinstance(node, ast.Import):
@@ -1199,6 +1259,7 @@ def _record_operator_import(
         "operator": {
             "setitem": setitem_aliases,
             "ior": ior_aliases,
+            "methodcaller": methodcaller_aliases,
         },
         "functools": {"partial": partial_aliases},
     }.get(node.module)
@@ -1213,6 +1274,7 @@ def _collect_operator_bindings_from_statements(
     setitem_aliases,
     ior_aliases,
     partial_aliases,
+    methodcaller_aliases,
 ):
     """Walk import-time statements and collect operator/functools aliases."""
     for node in statements:
@@ -1224,6 +1286,7 @@ def _collect_operator_bindings_from_statements(
             setitem_aliases,
             ior_aliases,
             partial_aliases,
+            methodcaller_aliases,
         )
         for block in _compound_statement_blocks(node):
             _collect_operator_bindings_from_statements(
@@ -1232,6 +1295,7 @@ def _collect_operator_bindings_from_statements(
                 setitem_aliases,
                 ior_aliases,
                 partial_aliases,
+                methodcaller_aliases,
             )
 
 
@@ -1241,15 +1305,18 @@ def _collect_operator_setitem_bindings(tree):
     setitem_aliases = set()
     ior_aliases = set()
     partial_aliases = set()
+    methodcaller_aliases = set()
     _collect_operator_bindings_from_statements(
         tree.body,
         module_aliases,
         setitem_aliases,
         ior_aliases,
         partial_aliases,
+        methodcaller_aliases,
     )
     namespace_aliases = _collect_module_namespace_aliases(tree)
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
+    dict_update_aliases = _collect_dict_update_aliases(tree)
     return (
         module_aliases,
         setitem_aliases,
@@ -1257,6 +1324,8 @@ def _collect_operator_setitem_bindings(tree):
         ior_aliases,
         partial_aliases,
         mutator_aliases,
+        methodcaller_aliases,
+        dict_update_aliases,
     )
 
 
