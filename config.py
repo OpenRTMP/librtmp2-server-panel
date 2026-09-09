@@ -486,6 +486,77 @@ def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     return _dict_merge_payload_may_set_workers(call.args[0])
 
 
+def _call_is_dict_type_update_on_module_namespace(call, namespace_aliases=None):
+    """Return True for ``dict.update(globals(), ...)`` style mutations."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "update":
+        if isinstance(func.value, ast.Name) and func.value.id == "dict":
+            if _is_module_namespace_mapping(call.args[0], namespace_aliases):
+                return _update_payload_may_set_workers(call)
+        return False
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    if not (
+        isinstance(func.args[0], ast.Name)
+        and func.args[0].id == "dict"
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "update"
+    ):
+        return False
+    if _is_module_namespace_mapping(call.args[0], namespace_aliases):
+        return _update_payload_may_set_workers(call)
+    return False
+
+
+def _methodcaller_method_name(call):
+    """Return the method name passed to ``operator.methodcaller``, if static."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return None
+    method = call.args[0]
+    if isinstance(method, ast.Constant) and isinstance(method.value, str):
+        return method.value
+    return None
+
+
+def _call_is_operator_methodcaller_on_module_namespace(
+    call,
+    operator_bindings,
+    namespace_aliases=None,
+):
+    """Return True for ``operator.methodcaller(...)(globals())`` mutations."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call):
+        return False
+    module_aliases, _, _ = (
+        operator_bindings
+        if len(operator_bindings) >= 3
+        else (set(), set(), set())
+    )
+    inner = func.func
+    if isinstance(inner, ast.Attribute) and inner.attr == "methodcaller":
+        if not (
+            isinstance(inner.value, ast.Name)
+            and inner.value.id in module_aliases
+        ):
+            return False
+    elif not (isinstance(inner, ast.Name) and inner.id == "methodcaller"):
+        return False
+    if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
+        return False
+    method = _methodcaller_method_name(func)
+    if method == "update":
+        return _update_payload_may_set_workers(func)
+    if method == "__ior__":
+        return len(func.args) >= 2 and _dict_merge_payload_may_set_workers(func.args[1])
+    return method is None
+
+
 def _namespace_assignment_values(node):
     """Return simple name assignments relevant to namespace alias tracking."""
     if isinstance(node, ast.Assign):
@@ -621,11 +692,18 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     """Return True for indirect import-time ``workers`` mutations."""
     if not isinstance(call, ast.Call):
         return False
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if (
         _call_sets_workers_via_setitem(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
         or _call_sets_workers_attribute(call)
+        or _call_is_dict_type_update_on_module_namespace(call, namespace_aliases)
+        or _call_is_operator_methodcaller_on_module_namespace(
+            call,
+            operator_bindings,
+            namespace_aliases,
+        )
     ):
         return True
     return isinstance(call.func, ast.Lambda) and _lambda_mutates_workers(

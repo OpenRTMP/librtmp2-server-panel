@@ -283,3 +283,21 @@ def test_gunicorn_config_unrelated_mapping_updates_are_not_dynamic(
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\ndict.update(globals(), {'workers': 4})\n",
+        "workers = 1\ngetattr(dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nimport operator\noperator.methodcaller('update', {'workers': 4})(globals())\n",
+        "workers = 1\nimport operator\noperator.methodcaller('__ior__', {'workers': 4})(globals())\n",
+    ],
+)
+def test_gunicorn_config_unbound_dict_update_on_globals_is_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
