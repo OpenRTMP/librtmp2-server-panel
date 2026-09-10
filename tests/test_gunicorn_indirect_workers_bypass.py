@@ -21,6 +21,10 @@ import config
         "workers = 1\ngetattr(__import__('builtins'), 'exec')('workers = 4')\n",
         "workers = 1\nbuiltins = __import__('builtins')\nbuiltins.exec('workers = 4')\n",
         "workers = 1\n__import__('builtins').__dict__['exec']('workers = 4')\n",
+        "workers = 1\nimport builtins\nbuiltins.exec('workers = 4')\n",
+        "workers = 1\nimport builtins as bi\ngetattr(bi, 'exec')('workers = 4')\n",
+        "workers = 1\nimport builtins as bi\nbi.__dict__['exec']('workers = 4')\n",
+        "workers = 1\nresult = getattr(__import__('builtins'), 'exec')('workers = 4')\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
