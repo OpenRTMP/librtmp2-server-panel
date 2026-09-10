@@ -16,6 +16,11 @@ import config
         "workers = 1\nns = globals()\nfrom functools import partial\npartial(ns.__setitem__, 'workers')(4)\n",
         "workers = 1\n(ns := globals()).update({'workers': 4})\n",
         "workers = 1\nupdate_workers = getattr(globals(), 'update')\nupdate_workers({'workers': 4})\n",
+        "workers = 1\nglobals()['update']({'workers': 4})\n",
+        "workers = 1\n(ns := globals())['update']({'workers': 4})\n",
+        "workers = 1\ngetattr(__import__('builtins'), 'exec')('workers = 4')\n",
+        "workers = 1\nbuiltins = __import__('builtins')\nbuiltins.exec('workers = 4')\n",
+        "workers = 1\n__import__('builtins').__dict__['exec']('workers = 4')\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):

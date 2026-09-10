@@ -336,6 +336,26 @@ def _subscript_slice_is_workers(node):
     return False
 
 
+def _subscript_slice_is_update(node):
+    """Return True when a subscript uses the literal ``'update'`` key."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    slice_node = node.slice
+    if isinstance(slice_node, ast.Constant):
+        return slice_node.value == "update"
+    return False
+
+
+def _subscript_base_node(node):
+    """Return the mapping/base expression behind a subscript lookup."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    value = node.value
+    if isinstance(value, ast.NamedExpr):
+        return value.value
+    return value
+
+
 def _is_globals_call(node):
     """Return True for a direct ``globals()`` call."""
     return (
@@ -763,25 +783,79 @@ def _unpack_operator_bindings(operator_bindings):
     )
 
 
-def _call_is_dynamic_exec_eval(call):
+def _is_builtins_import(node):
+    """Return True for ``__import__('builtins')``."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "__import__"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "builtins"
+        and not node.keywords
+    )
+
+
+def _values_are_builtins_aliases(values, aliases):
+    """Return True when every assignment resolves to ``__import__('builtins')``."""
+    resolved_values = [value for value in values if value is not None]
+    return bool(resolved_values) and all(
+        _is_builtins_import(value) or (
+            isinstance(value, ast.Name) and value.id in aliases
+        )
+        for value in resolved_values
+    )
+
+
+def _collect_builtins_aliases(tree):
+    """Collect names that are always bound to the builtins module."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if _values_are_builtins_aliases(assignments[name], aliases)
+        }
+        if not discovered:
+            break
+        aliases.update(discovered)
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
     """Return True for direct built-ins or ``__import__('builtins')`` calls."""
     if not isinstance(call, ast.Call):
         return False
+    if builtins_aliases is None:
+        builtins_aliases = set()
     func = call.func
     if isinstance(func, ast.Name) and func.id in {"exec", "eval"}:
         return True
+    if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "getattr":
+        if len(func.args) >= 2 and _is_builtins_import(func.args[0]):
+            key = func.args[1]
+            if isinstance(key, ast.Constant) and key.value in {"exec", "eval"}:
+                return True
+    if isinstance(func, ast.Subscript):
+        base = _subscript_base_node(func)
+        if (
+            isinstance(base, ast.Attribute)
+            and base.attr == "__dict__"
+            and _is_builtins_import(base.value)
+        ):
+            slice_node = func.slice
+            if isinstance(slice_node, ast.Constant) and slice_node.value in {"exec", "eval"}:
+                return True
     if not isinstance(func, ast.Attribute) or func.attr not in {"exec", "eval"}:
         return False
     owner = func.value
-    return (
-        isinstance(owner, ast.Call)
-        and isinstance(owner.func, ast.Name)
-        and owner.func.id == "__import__"
-        and len(owner.args) == 1
-        and isinstance(owner.args[0], ast.Constant)
-        and owner.args[0].value == "builtins"
-        and not owner.keywords
-    )
+    if _is_builtins_import(owner):
+        return True
+    return isinstance(owner, ast.Name) and owner.id in builtins_aliases
 
 
 def _attribute_is_namespace_setitem(node, namespace_aliases=None):
@@ -935,6 +1009,19 @@ def _lambda_mutates_workers(lambda_node, operator_bindings):
     )
 
 
+def _call_is_subscript_namespace_workers_update(call, namespace_aliases=None):
+    """Return True for ``globals()['update'](...)`` style mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not isinstance(func, ast.Subscript) or not _subscript_slice_is_update(func):
+        return False
+    base = _subscript_base_node(func)
+    if not _is_module_namespace_mapping(base, namespace_aliases):
+        return False
+    return _update_payload_may_set_workers(call)
+
+
 def _call_mutates_workers_via_indirection(call, operator_bindings):
     """Return True for indirect import-time ``workers`` mutations."""
     if not isinstance(call, ast.Call):
@@ -951,6 +1038,7 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
             namespace_aliases,
             dict_update_aliases,
         )
+        or _call_is_subscript_namespace_workers_update(call, namespace_aliases)
         or _call_is_operator_methodcaller_on_module_namespace(
             call,
             operator_bindings,
@@ -1035,7 +1123,8 @@ def _is_dynamic_workers_mutation(node, operator_bindings):
 
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         call = node.value
-        if _call_is_dynamic_exec_eval(call):
+        builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+        if _call_is_dynamic_exec_eval(call, builtins_aliases):
             return True
         if _call_mutates_workers_via_indirection(call, operator_bindings):
             return True
@@ -1317,6 +1406,7 @@ def _collect_operator_setitem_bindings(tree):
     namespace_aliases = _collect_module_namespace_aliases(tree)
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     dict_update_aliases = _collect_dict_update_aliases(tree)
+    builtins_aliases = _collect_builtins_aliases(tree)
     return (
         module_aliases,
         setitem_aliases,
@@ -1326,6 +1416,7 @@ def _collect_operator_setitem_bindings(tree):
         mutator_aliases,
         methodcaller_aliases,
         dict_update_aliases,
+        builtins_aliases,
     )
 
 
@@ -1456,6 +1547,36 @@ def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
     return _scan_gunicorn_config_workers(tree)
 
 
+def _argv_specifies_gunicorn_config(tokens: list[str]) -> bool:
+    """Return True when argv tokens pass an explicit Gunicorn config path."""
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("-c", "--config"):
+            return True
+        if token.startswith("--config="):
+            return True
+        i += 1
+    return False
+
+
+def _default_gunicorn_config_paths() -> list[Path]:
+    """Return cwd/project gunicorn.conf.py paths Gunicorn loads without -c/--config."""
+    candidates = [Path.cwd() / "gunicorn.conf.py", _PROJECT_ROOT / "gunicorn.conf.py"]
+    paths = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        paths.append(resolved)
+    return paths
+
+
 def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
     """Parse ``-c/--config`` paths from a token list and read worker counts."""
     count = 1
@@ -1501,6 +1622,18 @@ def _detect_worker_settings() -> tuple[int, bool]:
     config_count, config_dynamic = _workers_from_gunicorn_config_flag(sys.argv)
     count = max(count, config_count)
     dynamic = dynamic or config_dynamic
+    cmd_tokens = shlex.split(cmd_args) if cmd_args.strip() else []
+    explicit_config = (
+        _argv_specifies_gunicorn_config(sys.argv)
+        or _argv_specifies_gunicorn_config(cmd_tokens)
+    )
+    if not explicit_config:
+        for config_path in _default_gunicorn_config_paths():
+            config_count, config_dynamic = _workers_from_gunicorn_config_path(
+                str(config_path)
+            )
+            count = max(count, config_count)
+            dynamic = dynamic or config_dynamic
     return count, dynamic
 
 
