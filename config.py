@@ -745,10 +745,7 @@ def _call_is_operator_setitem_workers(call, operator_bindings):
     module_aliases, setitem_aliases = operator_bindings[:2]
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr == "setitem":
-        return (
-            isinstance(func.value, ast.Name)
-            and func.value.id in module_aliases
-        )
+        return isinstance(func.value, ast.Name) and func.value.id in module_aliases
     return isinstance(func, ast.Name) and func.id in setitem_aliases
 
 
@@ -803,12 +800,11 @@ def _is_builtins_import(node):
 
 
 def _values_are_builtins_aliases(values, aliases):
-    """Return True when every assignment resolves to ``__import__('builtins')``."""
+    """Return True when any assignment may bind the name to builtins."""
     resolved_values = [value for value in values if value is not None]
-    return bool(resolved_values) and all(
-        _is_builtins_import(value) or (
-            isinstance(value, ast.Name) and value.id in aliases
-        )
+    return any(
+        _is_builtins_import(value)
+        or (isinstance(value, ast.Name) and value.id in aliases)
         for value in resolved_values
     )
 
@@ -832,8 +828,9 @@ def _collect_builtins_aliases(tree):
     """Collect names that can resolve to the builtins module at import time."""
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
-    # Keep explicit import aliases even when the same name was assigned earlier.
-    # The import can be the effective binding by the time a later exec/eval call runs.
+    # Keep explicit import aliases even when the same name was assigned too. Mixed
+    # bindings are intentionally treated conservatively so dynamic exec/eval cannot
+    # evade the multi-worker guard through assignment ordering.
     aliases = _collect_builtins_import_aliases(tree.body)
     unresolved = set(assignments)
     while unresolved:
@@ -1604,17 +1601,10 @@ def _gunicorn_config_has_runtime_hooks(tree):
     return False
 
 
-def _scan_gunicorn_config_workers(tree):
-    """Return worker count and dynamic flag from a gunicorn config module AST.
-
-    Top-level ``workers = N`` literals are treated as static. Assignments inside
-    compound statements (``if``/``for``/``while``/``with``/``try``), augmented
-    assignments, or non-literal expressions cannot be verified at import time and
-    are treated as dynamic so multi-worker deployments fail closed unless a
-    shared rate-limit/session backend is configured.
-    """
+def _scan_gunicorn_config_worker_details(tree):
+    """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
-    runtime_hooks = _gunicorn_config_has_runtime_hooks(tree)
+    runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
     import_time_workers_mutators = _collect_import_time_workers_mutators(
         tree, operator_bindings
@@ -1626,22 +1616,41 @@ def _scan_gunicorn_config_workers(tree):
         global_workers_mutators=import_time_workers_mutators,
         operator_bindings=operator_bindings,
     )
-    if runtime_hooks:
-        state.dynamic = True
-    if not state.found:
-        return 1, state.dynamic
-    return state.count, state.dynamic
+    configured_count = state.count if state.found else None
+    return configured_count, state.dynamic, runtime_dynamic
+
+
+def _scan_gunicorn_config_workers(tree):
+    """Return worker count and dynamic flag from a gunicorn config module AST."""
+    count, assignment_dynamic, runtime_dynamic = _scan_gunicorn_config_worker_details(
+        tree
+    )
+    return (count if count is not None else 1), (
+        assignment_dynamic or runtime_dynamic
+    )
+
+
+def _gunicorn_config_worker_details_from_path(
+    config_path: str,
+) -> tuple[int | None, bool, bool]:
+    """Return worker details while preserving an omitted workers setting."""
+    path = _resolve_gunicorn_config_path(config_path)
+    if path is None:
+        return None, False, False
+    tree = _parse_gunicorn_config_tree(path)
+    if tree is None:
+        return None, False, False
+    return _scan_gunicorn_config_worker_details(tree)
 
 
 def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
     """Parse worker count and whether the effective assignment is dynamic."""
-    path = _resolve_gunicorn_config_path(config_path)
-    if path is None:
-        return 1, False
-    tree = _parse_gunicorn_config_tree(path)
-    if tree is None:
-        return 1, False
-    return _scan_gunicorn_config_workers(tree)
+    count, assignment_dynamic, runtime_dynamic = (
+        _gunicorn_config_worker_details_from_path(config_path)
+    )
+    return (count if count is not None else 1), (
+        assignment_dynamic or runtime_dynamic
+    )
 
 
 def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
@@ -1675,23 +1684,24 @@ def _is_gunicorn_process(tokens: list[str]) -> bool:
 
 
 def _gunicorn_launch_directories() -> list[Path]:
-    """Return likely Gunicorn launch directories, preferring the inherited PWD."""
+    """Return likely launch directories, preferring the actual current cwd."""
     directories = []
+    try:
+        cwd_path = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        cwd_path = None
+    if cwd_path is not None:
+        directories.append(cwd_path)
+
     inherited_pwd = os.environ.get("PWD", "").strip()
     if inherited_pwd:
         try:
             pwd_path = Path(inherited_pwd).resolve()
-            if pwd_path.is_dir():
+            if pwd_path.is_dir() and pwd_path not in directories:
                 directories.append(pwd_path)
         except (OSError, RuntimeError):
-            # Invalid/stale PWD is non-fatal; fall back to the actual cwd below.
+            # Invalid/stale PWD is non-fatal; the actual cwd remains authoritative.
             pass
-    try:
-        cwd_path = Path.cwd().resolve()
-    except (OSError, RuntimeError):
-        return directories
-    if cwd_path not in directories:
-        directories.append(cwd_path)
     return directories
 
 
@@ -1736,31 +1746,49 @@ def _selected_gunicorn_config_path(
     return _gunicorn_config_path_from_tokens(cmd_tokens)
 
 
+def _apply_gunicorn_config_worker_details(
+    count: int,
+    config_path: str,
+) -> tuple[int, bool, bool]:
+    """Apply config workers while preserving defaults when workers is omitted."""
+    configured_count, assignment_dynamic, runtime_dynamic = (
+        _gunicorn_config_worker_details_from_path(config_path)
+    )
+    if configured_count is not None:
+        count = configured_count
+    return count, assignment_dynamic, runtime_dynamic
+
+
 def _detect_worker_settings() -> tuple[int, bool]:
     """Best-effort worker count and dynamic-config flag for Gunicorn deployments."""
     count = _worker_count_from_environment()
-    dynamic = False
+    assignment_dynamic = False
+    runtime_dynamic = False
     cmd_args = os.environ.get("GUNICORN_CMD_ARGS", "")
     cmd_tokens = shlex.split(cmd_args) if cmd_args.strip() else []
 
     config_path = _selected_gunicorn_config_path(cmd_tokens, sys.argv)
     if config_path is not None:
-        count, dynamic = _workers_from_gunicorn_config_path(config_path)
+        count, assignment_dynamic, runtime_dynamic = (
+            _apply_gunicorn_config_worker_details(count, config_path)
+        )
     elif _is_gunicorn_process(sys.argv):
         default_paths = _default_gunicorn_config_paths()
         if default_paths:
-            count, dynamic = _workers_from_gunicorn_config_path(
-                str(default_paths[0])
+            count, assignment_dynamic, runtime_dynamic = (
+                _apply_gunicorn_config_worker_details(count, str(default_paths[0]))
             )
 
     cmd_override = _worker_count_override_from_tokens(cmd_tokens)
     if cmd_override is not None:
         count = cmd_override
+        assignment_dynamic = False
     argv_override = _worker_count_override_from_tokens(sys.argv)
     if argv_override is not None:
         count = argv_override
+        assignment_dynamic = False
 
-    return count, dynamic
+    return count, assignment_dynamic or runtime_dynamic
 
 
 def _detect_worker_count() -> int:
