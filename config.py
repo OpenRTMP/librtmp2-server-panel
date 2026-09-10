@@ -824,6 +824,26 @@ def _collect_builtins_import_aliases(statements):
     return aliases
 
 
+def _collect_builtins_exec_eval_aliases(statements):
+    """Collect direct aliases that may resolve to builtin exec/eval."""
+    aliases = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            for imported in node.names:
+                if imported.name in _DYNAMIC_EXEC_EVAL_NAMES:
+                    aliases.add(imported.asname or imported.name)
+        for name, value in _namespace_assignment_values(node):
+            if value is not None and isinstance(value, ast.Name) and value.id in aliases:
+                aliases.add(name)
+            elif name in aliases:
+                aliases.discard(name)
+        for block in _compound_statement_blocks(node):
+            aliases.update(_collect_builtins_exec_eval_aliases(block))
+    return aliases
+
+
 def _collect_builtins_aliases(tree):
     """Collect names that can resolve to the builtins module at import time."""
     assignments = {}
@@ -903,9 +923,18 @@ def _attribute_is_dynamic_exec_eval(func, builtins_aliases):
     )
 
 
-def _direct_name_is_builtin_exec_eval(func, call, shadow_lines):
-    """Return True when a direct exec/eval name still resolves to the builtin."""
-    if not isinstance(func, ast.Name) or func.id not in _DYNAMIC_EXEC_EVAL_NAMES:
+def _direct_name_is_builtin_exec_eval(
+    func,
+    call,
+    shadow_lines,
+    direct_aliases=None,
+):
+    """Return True when a direct name resolves to builtin exec/eval."""
+    if not isinstance(func, ast.Name):
+        return False
+    if direct_aliases and func.id in direct_aliases:
+        return True
+    if func.id not in _DYNAMIC_EXEC_EVAL_NAMES:
         return False
     shadow_line = shadow_lines.get(func.id)
     call_line = getattr(call, "lineno", 0)
@@ -916,6 +945,7 @@ def _call_is_dynamic_exec_eval(
     call,
     builtins_aliases=None,
     exec_eval_shadow_lines=None,
+    direct_aliases=None,
 ):
     """Return True for direct built-ins or known builtins-module calls."""
     if not isinstance(call, ast.Call):
@@ -924,9 +954,16 @@ def _call_is_dynamic_exec_eval(
         builtins_aliases = set()
     if exec_eval_shadow_lines is None:
         exec_eval_shadow_lines = {}
+    if direct_aliases is None:
+        direct_aliases = set()
     func = call.func
     return (
-        _direct_name_is_builtin_exec_eval(func, call, exec_eval_shadow_lines)
+        _direct_name_is_builtin_exec_eval(
+            func,
+            call,
+            exec_eval_shadow_lines,
+            direct_aliases,
+        )
         or _getattr_is_dynamic_exec_eval(func, builtins_aliases)
         or _subscript_is_dynamic_exec_eval(func, builtins_aliases)
         or _attribute_is_dynamic_exec_eval(func, builtins_aliases)
@@ -1069,11 +1106,15 @@ def _expression_mutates_workers(expr, operator_bindings):
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
     exec_eval_shadow_lines = operator_bindings[9] if len(operator_bindings) > 9 else {}
+    direct_exec_eval_aliases = (
+        operator_bindings[10] if len(operator_bindings) > 10 else set()
+    )
     if isinstance(expr, ast.Call) and (
         _call_is_dynamic_exec_eval(
             expr,
             builtins_aliases,
             exec_eval_shadow_lines,
+            direct_exec_eval_aliases,
         )
         or _call_is_module_namespace_workers_update(expr, namespace_aliases)
         or _call_is_module_namespace_workers_ior(expr, namespace_aliases)
@@ -1500,6 +1541,7 @@ def _collect_operator_setitem_bindings(tree):
     dict_update_aliases = _collect_dict_update_aliases(tree)
     builtins_aliases = _collect_builtins_aliases(tree)
     exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)
+    direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(tree.body)
     return (
         module_aliases,
         setitem_aliases,
@@ -1511,6 +1553,7 @@ def _collect_operator_setitem_bindings(tree):
         dict_update_aliases,
         builtins_aliases,
         exec_eval_shadow_lines,
+        direct_exec_eval_aliases,
     )
 
 
@@ -1705,15 +1748,62 @@ def _gunicorn_launch_directories() -> list[Path]:
     return directories
 
 
-def _default_gunicorn_config_paths() -> list[Path]:
-    """Return the implicit config from Gunicorn's launch directory, if present."""
-    for directory in _gunicorn_launch_directories():
-        try:
-            resolved = (directory / "gunicorn.conf.py").resolve()
-        except (OSError, RuntimeError):
+def _static_gunicorn_chdir(tree):
+    """Return a literal top-level Gunicorn chdir value when it is unambiguous."""
+    value = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
             continue
-        if resolved.is_file():
-            return [resolved]
+        if not any(isinstance(target, ast.Name) and target.id == "chdir" for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            return None
+        value = node.value.value
+    return value
+
+
+def _gunicorn_config_chdir_matches(config_path: Path, cwd: Path) -> bool:
+    """Verify that a launch config's literal chdir resolves to the current cwd."""
+    tree = _parse_gunicorn_config_tree(config_path)
+    if tree is None:
+        return False
+    raw_chdir = _static_gunicorn_chdir(tree)
+    if raw_chdir is None:
+        return False
+    try:
+        target = Path(raw_chdir)
+        if not target.is_absolute():
+            target = config_path.parent / target
+        return target.resolve() == cwd
+    except (OSError, RuntimeError):
+        return False
+
+
+def _default_gunicorn_config_paths() -> list[Path]:
+    """Return the implicit config, accepting PWD only when chdir proves it."""
+    directories = _gunicorn_launch_directories()
+    if not directories:
+        return []
+    cwd = directories[0]
+    try:
+        cwd_config = (cwd / "gunicorn.conf.py").resolve()
+    except (OSError, RuntimeError):
+        cwd_config = None
+
+    if len(directories) > 1:
+        try:
+            pwd_config = (directories[1] / "gunicorn.conf.py").resolve()
+        except (OSError, RuntimeError):
+            pwd_config = None
+        if (
+            pwd_config is not None
+            and pwd_config.is_file()
+            and _gunicorn_config_chdir_matches(pwd_config, cwd)
+        ):
+            return [pwd_config]
+
+    if cwd_config is not None and cwd_config.is_file():
+        return [cwd_config]
     return []
 
 
@@ -1726,13 +1816,13 @@ def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
 
 
 def _worker_count_from_environment() -> int:
-    """Return the environment-provided default worker count."""
-    count = 1
+    """Return the largest safety-relevant environment worker count."""
+    counts = [1]
     for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
         raw = os.environ.get(env_key, "").strip()
         if raw.isdigit():
-            count = int(raw)
-    return count
+            counts.append(int(raw))
+    return max(counts)
 
 
 def _selected_gunicorn_config_path(

@@ -100,3 +100,58 @@ def test_actual_cwd_wins_over_stale_pwd(monkeypatch, tmp_path, config_module):
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
     assert config_module._detect_worker_settings() == (4, False)
+
+
+
+def test_environment_does_not_let_gunicorn_workers_mask_web_concurrency(
+    monkeypatch, tmp_path, config_module
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.setenv("GUNICORN_WORKERS", "1")
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    assert config_module._detect_worker_settings() == (4, False)
+
+
+def test_direct_builtins_exec_alias_fails_closed(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "from builtins import exec as run\n"
+        "run('workers = 4')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_direct_builtins_alias_reassignment_is_not_false_positive(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "from builtins import exec as run\n"
+        "run = lambda value: value\n"
+        "result = run('workers = 4')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_post_chdir_prefers_verified_launch_pwd_config(
+    monkeypatch, tmp_path, config_module
+):
+    launch_dir = tmp_path / "launch"
+    app_dir = tmp_path / "app"
+    launch_dir.mkdir()
+    app_dir.mkdir()
+    (launch_dir / "gunicorn.conf.py").write_text(
+        f"chdir = {str(app_dir)!r}\nworkers = 4\n",
+        encoding="utf-8",
+    )
+    (app_dir / "gunicorn.conf.py").write_text(
+        "workers = 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PWD", str(launch_dir))
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    assert config_module._detect_worker_settings() == (4, False)
