@@ -1684,6 +1684,7 @@ def _gunicorn_launch_directories() -> list[Path]:
             if pwd_path.is_dir():
                 directories.append(pwd_path)
         except (OSError, RuntimeError):
+            # Invalid/stale PWD is non-fatal; fall back to the actual cwd below.
             pass
     try:
         cwd_path = Path.cwd().resolve()
