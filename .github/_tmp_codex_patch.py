@@ -45,7 +45,7 @@ def _collect_builtins_aliases(tree):''',
 
 
 def _collect_builtins_exec_eval_aliases(statements):
-    """Collect names imported directly from ``builtins`` as exec/eval aliases."""
+    """Collect direct aliases that may resolve to builtin exec/eval."""
     aliases = set()
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -54,6 +54,11 @@ def _collect_builtins_exec_eval_aliases(statements):
             for imported in node.names:
                 if imported.name in _DYNAMIC_EXEC_EVAL_NAMES:
                     aliases.add(imported.asname or imported.name)
+        for name, value in _namespace_assignment_values(node):
+            if value is not None and isinstance(value, ast.Name) and value.id in aliases:
+                aliases.add(name)
+            elif name in aliases:
+                aliases.discard(name)
         for block in _compound_statement_blocks(node):
             aliases.update(_collect_builtins_exec_eval_aliases(block))
     return aliases
@@ -205,17 +210,63 @@ replace_once(
         if resolved.is_file():
             return [resolved]
     return []''',
-    '''def _default_gunicorn_config_paths() -> list[Path]:
-    """Return all plausible implicit Gunicorn configs from cwd/PWD."""
-    paths = []
-    for directory in _gunicorn_launch_directories():
-        try:
-            resolved = (directory / "gunicorn.conf.py").resolve()
-        except (OSError, RuntimeError):
+    '''def _static_gunicorn_chdir(tree):
+    """Return a literal top-level Gunicorn chdir value when it is unambiguous."""
+    value = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
             continue
-        if resolved.is_file() and resolved not in paths:
-            paths.append(resolved)
-    return paths''',
+        if not any(isinstance(target, ast.Name) and target.id == "chdir" for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            return None
+        value = node.value.value
+    return value
+
+
+def _gunicorn_config_chdir_matches(config_path: Path, cwd: Path) -> bool:
+    """Verify that a launch config's literal chdir resolves to the current cwd."""
+    tree = _parse_gunicorn_config_tree(config_path)
+    if tree is None:
+        return False
+    raw_chdir = _static_gunicorn_chdir(tree)
+    if raw_chdir is None:
+        return False
+    try:
+        target = Path(raw_chdir)
+        if not target.is_absolute():
+            target = config_path.parent / target
+        return target.resolve() == cwd
+    except (OSError, RuntimeError):
+        return False
+
+
+def _default_gunicorn_config_paths() -> list[Path]:
+    """Return the implicit config, accepting PWD only when chdir proves it."""
+    directories = _gunicorn_launch_directories()
+    if not directories:
+        return []
+    cwd = directories[0]
+    try:
+        cwd_config = (cwd / "gunicorn.conf.py").resolve()
+    except (OSError, RuntimeError):
+        cwd_config = None
+
+    if len(directories) > 1:
+        try:
+            pwd_config = (directories[1] / "gunicorn.conf.py").resolve()
+        except (OSError, RuntimeError):
+            pwd_config = None
+        if (
+            pwd_config is not None
+            and pwd_config.is_file()
+            and _gunicorn_config_chdir_matches(pwd_config, cwd)
+        ):
+            return [pwd_config]
+
+    if cwd_config is not None and cwd_config.is_file():
+        return [cwd_config]
+    return []''',
 )
 
 replace_once(
@@ -237,85 +288,14 @@ replace_once(
     return max(counts)''',
 )
 
-replace_once(
-    '''def _detect_worker_settings() -> tuple[int, bool]:''',
-    '''def _apply_implicit_gunicorn_config_worker_details(
-    count: int,
-    config_paths: list[Path],
-) -> tuple[int, bool, bool]:
-    """Combine plausible implicit configs and fail closed on ambiguity."""
-    candidates = []
-    runtime_dynamic = False
-    for path in config_paths:
-        configured_count, candidate_dynamic, candidate_runtime_dynamic = (
-            _gunicorn_config_worker_details_from_path(str(path))
-        )
-        effective_count = configured_count if configured_count is not None else count
-        candidates.append((effective_count, candidate_dynamic))
-        runtime_dynamic = runtime_dynamic or candidate_runtime_dynamic
-    if not candidates:
-        return count, False, False
-    assignment_dynamic = (
-        any(candidate_dynamic for _, candidate_dynamic in candidates)
-        or len(set(candidates)) > 1
-    )
-    safe_count = max(candidate_count for candidate_count, _ in candidates)
-    return safe_count, assignment_dynamic, runtime_dynamic
-
-
-def _detect_worker_settings() -> tuple[int, bool]:''',
-)
-
-replace_once(
-    '''        if default_paths:
-            count, assignment_dynamic, runtime_dynamic = (
-                _apply_gunicorn_config_worker_details(count, str(default_paths[0]))
-            )''',
-    '''        if default_paths:
-            count, assignment_dynamic, runtime_dynamic = (
-                _apply_implicit_gunicorn_config_worker_details(count, default_paths)
-            )''',
-)
-
 config_path.write_text(text, encoding="utf-8")
 
 tests_path = Path("tests/test_gunicorn_worker_regressions.py")
 tests = tests_path.read_text(encoding="utf-8")
-
-old_test = '''def test_actual_cwd_wins_over_stale_pwd(monkeypatch, tmp_path, config_module):
-    stale_dir = tmp_path / "stale"
-    launch_dir = tmp_path / "launch"
-    stale_dir.mkdir()
-    launch_dir.mkdir()
-    (stale_dir / "gunicorn.conf.py").write_text("workers = 1\\n", encoding="utf-8")
-    (launch_dir / "gunicorn.conf.py").write_text("workers = 4\\n", encoding="utf-8")
-    monkeypatch.setenv("PWD", str(stale_dir))
-    monkeypatch.chdir(launch_dir)
-    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
-
-    assert config_module._detect_worker_settings() == (4, False)'''
-new_test = '''def test_conflicting_cwd_and_pwd_configs_fail_closed(
-    monkeypatch, tmp_path, config_module
-):
-    stale_dir = tmp_path / "stale"
-    launch_dir = tmp_path / "launch"
-    stale_dir.mkdir()
-    launch_dir.mkdir()
-    (stale_dir / "gunicorn.conf.py").write_text("workers = 1\\n", encoding="utf-8")
-    (launch_dir / "gunicorn.conf.py").write_text("workers = 4\\n", encoding="utf-8")
-    monkeypatch.setenv("PWD", str(stale_dir))
-    monkeypatch.chdir(launch_dir)
-    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
-
-    assert config_module._detect_worker_settings() == (4, True)'''
-if old_test not in tests:
-    raise SystemExit("existing cwd/PWD regression test not found")
-tests = tests.replace(old_test, new_test)
-
 extra = '''
 
 
-def test_environment_prefers_larger_safety_relevant_worker_count(
+def test_environment_does_not_let_gunicorn_workers_mask_web_concurrency(
     monkeypatch, tmp_path, config_module
 ):
     monkeypatch.chdir(tmp_path)
@@ -336,7 +316,18 @@ def test_direct_builtins_exec_alias_fails_closed(config_module):
     assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
 
 
-def test_post_chdir_cwd_and_launch_pwd_conflict_fails_closed(
+def test_direct_builtins_alias_reassignment_is_not_false_positive(config_module):
+    tree = ast.parse(
+        "workers = 1\\n"
+        "from builtins import exec as run\\n"
+        "run = lambda value: value\\n"
+        "result = run('workers = 4')\\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_post_chdir_prefers_verified_launch_pwd_config(
     monkeypatch, tmp_path, config_module
 ):
     launch_dir = tmp_path / "launch"
@@ -355,9 +346,9 @@ def test_post_chdir_cwd_and_launch_pwd_conflict_fails_closed(
     monkeypatch.chdir(app_dir)
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
-    assert config_module._detect_worker_settings() == (4, True)
+    assert config_module._detect_worker_settings() == (4, False)
 '''
-if "def test_environment_prefers_larger_safety_relevant_worker_count" not in tests:
+if "def test_environment_does_not_let_gunicorn_workers_mask_web_concurrency" not in tests:
     tests += extra
 tests_path.write_text(tests, encoding="utf-8")
 
