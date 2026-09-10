@@ -824,21 +824,34 @@ def _collect_builtins_import_aliases(statements):
     return aliases
 
 
+def _builtins_exec_eval_import_aliases(node):
+    """Return direct exec/eval names imported from builtins by one statement."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "builtins":
+        return set()
+    return {
+        imported.asname or imported.name
+        for imported in node.names
+        if imported.name in _DYNAMIC_EXEC_EVAL_NAMES
+    }
+
+
+def _update_builtins_exec_eval_assignment_aliases(node, aliases):
+    """Update direct exec/eval aliases for assignments in one statement."""
+    for name, value in _namespace_assignment_values(node):
+        if isinstance(value, ast.Name) and value.id in aliases:
+            aliases.add(name)
+        else:
+            aliases.discard(name)
+
+
 def _collect_builtins_exec_eval_aliases(statements):
     """Collect direct aliases that may resolve to builtin exec/eval."""
     aliases = set()
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, ast.ImportFrom) and node.module == "builtins":
-            for imported in node.names:
-                if imported.name in _DYNAMIC_EXEC_EVAL_NAMES:
-                    aliases.add(imported.asname or imported.name)
-        for name, value in _namespace_assignment_values(node):
-            if value is not None and isinstance(value, ast.Name) and value.id in aliases:
-                aliases.add(name)
-            elif name in aliases:
-                aliases.discard(name)
+        aliases.update(_builtins_exec_eval_import_aliases(node))
+        _update_builtins_exec_eval_assignment_aliases(node, aliases)
         for block in _compound_statement_blocks(node):
             aliases.update(_collect_builtins_exec_eval_aliases(block))
     return aliases
