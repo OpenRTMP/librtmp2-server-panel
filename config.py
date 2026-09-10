@@ -247,7 +247,6 @@ def _parse_positive_int(value, default, *, min_value=1, max_value=10_000, name="
         sys.exit(1)
     return parsed
 
-
 def _emit_config_error(message: str) -> None:
     """Emit a startup config error without interpolating sensitive env values."""
     sys.stderr.write("CONFIG ERROR: ")
@@ -496,8 +495,6 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
         return False
     return _update_payload_may_set_workers(call)
-
-
 def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     """Return True when module namespace ``__ior__`` may change workers."""
     if not isinstance(call, ast.Call):
@@ -765,6 +762,7 @@ def _call_is_getattr_setitem_workers(call):
 
 
 _NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
+_DYNAMIC_EXEC_EVAL_NAMES = frozenset({"exec", "eval"})
 
 
 def _unpack_operator_bindings(operator_bindings):
@@ -848,6 +846,45 @@ def _is_known_builtins_module(node, builtins_aliases):
     )
 
 
+def _constant_is_exec_eval(node):
+    """Return True for a literal ``exec`` or ``eval`` lookup key."""
+    return isinstance(node, ast.Constant) and node.value in _DYNAMIC_EXEC_EVAL_NAMES
+
+
+def _getattr_is_dynamic_exec_eval(func, builtins_aliases):
+    """Return True for ``getattr(builtins, 'exec'/'eval')`` callables."""
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and _is_known_builtins_module(func.args[0], builtins_aliases)
+        and _constant_is_exec_eval(func.args[1])
+    )
+
+
+def _subscript_is_dynamic_exec_eval(func, builtins_aliases):
+    """Return True for ``builtins.__dict__['exec'/'eval']`` callables."""
+    if not isinstance(func, ast.Subscript):
+        return False
+    base = _subscript_base_node(func)
+    return (
+        isinstance(base, ast.Attribute)
+        and base.attr == "__dict__"
+        and _is_known_builtins_module(base.value, builtins_aliases)
+        and _constant_is_exec_eval(func.slice)
+    )
+
+
+def _attribute_is_dynamic_exec_eval(func, builtins_aliases):
+    """Return True for ``builtins.exec`` / ``builtins.eval`` callables."""
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _DYNAMIC_EXEC_EVAL_NAMES
+        and _is_known_builtins_module(func.value, builtins_aliases)
+    )
+
+
 def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
     """Return True for direct built-ins or known builtins-module calls."""
     if not isinstance(call, ast.Call):
@@ -855,28 +892,12 @@ def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
     if builtins_aliases is None:
         builtins_aliases = set()
     func = call.func
-    if isinstance(func, ast.Name) and func.id in {"exec", "eval"}:
-        return True
-    if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "getattr":
-        if len(func.args) >= 2 and _is_known_builtins_module(
-            func.args[0], builtins_aliases
-        ):
-            key = func.args[1]
-            if isinstance(key, ast.Constant) and key.value in {"exec", "eval"}:
-                return True
-    if isinstance(func, ast.Subscript):
-        base = _subscript_base_node(func)
-        if (
-            isinstance(base, ast.Attribute)
-            and base.attr == "__dict__"
-            and _is_known_builtins_module(base.value, builtins_aliases)
-        ):
-            slice_node = func.slice
-            if isinstance(slice_node, ast.Constant) and slice_node.value in {"exec", "eval"}:
-                return True
-    if not isinstance(func, ast.Attribute) or func.attr not in {"exec", "eval"}:
-        return False
-    return _is_known_builtins_module(func.value, builtins_aliases)
+    return (
+        isinstance(func, ast.Name) and func.id in _DYNAMIC_EXEC_EVAL_NAMES
+        or _getattr_is_dynamic_exec_eval(func, builtins_aliases)
+        or _subscript_is_dynamic_exec_eval(func, builtins_aliases)
+        or _attribute_is_dynamic_exec_eval(func, builtins_aliases)
+    )
 
 
 def _attribute_is_namespace_setitem(node, namespace_aliases=None):
