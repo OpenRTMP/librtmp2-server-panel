@@ -425,6 +425,61 @@ def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch):
         config_file.unlink(missing_ok=True)
 
 
+def test_detect_worker_count_reads_default_gunicorn_conf_in_working_directory(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 6\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+    assert config._detect_worker_count() == 6
+
+
+def test_detect_worker_count_ignores_default_gunicorn_conf_for_dev_server(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 6\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(sys, "argv", ["python", "app.py"])
+    assert config._detect_worker_count() == 1
+
+
+def test_config_rejects_memory_ratelimit_with_default_gunicorn_conf_workers(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 3\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-default-gunicorn-conf")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-default-gunicorn-conf")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-default-gunicorn-conf")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    _forget_config_module()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.import_module("config")
+        assert exc.value.code == 1
+    finally:
+        _forget_config_module()
+
+
 def test_config_rejects_memory_ratelimit_with_gunicorn_config_file_workers(monkeypatch):
     _assert_config_import_with_gunicorn_file(monkeypatch, config_content="workers = 3\n")
 
