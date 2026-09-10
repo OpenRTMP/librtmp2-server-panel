@@ -425,24 +425,42 @@ def test_detect_worker_count_parses_gunicorn_config_file(monkeypatch):
         config_file.unlink(missing_ok=True)
 
 
-def test_detect_worker_count_reads_default_gunicorn_conf_in_project_root(monkeypatch):
-    config_file = _PROJECT_ROOT / "gunicorn.conf.py"
+def test_detect_worker_count_reads_default_gunicorn_conf_in_working_directory(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text("workers = 6\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
     monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
     monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
     import config
 
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
-    try:
-        assert config._detect_worker_count() == 6
-    finally:
-        config_file.unlink(missing_ok=True)
+    assert config._detect_worker_count() == 6
 
 
-def test_config_rejects_memory_ratelimit_with_default_gunicorn_conf_workers(monkeypatch):
-    config_file = _PROJECT_ROOT / "gunicorn.conf.py"
+def test_detect_worker_count_ignores_default_gunicorn_conf_for_dev_server(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 6\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    import config
+
+    monkeypatch.setattr(sys, "argv", ["python", "app.py"])
+    assert config._detect_worker_count() == 1
+
+
+def test_config_rejects_memory_ratelimit_with_default_gunicorn_conf_workers(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text("workers = 3\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-default-gunicorn-conf")
     monkeypatch.setenv("PASSWORD", "valid-test-password-for-default-gunicorn-conf")
     monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-default-gunicorn-conf")
@@ -459,7 +477,6 @@ def test_config_rejects_memory_ratelimit_with_default_gunicorn_conf_workers(monk
             importlib.import_module("config")
         assert exc.value.code == 1
     finally:
-        config_file.unlink(missing_ok=True)
         _forget_config_module()
 
 
