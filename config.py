@@ -807,11 +807,26 @@ def _values_are_builtins_aliases(values, aliases):
     )
 
 
+def _collect_builtins_import_aliases(statements):
+    """Collect import-time names introduced by ``import builtins``."""
+    aliases = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == "builtins":
+                    aliases.add(imported.asname or imported.name)
+        for block in _compound_statement_blocks(node):
+            aliases.update(_collect_builtins_import_aliases(block))
+    return aliases
+
+
 def _collect_builtins_aliases(tree):
     """Collect names that are always bound to the builtins module."""
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
-    aliases = set()
+    aliases = _collect_builtins_import_aliases(tree.body).difference(assignments)
     unresolved = set(assignments)
     while unresolved:
         discovered = {
@@ -826,8 +841,15 @@ def _collect_builtins_aliases(tree):
     return aliases
 
 
+def _is_known_builtins_module(node, builtins_aliases):
+    """Return True when an expression is known to resolve to ``builtins``."""
+    return _is_builtins_import(node) or (
+        isinstance(node, ast.Name) and node.id in builtins_aliases
+    )
+
+
 def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
-    """Return True for direct built-ins or ``__import__('builtins')`` calls."""
+    """Return True for direct built-ins or known builtins-module calls."""
     if not isinstance(call, ast.Call):
         return False
     if builtins_aliases is None:
@@ -836,7 +858,9 @@ def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
     if isinstance(func, ast.Name) and func.id in {"exec", "eval"}:
         return True
     if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "getattr":
-        if len(func.args) >= 2 and _is_builtins_import(func.args[0]):
+        if len(func.args) >= 2 and _is_known_builtins_module(
+            func.args[0], builtins_aliases
+        ):
             key = func.args[1]
             if isinstance(key, ast.Constant) and key.value in {"exec", "eval"}:
                 return True
@@ -845,17 +869,14 @@ def _call_is_dynamic_exec_eval(call, builtins_aliases=None):
         if (
             isinstance(base, ast.Attribute)
             and base.attr == "__dict__"
-            and _is_builtins_import(base.value)
+            and _is_known_builtins_module(base.value, builtins_aliases)
         ):
             slice_node = func.slice
             if isinstance(slice_node, ast.Constant) and slice_node.value in {"exec", "eval"}:
                 return True
     if not isinstance(func, ast.Attribute) or func.attr not in {"exec", "eval"}:
         return False
-    owner = func.value
-    if _is_builtins_import(owner):
-        return True
-    return isinstance(owner, ast.Name) and owner.id in builtins_aliases
+    return _is_known_builtins_module(func.value, builtins_aliases)
 
 
 def _attribute_is_namespace_setitem(node, namespace_aliases=None):
@@ -985,8 +1006,10 @@ def _expression_mutates_workers(expr, operator_bindings):
         return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
+    builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
     if isinstance(expr, ast.Call) and (
-        _call_is_module_namespace_workers_update(expr, namespace_aliases)
+        _call_is_dynamic_exec_eval(expr, builtins_aliases)
+        or _call_is_module_namespace_workers_update(expr, namespace_aliases)
         or _call_is_module_namespace_workers_ior(expr, namespace_aliases)
         or _call_is_getattr_namespace_workers_mutation(
             expr, namespace_aliases, mutator_aliases
@@ -1120,14 +1143,6 @@ def _is_dynamic_workers_mutation(node, operator_bindings):
         for child in ast.iter_child_nodes(node)
     ):
         return True
-
-    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-        call = node.value
-        builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
-        if _call_is_dynamic_exec_eval(call, builtins_aliases):
-            return True
-        if _call_mutates_workers_via_indirection(call, operator_bindings):
-            return True
 
     if isinstance(node, ast.Assign):
         return any(_indirect_workers_assignment_target(target) for target in node.targets)
@@ -1560,21 +1575,22 @@ def _argv_specifies_gunicorn_config(tokens: list[str]) -> bool:
     return False
 
 
+def _is_gunicorn_process(tokens: list[str]) -> bool:
+    """Return True when the current process is running under Gunicorn."""
+    if tokens:
+        executable = Path(str(tokens[0])).name.lower()
+        if executable in {"gunicorn", "gunicorn.exe"}:
+            return True
+    return "gunicorn" in sys.modules
+
+
 def _default_gunicorn_config_paths() -> list[Path]:
-    """Return cwd/project gunicorn.conf.py paths Gunicorn loads without -c/--config."""
-    candidates = [Path.cwd() / "gunicorn.conf.py", _PROJECT_ROOT / "gunicorn.conf.py"]
-    paths = []
-    seen = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except (OSError, RuntimeError):
-            continue
-        if resolved in seen or not resolved.is_file():
-            continue
-        seen.add(resolved)
-        paths.append(resolved)
-    return paths
+    """Return Gunicorn's implicit ``./gunicorn.conf.py`` when it exists."""
+    try:
+        resolved = (Path.cwd() / "gunicorn.conf.py").resolve()
+    except (OSError, RuntimeError):
+        return []
+    return [resolved] if resolved.is_file() else []
 
 
 def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
@@ -1627,7 +1643,7 @@ def _detect_worker_settings() -> tuple[int, bool]:
         _argv_specifies_gunicorn_config(sys.argv)
         or _argv_specifies_gunicorn_config(cmd_tokens)
     )
-    if not explicit_config:
+    if not explicit_config and _is_gunicorn_process(sys.argv):
         for config_path in _default_gunicorn_config_paths():
             config_count, config_dynamic = _workers_from_gunicorn_config_path(
                 str(config_path)
