@@ -17,7 +17,7 @@ jobs:
           ref: security/fix-gunicorn-getattr-attrgetter-bypasses
 
       - name: Apply PR 191 Codex fixes
-        if: github.event_name == 'push' && github.event.head_commit.message == 'ci: drive PR 191 Codex patch'
+        if: "github.event_name == 'push' && github.event.head_commit.message == 'ci: fix PR 191 patch driver condition'"
         run: python .github/scripts/pr191_fix.py
 
       - name: Set up Python
@@ -46,7 +46,7 @@ jobs:
         run: node --check static/js/scripts.js
 
       - name: Commit PR 191 Codex fixes
-        if: github.event_name == 'push' && github.event.head_commit.message == 'ci: drive PR 191 Codex patch'
+        if: "github.event_name == 'push' && github.event.head_commit.message == 'ci: fix PR 191 patch driver condition'"
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
