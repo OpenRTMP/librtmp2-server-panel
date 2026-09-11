@@ -1,0 +1,58 @@
+name: Apply PR 191 Sonar fix
+
+on:
+  push:
+    branches:
+      - security/fix-gunicorn-getattr-attrgetter-bypasses
+    paths:
+      - .github/workflows/pr191-sonar-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: security/fix-gunicorn-getattr-attrgetter-bypasses
+
+      - name: Replace empty partial factory branch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("config.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''    elif (
+              isinstance(partial_func, ast.Attribute)
+              and partial_func.attr == "partial"
+              and isinstance(partial_func.value, ast.Name)
+              and partial_func.value.id in partial_aliases
+          ):
+              pass
+          else:
+              return None
+          '''
+          new = '''    elif not (
+              isinstance(partial_func, ast.Attribute)
+              and partial_func.attr == "partial"
+              and isinstance(partial_func.value, ast.Name)
+              and partial_func.value.id in partial_aliases
+          ):
+              return None
+          '''
+          if old not in text:
+              raise SystemExit("Expected PR 191 partial factory block not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config.py
+          git diff --cached --check
+          git commit -m "Fix Sonar empty block in partial factory scanner"
+          git push origin HEAD:security/fix-gunicorn-getattr-attrgetter-bypasses
