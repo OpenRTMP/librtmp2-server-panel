@@ -24,28 +24,36 @@ jobs:
           from pathlib import Path
 
           path = Path("config.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''    elif (
-              isinstance(partial_func, ast.Attribute)
-              and partial_func.attr == "partial"
-              and isinstance(partial_func.value, ast.Name)
-              and partial_func.value.id in partial_aliases
-          ):
-              pass
-          else:
-              return None
-          '''
-          new = '''    elif not (
-              isinstance(partial_func, ast.Attribute)
-              and partial_func.attr == "partial"
-              and isinstance(partial_func.value, ast.Name)
-              and partial_func.value.id in partial_aliases
-          ):
-              return None
-          '''
-          if old not in text:
-              raise SystemExit("Expected PR 191 partial factory block not found")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+          start = next(
+              i for i, line in enumerate(lines)
+              if line.startswith("def _partial_factory_call(")
+          )
+          end = next(
+              i for i in range(start + 1, len(lines))
+              if lines[i].startswith("def ")
+          )
+
+          elif_index = next(
+              i for i in range(start, end)
+              if lines[i].strip() == "elif ("
+          )
+          pass_index = next(
+              i for i in range(elif_index, end)
+              if lines[i].strip() == "pass"
+          )
+          else_index = pass_index + 1
+          return_index = pass_index + 2
+
+          if lines[else_index].strip() != "else:" or lines[return_index].strip() != "return None":
+              raise SystemExit("Unexpected partial factory branch layout")
+
+          newline = "\r\n" if lines[elif_index].endswith("\r\n") else "\n"
+          lines[elif_index] = "    elif not (" + newline
+          del lines[pass_index:else_index + 1]
+
+          path.write_text("".join(lines), encoding="utf-8")
           PY
 
       - name: Commit fix
