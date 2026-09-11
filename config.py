@@ -786,19 +786,40 @@ def _getattr_operator_method_name(getattr_call, module_aliases):
     return None
 
 
+def _getattr_operator_method_is_dynamic(getattr_call, module_aliases):
+    """Return True for ``getattr(operator, <dynamic expression>)``."""
+    return (
+        isinstance(getattr_call, ast.Call)
+        and isinstance(getattr_call.func, ast.Name)
+        and getattr_call.func.id == "getattr"
+        and len(getattr_call.args) >= 2
+        and isinstance(getattr_call.args[0], ast.Name)
+        and getattr_call.args[0].id in module_aliases
+        and not (
+            isinstance(getattr_call.args[1], ast.Constant)
+            and isinstance(getattr_call.args[1].value, str)
+        )
+    )
+
+
 def _call_is_getattr_operator_namespace_mutation(call, operator_bindings):
-    """Return True for ``getattr(operator, 'setitem'/'ior'/...)`` on the namespace."""
-    if not isinstance(call, ast.Call) or not call.args:
+    """Return True for ``getattr(operator, ...)`` mutations on the namespace."""
+    if not isinstance(call, ast.Call):
         return False
-    method = _getattr_operator_method_name(call.func, operator_bindings[0])
-    if method is None:
-        return False
+    module_aliases = operator_bindings[0] if operator_bindings else set()
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    method = _getattr_operator_method_name(call.func, module_aliases)
+    if method is None:
+        return (
+            _getattr_operator_method_is_dynamic(call.func, module_aliases)
+            and bool(call.args)
+            and _is_module_namespace_mapping(call.args[0], namespace_aliases)
+        )
     if method == "setitem":
         return (
             len(call.args) >= 2
-            and _is_globals_call(call.args[0])
-            and _constant_is_workers(call.args[1])
+            and _is_module_namespace_mapping(call.args[0], namespace_aliases)
+            and _key_may_be_workers(call.args[1])
         )
     if method in {"ior", "__ior__"}:
         return (
@@ -808,7 +829,8 @@ def _call_is_getattr_operator_namespace_mutation(call, operator_bindings):
         )
     if method == "update":
         return (
-            _is_module_namespace_mapping(call.args[0], namespace_aliases)
+            bool(call.args)
+            and _is_module_namespace_mapping(call.args[0], namespace_aliases)
             and _update_payload_may_set_workers(call)
         )
     return False
@@ -825,9 +847,12 @@ def _operator_attrgetter_method_name(factory_call):
 
 
 def _is_operator_attrgetter_factory(call, operator_bindings):
-    """Return True for ``operator.attrgetter(...)`` or ``getattr(operator, 'attrgetter')``."""
+    """Return True for imported or module-qualified ``operator.attrgetter``."""
     module_aliases = operator_bindings[0] if operator_bindings else set()
+    attrgetter_aliases = operator_bindings[11] if len(operator_bindings) > 11 else set()
     func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in attrgetter_aliases
     if isinstance(func, ast.Attribute) and func.attr == "attrgetter":
         return isinstance(func.value, ast.Name) and func.value.id in module_aliases
     if not isinstance(func, ast.Call):
@@ -843,10 +868,12 @@ def _is_operator_attrgetter_factory(call, operator_bindings):
 
 
 def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
-    """Return True for ``operator.attrgetter('update')(globals())({...})`` mutations."""
-    if not isinstance(call, ast.Call) or not call.args:
+    """Return True for ``operator.attrgetter(...)(namespace)(...)`` mutations."""
+    if not isinstance(call, ast.Call):
         return False
     bound = call.func
+    if isinstance(bound, ast.NamedExpr) and isinstance(bound.value, ast.Call):
+        bound = bound.value
     if not isinstance(bound, ast.Call) or not bound.args:
         return False
     factory = bound.func
@@ -861,9 +888,9 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     if method == "update":
         return _update_payload_may_set_workers(call)
     if method in {"__ior__", "ior"}:
-        return _dict_merge_payload_may_set_workers(call.args[0])
+        return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
     if method == "__setitem__":
-        return len(call.args) >= 2 and _constant_is_workers(call.args[0])
+        return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
     return method is None
 
 
@@ -1207,18 +1234,83 @@ def _partial_factory_call(node, partial_aliases):
     return candidate
 
 
+def _partial_value_is_workers_setter(
+    value,
+    namespace_aliases,
+    partial_aliases,
+    known_aliases,
+):
+    """Return True when a value resolves to a partial workers setter."""
+    if isinstance(value, ast.Name):
+        return value.id in known_aliases
+    partial_call = _partial_factory_call(value, partial_aliases)
+    return (
+        partial_call is not None
+        and len(partial_call.args) >= 2
+        and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
+        and _constant_is_workers(partial_call.args[1])
+    )
+
+
+def _values_are_partial_workers_setters(
+    values,
+    namespace_aliases,
+    partial_aliases,
+    known_aliases,
+):
+    """Return True when every resolved assignment is a workers setter."""
+    resolved = [value for value in values if value is not None]
+    return bool(resolved) and all(
+        _partial_value_is_workers_setter(
+            value,
+            namespace_aliases,
+            partial_aliases,
+            known_aliases,
+        )
+        for value in resolved
+    )
+
+
+def _collect_partial_workers_setter_aliases(
+    tree,
+    namespace_aliases,
+    partial_aliases,
+):
+    """Collect names bound to ``partial(namespace.__setitem__, 'workers')``."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if _values_are_partial_workers_setters(
+                assignments[name],
+                namespace_aliases,
+                partial_aliases,
+                aliases,
+            )
+        }
+        if not discovered:
+            break
+        aliases.update(discovered)
+        unresolved.difference_update(discovered)
+    return aliases
+
+
 def _call_is_partial_bound_workers_setitem(call, operator_bindings):
-    """Return True for ``partial(namespace.__setitem__, 'workers')(value)``."""
+    """Return True for direct or saved partial workers setters."""
     _, _, namespace_aliases, _, partial_aliases = _unpack_operator_bindings(
         operator_bindings
     )
     if not isinstance(call, ast.Call):
         return False
-    func = call.func
-    partial_call = _partial_factory_call(func, partial_aliases)
-    if partial_call is None:
-        return False
-    if len(partial_call.args) < 2:
+    saved_aliases = operator_bindings[12] if len(operator_bindings) > 12 else set()
+    if isinstance(call.func, ast.Name) and call.func.id in saved_aliases:
+        return True
+    partial_call = _partial_factory_call(call.func, partial_aliases)
+    if partial_call is None or len(partial_call.args) < 2:
         return False
     if not _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases):
         return False
@@ -1593,6 +1685,7 @@ def _record_operator_import(
     ior_aliases,
     partial_aliases,
     methodcaller_aliases,
+    attrgetter_aliases,
 ):
     """Record operator/functools aliases introduced by one statement."""
     if isinstance(node, ast.Import):
@@ -1611,6 +1704,7 @@ def _record_operator_import(
             "setitem": setitem_aliases,
             "ior": ior_aliases,
             "methodcaller": methodcaller_aliases,
+            "attrgetter": attrgetter_aliases,
         },
         "functools": {"partial": partial_aliases},
     }.get(node.module)
@@ -1626,6 +1720,7 @@ def _collect_operator_bindings_from_statements(
     ior_aliases,
     partial_aliases,
     methodcaller_aliases,
+    attrgetter_aliases,
 ):
     """Walk import-time statements and collect operator/functools aliases."""
     for node in statements:
@@ -1638,6 +1733,7 @@ def _collect_operator_bindings_from_statements(
             ior_aliases,
             partial_aliases,
             methodcaller_aliases,
+            attrgetter_aliases,
         )
         for block in _compound_statement_blocks(node):
             _collect_operator_bindings_from_statements(
@@ -1647,6 +1743,7 @@ def _collect_operator_bindings_from_statements(
                 ior_aliases,
                 partial_aliases,
                 methodcaller_aliases,
+                attrgetter_aliases,
             )
 
 
@@ -1657,6 +1754,7 @@ def _collect_operator_setitem_bindings(tree):
     ior_aliases = set()
     partial_aliases = set()
     methodcaller_aliases = set()
+    attrgetter_aliases = set()
     _collect_operator_bindings_from_statements(
         tree.body,
         module_aliases,
@@ -1664,6 +1762,7 @@ def _collect_operator_setitem_bindings(tree):
         ior_aliases,
         partial_aliases,
         methodcaller_aliases,
+        attrgetter_aliases,
     )
     namespace_aliases = _collect_module_namespace_aliases(tree)
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
@@ -1671,6 +1770,11 @@ def _collect_operator_setitem_bindings(tree):
     builtins_aliases = _collect_builtins_aliases(tree)
     exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)
     direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(tree.body)
+    partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
+        tree,
+        namespace_aliases,
+        partial_aliases,
+    )
     return (
         module_aliases,
         setitem_aliases,
@@ -1683,6 +1787,8 @@ def _collect_operator_setitem_bindings(tree):
         builtins_aliases,
         exec_eval_shadow_lines,
         direct_exec_eval_aliases,
+        attrgetter_aliases,
+        partial_workers_setter_aliases,
     )
 
 

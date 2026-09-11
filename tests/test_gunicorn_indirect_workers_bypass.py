@@ -32,6 +32,14 @@ import config
         "workers = 1\nimport operator\ngetattr(operator, 'ior')(globals(), {'workers': 4})\n",
         "workers = 1\nimport operator\noperator.attrgetter('update')(globals())({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\n(p := partial(globals().__setitem__, 'workers'))(4)\n",
+        "workers = 1\nimport operator\noperator.attrgetter('update')(globals())(workers=4)\n",
+        "workers = 1\nfrom operator import attrgetter\nattrgetter('update')(globals())({'workers': 4})\n",
+        "workers = 1\nimport operator\nns = globals()\ngetattr(operator, 'setitem')(ns, 'workers', 4)\n",
+        "workers = 1\nimport operator\nkey = 'workers'\ngetattr(operator, 'setitem')(globals(), key, 4)\n",
+        "workers = 1\nimport operator\nmethod = 'ior'\ngetattr(operator, method)(globals(), {'workers': 4})\n",
+        "workers = 1\nimport operator\n(update := operator.attrgetter('update')(globals()))({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\nsetter = partial(globals().__setitem__, 'workers')\nsetter(4)\n",
+        "workers = 1\nfrom functools import partial\n(setter := partial(globals().__setitem__, 'workers'))\nsetter(4)\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
