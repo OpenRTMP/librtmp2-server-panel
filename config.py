@@ -1197,14 +1197,12 @@ def _partial_factory_call(node, partial_aliases):
     if isinstance(partial_func, ast.Name):
         if partial_func.id not in partial_aliases:
             return None
-    elif (
+    elif not (
         isinstance(partial_func, ast.Attribute)
         and partial_func.attr == "partial"
         and isinstance(partial_func.value, ast.Name)
         and partial_func.value.id in partial_aliases
     ):
-        pass
-    else:
         return None
     return candidate
 
