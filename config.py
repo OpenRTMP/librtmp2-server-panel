@@ -503,13 +503,25 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     return _update_payload_may_set_workers(call)
 
 
-def _call_is_mapping_update_workers(call):
-    """Return True when any ``.update(...)`` payload may assign ``workers``."""
+def _call_is_attribute_instance_update_workers(call):
+    """Return True for instance ``mapping.update({...})`` with a workers payload."""
     if not isinstance(call, ast.Call):
         return False
     if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
         return False
+    if isinstance(call.func.value, ast.Name) and call.func.value.id == "dict":
+        return False
     return _update_payload_may_set_workers(call)
+
+
+def _expression_has_risky_instance_update(expr):
+    """Return True when an expression calls instance ``.update()`` with workers."""
+    if isinstance(expr, ast.Call) and _call_is_attribute_instance_update_workers(expr):
+        return True
+    return any(
+        _expression_has_risky_instance_update(child)
+        for child in ast.iter_child_nodes(expr)
+    )
 
 
 def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
@@ -1392,7 +1404,6 @@ def _expression_mutates_workers(expr, operator_bindings):
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
-        or _call_is_mapping_update_workers(expr)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -1404,9 +1415,11 @@ def _expression_mutates_workers(expr, operator_bindings):
 
 def _lambda_mutates_workers(lambda_node, operator_bindings):
     """Return True when an invoked lambda body mutates ``workers`` indirectly."""
-    return isinstance(lambda_node, ast.Lambda) and _expression_mutates_workers(
-        lambda_node.body, operator_bindings
-    )
+    if not isinstance(lambda_node, ast.Lambda):
+        return False
+    if _expression_has_risky_instance_update(lambda_node.body):
+        return True
+    return _expression_mutates_workers(lambda_node.body, operator_bindings)
 
 
 def _call_is_subscript_namespace_workers_update(
