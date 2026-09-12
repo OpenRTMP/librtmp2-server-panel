@@ -1931,6 +1931,21 @@ def _collect_sys_import_aliases(statements):
     return aliases
 
 
+def _record_functools_reduce_import(node, module_aliases, reduce_aliases):
+    """Record functools module and direct reduce aliases from one statement."""
+    if isinstance(node, ast.Import):
+        _record_relevant_import_aliases(
+            node.names,
+            {"functools": module_aliases},
+        )
+        return
+    if isinstance(node, ast.ImportFrom) and node.module == "functools":
+        _record_relevant_import_aliases(
+            node.names,
+            {"reduce": reduce_aliases},
+        )
+
+
 def _collect_functools_reduce_aliases(statements):
     """Collect module and direct aliases that prove a ``functools.reduce`` call."""
     module_aliases = set()
@@ -1938,14 +1953,7 @@ def _collect_functools_reduce_aliases(statements):
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, ast.Import):
-            for imported in node.names:
-                if imported.name == "functools":
-                    module_aliases.add(imported.asname or imported.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "functools":
-            for imported in node.names:
-                if imported.name == "reduce":
-                    reduce_aliases.add(imported.asname or imported.name)
+        _record_functools_reduce_import(node, module_aliases, reduce_aliases)
         for block in _compound_statement_blocks(node):
             nested_modules, nested_reduce = _collect_functools_reduce_aliases(block)
             module_aliases.update(nested_modules)
