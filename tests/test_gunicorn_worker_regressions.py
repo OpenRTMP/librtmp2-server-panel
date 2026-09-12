@@ -191,6 +191,7 @@ def test_cwd_relative_explicit_config_is_inspected(
 ):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text("workers = 7\n", encoding="utf-8")
+    monkeypatch.setenv("PWD", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         sys,
@@ -199,6 +200,29 @@ def test_cwd_relative_explicit_config_is_inspected(
     )
 
     assert config_module._detect_worker_settings() == (7, False)
+
+
+def test_explicit_relative_config_prefers_launch_dir_after_chdir(
+    monkeypatch, tmp_path, config_module
+):
+    launch_dir = tmp_path / "launch"
+    app_dir = tmp_path / "app"
+    launch_dir.mkdir()
+    app_dir.mkdir()
+    (launch_dir / "gunicorn.conf.py").write_text(
+        f"chdir = {str(app_dir)!r}\nworkers = 4\n",
+        encoding="utf-8",
+    )
+    (app_dir / "gunicorn.conf.py").write_text("workers = 1\n", encoding="utf-8")
+    monkeypatch.setenv("PWD", str(launch_dir))
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", "gunicorn.conf.py", "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (4, False)
 
 
 def test_python_config_uri_rejects_memory_ratelimit(monkeypatch, config_module):

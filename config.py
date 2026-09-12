@@ -315,10 +315,19 @@ def _gunicorn_config_path_candidates(config_path: str) -> list[Path]:
     if candidate.is_absolute():
         search.append(candidate)
     else:
-        try:
-            search.append(Path.cwd() / candidate)
-        except (OSError, RuntimeError):
-            pass
+        # Relative -c/--config is resolved at launch, before Gunicorn chdir.
+        # After import, Path.cwd() is the app dir; prefer a PWD copy whose
+        # literal chdir matches the current cwd so we inspect the loaded file.
+        directories = _gunicorn_launch_directories()
+        cwd = directories[0] if directories else None
+        if cwd is not None:
+            for launch_dir in directories[1:]:
+                launch_candidate = launch_dir / candidate
+                if _gunicorn_config_chdir_matches(launch_candidate, cwd):
+                    search.append(launch_candidate)
+            search.append(cwd / candidate)
+            for launch_dir in directories[1:]:
+                search.append(launch_dir / candidate)
         search.append(_PROJECT_ROOT / candidate)
     resolved = []
     seen = set()
@@ -326,6 +335,7 @@ def _gunicorn_config_path_candidates(config_path: str) -> list[Path]:
         try:
             full = path.resolve()
         except (OSError, RuntimeError):
+            # Broken symlink or inaccessible path; try the next candidate.
             continue
         if full in seen:
             continue
