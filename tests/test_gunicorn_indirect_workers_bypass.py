@@ -40,6 +40,12 @@ import config
         "workers = 1\nimport operator\n(update := operator.attrgetter('update')(globals()))({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\nsetter = partial(globals().__setitem__, 'workers')\nsetter(4)\n",
         "workers = 1\nfrom functools import partial\n(setter := partial(globals().__setitem__, 'workers'))\nsetter(4)\n",
+        "workers = 1\n__builtins__['exec']('workers = 4')\n",
+        "workers = 1\ngetattr(__builtins__, 'exec')('workers = 4')\n",
+        "workers = 1\nimport sys\ngetattr(sys.modules[__name__], '__setattr__')('workers', 4)\n",
+        "workers = 1\nfrom functools import partial\n(p := partial(globals().update, {'workers': 4}))()\n",
+        "workers = 1\nfrom functools import partial\np = partial(globals().update, {'workers': 4})\np()\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda g, _: g.update({'workers': 4}) or g, [None], globals())\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):

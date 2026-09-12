@@ -503,6 +503,15 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     return _update_payload_may_set_workers(call)
 
 
+def _call_is_mapping_update_workers(call):
+    """Return True when any ``.update(...)`` payload may assign ``workers``."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+        return False
+    return _update_payload_may_set_workers(call)
+
+
 def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     """Return True when module namespace ``__ior__`` may change workers."""
     if not isinstance(call, ast.Call):
@@ -1018,10 +1027,17 @@ def _collect_definite_exec_eval_shadow_lines(tree):
     return shadows
 
 
+def _is_builtins_reference(node):
+    """Return True for the interpreter-provided ``__builtins__`` mapping."""
+    return isinstance(node, ast.Name) and node.id == "__builtins__"
+
+
 def _is_known_builtins_module(node, builtins_aliases):
     """Return True when an expression is known to resolve to ``builtins``."""
-    return _is_builtins_import(node) or (
-        isinstance(node, ast.Name) and node.id in builtins_aliases
+    return (
+        _is_builtins_import(node)
+        or _is_builtins_reference(node)
+        or (isinstance(node, ast.Name) and node.id in builtins_aliases)
     )
 
 
@@ -1047,6 +1063,11 @@ def _subscript_is_dynamic_exec_eval(func, builtins_aliases):
     if not isinstance(func, ast.Subscript):
         return False
     base = _subscript_base_node(func)
+    if (
+        _is_known_builtins_module(base, builtins_aliases)
+        and _constant_is_exec_eval(func.slice)
+    ):
+        return True
     return (
         isinstance(base, ast.Attribute)
         and base.attr == "__dict__"
@@ -1116,6 +1137,15 @@ def _attribute_is_namespace_setitem(node, namespace_aliases=None):
     return (
         isinstance(node, ast.Attribute)
         and node.attr == "__setitem__"
+        and _is_module_namespace_mapping(node.value, namespace_aliases)
+    )
+
+
+def _attribute_is_namespace_update(node, namespace_aliases=None):
+    """Return True for a module namespace ``update`` method."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "update"
         and _is_module_namespace_mapping(node.value, namespace_aliases)
     )
 
@@ -1234,6 +1264,13 @@ def _partial_factory_call(node, partial_aliases):
     return candidate
 
 
+def _partial_payload_may_set_workers(node):
+    """Return True when a partial-bound payload may assign ``workers``."""
+    if isinstance(node, ast.Dict):
+        return _dict_literal_sets_workers(node)
+    return True
+
+
 def _partial_value_is_workers_setter(
     value,
     namespace_aliases,
@@ -1244,11 +1281,16 @@ def _partial_value_is_workers_setter(
     if isinstance(value, ast.Name):
         return value.id in known_aliases
     partial_call = _partial_factory_call(value, partial_aliases)
-    return (
-        partial_call is not None
-        and len(partial_call.args) >= 2
-        and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
+    if partial_call is None or len(partial_call.args) < 2:
+        return False
+    if (
+        _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
         and _constant_is_workers(partial_call.args[1])
+    ):
+        return True
+    return (
+        _attribute_is_namespace_update(partial_call.args[0], namespace_aliases)
+        and _partial_payload_may_set_workers(partial_call.args[1])
     )
 
 
@@ -1312,15 +1354,21 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     partial_call = _partial_factory_call(call.func, partial_aliases)
     if partial_call is None or len(partial_call.args) < 2:
         return False
-    if not _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases):
-        return False
-    return _constant_is_workers(partial_call.args[1])
+    if (
+        _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
+        and _constant_is_workers(partial_call.args[1])
+    ):
+        return True
+    return (
+        _attribute_is_namespace_update(partial_call.args[0], namespace_aliases)
+        and _partial_payload_may_set_workers(partial_call.args[1])
+    )
 
 
 def _expression_mutates_workers(expr, operator_bindings):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
-        return False
+        return _lambda_mutates_workers(expr, operator_bindings)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
@@ -1344,6 +1392,7 @@ def _expression_mutates_workers(expr, operator_bindings):
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
+        or _call_is_mapping_update_workers(expr)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -1413,8 +1462,28 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     )
 
 
+def _call_is_getattr_bound_module_setattr_workers(call):
+    """Return True for ``getattr(module, '__setattr__')('workers', ...)`` calls."""
+    if not isinstance(call, ast.Call) or len(call.args) < 1:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call):
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    if len(func.args) < 2 or not _is_current_module_reference(func.args[0]):
+        return False
+    setattr_key = func.args[1]
+    if not isinstance(setattr_key, ast.Constant) or setattr_key.value != "__setattr__":
+        return False
+    worker_key = call.args[0]
+    return isinstance(worker_key, ast.Constant) and worker_key.value == "workers"
+
+
 def _call_sets_workers_attribute(call):
     """Return True for setattr/object.__setattr__ calls that bind ``workers``."""
+    if _call_is_getattr_bound_module_setattr_workers(call):
+        return True
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
     key = call.args[1]
