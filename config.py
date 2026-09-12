@@ -423,8 +423,10 @@ def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
     return False
 
 
-def _is_current_module_reference(node):
+def _is_current_module_reference(node, sys_aliases=None):
     """Return True for expressions that resolve to this config module."""
+    if sys_aliases is None:
+        sys_aliases = {"sys"}
     if not isinstance(node, ast.Subscript):
         return False
     if not isinstance(node.slice, ast.Name) or node.slice.id != "__name__":
@@ -433,7 +435,7 @@ def _is_current_module_reference(node):
     if not isinstance(modules, ast.Attribute) or modules.attr != "modules":
         return False
     root = modules.value
-    if isinstance(root, ast.Name) and root.id == "sys":
+    if isinstance(root, ast.Name) and root.id in sys_aliases:
         return True
     return (
         isinstance(root, ast.Call)
@@ -503,23 +505,37 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     return _update_payload_may_set_workers(call)
 
 
-def _call_is_attribute_instance_update_workers(call):
+def _call_is_attribute_instance_update_workers(call, shadowed_names=None):
     """Return True for instance ``mapping.update({...})`` with a workers payload."""
     if not isinstance(call, ast.Call):
         return False
     if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
         return False
-    if isinstance(call.func.value, ast.Name) and call.func.value.id == "dict":
+    if shadowed_names is None:
+        shadowed_names = set()
+    receiver = call.func.value
+    if (
+        isinstance(receiver, ast.Name)
+        and receiver.id == "dict"
+        and receiver.id not in shadowed_names
+    ):
         return False
     return _update_payload_may_set_workers(call)
 
 
-def _expression_has_risky_instance_update(expr):
+def _expression_has_risky_instance_update(expr, shadowed_names=None):
     """Return True when an expression calls instance ``.update()`` with workers."""
-    if isinstance(expr, ast.Call) and _call_is_attribute_instance_update_workers(expr):
+    if shadowed_names is None:
+        shadowed_names = set()
+    if isinstance(expr, ast.Lambda):
+        return False
+    if isinstance(expr, ast.Call) and _call_is_attribute_instance_update_workers(
+        expr,
+        shadowed_names,
+    ):
         return True
     return any(
-        _expression_has_risky_instance_update(child)
+        _expression_has_risky_instance_update(child, shadowed_names)
         for child in ast.iter_child_nodes(expr)
     )
 
@@ -917,6 +933,7 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
 
 _NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
 _DYNAMIC_EXEC_EVAL_NAMES = frozenset({"exec", "eval"})
+_BUILTINS_SHADOW_MARKER = "__builtins_shadowed__"
 
 
 def _unpack_operator_bindings(operator_bindings):
@@ -1006,6 +1023,19 @@ def _collect_builtins_exec_eval_aliases(statements):
     return aliases
 
 
+def _collect_definite_builtins_shadow_line(tree):
+    """Return the first unconditional module-level assignment to ``__builtins__``."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if any(
+            name == "__builtins__"
+            for name, _value in _namespace_assignment_values(node)
+        ):
+            return getattr(node, "lineno", None)
+    return None
+
+
 def _collect_builtins_aliases(tree):
     """Collect names that can resolve to the builtins module at import time."""
     assignments = {}
@@ -1025,6 +1055,9 @@ def _collect_builtins_aliases(tree):
             break
         aliases.update(discovered)
         unresolved.difference_update(discovered)
+    shadow_line = _collect_definite_builtins_shadow_line(tree)
+    if shadow_line is not None:
+        aliases.add((_BUILTINS_SHADOW_MARKER, shadow_line))
     return aliases
 
 
@@ -1039,16 +1072,30 @@ def _collect_definite_exec_eval_shadow_lines(tree):
     return shadows
 
 
-def _is_builtins_reference(node):
+def _is_builtins_reference(node, builtins_aliases=None):
     """Return True for the interpreter-provided ``__builtins__`` mapping."""
-    return isinstance(node, ast.Name) and node.id == "__builtins__"
+    if not isinstance(node, ast.Name) or node.id != "__builtins__":
+        return False
+    if not builtins_aliases:
+        return True
+    shadow_lines = [
+        alias[1]
+        for alias in builtins_aliases
+        if isinstance(alias, tuple)
+        and len(alias) == 2
+        and alias[0] == _BUILTINS_SHADOW_MARKER
+    ]
+    if not shadow_lines:
+        return True
+    node_line = getattr(node, "lineno", 0)
+    return not node_line or node_line <= min(shadow_lines)
 
 
 def _is_known_builtins_module(node, builtins_aliases):
     """Return True when an expression is known to resolve to ``builtins``."""
     return (
         _is_builtins_import(node)
-        or _is_builtins_reference(node)
+        or _is_builtins_reference(node, builtins_aliases)
         or (isinstance(node, ast.Name) and node.id in builtins_aliases)
     )
 
@@ -1276,13 +1323,6 @@ def _partial_factory_call(node, partial_aliases):
     return candidate
 
 
-def _partial_payload_may_set_workers(node):
-    """Return True when a partial-bound payload may assign ``workers``."""
-    if isinstance(node, ast.Dict):
-        return _dict_literal_sets_workers(node)
-    return True
-
-
 def _partial_value_is_workers_setter(
     value,
     namespace_aliases,
@@ -1293,16 +1333,17 @@ def _partial_value_is_workers_setter(
     if isinstance(value, ast.Name):
         return value.id in known_aliases
     partial_call = _partial_factory_call(value, partial_aliases)
-    if partial_call is None or len(partial_call.args) < 2:
+    if partial_call is None or not partial_call.args:
         return False
     if (
-        _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
+        len(partial_call.args) >= 2
+        and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
         and _constant_is_workers(partial_call.args[1])
     ):
         return True
     return (
         _attribute_is_namespace_update(partial_call.args[0], namespace_aliases)
-        and _partial_payload_may_set_workers(partial_call.args[1])
+        and _update_payload_may_set_workers(partial_call, start_index=1)
     )
 
 
@@ -1364,23 +1405,47 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     if isinstance(call.func, ast.Name) and call.func.id in saved_aliases:
         return True
     partial_call = _partial_factory_call(call.func, partial_aliases)
-    if partial_call is None or len(partial_call.args) < 2:
+    if partial_call is None or not partial_call.args:
         return False
     if (
-        _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
+        len(partial_call.args) >= 2
+        and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
         and _constant_is_workers(partial_call.args[1])
     ):
         return True
     return (
         _attribute_is_namespace_update(partial_call.args[0], namespace_aliases)
-        and _partial_payload_may_set_workers(partial_call.args[1])
+        and _update_payload_may_set_workers(partial_call, start_index=1)
     )
+
+
+def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
+    """Return True when a known ``functools.reduce`` invocation runs a risky lambda."""
+    if (
+        not isinstance(call, ast.Call)
+        or not call.args
+        or not isinstance(call.args[0], ast.Lambda)
+    ):
+        return False
+    functools_aliases = operator_bindings[14] if len(operator_bindings) > 14 else set()
+    reduce_aliases = operator_bindings[15] if len(operator_bindings) > 15 else set()
+    func = call.func
+    if isinstance(func, ast.Name):
+        is_reduce = func.id in reduce_aliases
+    else:
+        is_reduce = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "reduce"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in functools_aliases
+        )
+    return is_reduce and _lambda_mutates_workers(call.args[0], operator_bindings)
 
 
 def _expression_mutates_workers(expr, operator_bindings):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
-        return _lambda_mutates_workers(expr, operator_bindings)
+        return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
@@ -1404,6 +1469,7 @@ def _expression_mutates_workers(expr, operator_bindings):
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
+        or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
     ):
         return True
@@ -1413,11 +1479,28 @@ def _expression_mutates_workers(expr, operator_bindings):
     )
 
 
+def _lambda_bound_names(lambda_node):
+    """Return parameter names that shadow globals inside a lambda body."""
+    args = lambda_node.args
+    names = {
+        arg.arg
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+    }
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    return names
+
+
 def _lambda_mutates_workers(lambda_node, operator_bindings):
     """Return True when an invoked lambda body mutates ``workers`` indirectly."""
     if not isinstance(lambda_node, ast.Lambda):
         return False
-    if _expression_has_risky_instance_update(lambda_node.body):
+    if _expression_has_risky_instance_update(
+        lambda_node.body,
+        _lambda_bound_names(lambda_node),
+    ):
         return True
     return _expression_mutates_workers(lambda_node.body, operator_bindings)
 
@@ -1448,11 +1531,12 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
+    sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else {"sys"}
     if (
         _call_sets_workers_via_setitem(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
-        or _call_sets_workers_attribute(call)
+        or _call_sets_workers_attribute(call, sys_aliases)
         or _call_is_dict_type_update_on_module_namespace(
             call,
             namespace_aliases,
@@ -1475,7 +1559,7 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     )
 
 
-def _call_is_getattr_bound_module_setattr_workers(call):
+def _call_is_getattr_bound_module_setattr_workers(call, sys_aliases=None):
     """Return True for ``getattr(module, '__setattr__')('workers', ...)`` calls."""
     if not isinstance(call, ast.Call) or len(call.args) < 1:
         return False
@@ -1484,7 +1568,10 @@ def _call_is_getattr_bound_module_setattr_workers(call):
         return False
     if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
         return False
-    if len(func.args) < 2 or not _is_current_module_reference(func.args[0]):
+    if len(func.args) < 2 or not _is_current_module_reference(
+        func.args[0],
+        sys_aliases,
+    ):
         return False
     setattr_key = func.args[1]
     if not isinstance(setattr_key, ast.Constant) or setattr_key.value != "__setattr__":
@@ -1493,9 +1580,9 @@ def _call_is_getattr_bound_module_setattr_workers(call):
     return isinstance(worker_key, ast.Constant) and worker_key.value == "workers"
 
 
-def _call_sets_workers_attribute(call):
+def _call_sets_workers_attribute(call, sys_aliases=None):
     """Return True for setattr/object.__setattr__ calls that bind ``workers``."""
-    if _call_is_getattr_bound_module_setattr_workers(call):
+    if _call_is_getattr_bound_module_setattr_workers(call, sys_aliases):
         return True
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
@@ -1829,6 +1916,43 @@ def _collect_operator_bindings_from_statements(
             )
 
 
+def _collect_sys_import_aliases(statements):
+    """Collect names introduced by ``import sys`` statements."""
+    aliases = {"sys"}
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == "sys":
+                    aliases.add(imported.asname or imported.name)
+        for block in _compound_statement_blocks(node):
+            aliases.update(_collect_sys_import_aliases(block))
+    return aliases
+
+
+def _collect_functools_reduce_aliases(statements):
+    """Collect module and direct aliases that prove a ``functools.reduce`` call."""
+    module_aliases = set()
+    reduce_aliases = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == "functools":
+                    module_aliases.add(imported.asname or imported.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "functools":
+            for imported in node.names:
+                if imported.name == "reduce":
+                    reduce_aliases.add(imported.asname or imported.name)
+        for block in _compound_statement_blocks(node):
+            nested_modules, nested_reduce = _collect_functools_reduce_aliases(block)
+            module_aliases.update(nested_modules)
+            reduce_aliases.update(nested_reduce)
+    return module_aliases, reduce_aliases
+
+
 def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
@@ -1857,6 +1981,8 @@ def _collect_operator_setitem_bindings(tree):
         namespace_aliases,
         partial_aliases,
     )
+    sys_aliases = _collect_sys_import_aliases(tree.body)
+    functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
     return (
         module_aliases,
         setitem_aliases,
@@ -1871,6 +1997,9 @@ def _collect_operator_setitem_bindings(tree):
         direct_exec_eval_aliases,
         attrgetter_aliases,
         partial_workers_setter_aliases,
+        sys_aliases,
+        functools_aliases,
+        reduce_aliases,
     )
 
 
