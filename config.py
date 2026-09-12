@@ -300,22 +300,48 @@ def _static_int_from_ast(node):
     return None
 
 
+def _gunicorn_config_path_candidates(config_path: str) -> list[Path]:
+    """Filesystem locations Gunicorn may load for a PATH or file:PATH spec."""
+    spec = config_path.strip()
+    if spec.startswith("file:"):
+        spec = spec[5:]
+    if not spec or spec.startswith("python:"):
+        return []
+    try:
+        candidate = Path(spec)
+    except (OSError, RuntimeError, ValueError):
+        return []
+    search = []
+    if candidate.is_absolute():
+        search.append(candidate)
+    else:
+        try:
+            search.append(Path.cwd() / candidate)
+        except (OSError, RuntimeError):
+            pass
+        search.append(_PROJECT_ROOT / candidate)
+    resolved = []
+    seen = set()
+    for path in search:
+        try:
+            full = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        resolved.append(full)
+    return resolved
+
+
 def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
     """Return the exact Gunicorn config path when it resolves to a regular file."""
     if not config_path or "\0" in config_path:
         return None
-    try:
-        candidate = Path(config_path)
-        resolved = (
-            (_PROJECT_ROOT / candidate).resolve()
-            if not candidate.is_absolute()
-            else candidate.resolve()
-        )
-    except (OSError, RuntimeError):
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
+    for resolved in _gunicorn_config_path_candidates(config_path):
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def _target_assigns_workers(node):
@@ -2130,13 +2156,21 @@ def _scan_gunicorn_config_workers(tree):
 def _gunicorn_config_worker_details_from_path(
     config_path: str,
 ) -> tuple[int | None, bool, bool]:
-    """Return worker details while preserving an omitted workers setting."""
+    """Return worker details while preserving an omitted workers setting.
+
+    Explicit ``--config`` values that cannot be inspected (``python:MODULE``,
+    missing ``file:PATH``, unreadable files) are treated as dynamic so
+    ``memory://`` cannot silently pair with a multi-worker Gunicorn process.
+    """
+    spec = (config_path or "").strip()
+    if spec.startswith("python:"):
+        return None, True, True
     path = _resolve_gunicorn_config_path(config_path)
     if path is None:
-        return None, False, False
+        return None, True, True
     tree = _parse_gunicorn_config_tree(path)
     if tree is None:
-        return None, False, False
+        return None, True, True
     return _scan_gunicorn_config_worker_details(tree)
 
 

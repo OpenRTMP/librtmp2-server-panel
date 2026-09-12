@@ -155,3 +155,56 @@ def test_post_chdir_prefers_verified_launch_pwd_config(
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
     assert config_module._detect_worker_settings() == (4, False)
+
+
+def test_python_config_uri_fails_closed(monkeypatch, config_module):
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "-c", "python:myconf", "app:app"])
+
+    assert config_module._detect_worker_settings() == (1, True)
+
+
+def test_missing_explicit_config_fails_closed(monkeypatch, tmp_path, config_module):
+    missing = tmp_path / "does-not-exist.py"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(missing), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (1, True)
+
+
+def test_file_uri_config_is_inspected(monkeypatch, tmp_path, config_module):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 5\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", f"file:{config_file}", "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (5, False)
+
+
+def test_cwd_relative_explicit_config_is_inspected(
+    monkeypatch, tmp_path, config_module
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers = 7\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", "gunicorn.conf.py", "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (7, False)
+
+
+def test_python_config_uri_rejects_memory_ratelimit(monkeypatch, config_module):
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "-c", "python:myconf", "app:app"])
+
+    error = config_module._ratelimit_storage_error()
+    assert error is not None
+    assert "memory://" in error
