@@ -1893,46 +1893,70 @@ def _comprehension_param_namespace_mutation(node, param_name):
     return _lambda_param_namespace_mutation(node.elt, param_name)
 
 
+def _attribute_call_mutates_lambda_param(call, param_name):
+    """Return True when an attribute call mutates the lambda parameter."""
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == param_name
+    ):
+        return False
+    if func.attr == "update":
+        return _update_payload_may_set_workers(call)
+    if func.attr in {"__ior__", "ior"}:
+        return bool(call.args) and _dict_merge_payload_may_set_workers(
+            call.args[0]
+        )
+    if func.attr == "__setitem__" and call.args:
+        return _key_may_be_workers(call.args[0])
+    return False
+
+
+def _invoked_lambda_param_namespace_mutation(call, param_name):
+    """Inspect an immediately invoked lambda without crossing shadowed scope."""
+    func = call.func
+    if not isinstance(func, ast.Lambda):
+        return False
+    if any(
+        _lambda_param_namespace_mutation(arg, param_name)
+        for arg in call.args
+    ):
+        return True
+    if any(
+        _lambda_param_namespace_mutation(keyword.value, param_name)
+        for keyword in call.keywords
+    ):
+        return True
+    if param_name in _lambda_bound_names(func):
+        return False
+    return _lambda_param_namespace_mutation(func.body, param_name)
+
+
+def _call_mutates_lambda_param_namespace(call, param_name):
+    """Return True when one call can mutate the tracked lambda parameter."""
+    return _attribute_call_mutates_lambda_param(
+        call,
+        param_name,
+    ) or _invoked_lambda_param_namespace_mutation(call, param_name)
+
+
 def _lambda_param_namespace_mutation(body, param_name):
     """Return True when a lambda body mutates ``param_name`` with a workers payload."""
     if isinstance(body, ast.Lambda):
         return False
     if isinstance(body, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
         return _comprehension_param_namespace_mutation(body, param_name)
-    if isinstance(body, ast.Call):
-        func = body.func
-        if (
-            isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
-            and func.value.id == param_name
-        ):
-            if func.attr == "update":
-                return _update_payload_may_set_workers(body)
-            if func.attr in {"__ior__", "ior"}:
-                return bool(body.args) and _dict_merge_payload_may_set_workers(
-                    body.args[0]
-                )
-            if func.attr == "__setitem__" and body.args:
-                return _key_may_be_workers(body.args[0])
-        if isinstance(func, ast.Lambda):
-            if any(
-                _lambda_param_namespace_mutation(arg, param_name)
-                for arg in body.args
-            ) or any(
-                _lambda_param_namespace_mutation(keyword.value, param_name)
-                for keyword in body.keywords
-            ):
-                return True
-            if param_name in _lambda_bound_names(func):
-                return False
-            return _lambda_param_namespace_mutation(func.body, param_name)
+    if isinstance(body, ast.Call) and _call_mutates_lambda_param_namespace(
+        body,
+        param_name,
+    ):
+        return True
     return any(
         _lambda_param_namespace_mutation(child, param_name)
         for child in ast.iter_child_nodes(body)
         if isinstance(child, ast.AST) and not isinstance(child, ast.Lambda)
     )
-
-
 
 def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
     """Return True when a known ``functools.reduce`` invocation runs a risky lambda."""
