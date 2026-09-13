@@ -1,0 +1,92 @@
+name: Fix Sonar PR 207
+
+on:
+  push:
+    branches:
+      - fix/ci-unrelated-mapping-update-false-positive
+    paths:
+      - .github/workflows/fix-sonar-pr-207.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Refactor importlib alias collection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("config.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''def _collect_importlib_import_module_aliases(statements):
+              """Collect names introduced by ``from importlib import import_module``."""
+              aliases = set()
+              for node in statements:
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                      continue
+                  if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+                      for imported in node.names:
+                          if imported.name == "import_module":
+                              aliases.add(imported.asname or imported.name)
+                  for block in _compound_statement_blocks(node):
+                      aliases.update(_collect_importlib_import_module_aliases(block))
+              return aliases
+          '''
+          new = '''def _importlib_import_module_aliases(node):
+              """Return import_module names imported from importlib by one statement."""
+              if not isinstance(node, ast.ImportFrom) or node.module != "importlib":
+                  return set()
+              return {
+                  imported.asname or imported.name
+                  for imported in node.names
+                  if imported.name == "import_module"
+              }
+
+
+          def _collect_importlib_import_module_aliases(statements):
+              """Collect names introduced by ``from importlib import import_module``."""
+              aliases = set()
+              for node in statements:
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                      continue
+                  aliases.update(_importlib_import_module_aliases(node))
+                  for block in _compound_statement_blocks(node):
+                      aliases.update(_collect_importlib_import_module_aliases(block))
+              return aliases
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"Expected exactly one target block, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        run: "pip install --only-binary=:all: Flask==3.1.3 gunicorn==26.0.0 requests==2.34.2 Flask-WTF==1.3.0 'Flask-Limiter[redis]==4.1.1' pytest==9.1.1"
+
+      - name: Validate syntax and tests
+        env:
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+          LRTMP2_API_TOKEN: test-api-token-for-ci-only
+        run: |
+          python -m py_compile config.py
+          python -m pytest -q --tb=short -m "not integration"
+
+      - name: Commit fix and remove temporary workflow
+        run: |
+          rm .github/workflows/fix-sonar-pr-207.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config.py .github/workflows/fix-sonar-pr-207.yml
+          git commit -m "refactor: reduce importlib alias scan complexity"
+          git push origin HEAD:${GITHUB_REF_NAME}
