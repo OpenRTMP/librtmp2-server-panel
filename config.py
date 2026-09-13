@@ -523,6 +523,87 @@ def _call_is_attribute_instance_update_workers(call, shadowed_names=None):
     return _update_payload_may_set_workers(call)
 
 
+def _expression_is_namespace_update_reference(expr, namespace_aliases=None):
+    """Return True for expressions that reference ``globals().update`` or an alias."""
+    if isinstance(expr, ast.Attribute) and expr.attr == "update":
+        return _is_module_namespace_mapping(expr.value, namespace_aliases)
+    return False
+
+
+def _simple_namespace_call_delegates_update(call, namespace_aliases=None):
+    """Return True when ``SimpleNamespace(update=globals().update)`` is constructed."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Name) or call.func.id != "SimpleNamespace":
+        return False
+    return any(
+        keyword.arg == "update"
+        and _expression_is_namespace_update_reference(keyword.value, namespace_aliases)
+        for keyword in call.keywords
+    )
+
+
+def _collect_delegated_update_namespace_aliases(tree, namespace_aliases):
+    """Collect names bound to ``SimpleNamespace(update=globals().update)``."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    for name, values in assignments.items():
+        for value in values:
+            if value is not None and _simple_namespace_call_delegates_update(
+                value,
+                namespace_aliases,
+            ):
+                aliases.add(name)
+                break
+    return aliases
+
+
+def _chainmap_call_includes_namespace(chainmap_call, namespace_aliases=None):
+    """Return True when a ``ChainMap`` call includes the module namespace."""
+    if not isinstance(chainmap_call, ast.Call):
+        return False
+    if not isinstance(chainmap_call.func, ast.Name) or chainmap_call.func.id != "ChainMap":
+        return False
+    return any(
+        _is_module_namespace_mapping(arg, namespace_aliases) for arg in chainmap_call.args
+    )
+
+
+def _call_is_chainmap_maps_update(call, namespace_aliases=None):
+    """Return True for ``ChainMap(..., globals()).maps[i].update(...)`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Subscript):
+        return False
+    maps_attr = receiver.value
+    if not isinstance(maps_attr, ast.Attribute) or maps_attr.attr != "maps":
+        return False
+    if not _chainmap_call_includes_namespace(maps_attr.value, namespace_aliases):
+        return False
+    return _update_payload_may_set_workers(call)
+
+
+def _call_is_delegated_simplenamespace_update(
+    call,
+    delegated_update_aliases=None,
+):
+    """Return True for ``ns.update(...)`` when ``ns`` delegates to ``globals().update``."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    if receiver.id not in (delegated_update_aliases or set()):
+        return False
+    return _update_payload_may_set_workers(call)
+
+
 def _expression_has_risky_instance_update(expr, shadowed_names=None):
     """Return True when an expression calls instance ``.update()`` with workers."""
     if shadowed_names is None:
@@ -1678,9 +1759,12 @@ def _expression_mutates_workers(expr, operator_bindings):
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
+        or _call_is_chainmap_maps_update(expr, namespace_aliases)
+        or _call_is_delegated_simplenamespace_update(
+            expr,
+            operator_bindings[17] if len(operator_bindings) > 17 else set(),
+        )
     ):
-        return True
-    if _expression_has_risky_instance_update(expr):
         return True
     return any(
         _expression_mutates_workers(child, operator_bindings)
@@ -2205,6 +2289,10 @@ def _collect_operator_setitem_bindings(tree):
     )
     sys_aliases = _collect_sys_import_aliases(tree.body)
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
+    delegated_update_aliases = _collect_delegated_update_namespace_aliases(
+        tree,
+        namespace_aliases,
+    )
     return (
         module_aliases,
         setitem_aliases,
@@ -2223,6 +2311,7 @@ def _collect_operator_setitem_bindings(tree):
         functools_aliases,
         reduce_aliases,
         importlib_aliases,
+        delegated_update_aliases,
     )
 
 
