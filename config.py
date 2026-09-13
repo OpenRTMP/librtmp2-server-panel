@@ -300,22 +300,52 @@ def _static_int_from_ast(node):
     return None
 
 
+def _gunicorn_config_path_candidates(config_path: str) -> list[Path]:
+    """Filesystem locations Gunicorn may load for a PATH or file:PATH spec."""
+    spec = config_path.strip()
+    if spec.startswith("file:"):
+        spec = spec[5:]
+    if not spec or spec.startswith("python:"):
+        return []
+    try:
+        candidate = Path(spec)
+    except (OSError, RuntimeError, ValueError):
+        return []
+    search = []
+    if candidate.is_absolute():
+        search.append(candidate)
+    else:
+        # Relative -c/--config is resolved at launch, before Gunicorn chdir.
+        # Reuse the implicit-config lookup; if that cannot identify the loaded
+        # file, return no candidates so the scanner fails closed.
+        search.extend(
+            _gunicorn_relative_config_paths(
+                candidate, fail_closed_if_ambiguous=True
+            )
+        )
+    resolved = []
+    seen = set()
+    for path in search:
+        try:
+            full = path.resolve()
+        except (OSError, RuntimeError):
+            # Broken symlink or inaccessible path; try the next candidate.
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        resolved.append(full)
+    return resolved
+
+
 def _resolve_gunicorn_config_path(config_path: str) -> Path | None:
     """Return the exact Gunicorn config path when it resolves to a regular file."""
     if not config_path or "\0" in config_path:
         return None
-    try:
-        candidate = Path(config_path)
-        resolved = (
-            (_PROJECT_ROOT / candidate).resolve()
-            if not candidate.is_absolute()
-            else candidate.resolve()
-        )
-    except (OSError, RuntimeError):
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
+    for resolved in _gunicorn_config_path_candidates(config_path):
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def _target_assigns_workers(node):
@@ -2130,13 +2160,21 @@ def _scan_gunicorn_config_workers(tree):
 def _gunicorn_config_worker_details_from_path(
     config_path: str,
 ) -> tuple[int | None, bool, bool]:
-    """Return worker details while preserving an omitted workers setting."""
+    """Return worker details while preserving an omitted workers setting.
+
+    Explicit ``--config`` values that cannot be inspected (``python:MODULE``,
+    missing ``file:PATH``, unreadable files) are treated as dynamic so
+    ``memory://`` cannot silently pair with a multi-worker Gunicorn process.
+    """
+    spec = (config_path or "").strip()
+    if spec.startswith("python:"):
+        return None, True, True
     path = _resolve_gunicorn_config_path(config_path)
     if path is None:
-        return None, False, False
+        return None, True, True
     tree = _parse_gunicorn_config_tree(path)
     if tree is None:
-        return None, False, False
+        return None, True, True
     return _scan_gunicorn_config_worker_details(tree)
 
 
@@ -2233,20 +2271,23 @@ def _gunicorn_config_chdir_matches(config_path: Path, cwd: Path) -> bool:
         return False
 
 
-def _default_gunicorn_config_paths() -> list[Path]:
-    """Return the implicit config, accepting PWD only when chdir proves it."""
+def _gunicorn_relative_config_paths(
+    relative: Path, *, fail_closed_if_ambiguous: bool = False
+) -> list[Path]:
+    """Locate a relative Gunicorn config using launch-directory chdir rules."""
     directories = _gunicorn_launch_directories()
     if not directories:
         return []
     cwd = directories[0]
     try:
-        cwd_config = (cwd / "gunicorn.conf.py").resolve()
+        cwd_config = (cwd / relative).resolve()
     except (OSError, RuntimeError):
         cwd_config = None
 
+    pwd_config = None
     if len(directories) > 1:
         try:
-            pwd_config = (directories[1] / "gunicorn.conf.py").resolve()
+            pwd_config = (directories[1] / relative).resolve()
         except (OSError, RuntimeError):
             pwd_config = None
         if (
@@ -2256,9 +2297,22 @@ def _default_gunicorn_config_paths() -> list[Path]:
         ):
             return [pwd_config]
 
-    if cwd_config is not None and cwd_config.is_file():
+    cwd_exists = cwd_config is not None and cwd_config.is_file()
+    pwd_exists = (
+        pwd_config is not None
+        and pwd_config.is_file()
+        and pwd_config != cwd_config
+    )
+    if fail_closed_if_ambiguous and cwd_exists and pwd_exists:
+        return []
+    if cwd_exists:
         return [cwd_config]
     return []
+
+
+def _default_gunicorn_config_paths() -> list[Path]:
+    """Return the implicit config, accepting PWD only when chdir proves it."""
+    return _gunicorn_relative_config_paths(Path("gunicorn.conf.py"))
 
 
 def _workers_from_gunicorn_config_flag(tokens: list[str]) -> tuple[int, bool]:
