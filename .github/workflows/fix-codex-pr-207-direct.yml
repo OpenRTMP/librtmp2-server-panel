@@ -1,0 +1,130 @@
+name: Fix Codex PR 207 Direct
+
+on:
+  push:
+    branches:
+      - fix/ci-unrelated-mapping-update-false-positive
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Apply fixes
+        run: python .github/scripts/apply_pr207_codex_fixes.py
+
+      - name: Add regression tests
+        run: |
+          cat > tests/test_codex_pr207_regressions.py <<'PYTEST'
+          import pytest
+
+          import config
+
+
+          @pytest.mark.parametrize(
+              ("config_content", "expected"),
+              [
+                  (
+                      "workers = 1\n"
+                      "from collections import ChainMap\n"
+                      "ChainMap({}, globals()).maps[0].update({'workers': 4})\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "from types import SimpleNamespace\n"
+                      "ns = SimpleNamespace(update=globals().update)\n"
+                      "ns = SimpleNamespace(update={}.update)\n"
+                      "ns.update({'workers': 4})\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "class dict:\n"
+                      "    @staticmethod\n"
+                      "    def __setitem__(*args):\n"
+                      "        return None\n"
+                      "dict.__setitem__(globals(), 'workers', 4)\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "from importlib import import_module\n"
+                      "import_module = lambda name: None\n"
+                      "import_module('builtins').exec('workers = 4')\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "from functools import reduce\n"
+                      "reduce(lambda g, _: g.__ior__({'workers': 4}), [None], initial=globals())\n",
+                      (1, True),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "import builtins\n"
+                      "types_exec = builtins.exec\n"
+                      "types_exec('workers = 4')\n"
+                      "types_exec = lambda code: None\n",
+                      (1, True),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "from functools import reduce\n"
+                      "reduce(lambda g, _: (lambda g: g.update({'workers': 4}))({}) or g, [None], globals())\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "import builtins\n"
+                      "types_exec = builtins.exec\n"
+                      "types_exec = lambda code: None\n"
+                      "types_exec('workers = 4')\n",
+                      (1, False),
+                  ),
+                  (
+                      "workers = 1\n"
+                      "(lambda g: g.update({'workers': 4}))(globals())\n",
+                      (1, True),
+                  ),
+              ],
+          )
+          def test_codex_pr207_regressions(tmp_path, config_content, expected):
+              config_file = tmp_path / "gunicorn.conf.py"
+              config_file.write_text(config_content, encoding="utf-8")
+              assert config._workers_from_gunicorn_config_path(str(config_file)) == expected
+          PYTEST
+
+      - name: Install test dependencies
+        run: "pip install --only-binary=:all: Flask==3.1.3 gunicorn==26.0.0 requests==2.34.2 Flask-WTF==1.3.0 'Flask-Limiter[redis]==4.1.1' pytest==9.1.1"
+
+      - name: Validate syntax and tests
+        env:
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+          LRTMP2_API_TOKEN: test-api-token-for-ci-only
+        run: |
+          python -m py_compile config.py tests/test_codex_pr207_regressions.py
+          python -m pytest -q --tb=short -m "not integration"
+
+      - name: Commit fixes and remove temporary files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/scripts/apply_pr207_codex_fixes.py
+          git rm .github/workflows/fix-codex-pr-207.yml
+          git rm .github/workflows/fix-codex-pr-207-retry.yml
+          git rm .github/workflows/fix-codex-pr-207-direct.yml
+          git add config.py tests/test_codex_pr207_regressions.py
+          git commit -m "fix: address Codex findings in gunicorn worker scan"
+          git push
