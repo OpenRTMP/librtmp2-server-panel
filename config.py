@@ -1343,16 +1343,24 @@ def _direct_name_is_builtin_exec_eval(
     return shadow_line is None or not call_line or shadow_line > call_line
 
 
+def _importlib_import_module_aliases(node):
+    """Return import_module names imported from importlib by one statement."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "importlib":
+        return set()
+    return {
+        imported.asname or imported.name
+        for imported in node.names
+        if imported.name == "import_module"
+    }
+
+
 def _collect_importlib_import_module_aliases(statements):
     """Collect names introduced by ``from importlib import import_module``."""
     aliases = set()
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
-            for imported in node.names:
-                if imported.name == "import_module":
-                    aliases.add(imported.asname or imported.name)
+        aliases.update(_importlib_import_module_aliases(node))
         for block in _compound_statement_blocks(node):
             aliases.update(_collect_importlib_import_module_aliases(block))
     return aliases
