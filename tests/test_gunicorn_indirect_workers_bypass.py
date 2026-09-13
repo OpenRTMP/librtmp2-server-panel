@@ -51,6 +51,15 @@ import config
         "workers = 1\nfrom functools import partial\npayload = {'workers': 4}\npartial(globals().update, **payload)()\n",
         "workers = 1\n(lambda dict: dict.update({'workers': 4}))(globals())\n",
         "workers = 1\nfrom functools import reduce\nreduce(lambda g, _: g.update({'workers': 4}) or g, [None], globals())\n",
+        "workers = 1\nimport builtins\ntypes_exec = getattr(builtins, 'exec')\ntypes_exec('workers = 4')\n",
+        "workers = 1\nimport operator\noperator.methodcaller('exec', 'workers = 4')(__import__('builtins'))\n",
+        "workers = 1\ngetattr(__import__('operator'), 'methodcaller')('exec', 'workers = 4')(__import__('builtins'))\n",
+        "workers = 1\nfrom importlib import import_module\nimport_module('builtins').exec('workers = 4')\n",
+        "workers = 1\ngetattr(dict, '__setitem__')(globals(), 'workers', 4)\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda g, _: g.__ior__({'workers': 4}), [None], globals())\n",
+        "workers = 1\nfrom collections import ChainMap\nChainMap({}, globals()).maps[1].update({'workers': 4})\n",
+        "workers = 1\nfrom types import SimpleNamespace\nns = SimpleNamespace(update=globals().update)\nns.update({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\ngetattr(partial, '__call__')(partial(globals().__setitem__, 'workers'), 4)\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
