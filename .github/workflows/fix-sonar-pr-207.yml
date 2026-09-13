@@ -99,7 +99,7 @@ jobs:
                   if isinstance(child, ast.AST) and not isinstance(child, ast.Lambda)
               )
 
-'''
+          '''
 
           text = text[:start] + replacement + text[end + 1:]
           path.write_text(text, encoding='utf-8')
