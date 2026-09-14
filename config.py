@@ -453,6 +453,24 @@ def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
     return False
 
 
+def _is_import_module_sys_call(node):
+    """Return True for ``import_module('sys')`` from importlib."""
+    if not isinstance(node, ast.Call) or not node.args:
+        return False
+    module_arg = node.args[0]
+    if not (isinstance(module_arg, ast.Constant) and module_arg.value == "sys"):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "import_module":
+        return True
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "import_module"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "importlib"
+    )
+
+
 def _is_current_module_reference(node, sys_aliases=None):
     """Return True for expressions that resolve to this config module."""
     if sys_aliases is None:
@@ -466,6 +484,8 @@ def _is_current_module_reference(node, sys_aliases=None):
         return False
     root = modules.value
     if isinstance(root, ast.Name) and root.id in sys_aliases:
+        return True
+    if _is_import_module_sys_call(root):
         return True
     return (
         isinstance(root, ast.Call)
@@ -856,6 +876,144 @@ def _call_is_dict_type_setitem_on_module_namespace(
         return False
     return _key_may_be_workers(call.args[1])
 
+
+def _is_dict_type_ior_callable(
+    func,
+    *,
+    reference_line=0,
+    dict_shadow_line=None,
+):
+    """Return True for builtin ``dict.__ior__`` variants."""
+    if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
+        return False
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == "__ior__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "dict"
+        )
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Name)
+        and func.args[0].id == "dict"
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "__ior__"
+    )
+
+
+def _call_is_dict_type_ior_on_module_namespace(
+    call,
+    namespace_aliases=None,
+    dict_shadow_line=None,
+):
+    """Return True for ``dict.__ior__(globals(), {'workers': ...})`` mutations."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not _is_dict_type_ior_callable(
+        call.func,
+        reference_line=getattr(call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return False
+    if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
+        return False
+    return _dict_merge_payload_may_set_workers(call.args[1])
+
+
+def _is_types_functiontype_callable(func):
+    """Return True for ``types.FunctionType`` or a direct import alias."""
+    if isinstance(func, ast.Name) and func.id == "FunctionType":
+        return True
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "FunctionType"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "types"
+    )
+
+
+def _is_compile_call(node):
+    """Return True for a direct ``compile(...)`` call."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "compile":
+        return True
+    return isinstance(func, ast.Attribute) and func.attr == "compile"
+
+
+def _call_is_functiontype_namespace_code(call, namespace_aliases=None):
+    """Return True for ``types.FunctionType(compile(...), globals())`` calls."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not _is_types_functiontype_callable(call.func):
+        return False
+    if not _is_compile_call(call.args[0]):
+        return False
+    return _is_module_namespace_mapping(call.args[1], namespace_aliases)
+
+
+def _call_is_invoked_functiontype_namespace_code(call, namespace_aliases=None):
+    """Return True for immediate ``FunctionType(compile(...), globals())()`` calls."""
+    if not isinstance(call, ast.Call):
+        return False
+    inner = call.func
+    return isinstance(inner, ast.Call) and _call_is_functiontype_namespace_code(
+        inner,
+        namespace_aliases,
+    )
+
+
+def _collect_functiontype_namespace_aliases(tree, namespace_aliases):
+    """Collect names bound to ``FunctionType(compile(...), globals())``."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if assignments[name]
+            and all(
+                value is not None
+                and _call_is_functiontype_namespace_code(value, namespace_aliases)
+                for value in assignments[name]
+            )
+        }
+        if not discovered:
+            break
+        aliases.update(discovered)
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _partial_uses_unbound_dict_namespace_mutation(
+    partial_call,
+    namespace_aliases,
+    dict_update_aliases,
+    dict_shadow_line=None,
+):
+    """Return True for ``partial(dict.update/__ior__, globals(), ...)``."""
+    if partial_call is None or len(partial_call.args) < 2:
+        return False
+    if not _is_module_namespace_mapping(partial_call.args[1], namespace_aliases):
+        return False
+    if _is_dict_type_update_callable(partial_call.args[0], dict_update_aliases):
+        return _update_payload_may_set_workers(partial_call, start_index=2)
+    if _is_dict_type_ior_callable(
+        partial_call.args[0],
+        reference_line=getattr(partial_call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return (
+            len(partial_call.args) >= 3
+            and _dict_merge_payload_may_set_workers(partial_call.args[2])
+        )
+    return False
 
 
 def _methodcaller_method_name(call):
@@ -1778,13 +1936,24 @@ def _partial_value_is_workers_setter(
     namespace_aliases,
     partial_aliases,
     known_aliases,
+    dict_update_aliases=None,
+    dict_shadow_line=None,
 ):
     """Return True when a value resolves to a partial workers setter."""
+    if dict_update_aliases is None:
+        dict_update_aliases = set()
     if isinstance(value, ast.Name):
         return value.id in known_aliases
     partial_call = _partial_factory_call(value, partial_aliases)
     if partial_call is None or not partial_call.args:
         return False
+    if _partial_uses_unbound_dict_namespace_mutation(
+        partial_call,
+        namespace_aliases,
+        dict_update_aliases,
+        dict_shadow_line,
+    ):
+        return True
     if (
         len(partial_call.args) >= 2
         and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
@@ -1802,6 +1971,8 @@ def _values_are_partial_workers_setters(
     namespace_aliases,
     partial_aliases,
     known_aliases,
+    dict_update_aliases=None,
+    dict_shadow_line=None,
 ):
     """Return True when every resolved assignment is a workers setter."""
     resolved = [value for value in values if value is not None]
@@ -1811,6 +1982,8 @@ def _values_are_partial_workers_setters(
             namespace_aliases,
             partial_aliases,
             known_aliases,
+            dict_update_aliases,
+            dict_shadow_line,
         )
         for value in resolved
     )
@@ -1820,8 +1993,12 @@ def _collect_partial_workers_setter_aliases(
     tree,
     namespace_aliases,
     partial_aliases,
+    dict_update_aliases=None,
+    dict_shadow_line=None,
 ):
     """Collect names bound to ``partial(namespace.__setitem__, 'workers')``."""
+    if dict_update_aliases is None:
+        dict_update_aliases = _collect_dict_update_aliases(tree)
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
     aliases = set()
@@ -1835,6 +2012,8 @@ def _collect_partial_workers_setter_aliases(
                 namespace_aliases,
                 partial_aliases,
                 aliases,
+                dict_update_aliases,
+                dict_shadow_line,
             )
         }
         if not discovered:
@@ -1866,6 +2045,8 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     _, _, namespace_aliases, _, partial_aliases = _unpack_operator_bindings(
         operator_bindings
     )
+    dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
+    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     if not isinstance(call, ast.Call):
         return False
     saved_aliases = operator_bindings[12] if len(operator_bindings) > 12 else set()
@@ -1880,6 +2061,13 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
         partial_call = _partial_factory_call(call.args[0], partial_aliases)
     if partial_call is None or not partial_call.args:
         return False
+    if _partial_uses_unbound_dict_namespace_mutation(
+        partial_call,
+        namespace_aliases,
+        dict_update_aliases,
+        dict_shadow_line,
+    ):
+        return True
     if (
         len(partial_call.args) >= 2
         and _attribute_is_namespace_setitem(partial_call.args[0], namespace_aliases)
@@ -2081,6 +2269,17 @@ def _expression_mutates_workers(expr, operator_bindings):
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
+        or _call_is_functiontype_namespace_code(expr, namespace_aliases)
+        or _call_is_invoked_functiontype_namespace_code(expr, namespace_aliases)
+        or (
+            isinstance(expr.func, ast.Name)
+            and expr.func.id
+            in (
+                operator_bindings[22]
+                if len(operator_bindings) > 22
+                else set()
+            )
+        )
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
         or _call_is_chainmap_maps_update(expr, namespace_aliases)
         or _call_is_delegated_simplenamespace_update(
@@ -2166,6 +2365,12 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
             namespace_aliases,
             dict_update_aliases,
         )
+        or _call_is_dict_type_ior_on_module_namespace(
+            call,
+            namespace_aliases,
+            dict_shadow_line,
+        )
+        or _call_is_invoked_functiontype_namespace_code(call, namespace_aliases)
         or _call_is_subscript_namespace_workers_update(
             call,
             namespace_aliases,
@@ -2641,10 +2846,13 @@ def _collect_operator_setitem_bindings(tree):
     )
     importlib_aliases = _collect_importlib_import_module_aliases(tree.body)
     importlib_alias_events = _collect_importlib_import_module_alias_events(tree)
+    dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
         tree,
         namespace_aliases,
         partial_aliases,
+        dict_update_aliases,
+        dict_shadow_line,
     )
     sys_aliases = _collect_sys_import_aliases(tree.body)
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
@@ -2656,7 +2864,10 @@ def _collect_operator_setitem_bindings(tree):
         tree,
         namespace_aliases,
     )
-    dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
+    functiontype_namespace_aliases = _collect_functiontype_namespace_aliases(
+        tree,
+        namespace_aliases,
+    )
     return (
         module_aliases,
         setitem_aliases,
@@ -2680,6 +2891,7 @@ def _collect_operator_setitem_bindings(tree):
         importlib_alias_events,
         delegated_update_alias_events,
         dict_shadow_line,
+        functiontype_namespace_aliases,
     )
 
 
