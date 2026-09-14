@@ -60,6 +60,21 @@ import config
         "workers = 1\nfrom collections import ChainMap\nChainMap({}, globals()).maps[1].update({'workers': 4})\n",
         "workers = 1\nfrom types import SimpleNamespace\nns = SimpleNamespace(update=globals().update)\nns.update({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\ngetattr(partial, '__call__')(partial(globals().__setitem__, 'workers'), 4)\n",
+        "workers = 1\ndict.__ior__(globals(), {'workers': 4})\n",
+        "workers = 1\ngetattr(dict, '__ior__')(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module\nimport_module('sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\n(p := partial(dict.update, globals(), {'workers': 4}))()\n",
+        "workers = 1\nimport types\nf = types.FunctionType(compile('workers=4','','exec'), globals())\nf()\n",
+        "workers = 1\nfrom importlib import import_module as im\nim('sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nimport importlib as il\nil.import_module('sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nmerge = dict.__ior__\nmerge(globals(), {'workers': 4})\n",
+        "workers = 1\nmerge = dict.__ior__\nmerge2 = merge\nmerge2(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom types import FunctionType as FT\nFT(compile('workers=4','','exec'), globals())()\n",
+        "workers = 1\nimport types as t\nt.FunctionType(code=compile('workers=4','','exec'), globals=globals())()\n",
+        "workers = 1\nfrom functools import partial\npartial(dict.update, globals())({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\np = partial(dict.update, globals())\np({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\npartial(dict.__ior__, globals())({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\np = partial(dict.__ior__, globals())\np({'workers': 4})\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
@@ -67,6 +82,40 @@ def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, con
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom importlib import import_module\nimport_module(name='sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nfrom types import FunctionType\ncode = compile('workers=4','','exec')\nFunctionType(code, globals())()\n",
+        "workers = 1\nfrom types import FunctionType\ncode = compile('workers=4','','exec')\nf = FunctionType(code, globals())\nf()\n",
+        "workers = 1\nfrom functools import partial\np = partial(dict.update, globals())\np({'workers': 4})\np = None\n",
+        "workers = 1\nfrom importlib import import_module as im\ndict.update(im('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\ndict.__ior__(im('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\nvars(im('sys').modules[__name__]).update({'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\ngetattr(im('sys').modules[__name__], '__dict__').update({'workers': 4})\n",
+        "workers = 1\nimport importlib as il\ndict.update(il.import_module('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\nns = im('sys').modules[__name__].__dict__\nns.update({'workers': 4})\n",
+    ],
+)
+def test_review_followup_namespace_mutations_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_dormant_functiontype_constructor_does_not_mark_workers_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "from types import FunctionType\n"
+        "f = FunctionType(compile('workers=4','','exec'), globals())\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
 def test_unrelated_eval_exec_methods_do_not_mark_workers_dynamic(tmp_path):
@@ -156,6 +205,34 @@ def test_globals_update_entry_helper_does_not_mark_workers_dynamic(tmp_path):
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
+
+def test_shadowed_dict_update_partial_does_not_mark_workers_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class dict:\n"
+        "    @staticmethod\n"
+        "    def update(target, payload):\n"
+        "        return target\n"
+        "from functools import partial\n"
+        "partial(dict.update, globals(), {'workers': 4})()\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_safe_partial_dict_update_payload_does_not_mark_workers_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "from functools import partial\n"
+        "p = partial(dict.update, globals())\n"
+        "p({'not_workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 def _clear_worker_environment(monkeypatch):
     monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
