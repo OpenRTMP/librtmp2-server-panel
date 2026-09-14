@@ -554,6 +554,17 @@ class _ModuleNamespaceAliases(set):
             else set(importlib_module_aliases)
         )
 
+    def __eq__(self, other):
+        """Compare alias members and the module-reference metadata."""
+        if not isinstance(other, _ModuleNamespaceAliases):
+            return set.__eq__(self, other)
+        return (
+            set.__eq__(self, other)
+            and self.sys_aliases == other.sys_aliases
+            and self.importlib_aliases == other.importlib_aliases
+            and self.importlib_module_aliases == other.importlib_module_aliases
+        )
+
 
 def _namespace_aliases_reference_current_module(node, namespace_aliases):
     """Resolve current-module references using aliases collected for the scan."""
