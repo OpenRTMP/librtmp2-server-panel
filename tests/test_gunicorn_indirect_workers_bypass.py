@@ -60,6 +60,11 @@ import config
         "workers = 1\nfrom collections import ChainMap\nChainMap({}, globals()).maps[1].update({'workers': 4})\n",
         "workers = 1\nfrom types import SimpleNamespace\nns = SimpleNamespace(update=globals().update)\nns.update({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\ngetattr(partial, '__call__')(partial(globals().__setitem__, 'workers'), 4)\n",
+        "workers = 1\ndict.__ior__(globals(), {'workers': 4})\n",
+        "workers = 1\ngetattr(dict, '__ior__')(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module\nimport_module('sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\n(p := partial(dict.update, globals(), {'workers': 4}))()\n",
+        "workers = 1\nimport types\nf = types.FunctionType(compile('workers=4','','exec'), globals())\nf()\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
