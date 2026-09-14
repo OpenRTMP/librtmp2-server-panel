@@ -84,6 +84,40 @@ def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, con
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom importlib import import_module\nimport_module(name='sys').modules[__name__].__dict__.update({'workers': 4})\n",
+        "workers = 1\nfrom types import FunctionType\ncode = compile('workers=4','','exec')\nFunctionType(code, globals())()\n",
+        "workers = 1\nfrom types import FunctionType\ncode = compile('workers=4','','exec')\nf = FunctionType(code, globals())\nf()\n",
+        "workers = 1\nfrom functools import partial\np = partial(dict.update, globals())\np({'workers': 4})\np = None\n",
+        "workers = 1\nfrom importlib import import_module as im\ndict.update(im('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\ndict.__ior__(im('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\nvars(im('sys').modules[__name__]).update({'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\ngetattr(im('sys').modules[__name__], '__dict__').update({'workers': 4})\n",
+        "workers = 1\nimport importlib as il\ndict.update(il.import_module('sys').modules[__name__].__dict__, {'workers': 4})\n",
+        "workers = 1\nfrom importlib import import_module as im\nns = im('sys').modules[__name__].__dict__\nns.update({'workers': 4})\n",
+    ],
+)
+def test_review_followup_namespace_mutations_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_dormant_functiontype_constructor_does_not_mark_workers_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "from types import FunctionType\n"
+        "f = FunctionType(compile('workers=4','','exec'), globals())\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
 def test_unrelated_eval_exec_methods_do_not_mark_workers_dynamic(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(

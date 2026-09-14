@@ -447,7 +447,9 @@ def _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
             if (
                 isinstance(target, ast.Attribute)
                 and target.attr == "__dict__"
-                and _is_current_module_reference(target.value)
+                and _namespace_aliases_reference_current_module(
+                    target.value, namespace_aliases
+                )
             ):
                 return _dict_merge_payload_may_set_workers(node.value)
     return False
@@ -459,9 +461,18 @@ def _is_import_module_sys_call(
     importlib_module_aliases=None,
 ):
     """Return True for a proven ``importlib.import_module('sys')`` call."""
-    if not isinstance(node, ast.Call) or not node.args:
+    if not isinstance(node, ast.Call):
         return False
-    module_arg = node.args[0]
+    module_arg = node.args[0] if node.args else next(
+        (
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg == "name"
+        ),
+        None,
+    )
+    if module_arg is None:
+        return False
     if not (isinstance(module_arg, ast.Constant) and module_arg.value == "sys"):
         return False
     if importlib_aliases is None:
@@ -517,6 +528,43 @@ def _is_current_module_reference(
 
 
 
+class _ModuleNamespaceAliases(set):
+    """Namespace aliases plus imports needed to recognize module references."""
+
+    def __init__(
+        self,
+        values=(),
+        *,
+        sys_aliases=None,
+        importlib_aliases=None,
+        importlib_module_aliases=None,
+    ):
+        super().__init__(values)
+        self.sys_aliases = (
+            {"sys"} if sys_aliases is None else set(sys_aliases)
+        )
+        self.importlib_aliases = (
+            {"import_module"}
+            if importlib_aliases is None
+            else set(importlib_aliases)
+        )
+        self.importlib_module_aliases = (
+            {"importlib"}
+            if importlib_module_aliases is None
+            else set(importlib_module_aliases)
+        )
+
+
+def _namespace_aliases_reference_current_module(node, namespace_aliases):
+    """Resolve current-module references using aliases collected for the scan."""
+    return _is_current_module_reference(
+        node,
+        getattr(namespace_aliases, "sys_aliases", None),
+        getattr(namespace_aliases, "importlib_aliases", None),
+        getattr(namespace_aliases, "importlib_module_aliases", None),
+    )
+
+
 def _is_module_namespace_mapping(node, namespace_aliases=None):
     """Return True for mappings known to be the current module namespace."""
     if namespace_aliases is None:
@@ -528,20 +576,26 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
     if _is_globals_call(node):
         return True
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
-        return _is_current_module_reference(node.value)
+        return _namespace_aliases_reference_current_module(
+            node.value, namespace_aliases
+        )
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return False
     if node.func.id == "vars":
         return (
             len(node.args) == 1
             and not node.keywords
-            and _is_current_module_reference(node.args[0])
+            and _namespace_aliases_reference_current_module(
+                node.args[0], namespace_aliases
+            )
         )
     if node.func.id == "getattr":
         return (
             len(node.args) == 2
             and not node.keywords
-            and _is_current_module_reference(node.args[0])
+            and _namespace_aliases_reference_current_module(
+                node.args[0], namespace_aliases
+            )
             and isinstance(node.args[1], ast.Constant)
             and node.args[1].value == "__dict__"
         )
@@ -1104,7 +1158,7 @@ def _call_is_functiontype_namespace_code(
     types_module_aliases=None,
     functiontype_aliases=None,
 ):
-    """Return True for ``FunctionType(compile(...), globals())`` calls."""
+    """Return True for ``FunctionType(..., globals())`` constructors."""
     if not isinstance(call, ast.Call):
         return False
     if not _is_types_functiontype_callable(
@@ -1118,7 +1172,6 @@ def _call_is_functiontype_namespace_code(
     return (
         code_arg is not None
         and globals_arg is not None
-        and _is_compile_call(code_arg)
         and _is_module_namespace_mapping(globals_arg, namespace_aliases)
     )
 
@@ -1418,9 +1471,19 @@ def _values_are_module_namespace_aliases(values, aliases):
     )
 
 
-def _resolve_module_namespace_aliases(assignments):
+def _resolve_module_namespace_aliases(
+    assignments,
+    *,
+    sys_aliases=None,
+    importlib_aliases=None,
+    importlib_module_aliases=None,
+):
     """Resolve aliases transitively until no additional names can be proven."""
-    aliases = set()
+    aliases = _ModuleNamespaceAliases(
+        sys_aliases=sys_aliases,
+        importlib_aliases=importlib_aliases,
+        importlib_module_aliases=importlib_module_aliases,
+    )
     unresolved = set(assignments)
     while unresolved:
         discovered = {
@@ -1435,11 +1498,22 @@ def _resolve_module_namespace_aliases(assignments):
     return aliases
 
 
-def _collect_module_namespace_aliases(tree):
+def _collect_module_namespace_aliases(
+    tree,
+    *,
+    sys_aliases=None,
+    importlib_aliases=None,
+    importlib_module_aliases=None,
+):
     """Collect names that are always assigned a module namespace mapping."""
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
-    return _resolve_module_namespace_aliases(assignments)
+    return _resolve_module_namespace_aliases(
+        assignments,
+        sys_aliases=sys_aliases,
+        importlib_aliases=importlib_aliases,
+        importlib_module_aliases=importlib_module_aliases,
+    )
 
 
 def _constant_is_workers(node):
@@ -2308,7 +2382,7 @@ def _partial_value_dict_namespace_method(
     )
 
 
-def _collect_partial_dict_namespace_mutator_aliases(
+def _collect_partial_dict_namespace_mutator_alias_events(
     tree,
     namespace_aliases,
     partial_aliases,
@@ -2316,36 +2390,28 @@ def _collect_partial_dict_namespace_mutator_aliases(
     dict_ior_aliases,
     dict_shadow_line,
 ):
-    """Collect saved partials bound to builtin dict mutators on globals()."""
-    assignments = {}
-    _record_module_namespace_assignments(tree.body, assignments)
-    aliases = {}
-    unresolved = set(assignments)
-    while unresolved:
-        discovered = {}
-        for name in unresolved:
-            methods = [
-                _partial_value_dict_namespace_method(
+    """Track saved partial dict mutators at each top-level binding event."""
+    events = {}
+    current_aliases = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        line = getattr(node, "lineno", 0)
+        for name, value in _namespace_assignment_values(node):
+            method = None
+            if value is not None:
+                method = _partial_value_dict_namespace_method(
                     value,
                     namespace_aliases,
                     partial_aliases,
-                    aliases,
+                    current_aliases,
                     dict_update_aliases,
                     dict_ior_aliases,
                     dict_shadow_line,
                 )
-                for value in assignments[name]
-                if value is not None
-            ]
-            if methods and methods[0] is not None and all(
-                method == methods[0] for method in methods
-            ):
-                discovered[name] = methods[0]
-        if not discovered:
-            break
-        aliases.update(discovered)
-        unresolved.difference_update(discovered)
-    return aliases
+            current_aliases[name] = method
+            events.setdefault(name, []).append((line, method))
+    return events
 
 def _call_is_getattr_partial_invocation(call, partial_aliases):
     """Return True for ``getattr(partial, '__call__')(...)`` invocations."""
@@ -2398,13 +2464,17 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     saved_aliases = operator_bindings[12] if len(operator_bindings) > 12 else set()
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
-    partial_mutator_aliases = (
+    partial_mutator_alias_events = (
         operator_bindings[27] if len(operator_bindings) > 27 else {}
     )
     if isinstance(call.func, ast.Name):
         if call.func.id in saved_aliases:
             return True
-        saved_method = partial_mutator_aliases.get(call.func.id)
+        saved_method = _binding_state_at_line(
+            partial_mutator_alias_events,
+            call.func.id,
+            getattr(call, "lineno", 0),
+        )
         if saved_method is not None:
             return _call_payload_may_set_workers(saved_method, call)
     partial_call, invocation_start = _resolve_partial_invocation(call, partial_aliases)
@@ -2607,12 +2677,6 @@ def _call_expression_mutates_workers(expr, operator_bindings):
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
-        or _call_is_functiontype_namespace_code(
-            expr,
-            namespace_aliases,
-            types_module_aliases,
-            functiontype_aliases,
-        )
         or _call_is_invoked_functiontype_namespace_code(
             expr,
             namespace_aliases,
@@ -3250,8 +3314,6 @@ def _collect_operator_setitem_bindings(tree):
         methodcaller_aliases,
         attrgetter_aliases,
     )
-    namespace_aliases = _collect_module_namespace_aliases(tree)
-    mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
     dict_update_aliases = _collect_dict_update_aliases(tree, dict_shadow_line)
     dict_ior_aliases = _collect_dict_ior_aliases(tree, dict_shadow_line)
@@ -3268,6 +3330,14 @@ def _collect_operator_setitem_bindings(tree):
     importlib_aliases = _collect_importlib_import_module_aliases(tree.body)
     importlib_alias_events = _collect_importlib_import_module_alias_events(tree)
     importlib_module_aliases = _collect_importlib_module_aliases(tree.body)
+    sys_aliases = _collect_sys_import_aliases(tree.body)
+    namespace_aliases = _collect_module_namespace_aliases(
+        tree,
+        sys_aliases=sys_aliases,
+        importlib_aliases=importlib_aliases,
+        importlib_module_aliases=importlib_module_aliases,
+    )
+    mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
         tree,
         namespace_aliases,
@@ -3276,15 +3346,16 @@ def _collect_operator_setitem_bindings(tree):
         dict_shadow_line,
         dict_ior_aliases,
     )
-    partial_dict_mutator_aliases = _collect_partial_dict_namespace_mutator_aliases(
-        tree,
-        namespace_aliases,
-        partial_aliases,
-        dict_update_aliases,
-        dict_ior_aliases,
-        dict_shadow_line,
+    partial_dict_mutator_alias_events = (
+        _collect_partial_dict_namespace_mutator_alias_events(
+            tree,
+            namespace_aliases,
+            partial_aliases,
+            dict_update_aliases,
+            dict_ior_aliases,
+            dict_shadow_line,
+        )
     )
-    sys_aliases = _collect_sys_import_aliases(tree.body)
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
     delegated_update_aliases = _collect_delegated_update_namespace_aliases(
         tree,
@@ -3331,7 +3402,7 @@ def _collect_operator_setitem_bindings(tree):
         importlib_module_aliases,
         types_module_aliases,
         functiontype_aliases,
-        partial_dict_mutator_aliases,
+        partial_dict_mutator_alias_events,
     )
 
 
