@@ -1019,6 +1019,28 @@ def _call_is_dict_type_ior_on_module_namespace(
 
 
 
+def _types_functiontype_aliases_from_import(node):
+    """Return aliases introduced by one ``types`` import statement."""
+    if isinstance(node, ast.Import):
+        return (
+            {
+                imported.asname or imported.name
+                for imported in node.names
+                if imported.name == "types"
+            },
+            set(),
+        )
+    if isinstance(node, ast.ImportFrom) and node.module == "types":
+        return (
+            set(),
+            {
+                imported.asname or imported.name
+                for imported in node.names
+                if imported.name == "FunctionType"
+            },
+        )
+    return set(), set()
+
 def _collect_types_functiontype_aliases(statements):
     """Collect ``types`` module aliases and imported ``FunctionType`` aliases."""
     module_aliases = set()
@@ -1026,19 +1048,15 @@ def _collect_types_functiontype_aliases(statements):
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, ast.Import):
-            for imported in node.names:
-                if imported.name == "types":
-                    module_aliases.add(imported.asname or imported.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "types":
-            for imported in node.names:
-                if imported.name == "FunctionType":
-                    callable_aliases.add(imported.asname or imported.name)
+        node_modules, node_callables = _types_functiontype_aliases_from_import(node)
+        module_aliases.update(node_modules)
+        callable_aliases.update(node_callables)
         for block in _compound_statement_blocks(node):
             nested_modules, nested_callables = _collect_types_functiontype_aliases(block)
             module_aliases.update(nested_modules)
             callable_aliases.update(nested_callables)
     return module_aliases, callable_aliases
+
 
 def _is_types_functiontype_callable(
     func,
@@ -2704,21 +2722,17 @@ def _call_is_importlib_sys_namespace_mutation(call, operator_bindings):
         return bool(call.args) and _key_may_be_workers(call.args[0])
     return False
 
-def _call_mutates_workers_via_indirection(call, operator_bindings):
-    """Return True for indirect import-time ``workers`` mutations."""
-    if not isinstance(call, ast.Call):
-        return False
+def _call_has_direct_worker_indirection(call, operator_bindings):
+    """Return True for non-lambda indirect namespace mutation calls."""
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
     sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else {"sys"}
+    importlib_aliases = operator_bindings[16] if len(operator_bindings) > 16 else set()
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
-    importlib_aliases = operator_bindings[16] if len(operator_bindings) > 16 else set()
-    importlib_module_aliases = (
-        operator_bindings[24] if len(operator_bindings) > 24 else set()
-    )
-    if (
+    importlib_module_aliases = operator_bindings[24] if len(operator_bindings) > 24 else set()
+    return (
         _call_sets_workers_via_setitem(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
@@ -2756,20 +2770,24 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
             operator_bindings,
             namespace_aliases,
         )
-    ):
-        return True
+    )
+
+
+def _lambda_invocation_mutates_workers(call, operator_bindings):
+    """Return True when an invoked lambda mutates a namespace argument."""
     if not isinstance(call.func, ast.Lambda):
         return False
     lambda_node = call.func
     if _lambda_mutates_workers(lambda_node, operator_bindings):
         return True
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
-    for param, value in zip(positional_params, call.args):
-        if (
-            _is_module_namespace_mapping(value, namespace_aliases)
-            and _lambda_param_namespace_mutation(lambda_node.body, param.arg)
-        ):
-            return True
+    if any(
+        _is_module_namespace_mapping(value, namespace_aliases)
+        and _lambda_param_namespace_mutation(lambda_node.body, param.arg)
+        for param, value in zip(positional_params, call.args)
+    ):
+        return True
     keyword_values = {
         keyword.arg: keyword.value
         for keyword in call.keywords
@@ -2777,13 +2795,19 @@ def _call_mutates_workers_via_indirection(call, operator_bindings):
     }
     return any(
         param.arg in keyword_values
-        and _is_module_namespace_mapping(
-            keyword_values[param.arg],
-            namespace_aliases,
-        )
+        and _is_module_namespace_mapping(keyword_values[param.arg], namespace_aliases)
         and _lambda_param_namespace_mutation(lambda_node.body, param.arg)
         for param in (*positional_params, *lambda_node.args.kwonlyargs)
     )
+
+def _call_mutates_workers_via_indirection(call, operator_bindings):
+    """Return True for indirect import-time ``workers`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if _call_has_direct_worker_indirection(call, operator_bindings):
+        return True
+    return _lambda_invocation_mutates_workers(call, operator_bindings)
+
 
 
 
