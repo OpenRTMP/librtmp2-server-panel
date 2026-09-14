@@ -115,6 +115,21 @@ class Lrtmp2Client:
             json=payload,
         )
 
+    def _poll_stream_deleted(self, stream_id):
+        """Return True when the stream is gone, False when still listed, None on transient errors."""
+        try:
+            streams = self.list_streams()
+        except Lrtmp2ApiError:
+            return None
+        if not isinstance(streams, list):
+            return None
+        if any(
+            isinstance(item, dict) and item.get("id") == stream_id
+            for item in streams
+        ):
+            return False
+        return True
+
     def delete_stream(
         self,
         stream_id,
@@ -143,16 +158,22 @@ class Lrtmp2Client:
         if resp.status_code == 202:
             deadline = time.monotonic() + wait_timeout
             while time.monotonic() < deadline:
-                streams = self.list_streams()
-                if not any(s.get("id") == stream_id for s in streams):
+                deleted = self._poll_stream_deleted(stream_id)
+                if deleted is True:
                     return
                 time.sleep(poll_interval)
-            streams = self.list_streams()
-            if any(s.get("id") == stream_id for s in streams):
+            deleted = self._poll_stream_deleted(stream_id)
+            if deleted is True:
+                return
+            if deleted is False:
                 raise Lrtmp2ApiError(
                     "delete_stream failed: stream is still present after waiting "
                     "for active RTMP sessions to drain. Try again shortly."
                 )
+            raise Lrtmp2ApiError(
+                "delete_stream failed: could not confirm stream removal while "
+                "waiting for active RTMP sessions to drain. Try again shortly."
+            )
 
     def create_player(self, stream_id, name=None, play_key=None):
         payload = {}

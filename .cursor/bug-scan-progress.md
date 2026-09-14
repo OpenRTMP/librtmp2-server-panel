@@ -1,17 +1,43 @@
 # Bug scan progress
 
-Last scanned: static/js/ — 2026-09-06
+Last scanned: app.py — 2026-09-14
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [x] `config.py` — startup validation and environment configuration
-- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
-- [x] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [ ] `config.py` — startup validation and environment configuration
+- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
 
-(`templates/`/`static/js/` were actually scanned 2026-07-05/06, see findings
-below — checkboxes just hadn't been ticked.)
+## Findings (2026-09-14 app.py pass)
+
+- **Bug (fixed):** `delete_stream()` HTTP 202 drain polling in
+  `lrtmp2_client.py` (called synchronously from `app.delete_stream`) aborted
+  the entire 305s wait window on the first `list_streams()` failure. Each poll
+  uses the client's default 5s HTTP timeout; any timeout, connection reset, or
+  brief API stall during drain raised `Lrtmp2ApiError` immediately instead of
+  retrying until `DELETE_STREAM_DRAIN_WAIT_SECONDS` elapsed. Scenario:
+  operator deletes a live stream during incident response while
+  librtmp2-server is under load; server returns HTTP 202 and keeps draining for
+  up to 300s; an overloaded or flaky `GET /api/v1/streams` times out on one
+  poll (~20s into the drain); the panel flashes a delete error and redirects
+  even though the revoke is still progressing normally on the server. Impact:
+  false delete failure during incident response — operator believes publish/play
+  keys were not revoked and may stop monitoring while keys remain valid until
+  drain completes. Fixed by treating transient `list_streams` errors as
+  "unknown" during polling (retry until the drain deadline) and distinguishing
+  "still listed" from "could not confirm removal" after the deadline.
+- Reviewed but not a bug: auth/session (`login_required` on sensitive routes,
+  `session.clear()` + Redis token rotation on login, `credential_fp` binding to
+  `SECRET_KEY`/`PASSWORD`/`LRTMP2_API_TOKEN`, fail-closed Redis session checks,
+  logout preserves session when revoke fails); login POST rate limit registered
+  before CSRF so missing tokens still count; `delete_stream` synchronous with
+  bounded drain slots (2) and Gunicorn 330s timeout; stream/player ID and
+  access-key validation; stats rate limits (per-IP + per-stream, default limit
+  exempt, invalid-ID exempt); security headers incl. `Referrer-Policy:
+  same-origin`; no open redirects; cluster actions validate node ID and surface
+  API errors via `flash_error`.
 
 ## Findings (2026-09-06 static/js/ pass)
 
