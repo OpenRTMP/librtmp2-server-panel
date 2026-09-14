@@ -1,0 +1,129 @@
+name: PR212 final findings
+
+on:
+  push:
+    branches:
+      - chatgpt/pr212-final-findings
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: cursor/application-security-review-81a9
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply final review fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('config.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, got {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '''    if not isinstance(node, ast.Call) or not node.args:\n        return False\n    module_arg = node.args[0]\n''',
+              '''    if not isinstance(node, ast.Call):\n        return False\n    module_arg = node.args[0] if node.args else next(\n        (\n            keyword.value\n            for keyword in node.keywords\n            if keyword.arg == "name"\n        ),\n        None,\n    )\n    if module_arg is None:\n        return False\n''',
+              'import_module keyword argument',
+          )
+
+          old_namespace = '''def _is_module_namespace_mapping(node, namespace_aliases=None):\n    """Return True for mappings known to be the current module namespace."""\n    if namespace_aliases is None:\n        namespace_aliases = set()\n    if isinstance(node, ast.Name) and node.id in namespace_aliases:\n        return True\n    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):\n        return _is_module_namespace_mapping(node.value, namespace_aliases)\n    if _is_globals_call(node):\n        return True\n    if isinstance(node, ast.Attribute) and node.attr == "__dict__":\n        return _is_current_module_reference(node.value)\n    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):\n        return False\n    if node.func.id == "vars":\n        return (\n            len(node.args) == 1\n            and not node.keywords\n            and _is_current_module_reference(node.args[0])\n        )\n    if node.func.id == "getattr":\n        return (\n            len(node.args) == 2\n            and not node.keywords\n            and _is_current_module_reference(node.args[0])\n            and isinstance(node.args[1], ast.Constant)\n            and node.args[1].value == "__dict__"\n        )\n    return False\n'''
+          new_namespace = '''class _ModuleNamespaceAliases(set):\n    """Namespace aliases plus imports needed to recognize module references."""\n\n    def __init__(\n        self,\n        values=(),\n        *,\n        sys_aliases=None,\n        importlib_aliases=None,\n        importlib_module_aliases=None,\n    ):\n        super().__init__(values)\n        self.sys_aliases = (\n            {"sys"} if sys_aliases is None else set(sys_aliases)\n        )\n        self.importlib_aliases = (\n            {"import_module"}\n            if importlib_aliases is None\n            else set(importlib_aliases)\n        )\n        self.importlib_module_aliases = (\n            {"importlib"}\n            if importlib_module_aliases is None\n            else set(importlib_module_aliases)\n        )\n\n\ndef _namespace_aliases_reference_current_module(node, namespace_aliases):\n    """Resolve current-module references using aliases collected for the scan."""\n    return _is_current_module_reference(\n        node,\n        getattr(namespace_aliases, "sys_aliases", None),\n        getattr(namespace_aliases, "importlib_aliases", None),\n        getattr(namespace_aliases, "importlib_module_aliases", None),\n    )\n\n\ndef _is_module_namespace_mapping(node, namespace_aliases=None):\n    """Return True for mappings known to be the current module namespace."""\n    if namespace_aliases is None:\n        namespace_aliases = set()\n    if isinstance(node, ast.Name) and node.id in namespace_aliases:\n        return True\n    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):\n        return _is_module_namespace_mapping(node.value, namespace_aliases)\n    if _is_globals_call(node):\n        return True\n    if isinstance(node, ast.Attribute) and node.attr == "__dict__":\n        return _namespace_aliases_reference_current_module(\n            node.value, namespace_aliases\n        )\n    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):\n        return False\n    if node.func.id == "vars":\n        return (\n            len(node.args) == 1\n            and not node.keywords\n            and _namespace_aliases_reference_current_module(\n                node.args[0], namespace_aliases\n            )\n        )\n    if node.func.id == "getattr":\n        return (\n            len(node.args) == 2\n            and not node.keywords\n            and _namespace_aliases_reference_current_module(\n                node.args[0], namespace_aliases\n            )\n            and isinstance(node.args[1], ast.Constant)\n            and node.args[1].value == "__dict__"\n        )\n    return False\n'''
+          replace_once(old_namespace, new_namespace, 'module namespace alias context')
+
+          replace_once(
+              '''                and _is_current_module_reference(target.value)\n''',
+              '''                and _namespace_aliases_reference_current_module(\n                    target.value, namespace_aliases\n                )\n''',
+              'namespace merge alias context',
+          )
+
+          old_resolver = '''def _resolve_module_namespace_aliases(assignments):\n    """Resolve aliases transitively until no additional names can be proven."""\n    aliases = set()\n    unresolved = set(assignments)\n    while unresolved:\n        discovered = {\n            name\n            for name in unresolved\n            if _values_are_module_namespace_aliases(assignments[name], aliases)\n        }\n        if not discovered:\n            break\n        aliases.update(discovered)\n        unresolved.difference_update(discovered)\n    return aliases\n\n\ndef _collect_module_namespace_aliases(tree):\n    """Collect names that are always assigned a module namespace mapping."""\n    assignments = {}\n    _record_module_namespace_assignments(tree.body, assignments)\n    return _resolve_module_namespace_aliases(assignments)\n'''
+          new_resolver = '''def _resolve_module_namespace_aliases(\n    assignments,\n    *,\n    sys_aliases=None,\n    importlib_aliases=None,\n    importlib_module_aliases=None,\n):\n    """Resolve aliases transitively until no additional names can be proven."""\n    aliases = _ModuleNamespaceAliases(\n        sys_aliases=sys_aliases,\n        importlib_aliases=importlib_aliases,\n        importlib_module_aliases=importlib_module_aliases,\n    )\n    unresolved = set(assignments)\n    while unresolved:\n        discovered = {\n            name\n            for name in unresolved\n            if _values_are_module_namespace_aliases(assignments[name], aliases)\n        }\n        if not discovered:\n            break\n        aliases.update(discovered)\n        unresolved.difference_update(discovered)\n    return aliases\n\n\ndef _collect_module_namespace_aliases(\n    tree,\n    *,\n    sys_aliases=None,\n    importlib_aliases=None,\n    importlib_module_aliases=None,\n):\n    """Collect names that are always assigned a module namespace mapping."""\n    assignments = {}\n    _record_module_namespace_assignments(tree.body, assignments)\n    return _resolve_module_namespace_aliases(\n        assignments,\n        sys_aliases=sys_aliases,\n        importlib_aliases=importlib_aliases,\n        importlib_module_aliases=importlib_module_aliases,\n    )\n'''
+          replace_once(old_resolver, new_resolver, 'namespace alias resolver')
+
+          old_functiontype = '''    return (\n        code_arg is not None\n        and globals_arg is not None\n        and _is_compile_call(code_arg)\n        and _is_module_namespace_mapping(globals_arg, namespace_aliases)\n    )\n'''
+          new_functiontype = '''    return (\n        code_arg is not None\n        and globals_arg is not None\n        and _is_module_namespace_mapping(globals_arg, namespace_aliases)\n    )\n'''
+          replace_once(old_functiontype, new_functiontype, 'FunctionType code aliases')
+          text = text.replace(
+              '    """Return True for ``FunctionType(compile(...), globals())`` calls."""',
+              '    """Return True for ``FunctionType(..., globals())`` constructors."""',
+              1,
+          )
+
+          direct_functiontype = '''        or _call_is_functiontype_namespace_code(\n            expr,\n            namespace_aliases,\n            types_module_aliases,\n            functiontype_aliases,\n        )\n'''
+          if text.count(direct_functiontype) != 1:
+              raise SystemExit('dormant FunctionType: expected one direct detector')
+          text = text.replace(direct_functiontype, '', 1)
+
+          old_partial_collector = '''def _collect_partial_dict_namespace_mutator_aliases(\n    tree,\n    namespace_aliases,\n    partial_aliases,\n    dict_update_aliases,\n    dict_ior_aliases,\n    dict_shadow_line,\n):\n    """Collect saved partials bound to builtin dict mutators on globals()."""\n    assignments = {}\n    _record_module_namespace_assignments(tree.body, assignments)\n    aliases = {}\n    unresolved = set(assignments)\n    while unresolved:\n        discovered = {}\n        for name in unresolved:\n            methods = [\n                _partial_value_dict_namespace_method(\n                    value,\n                    namespace_aliases,\n                    partial_aliases,\n                    aliases,\n                    dict_update_aliases,\n                    dict_ior_aliases,\n                    dict_shadow_line,\n                )\n                for value in assignments[name]\n                if value is not None\n            ]\n            if methods and methods[0] is not None and all(\n                method == methods[0] for method in methods\n            ):\n                discovered[name] = methods[0]\n        if not discovered:\n            break\n        aliases.update(discovered)\n        unresolved.difference_update(discovered)\n    return aliases\n'''
+          new_partial_collector = '''def _collect_partial_dict_namespace_mutator_alias_events(\n    tree,\n    namespace_aliases,\n    partial_aliases,\n    dict_update_aliases,\n    dict_ior_aliases,\n    dict_shadow_line,\n):\n    """Track saved partial dict mutators at each top-level binding event."""\n    events = {}\n    current_aliases = {}\n    for node in tree.body:\n        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            continue\n        line = getattr(node, "lineno", 0)\n        for name, value in _namespace_assignment_values(node):\n            method = None\n            if value is not None:\n                method = _partial_value_dict_namespace_method(\n                    value,\n                    namespace_aliases,\n                    partial_aliases,\n                    current_aliases,\n                    dict_update_aliases,\n                    dict_ior_aliases,\n                    dict_shadow_line,\n                )\n            current_aliases[name] = method\n            events.setdefault(name, []).append((line, method))\n    return events\n'''
+          replace_once(old_partial_collector, new_partial_collector, 'partial call-site bindings')
+
+          replace_once(
+              '''    partial_mutator_aliases = (\n        operator_bindings[27] if len(operator_bindings) > 27 else {}\n    )\n''',
+              '''    partial_mutator_alias_events = (\n        operator_bindings[27] if len(operator_bindings) > 27 else {}\n    )\n''',
+              'partial event bindings variable',
+          )
+          replace_once(
+              '''        saved_method = partial_mutator_aliases.get(call.func.id)\n        if saved_method is not None:\n            return _call_payload_may_set_workers(saved_method, call)\n''',
+              '''        saved_method = _binding_state_at_line(\n            partial_mutator_alias_events,\n            call.func.id,\n            getattr(call, "lineno", 0),\n        )\n        if saved_method is not None:\n            return _call_payload_may_set_workers(saved_method, call)\n''',
+              'partial method at invocation line',
+          )
+
+          old_binding_setup = '''    namespace_aliases = _collect_module_namespace_aliases(tree)\n    mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)\n    dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")\n    dict_update_aliases = _collect_dict_update_aliases(tree, dict_shadow_line)\n    dict_ior_aliases = _collect_dict_ior_aliases(tree, dict_shadow_line)\n    builtins_aliases = _collect_builtins_aliases(tree)\n    exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)\n    direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(\n        tree.body,\n        builtins_aliases,\n    )\n    direct_exec_eval_alias_events = _collect_builtins_exec_eval_alias_events(\n        tree,\n        builtins_aliases,\n    )\n    importlib_aliases = _collect_importlib_import_module_aliases(tree.body)\n    importlib_alias_events = _collect_importlib_import_module_alias_events(tree)\n    importlib_module_aliases = _collect_importlib_module_aliases(tree.body)\n    partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(\n        tree,\n        namespace_aliases,\n        partial_aliases,\n        dict_update_aliases,\n        dict_shadow_line,\n        dict_ior_aliases,\n    )\n    partial_dict_mutator_aliases = _collect_partial_dict_namespace_mutator_aliases(\n        tree,\n        namespace_aliases,\n        partial_aliases,\n        dict_update_aliases,\n        dict_ior_aliases,\n        dict_shadow_line,\n    )\n    sys_aliases = _collect_sys_import_aliases(tree.body)\n'''
+          new_binding_setup = '''    dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")\n    dict_update_aliases = _collect_dict_update_aliases(tree, dict_shadow_line)\n    dict_ior_aliases = _collect_dict_ior_aliases(tree, dict_shadow_line)\n    builtins_aliases = _collect_builtins_aliases(tree)\n    exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)\n    direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(\n        tree.body,\n        builtins_aliases,\n    )\n    direct_exec_eval_alias_events = _collect_builtins_exec_eval_alias_events(\n        tree,\n        builtins_aliases,\n    )\n    importlib_aliases = _collect_importlib_import_module_aliases(tree.body)\n    importlib_alias_events = _collect_importlib_import_module_alias_events(tree)\n    importlib_module_aliases = _collect_importlib_module_aliases(tree.body)\n    sys_aliases = _collect_sys_import_aliases(tree.body)\n    namespace_aliases = _collect_module_namespace_aliases(\n        tree,\n        sys_aliases=sys_aliases,\n        importlib_aliases=importlib_aliases,\n        importlib_module_aliases=importlib_module_aliases,\n    )\n    mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)\n    partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(\n        tree,\n        namespace_aliases,\n        partial_aliases,\n        dict_update_aliases,\n        dict_shadow_line,\n        dict_ior_aliases,\n    )\n    partial_dict_mutator_alias_events = (\n        _collect_partial_dict_namespace_mutator_alias_events(\n            tree,\n            namespace_aliases,\n            partial_aliases,\n            dict_update_aliases,\n            dict_ior_aliases,\n            dict_shadow_line,\n        )\n    )\n'''
+          replace_once(old_binding_setup, new_binding_setup, 'operator binding setup')
+          replace_once(
+              '''        partial_dict_mutator_aliases,\n''',
+              '''        partial_dict_mutator_alias_events,\n''',
+              'partial events return binding',
+          )
+
+          path.write_text(text, encoding='utf-8')
+
+          test_path = Path('tests/test_gunicorn_indirect_workers_bypass.py')
+          tests = test_path.read_text(encoding='utf-8')
+          marker = '''def test_unrelated_eval_exec_methods_do_not_mark_workers_dynamic(tmp_path):\n'''
+          if tests.count(marker) != 1:
+              raise SystemExit('test insertion marker not found exactly once')
+          followup_tests = '''@pytest.mark.parametrize(\n    "config_content",\n    [\n        "workers = 1\\nfrom importlib import import_module\\nimport_module(name='sys').modules[__name__].__dict__.update({'workers': 4})\\n",\n        "workers = 1\\nfrom types import FunctionType\\ncode = compile('workers=4','','exec')\\nFunctionType(code, globals())()\\n",\n        "workers = 1\\nfrom types import FunctionType\\ncode = compile('workers=4','','exec')\\nf = FunctionType(code, globals())\\nf()\\n",\n        "workers = 1\\nfrom functools import partial\\np = partial(dict.update, globals())\\np({'workers': 4})\\np = None\\n",\n        "workers = 1\\nfrom importlib import import_module as im\\ndict.update(im('sys').modules[__name__].__dict__, {'workers': 4})\\n",\n        "workers = 1\\nfrom importlib import import_module as im\\ndict.__ior__(im('sys').modules[__name__].__dict__, {'workers': 4})\\n",\n        "workers = 1\\nfrom importlib import import_module as im\\nvars(im('sys').modules[__name__]).update({'workers': 4})\\n",\n        "workers = 1\\nfrom importlib import import_module as im\\ngetattr(im('sys').modules[__name__], '__dict__').update({'workers': 4})\\n",\n        "workers = 1\\nimport importlib as il\\ndict.update(il.import_module('sys').modules[__name__].__dict__, {'workers': 4})\\n",\n        "workers = 1\\nfrom importlib import import_module as im\\nns = im('sys').modules[__name__].__dict__\\nns.update({'workers': 4})\\n",\n    ],\n)\ndef test_review_followup_namespace_mutations_are_dynamic(tmp_path, config_content):\n    config_file = tmp_path / "gunicorn.conf.py"\n    config_file.write_text(config_content, encoding="utf-8")\n\n    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)\n\n\ndef test_dormant_functiontype_constructor_does_not_mark_workers_dynamic(tmp_path):\n    config_file = tmp_path / "gunicorn.conf.py"\n    config_file.write_text(\n        "workers = 1\\n"\n        "from types import FunctionType\\n"\n        "f = FunctionType(compile('workers=4','','exec'), globals())\\n",\n        encoding="utf-8",\n    )\n\n    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)\n\n\n'''
+          tests = tests.replace(marker, followup_tests + marker, 1)
+          test_path.write_text(tests, encoding='utf-8')
+          PY
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Compile config
+        run: python -m py_compile config.py
+
+      - name: Run regression tests
+        run: python -m pytest -q tests/test_gunicorn_indirect_workers_bypass.py
+
+      - name: Commit and push PR branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config.py tests/test_gunicorn_indirect_workers_bypass.py
+          git diff --cached --check
+          git commit -m "fix: address final PR212 review findings"
+          git push origin HEAD:cursor/application-security-review-81a9
