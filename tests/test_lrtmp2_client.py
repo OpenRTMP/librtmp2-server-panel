@@ -82,6 +82,38 @@ def test_delete_stream_polls_until_gone_on_202():
     mock_sleep.assert_called_once()
 
 
+def test_delete_stream_202_retries_transient_list_streams_errors():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.get"
+    ) as mock_get, patch("lrtmp2_client.time.sleep"):
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 202
+
+        gone = type("R", (), {"ok": True, "json": lambda self: []})()
+        mock_get.side_effect = [
+            requests.exceptions.Timeout("slow"),
+            gone,
+        ]
+
+        client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
+
+    assert mock_get.call_count == 2
+
+
+def test_delete_stream_202_raises_when_list_streams_unavailable_at_deadline():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.get",
+        side_effect=requests.exceptions.Timeout("slow"),
+    ), patch("lrtmp2_client.time.monotonic", side_effect=[0, 10]):
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 202
+
+        with pytest.raises(Lrtmp2ApiError, match="could not confirm stream removal"):
+            client.delete_stream("s1", wait_timeout=5, poll_interval=0.1)
+
+
 def test_delete_stream_202_raises_when_still_present_after_timeout():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
