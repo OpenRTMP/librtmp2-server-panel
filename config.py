@@ -2981,7 +2981,6 @@ def _call_expression_mutates_workers(expr, operator_bindings):
     importlib_module_aliases = operator_bindings[24] if len(operator_bindings) > 24 else set()
     sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else set()
     chainmap_aliases = operator_bindings[28] if len(operator_bindings) > 28 else set()
-    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     return (
         _call_is_dynamic_exec_eval(
             expr,
