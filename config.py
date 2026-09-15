@@ -769,7 +769,7 @@ def _chainmap_selected_entry_is_namespace(receiver, namespace_aliases=None):
     )
 
 
-def _call_is_chainmap_maps_update(call, namespace_aliases=None):
+def _call_is_chainmap_maps_update(call, namespace_aliases=None, chainmap_aliases=None):
     """Return True for ``ChainMap(..., globals()).maps[i].update(...)`` mutations."""
     if not isinstance(call, ast.Call):
         return False
@@ -779,6 +779,44 @@ def _call_is_chainmap_maps_update(call, namespace_aliases=None):
         call.func.value,
         namespace_aliases,
     ):
+        return _call_is_chainmap_alias_maps_update(
+            call,
+            chainmap_aliases,
+        )
+    return _update_payload_may_set_workers(call)
+
+
+def _collect_chainmap_namespace_aliases(tree, namespace_aliases):
+    """Collect names bound to ``ChainMap(..., globals(), ...)`` at import time."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = set()
+    for name, values in assignments.items():
+        for value in values:
+            if (
+                value is not None
+                and isinstance(value, ast.Call)
+                and _chainmap_call_includes_namespace(value, namespace_aliases)
+            ):
+                aliases.add(name)
+                break
+    return aliases
+
+
+def _call_is_chainmap_alias_maps_update(call, chainmap_aliases=None):
+    """Return True for ``alias.maps[i].update(...)`` when alias wraps the namespace."""
+    if not chainmap_aliases or not isinstance(call, ast.Call):
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Subscript):
+        return False
+    maps_attr = receiver.value
+    if not isinstance(maps_attr, ast.Attribute) or maps_attr.attr != "maps":
+        return False
+    base = maps_attr.value
+    if not isinstance(base, ast.Name) or base.id not in chainmap_aliases:
         return False
     return _update_payload_may_set_workers(call)
 
@@ -861,16 +899,35 @@ def _is_dict_type_update_callable(
             and isinstance(func.value, ast.Name)
             and func.value.id == "dict"
         )
-    return (
-        isinstance(func, ast.Call)
-        and isinstance(func.func, ast.Name)
-        and func.func.id == "getattr"
-        and len(func.args) >= 2
-        and isinstance(func.args[0], ast.Name)
-        and func.args[0].id == "dict"
-        and isinstance(func.args[1], ast.Constant)
-        and func.args[1].value == "update"
-    )
+    if isinstance(func, ast.Call) and isinstance(func.func, ast.Name):
+        if func.func.id != "getattr" or len(func.args) < 2:
+            return False
+        if (
+            isinstance(func.args[0], ast.Name)
+            and func.args[0].id == "dict"
+            and isinstance(func.args[1], ast.Constant)
+            and func.args[1].value == "update"
+        ):
+            return True
+        if (
+            isinstance(func.args[1], ast.Constant)
+            and func.args[1].value == "update"
+            and isinstance(func.args[0], ast.Call)
+            and isinstance(func.args[0].func, ast.Name)
+            and func.args[0].func.id == "type"
+            and func.args[0].args
+            and _is_globals_call(func.args[0].args[0])
+        ):
+            return True
+        return (
+            isinstance(func.args[1], ast.Constant)
+            and func.args[1].value == "update"
+            and isinstance(func.args[0], ast.Subscript)
+            and _is_builtins_reference(func.args[0].value)
+            and isinstance(func.args[0].slice, ast.Constant)
+            and func.args[0].slice.value == "dict"
+        )
+    return False
 
 
 
@@ -1135,6 +1192,17 @@ def _is_types_functiontype_callable(
         callable_aliases = {"FunctionType"}
     if isinstance(func, ast.Name):
         return func.id in callable_aliases
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Name)
+        and func.args[0].id in module_aliases
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "FunctionType"
+    ):
+        return True
     return (
         isinstance(func, ast.Attribute)
         and func.attr == "FunctionType"
@@ -1269,6 +1337,12 @@ def _partial_unbound_dict_namespace_method(
         dict_shadow_line=dict_shadow_line,
     ):
         return "__ior__"
+    if _is_dict_type_setitem_callable(
+        target,
+        reference_line=getattr(partial_call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return "__setitem__"
     return None
 
 
@@ -1280,6 +1354,11 @@ def _call_payload_may_set_workers(method, call, start_index=0):
         return (
             len(call.args) > start_index
             and _dict_merge_payload_may_set_workers(call.args[start_index])
+        )
+    if method == "__setitem__":
+        return (
+            len(call.args) > start_index
+            and _key_may_be_workers(call.args[start_index])
         )
     return False
 
@@ -2058,10 +2137,82 @@ def _collect_importlib_import_module_alias_events(tree):
 
 
 
+def _attribute_is_sys_modules_builtins_exec(func, sys_aliases=None):
+    """Return True for ``sys.modules['builtins'].exec/eval`` callables."""
+    if not isinstance(func, ast.Attribute) or func.attr not in _DYNAMIC_EXEC_EVAL_NAMES:
+        return False
+    base = func.value
+    if not isinstance(base, ast.Subscript):
+        return False
+    modules_attr = base.value
+    if not (
+        isinstance(modules_attr, ast.Attribute)
+        and modules_attr.attr == "modules"
+        and isinstance(modules_attr.value, ast.Name)
+        and modules_attr.value.id in (sys_aliases or {"sys"})
+    ):
+        return False
+    return (
+        isinstance(base.slice, ast.Constant)
+        and base.slice.value == "builtins"
+    )
+
+
+def _attribute_is_imported_builtins_exec_eval(node):
+    """Return True for ``__import__('builtins').exec/eval`` attribute references."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in _DYNAMIC_EXEC_EVAL_NAMES
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "__import__"
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Constant)
+        and node.value.args[0].value == "builtins"
+        and not node.value.keywords
+    )
+
+
+def _subscript_is_hidden_exec_eval(func, operator_bindings):
+    """Return True for ``[builtins.exec(...)][0](...)`` style indirection."""
+    if not isinstance(func, ast.Subscript):
+        return False
+    if not isinstance(func.slice, ast.Constant) or func.slice.value != 0:
+        return False
+    if not isinstance(func.value, ast.List) or len(func.value.elts) != 1:
+        return False
+    inner = func.value.elts[0]
+    if isinstance(inner, ast.Call):
+        return _call_is_dynamic_exec_eval(
+            inner,
+            operator_bindings=operator_bindings,
+        )
+    if _attribute_is_imported_builtins_exec_eval(inner):
+        return True
+    builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+    return _attribute_is_dynamic_exec_eval(inner, builtins_aliases)
+
+
+def _importlib_import_module_call(node, importlib_aliases, importlib_module_aliases):
+    """Return True for ``import_module('builtins')`` via importlib aliases."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in importlib_aliases and bool(node.args)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "import_module"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in importlib_module_aliases
+    ):
+        return bool(node.args)
+    return False
+
+
 def _call_is_importlib_builtins_exec_eval(
     call,
     importlib_aliases,
     importlib_alias_events=None,
+    importlib_module_aliases=None,
 ):
     """Return True for ``import_module('builtins').exec/eval(...)`` calls."""
     if not isinstance(call, ast.Call):
@@ -2070,17 +2221,28 @@ def _call_is_importlib_builtins_exec_eval(
     if not isinstance(func, ast.Attribute) or func.attr not in _DYNAMIC_EXEC_EVAL_NAMES:
         return False
     base = func.value
-    if not isinstance(base, ast.Call) or not isinstance(base.func, ast.Name):
+    module_aliases = importlib_module_aliases or set()
+    if not isinstance(base, ast.Call):
         return False
-    is_alias = base.func.id in importlib_aliases
-    if importlib_alias_events and base.func.id in importlib_alias_events:
-        state = _binding_state_at_line(
-            importlib_alias_events,
-            base.func.id,
-            getattr(call, "lineno", 0),
-        )
-        if state is not None:
-            is_alias = state
+    if isinstance(base.func, ast.Name):
+        is_alias = base.func.id in importlib_aliases
+        if importlib_alias_events and base.func.id in importlib_alias_events:
+            state = _binding_state_at_line(
+                importlib_alias_events,
+                base.func.id,
+                getattr(call, "lineno", 0),
+            )
+            if state is not None:
+                is_alias = state
+    elif (
+        isinstance(base.func, ast.Attribute)
+        and base.func.attr == "import_module"
+        and isinstance(base.func.value, ast.Name)
+        and base.func.value.id in module_aliases
+    ):
+        is_alias = True
+    else:
+        return False
     if not is_alias or not base.args:
         return False
     module_name = base.args[0]
@@ -2099,6 +2261,9 @@ def _call_is_dynamic_exec_eval(
     importlib_aliases=None,
     direct_alias_events=None,
     importlib_alias_events=None,
+    importlib_module_aliases=None,
+    sys_aliases=None,
+    operator_bindings=None,
 ):
     """Return True for direct built-ins or known builtins-module calls."""
     if not isinstance(call, ast.Call):
@@ -2112,8 +2277,12 @@ def _call_is_dynamic_exec_eval(
     if importlib_aliases is None:
         importlib_aliases = set()
     func = call.func
+    hidden_exec = False
+    if operator_bindings is not None:
+        hidden_exec = _subscript_is_hidden_exec_eval(func, operator_bindings)
     return (
-        _direct_name_is_builtin_exec_eval(
+        hidden_exec
+        or _direct_name_is_builtin_exec_eval(
             func,
             call,
             exec_eval_shadow_lines,
@@ -2123,10 +2292,12 @@ def _call_is_dynamic_exec_eval(
         or _getattr_is_dynamic_exec_eval(func, builtins_aliases)
         or _subscript_is_dynamic_exec_eval(func, builtins_aliases)
         or _attribute_is_dynamic_exec_eval(func, builtins_aliases)
+        or _attribute_is_sys_modules_builtins_exec(func, sys_aliases)
         or _call_is_importlib_builtins_exec_eval(
             call,
             importlib_aliases,
             importlib_alias_events,
+            importlib_module_aliases,
         )
     )
 
@@ -2579,15 +2750,16 @@ def _invoked_lambda_param_namespace_mutation(call, param_name):
     return _lambda_param_namespace_mutation(func.body, param_name)
 
 
-def _call_mutates_lambda_param_namespace(call, param_name):
+def _call_mutates_lambda_param_namespace(call, param_name, dict_shadow_line=None):
     """Return True when one call can mutate the tracked lambda parameter."""
-    return _attribute_call_mutates_lambda_param(
-        call,
-        param_name,
-    ) or _invoked_lambda_param_namespace_mutation(call, param_name)
+    return (
+        _attribute_call_mutates_lambda_param(call, param_name)
+        or _call_is_dict_setitem_on_name(call, param_name, dict_shadow_line)
+        or _invoked_lambda_param_namespace_mutation(call, param_name)
+    )
 
 
-def _lambda_param_namespace_mutation(body, param_name):
+def _lambda_param_namespace_mutation(body, param_name, dict_shadow_line=None):
     """Return True when a lambda body mutates ``param_name`` with a workers payload."""
     if isinstance(body, ast.Lambda):
         return False
@@ -2596,13 +2768,150 @@ def _lambda_param_namespace_mutation(body, param_name):
     if isinstance(body, ast.Call) and _call_mutates_lambda_param_namespace(
         body,
         param_name,
+        dict_shadow_line,
     ):
         return True
     return any(
-        _lambda_param_namespace_mutation(child, param_name)
+        _lambda_param_namespace_mutation(child, param_name, dict_shadow_line)
         for child in ast.iter_child_nodes(body)
         if isinstance(child, ast.AST) and not isinstance(child, ast.Lambda)
     )
+
+def _call_is_dict_setitem_on_name(call, name, dict_shadow_line=None):
+    """Return True for ``dict.__setitem__(name, 'workers', ...)`` calls."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not isinstance(call.args[0], ast.Name) or call.args[0].id != name:
+        return False
+    if not _is_dict_type_setitem_callable(
+        call.func,
+        reference_line=getattr(call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return False
+    return _key_may_be_workers(call.args[1])
+
+
+def _call_is_operator_call_namespace_update(call, operator_bindings):
+    """Return True for ``operator.call(globals().update, {...})`` mutations."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "call"
+        and _is_operator_module_reference(func.value, module_aliases)
+    ):
+        return False
+    callee = call.args[0]
+    if not (
+        isinstance(callee, ast.Attribute)
+        and callee.attr == "update"
+        and _is_module_namespace_mapping(callee.value, namespace_aliases)
+    ):
+        return False
+    return _update_payload_may_set_workers(call, start_index=1)
+
+
+def _call_is_map_lambda_namespace_update(call, operator_bindings):
+    """Return True for ``map(lambda g: g.update(...), [globals()])`` mutations."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    if not isinstance(call.func, ast.Name) or call.func.id != "map":
+        return False
+    lambda_node = call.args[0]
+    if not isinstance(lambda_node, ast.Lambda) or not lambda_node.args.args:
+        return False
+    param_name = lambda_node.args.args[0].arg
+    if not _lambda_param_namespace_mutation(lambda_node.body, param_name):
+        return False
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    for arg in call.args[1:]:
+        if _is_module_namespace_mapping(arg, namespace_aliases):
+            return True
+        if isinstance(arg, (ast.List, ast.Tuple)):
+            if any(
+                _is_module_namespace_mapping(element, namespace_aliases)
+                for element in arg.elts
+            ):
+                return True
+    return False
+
+
+def _call_is_type_constructor_side_effect(call, operator_bindings):
+    """Return True for ``type(..., {'__init__': lambda: ...})()`` side effects."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not (isinstance(func, ast.Name) and func.id == "type"):
+        return False
+    if len(call.args) >= 3 and isinstance(call.args[2], ast.Dict):
+        for key, value in zip(call.args[2].keys, call.args[2].values):
+            if isinstance(key, ast.Constant) and key.value == "__init__":
+                if isinstance(value, ast.Lambda):
+                    return _expression_mutates_workers(value.body, operator_bindings)
+    for keyword in call.keywords:
+        if keyword.arg == "__init__" and isinstance(keyword.value, ast.Lambda):
+            return _expression_mutates_workers(keyword.value.body, operator_bindings)
+    return False
+
+
+def _call_is_partial_reduce_namespace_mutation(call, operator_bindings):
+    """Return True for ``partial(reduce, lambda..., [None], globals())()`` mutations."""
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    reduce_aliases = operator_bindings[15] if len(operator_bindings) > 15 else set()
+    functools_aliases = operator_bindings[14] if len(operator_bindings) > 14 else set()
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    partial_call, _ = _resolve_partial_invocation(call, partial_aliases)
+    if partial_call is None or len(partial_call.args) < 2:
+        return False
+    first = partial_call.args[0]
+    is_reduce = (isinstance(first, ast.Name) and first.id in reduce_aliases) or (
+        isinstance(first, ast.Attribute)
+        and first.attr == "reduce"
+        and isinstance(first.value, ast.Name)
+        and first.value.id in functools_aliases
+    )
+    if not is_reduce or not isinstance(partial_call.args[1], ast.Lambda):
+        return False
+    initializer = partial_call.args[3] if len(partial_call.args) >= 4 else None
+    if initializer is None or not _is_module_namespace_mapping(
+        initializer, namespace_aliases
+    ):
+        return False
+    lambda_args = partial_call.args[1].args.args
+    if not lambda_args:
+        return False
+    return _lambda_param_namespace_mutation(
+        partial_call.args[1].body,
+        lambda_args[0].arg,
+    )
+
+
+def _call_is_partial_operator_methodcaller_namespace_update(call, operator_bindings):
+    """Return True for ``partial(methodcaller(...), globals())()`` mutations."""
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    partial_call, _ = _resolve_partial_invocation(call, partial_aliases)
+    if partial_call is None or len(partial_call.args) < 2:
+        return False
+    if not _is_module_namespace_mapping(partial_call.args[1], namespace_aliases):
+        return False
+    factory = partial_call.args[0]
+    if not isinstance(factory, ast.Call):
+        return False
+    return _call_is_operator_methodcaller_on_module_namespace(
+        ast.Call(
+            func=factory,
+            args=[partial_call.args[1]],
+            keywords=[],
+        ),
+        operator_bindings,
+        namespace_aliases,
+    )
+
 
 def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
     """Return True when a known ``functools.reduce`` invocation runs a risky lambda."""
@@ -2646,9 +2955,11 @@ def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
     lambda_args = call.args[0].args.args
     if not lambda_args:
         return False
+    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     return _lambda_param_namespace_mutation(
         call.args[0].body,
         lambda_args[0].arg,
+        dict_shadow_line,
     )
 
 
@@ -2667,6 +2978,10 @@ def _call_expression_mutates_workers(expr, operator_bindings):
     functiontype_namespace_aliases = operator_bindings[22] if len(operator_bindings) > 22 else set()
     types_module_aliases = operator_bindings[25] if len(operator_bindings) > 25 else set()
     functiontype_aliases = operator_bindings[26] if len(operator_bindings) > 26 else set()
+    importlib_module_aliases = operator_bindings[24] if len(operator_bindings) > 24 else set()
+    sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else set()
+    chainmap_aliases = operator_bindings[28] if len(operator_bindings) > 28 else set()
+    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     return (
         _call_is_dynamic_exec_eval(
             expr,
@@ -2676,6 +2991,9 @@ def _call_expression_mutates_workers(expr, operator_bindings):
             importlib_aliases,
             direct_exec_eval_alias_events,
             importlib_alias_events,
+            importlib_module_aliases,
+            sys_aliases,
+            operator_bindings,
         )
         or _call_is_operator_methodcaller_exec_on_builtins(expr, operator_bindings)
         or _call_is_module_namespace_workers_update(expr, namespace_aliases)
@@ -2699,11 +3017,22 @@ def _call_expression_mutates_workers(expr, operator_bindings):
             and expr.func.id in functiontype_namespace_aliases
         )
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
-        or _call_is_chainmap_maps_update(expr, namespace_aliases)
+        or _call_is_chainmap_maps_update(
+            expr,
+            namespace_aliases,
+            chainmap_aliases,
+        )
         or _call_is_delegated_simplenamespace_update(
             expr,
             operator_bindings[17] if len(operator_bindings) > 17 else set(),
             delegated_update_alias_events,
+        )
+        or _call_is_operator_call_namespace_update(expr, operator_bindings)
+        or _call_is_map_lambda_namespace_update(expr, operator_bindings)
+        or _call_is_type_constructor_side_effect(expr, operator_bindings)
+        or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
+        or _call_is_partial_operator_methodcaller_namespace_update(
+            expr, operator_bindings
         )
     )
 
@@ -3385,6 +3714,10 @@ def _collect_operator_setitem_bindings(tree):
         types_module_aliases,
         functiontype_aliases,
     )
+    chainmap_namespace_aliases = _collect_chainmap_namespace_aliases(
+        tree,
+        namespace_aliases,
+    )
     return (
         module_aliases,
         setitem_aliases,
@@ -3414,6 +3747,7 @@ def _collect_operator_setitem_bindings(tree):
         types_module_aliases,
         functiontype_aliases,
         partial_dict_mutator_alias_events,
+        chainmap_namespace_aliases,
     )
 
 
@@ -3465,7 +3799,15 @@ def _walk_gunicorn_workers_statements(
         operator_bindings = (set(), set())
 
     for node in statements:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(
+                isinstance(decorator, ast.Name)
+                and decorator.id in global_workers_mutators
+                for decorator in node.decorator_list
+            ):
+                state.dynamic = True
+            continue
+        if isinstance(node, ast.ClassDef):
             continue
         if _node_has_dynamic_workers_effect(
             node,
