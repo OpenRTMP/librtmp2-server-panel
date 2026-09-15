@@ -1,0 +1,135 @@
+name: Fix PR 226 Sonar follow-up
+
+on:
+  push:
+    branches:
+      - security/fix-gunicorn-ast-bypasses-sep15
+
+permissions:
+  contents: write
+
+jobs:
+  preserve-refactor-semantics:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/fix-gunicorn-ast-bypasses-sep15
+
+      - name: Preserve semantics and remove unused alias
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("config.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''def _dict_init_lambda_mutates_workers(namespace_dict, operator_bindings):
+              """Inspect a type namespace dict for an ``__init__`` lambda side effect."""
+              if not isinstance(namespace_dict, ast.Dict):
+                  return False
+              for key, value in zip(namespace_dict.keys, namespace_dict.values):
+                  if isinstance(key, ast.Constant) and key.value == "__init__":
+                      if isinstance(value, ast.Lambda):
+                          return _expression_mutates_workers(value.body, operator_bindings)
+              return False
+
+
+          def _keyword_init_lambda_mutates_workers(keywords, operator_bindings):
+              """Inspect type constructor keywords for an ``__init__`` lambda."""
+              for keyword in keywords:
+                  if keyword.arg == "__init__" and isinstance(keyword.value, ast.Lambda):
+                      return _expression_mutates_workers(
+                          keyword.value.body,
+                          operator_bindings,
+                      )
+              return False
+
+
+          def _call_is_type_constructor_side_effect(call, operator_bindings):
+              """Return True for ``type(..., {'__init__': lambda: ...})()`` side effects."""
+              if not isinstance(call, ast.Call):
+                  return False
+              func = call.func
+              if not (isinstance(func, ast.Name) and func.id == "type"):
+                  return False
+              namespace_dict = call.args[2] if len(call.args) >= 3 else None
+              return _dict_init_lambda_mutates_workers(
+                  namespace_dict,
+                  operator_bindings,
+              ) or _keyword_init_lambda_mutates_workers(
+                  call.keywords,
+                  operator_bindings,
+              )'''
+
+          new = '''def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
+              """Return the first ``__init__`` lambda effect, or None when absent."""
+              if not isinstance(namespace_dict, ast.Dict):
+                  return None
+              for key, value in zip(namespace_dict.keys, namespace_dict.values):
+                  if isinstance(key, ast.Constant) and key.value == "__init__":
+                      if isinstance(value, ast.Lambda):
+                          return _expression_mutates_workers(value.body, operator_bindings)
+              return None
+
+
+          def _keyword_init_lambda_workers_effect(keywords, operator_bindings):
+              """Return the first keyword ``__init__`` lambda effect, or None."""
+              for keyword in keywords:
+                  if keyword.arg == "__init__" and isinstance(keyword.value, ast.Lambda):
+                      return _expression_mutates_workers(
+                          keyword.value.body,
+                          operator_bindings,
+                      )
+              return None
+
+
+          def _call_is_type_constructor_side_effect(call, operator_bindings):
+              """Return True for ``type(..., {'__init__': lambda: ...})()`` side effects."""
+              if not isinstance(call, ast.Call):
+                  return False
+              func = call.func
+              if not (isinstance(func, ast.Name) and func.id == "type"):
+                  return False
+              namespace_dict = call.args[2] if len(call.args) >= 3 else None
+              dict_effect = _dict_init_lambda_workers_effect(
+                  namespace_dict,
+                  operator_bindings,
+              )
+              if dict_effect is not None:
+                  return dict_effect
+              keyword_effect = _keyword_init_lambda_workers_effect(
+                  call.keywords,
+                  operator_bindings,
+              )
+              return bool(keyword_effect)'''
+
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one type-constructor block, found {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          start = text.index("def _call_has_secondary_worker_mutation(")
+          end = text.index("\ndef _call_expression_mutates_workers", start)
+          block = text[start:end]
+          unused = "    importlib_module_aliases = operator_bindings[24] if len(operator_bindings) > 24 else set()\n"
+          if block.count(unused) != 1:
+              raise SystemExit(f"expected one unused alias assignment, found {block.count(unused)}")
+          text = text[:start] + block.replace(unused, "", 1) + text[end:]
+
+          path.write_text(text, encoding="utf-8")
+
+      - name: Validate follow-up
+        run: |
+          python -m py_compile config.py
+          git diff --check
+          git diff -- config.py
+
+      - name: Commit follow-up and clean helper workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config.py
+          git rm .github/workflows/fix-pr-226-sonar-followup.yml
+          git commit -m "refactor: preserve worker scan semantics"
+          git push origin HEAD:security/fix-gunicorn-ast-bypasses-sep15
