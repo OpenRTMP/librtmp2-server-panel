@@ -75,6 +75,21 @@ import config
         "workers = 1\nfrom functools import partial\np = partial(dict.update, globals())\np({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\npartial(dict.__ior__, globals())({'workers': 4})\n",
         "workers = 1\nfrom functools import partial\np = partial(dict.__ior__, globals())\np({'workers': 4})\n",
+        "workers = 1\nfrom collections import ChainMap\ncm = ChainMap(globals(), {})\ncm.maps[0].update({'workers': 4})\n",
+        "workers = 1\nlist(map(lambda g: g.update({'workers': 4}), [globals()]))\n",
+        "workers = 1\ndef dec(f):\n    globals()['workers'] = 4\n    return f\n@dec\ndef f(): pass\n",
+        "workers = 1\nimport sys\nsys.modules['builtins'].exec('workers=4')\n",
+        "workers = 1\nimport operator\noperator.call(globals().update, {'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\npartial(dict.__setitem__, globals(), 'workers')(4)\n",
+        "workers = 1\nimport types\nc=compile('workers=4','','exec')\ngetattr(types, 'FunctionType')(c, globals())()\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda g, _: dict.__setitem__(g, 'workers', 4), [None], globals())\n",
+        "workers = 1\ntype('X', (), {'__init__': lambda self: globals().update({'workers': 4})})()\n",
+        "workers = 1\ngetattr(type(globals()), 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\n[__import__('builtins').exec][0]('workers=4')\n",
+        "workers = 1\nimport importlib\nimportlib.import_module('builtins').exec('workers=4')\n",
+        "workers = 1\nfrom functools import partial\nfrom operator import methodcaller\npartial(methodcaller('update', {'workers': 4}), globals())()\n",
+        "workers = 1\ngetattr(__builtins__['dict'], 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom functools import partial, reduce\npartial(reduce, lambda g,_: g.update({'workers':4}), [None], globals())()\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
@@ -267,3 +282,39 @@ def test_cli_workers_override_implicit_config(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["gunicorn", "--workers", "1", "app:app"])
 
     assert config._detect_worker_settings() == (1, False)
+
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport operator\noperator.call(globals().update, workers=4)\n",
+        "workers = 1\nlist(map(lambda _, g: g.update({'workers': 4}), [None], [globals()]))\n",
+        "workers = 1\ndef dec(value):\n    globals()['workers'] = 4\n    return value\n@dec\nclass C:\n    pass\n",
+        "workers = 1\n[None, __import__('builtins').exec][1]('workers=4')\n",
+        "workers = 1\n(__import__('builtins').exec,)[0]('workers=4')\n",
+        "workers = 1\n[None, __import__('builtins').exec][-1]('workers=4')\n",
+        "workers = 1\nfrom functools import partial, reduce\npartial(reduce, lambda g, _: g.update({'workers': 4}) or g, [None], initial=globals())()\n",
+        "workers = 1\ndict = object()\ngetattr(type(globals()), 'update')(globals(), {'workers': 4})\n",
+    ],
+)
+def test_codex_followup_worker_mutations_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom collections import ChainMap\ncm = ChainMap({}, globals())\ncm.maps[0].update({'workers': 4})\n",
+        "workers = 1\nT = type('X', (), {'__init__': lambda self: globals().update({'workers': 4})})\n",
+        "workers = 1\nimport importlib\nclass Helper:\n    def import_module(self, name):\n        class Builtins:\n            @staticmethod\n            def exec(code):\n                return None\n        return Builtins()\nimportlib = Helper()\nimportlib.import_module('builtins').exec('workers=4')\n",
+    ],
+)
+def test_codex_followup_safe_patterns_stay_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
