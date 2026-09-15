@@ -2888,26 +2888,26 @@ def _call_is_map_lambda_namespace_update(call, operator_bindings):
     )
 
 
-def _dict_init_lambda_mutates_workers(namespace_dict, operator_bindings):
-    """Inspect a type namespace dict for an ``__init__`` lambda side effect."""
+def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
+    """Return the first ``__init__`` lambda effect, or None when absent."""
     if not isinstance(namespace_dict, ast.Dict):
-        return False
+        return None
     for key, value in zip(namespace_dict.keys, namespace_dict.values):
         if isinstance(key, ast.Constant) and key.value == "__init__":
             if isinstance(value, ast.Lambda):
                 return _expression_mutates_workers(value.body, operator_bindings)
-    return False
+    return None
 
 
-def _keyword_init_lambda_mutates_workers(keywords, operator_bindings):
-    """Inspect type constructor keywords for an ``__init__`` lambda."""
+def _keyword_init_lambda_workers_effect(keywords, operator_bindings):
+    """Return the first keyword ``__init__`` lambda effect, or None."""
     for keyword in keywords:
         if keyword.arg == "__init__" and isinstance(keyword.value, ast.Lambda):
             return _expression_mutates_workers(
                 keyword.value.body,
                 operator_bindings,
             )
-    return False
+    return None
 
 
 def _call_is_type_constructor_side_effect(call, operator_bindings):
@@ -2918,13 +2918,17 @@ def _call_is_type_constructor_side_effect(call, operator_bindings):
     if not (isinstance(func, ast.Name) and func.id == "type"):
         return False
     namespace_dict = call.args[2] if len(call.args) >= 3 else None
-    return _dict_init_lambda_mutates_workers(
+    dict_effect = _dict_init_lambda_workers_effect(
         namespace_dict,
         operator_bindings,
-    ) or _keyword_init_lambda_mutates_workers(
+    )
+    if dict_effect is not None:
+        return dict_effect
+    keyword_effect = _keyword_init_lambda_workers_effect(
         call.keywords,
         operator_bindings,
     )
+    return bool(keyword_effect)
 
 
 def _call_is_partial_reduce_namespace_mutation(call, operator_bindings):
@@ -3100,7 +3104,6 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings):
     delegated_update_aliases = operator_bindings[17] if len(operator_bindings) > 17 else set()
     delegated_update_alias_events = operator_bindings[20] if len(operator_bindings) > 20 else {}
     functiontype_namespace_aliases = operator_bindings[22] if len(operator_bindings) > 22 else set()
-    importlib_module_aliases = operator_bindings[24] if len(operator_bindings) > 24 else set()
     types_module_aliases = operator_bindings[25] if len(operator_bindings) > 25 else set()
     functiontype_aliases = operator_bindings[26] if len(operator_bindings) > 26 else set()
     chainmap_aliases = operator_bindings[28] if len(operator_bindings) > 28 else set()
