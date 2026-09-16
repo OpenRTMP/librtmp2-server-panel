@@ -318,3 +318,30 @@ def test_codex_followup_safe_patterns_stay_static(tmp_path, config_content):
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport operator\noperator.call(globals().__setitem__, 'workers', 4)\n",
+        "workers = 1\n(globals().__class__.__dict__['update'])(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\ngetattr(builtins.dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom contextlib import contextmanager\n@contextmanager\ndef cm():\n    globals().update({'workers': 4})\n    yield\nwith cm(): pass\n",
+        "workers = 1\nclass C:\n    def __init__(self):\n        globals().update({'workers': 4})\nC()\n",
+        "workers = 1\nclass C:\n    @staticmethod\n    def f():\n        globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\nclass C:\n    @classmethod\n    def f(cls):\n        globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\nclass C:\n    @property\n    def p(self):\n        globals().update({'workers': 4})\n        return 0\nC().p\n",
+        "workers = 1\nclass M(type):\n    def __init__(cls, name, bases, ns):\n        globals().update({'workers': 4})\nclass C(metaclass=M): pass\n",
+        "workers = 1\nsorted([0], key=lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nlist(filter(lambda _: globals().update({'workers': 4}), [True]))\n",
+        "workers = 1\nimport operator\ngetattr(operator, 'call')(operator.setitem, globals(), 'workers', 4)\n",
+        "workers = 1\n__builtins__['dict'].update(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\ngetattr(partial(globals().update, {'workers': 4}), '__call__')()\n",
+    ],
+)
+def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
