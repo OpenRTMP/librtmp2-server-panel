@@ -3172,35 +3172,85 @@ def _class_overrides_update(class_node):
     return False
 
 
+
+def _dict_subclass_uses_builtin_update(class_node, dict_shadow_line=None):
+    """Return whether a class inherits the unmodified builtin dict.update."""
+    line = getattr(class_node, 'lineno', 0)
+    inherits_builtin_dict = (
+        _dict_name_is_builtin_at_line(line, dict_shadow_line)
+        and any(
+            isinstance(base, ast.Name) and base.id == 'dict'
+            for base in class_node.bases
+        )
+    )
+    return inherits_builtin_dict and not _class_overrides_update(class_node)
+
+
+def _deactivate_tracked_binding(events, name, line):
+    """Record that a previously tracked binding is no longer active."""
+    if name in events:
+        events[name].append((line, False))
+
+
+def _invalidate_tracked_bindings_from_statement(node, events, line):
+    """Deactivate tracked names rebound by a non-class statement."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        _deactivate_tracked_binding(events, node.name, line)
+    for name, _value in _namespace_assignment_values(node):
+        _deactivate_tracked_binding(events, name, line)
+
+
+def _record_dict_subclass_definition(
+    class_node,
+    events,
+    dict_shadow_line,
+    *,
+    conditional,
+):
+    """Record one dict-subclass definition while preserving branch uncertainty."""
+    line = getattr(class_node, 'lineno', 0)
+    if _dict_subclass_uses_builtin_update(class_node, dict_shadow_line):
+        events.setdefault(class_node.name, []).append((line, True))
+        return
+    if not conditional:
+        _deactivate_tracked_binding(events, class_node.name, line)
+
+
+def _scan_dict_subclass_bindings(
+    statements,
+    events,
+    dict_shadow_line,
+    *,
+    conditional=False,
+):
+    """Populate source-ordered dict-subclass binding events."""
+    for node in statements:
+        line = getattr(node, 'lineno', 0)
+        if isinstance(node, ast.ClassDef):
+            _record_dict_subclass_definition(
+                node,
+                events,
+                dict_shadow_line,
+                conditional=conditional,
+            )
+            continue
+        if not conditional:
+            _invalidate_tracked_bindings_from_statement(node, events, line)
+        for nested in _compound_statement_blocks(node):
+            _scan_dict_subclass_bindings(
+                nested,
+                events,
+                dict_shadow_line,
+                conditional=True,
+            )
+
+
 def _collect_dict_subclass_names(statements, dict_shadow_line=None):
     """Track class names that inherit the unmodified builtin ``dict.update``."""
     events = {}
-
-    def scan(block, *, conditional=False):
-        for node in block:
-            line = getattr(node, 'lineno', 0)
-            if isinstance(node, ast.ClassDef):
-                active = (
-                    _dict_name_is_builtin_at_line(line, dict_shadow_line)
-                    and any(isinstance(base, ast.Name) and base.id == 'dict' for base in node.bases)
-                    and not _class_overrides_update(node)
-                )
-                if active:
-                    events.setdefault(node.name, []).append((line, True))
-                elif not conditional and node.name in events:
-                    events[node.name].append((line, False))
-                continue
-            if not conditional:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in events:
-                    events[node.name].append((line, False))
-                for name, _value in _namespace_assignment_values(node):
-                    if name in events:
-                        events[name].append((line, False))
-            for nested in _compound_statement_blocks(node):
-                scan(nested, conditional=True)
-
-    scan(statements)
+    _scan_dict_subclass_bindings(statements, events, dict_shadow_line)
     return events
+
 
 
 
@@ -3237,18 +3287,27 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 
+
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     """Return True when consuming a map/filter must execute a risky lambda."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
         return False
-    if call.func.id not in {'map', 'filter'} or not call.args:
+    name = call.func.id
+    if name not in {'map', 'filter'} or not call.args:
+        return False
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    if not _name_is_unshadowed_builtin(
+        name,
+        getattr(call, 'lineno', 0),
+        shadow_lines,
+    ):
         return False
     lambda_node = call.args[0]
     if not isinstance(lambda_node, ast.Lambda):
         return False
     if _lambda_mutates_workers(lambda_node, operator_bindings):
         return True
-    if call.func.id != 'map':
+    if name != 'map':
         return False
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
@@ -3259,30 +3318,157 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     )
 
 
-def _call_has_mutating_lambda_argument(call, operator_bindings):
-    """Detect callbacks only where the current expression actually executes them."""
+
+
+def _lazy_iterator_alias_is_active(expr, operator_bindings):
+    """Return True for a saved risky map/filter iterator at this source line."""
+    if not isinstance(expr, ast.Name) or len(operator_bindings) <= 33:
+        return False
+    events = operator_bindings[33]
+    return bool(
+        _binding_state_at_line(
+            events,
+            expr.id,
+            getattr(expr, 'lineno', 0),
+        )
+    )
+
+
+def _expression_is_mutating_lazy_iterator(expr, operator_bindings):
+    """Return True for a direct or saved map/filter iterator with a risky callback."""
+    return _map_or_filter_lambda_mutates_when_consumed(
+        expr,
+        operator_bindings,
+    ) or _lazy_iterator_alias_is_active(expr, operator_bindings)
+
+
+def _key_lambda_mutates_workers(call, operator_bindings):
+    """Return True when a key callback executed by this call mutates workers."""
+    return any(
+        keyword.arg == 'key'
+        and isinstance(keyword.value, ast.Lambda)
+        and _lambda_mutates_workers(keyword.value, operator_bindings)
+        for keyword in call.keywords
+    )
+
+
+def _builtin_consumer_is_active(name, call, operator_bindings):
+    """Return whether a known eager iterable consumer still resolves to a builtin."""
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    return _name_is_unshadowed_builtin(
+        name,
+        getattr(call, 'lineno', 0),
+        shadow_lines,
+    )
+
+
+def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect eager builtin consumers of direct or saved risky map/filter iterators."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
         return False
-    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    reference_line = getattr(call, 'lineno', 0)
     name = call.func.id
-    if name == 'sorted':
-        if not _name_is_unshadowed_builtin('sorted', reference_line, builtin_shadow_lines):
-            return False
-        return any(
-            keyword.arg == 'key'
-            and isinstance(keyword.value, ast.Lambda)
-            and _lambda_mutates_workers(keyword.value, operator_bindings)
-            for keyword in call.keywords
-        )
-    if name not in {'list', 'tuple', 'set', 'any', 'all', 'max', 'min', 'next'}:
+    consumers = {'list', 'tuple', 'set', 'any', 'all', 'max', 'min', 'next', 'sorted'}
+    if name not in consumers or not _builtin_consumer_is_active(
+        name,
+        call,
+        operator_bindings,
+    ):
         return False
-    if not _name_is_unshadowed_builtin(name, reference_line, builtin_shadow_lines):
+    if name in {'sorted', 'max', 'min'} and _key_lambda_mutates_workers(
+        call,
+        operator_bindings,
+    ):
+        return True
+    if not call.args:
         return False
-    return bool(call.args) and _map_or_filter_lambda_mutates_when_consumed(
+    if name in {'max', 'min'} and len(call.args) != 1:
+        return False
+    return _expression_is_mutating_lazy_iterator(
         call.args[0],
         operator_bindings,
     )
+
+
+def _lazy_iterator_assignment_is_mutating(value, active_names, operator_bindings):
+    """Return whether an assignment stores a risky lazy iterator."""
+    if _map_or_filter_lambda_mutates_when_consumed(value, operator_bindings):
+        return True
+    return isinstance(value, ast.Name) and value.id in active_names
+
+
+def _record_lazy_iterator_assignment_events(
+    node,
+    active_names,
+    events,
+    operator_bindings,
+    *,
+    conditional,
+):
+    """Record source-ordered assignment/rebinding events for lazy iterators."""
+    line = getattr(node, 'lineno', 0)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional and node.name in active_names:
+            active_names.discard(node.name)
+            events.setdefault(node.name, []).append((line, False))
+        return
+    for name, value in _namespace_assignment_values(node):
+        if _lazy_iterator_assignment_is_mutating(
+            value,
+            active_names,
+            operator_bindings,
+        ):
+            active_names.add(name)
+            events.setdefault(name, []).append((line, True))
+        elif not conditional and name in active_names:
+            active_names.discard(name)
+            events.setdefault(name, []).append((line, False))
+
+
+def _scan_lazy_iterator_alias_events(
+    statements,
+    active_names,
+    events,
+    operator_bindings,
+    *,
+    conditional=False,
+):
+    """Collect risky lazy-iterator aliases through import-time compound blocks."""
+    for node in statements:
+        _record_lazy_iterator_assignment_events(
+            node,
+            active_names,
+            events,
+            operator_bindings,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_lazy_iterator_alias_events(
+                block,
+                active_names,
+                events,
+                operator_bindings,
+                conditional=True,
+            )
+
+
+def _collect_mutating_lazy_iterator_alias_events(tree, operator_bindings):
+    """Collect source-ordered names that hold risky lazy map/filter iterators."""
+    events = {}
+    _scan_lazy_iterator_alias_events(
+        tree.body,
+        set(),
+        events,
+        operator_bindings,
+    )
+    return events
+
+
+def _call_has_mutating_lambda_argument(call, operator_bindings):
+    """Detect callbacks only when the current call actually executes them."""
+    return _call_consumes_mutating_lazy_iterator(call, operator_bindings)
+
 
 
 
@@ -3397,44 +3583,111 @@ def _record_class_side_effect_target(
 
 
 
+
+def _class_has_worker_side_effect_target(
+    class_node,
+    operator_bindings,
+    constructors,
+    methods,
+    properties,
+):
+    """Record all risky hooks in one class and report whether any were found."""
+    risky = False
+    for stmt in class_node.body:
+        if _record_class_side_effect_target(
+            class_node.name,
+            stmt,
+            operator_bindings,
+            constructors,
+            methods,
+            properties,
+        ):
+            risky = True
+    return risky
+
+
+def _record_class_side_effect_binding(
+    class_node,
+    binding_events,
+    risky,
+    *,
+    conditional,
+):
+    """Record activation or definite replacement of one risky class binding."""
+    line = getattr(class_node, 'lineno', 0)
+    if risky:
+        binding_events.setdefault(class_node.name, []).append((line, True))
+        return
+    if not conditional:
+        _deactivate_tracked_binding(binding_events, class_node.name, line)
+
+
+def _scan_class_side_effect_bindings(
+    statements,
+    operator_bindings,
+    constructors,
+    methods,
+    properties,
+    binding_events,
+    *,
+    conditional=False,
+):
+    """Populate source-ordered risky class bindings through compound blocks."""
+    for node in statements:
+        line = getattr(node, 'lineno', 0)
+        if isinstance(node, ast.ClassDef):
+            risky = _class_has_worker_side_effect_target(
+                node,
+                operator_bindings,
+                constructors,
+                methods,
+                properties,
+            )
+            _record_class_side_effect_binding(
+                node,
+                binding_events,
+                risky,
+                conditional=conditional,
+            )
+            continue
+        if not conditional:
+            _invalidate_tracked_bindings_from_statement(
+                node,
+                binding_events,
+                line,
+            )
+        for block in _compound_statement_blocks(node):
+            _scan_class_side_effect_bindings(
+                block,
+                operator_bindings,
+                constructors,
+                methods,
+                properties,
+                binding_events,
+                conditional=True,
+            )
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
     properties = set()
-    metaclass_definitions = _collect_metaclass_definition_mutators(tree, operator_bindings)
+    metaclass_definitions = _collect_metaclass_definition_mutators(
+        tree,
+        operator_bindings,
+    )
     binding_events = {}
-
-    def scan(statements, *, conditional=False):
-        for node in statements:
-            line = getattr(node, 'lineno', 0)
-            if isinstance(node, ast.ClassDef):
-                risky = False
-                for stmt in node.body:
-                    risky = _record_class_side_effect_target(
-                        node.name,
-                        stmt,
-                        operator_bindings,
-                        constructors,
-                        methods,
-                        properties,
-                    ) or risky
-                if risky:
-                    binding_events.setdefault(node.name, []).append((line, True))
-                elif not conditional and node.name in binding_events:
-                    binding_events[node.name].append((line, False))
-                continue
-            if not conditional:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in binding_events:
-                    binding_events[node.name].append((line, False))
-                for name, _value in _namespace_assignment_values(node):
-                    if name in binding_events:
-                        binding_events[name].append((line, False))
-            for block in _compound_statement_blocks(node):
-                scan(block, conditional=True)
-
-    scan(tree.body)
+    _scan_class_side_effect_bindings(
+        tree.body,
+        operator_bindings,
+        constructors,
+        methods,
+        properties,
+        binding_events,
+    )
     return constructors, methods, properties, metaclass_definitions, binding_events
+
 
 
 
@@ -3785,10 +4038,31 @@ def _call_expression_mutates_workers(expr, operator_bindings, dict_subclass_name
     )
 
 
+
+def _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
+    """Return True for eager expression forms that consume a risky lazy iterator."""
+    if isinstance(expr, ast.Starred) and isinstance(expr.ctx, ast.Load):
+        return _expression_is_mutating_lazy_iterator(
+            expr.value,
+            operator_bindings,
+        )
+    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp)):
+        return any(
+            _expression_is_mutating_lazy_iterator(
+                generator.iter,
+                operator_bindings,
+            )
+            for generator in expr.generators
+        )
+    return False
+
+
 def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
         return False
+    if _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
+        return True
     if isinstance(expr, ast.Call) and _call_expression_mutates_workers(
         expr,
         operator_bindings,
@@ -3799,6 +4073,7 @@ def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=Non
         _expression_mutates_workers(child, operator_bindings, dict_subclass_names)
         for child in ast.iter_child_nodes(expr)
     )
+
 
 
 
@@ -4045,6 +4320,17 @@ def _indirect_workers_assignment_target(node):
     )
 
 
+
+def _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
+    """Return True when a loop eagerly advances a risky lazy iterator."""
+    return isinstance(node, (ast.For, ast.AsyncFor)) and (
+        _expression_is_mutating_lazy_iterator(
+            node.iter,
+            operator_bindings,
+        )
+    )
+
+
 def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if dict_subclass_names is None:
@@ -4052,7 +4338,8 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
         return True
-
+    if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
+        return True
     if any(
         isinstance(child, ast.expr)
         and _expression_mutates_workers(
@@ -4063,14 +4350,15 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         for child in ast.iter_child_nodes(node)
     ):
         return True
-
     if isinstance(node, ast.Assign):
-        return any(_indirect_workers_assignment_target(target) for target in node.targets)
-
+        return any(
+            _indirect_workers_assignment_target(target)
+            for target in node.targets
+        )
     if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
         return _indirect_workers_assignment_target(node.target)
-
     return False
+
 
 
 def _statements_declare_global_workers(statements):
@@ -4441,29 +4729,50 @@ def _collect_functools_reduce_aliases(statements):
     return module_aliases, reduce_aliases
 
 
+
+def _record_imported_module_aliases(node, module_name, active, events, line):
+    """Record aliases introduced by a matching import statement."""
+    if not isinstance(node, ast.Import):
+        return
+    for imported in node.names:
+        if imported.name == module_name:
+            name = imported.asname or imported.name
+            active.add(name)
+            events.setdefault(name, []).append((line, True))
+
+
+def _deactivate_imported_module_alias(name, active, events, line):
+    """Deactivate a proven module alias after a definite rebinding."""
+    if name in active or name in events:
+        active.discard(name)
+        events.setdefault(name, []).append((line, False))
+
+
+def _invalidate_imported_module_aliases(node, active, events, line):
+    """Record definite definition/assignment rebindings of module aliases."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        _deactivate_imported_module_alias(node.name, active, events, line)
+        return
+    for name, _value in _namespace_assignment_values(node):
+        _deactivate_imported_module_alias(name, active, events, line)
+
+
 def _collect_imported_module_alias_events(tree, module_name):
     """Track unconditional module import aliases and later rebindings."""
     events = {}
     active = set()
     for node in tree.body:
         line = getattr(node, 'lineno', 0)
-        if isinstance(node, ast.Import):
-            for imported in node.names:
-                if imported.name == module_name:
-                    name = imported.asname or imported.name
-                    active.add(name)
-                    events.setdefault(name, []).append((line, True))
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            name = node.name
-            if name in active or name in events:
-                active.discard(name)
-                events.setdefault(name, []).append((line, False))
-            continue
-        for name, _value in _namespace_assignment_values(node):
-            if name in active or name in events:
-                active.discard(name)
-                events.setdefault(name, []).append((line, False))
+        _record_imported_module_aliases(
+            node,
+            module_name,
+            active,
+            events,
+            line,
+        )
+        _invalidate_imported_module_aliases(node, active, events, line)
     return events
+
 
 
 def _collect_operator_setitem_bindings(tree):
@@ -4733,6 +5042,11 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (*operator_bindings, lazy_iterator_alias_events)
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)

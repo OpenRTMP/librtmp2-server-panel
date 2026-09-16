@@ -385,3 +385,36 @@ def test_codex_review_dynamic_patterns_are_detected(tmp_path, config_content):
     config_file = tmp_path / 'gunicorn.conf.py'
     config_file.write_text(config_content, encoding='utf-8')
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+
+# Cursor lazy-consumer follow-up regressions
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nsorted(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfor _ in map(lambda _: globals().update({'workers': 4}), [1]):\n    pass\n",
+        "workers = 1\n[*map(lambda _: globals().update({'workers': 4}), [1])]\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\nlist(it)\n",
+        "workers = 1\nmax([1], key=lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nmin([1], key=lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_cursor_lazy_iterator_consumers_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nit = filter(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\nit = []\nlist(it)\n",
+    ],
+)
+def test_cursor_unconsumed_or_rebound_lazy_iterators_stay_static(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
