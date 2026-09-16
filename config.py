@@ -3236,10 +3236,6 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 
-_HIGHER_ORDER_LAMBDA_BUILTINS = frozenset(
-    {"map", "filter", "sorted", "any", "all", "max", "min", "list", "bool", "next"}
-)
-
 
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     """Return True when consuming a map/filter must execute a risky lambda."""
