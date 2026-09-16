@@ -345,3 +345,43 @@ def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nbool(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nmap(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nfilter(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\nC = lambda: None\nC()\n",
+        "workers = 1\nclass dict:\n    @staticmethod\n    def update(target, payload): return target\nclass D(dict): pass\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict):\n    @staticmethod\n    def update(target, payload): return target\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\nclass Helper:\n    class Dict:\n        @staticmethod\n        def update(target, payload): return target\n    dict = Dict\nbuiltins = Helper()\ngetattr(builtins.dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nimport operator\nclass Helper:\n    @staticmethod\n    def call(*args): return None\noperator = Helper()\noperator.call(globals().__setitem__, 'workers', 4)\n",
+        "workers = 1\nfrom functools import partial\ngetattr = lambda obj, name: (lambda: None)\ngetattr(partial(globals().update, {'workers': 4}), '__call__')()\n",
+        "workers = 1\ndef staticmethod(fn):\n    return lambda *a, **k: None\nclass C:\n    @staticmethod\n    def f(): globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\ndef globals():\n    class Mapping(dict):\n        @staticmethod\n        def update(target, payload): return target\n    return Mapping()\n(globals().__class__.__dict__['update'])(globals(), {'workers': 4})\n",
+    ],
+)
+def test_codex_review_safe_patterns_remain_static(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\nprint(C())\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\n(C(),)\n",
+        "workers = 1\nif True:\n    class C:\n        def __init__(self): globals().update({'workers': 4})\nC()\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\ndef helper():\n    return C()\nhelper()\n",
+        "workers = 1\nclass D(dict): pass\ndef helper():\n    D.update(globals(), {'workers': 4})\nhelper()\n",
+        "workers = 1\nimport builtins\nbuiltins.dict.update(globals(), {'workers': 4})\n",
+        "workers = 1\ngetattr(globals().__class__.__dict__, 'update')(globals(), {'workers': 4})\n",
+    ],
+)
+def test_codex_review_dynamic_patterns_are_detected(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

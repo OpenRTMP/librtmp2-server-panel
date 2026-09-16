@@ -945,43 +945,86 @@ def _is_builtins_dict_subscript(node):
     )
 
 
-def _is_builtins_dict_attribute(node):
-    """Return True for ``builtins.dict`` attribute references."""
+def _module_alias_active_at_line(node, aliases, events, reference_line=0):
+    """Return whether a name still resolves to a proven imported module."""
+    if not isinstance(node, ast.Name):
+        return False
+    if events and node.id in events:
+        state = _binding_state_at_line(events, node.id, reference_line or getattr(node, 'lineno', 0))
+        if state is not None:
+            return bool(state)
+    return node.id in (aliases or set())
+
+
+def _name_is_unshadowed_builtin(name, reference_line, shadow_lines=None):
+    """Return whether a builtin name is still visible at one source line."""
+    shadow_line = (shadow_lines or {}).get(name)
+    return shadow_line is None or not reference_line or reference_line < shadow_line
+
+
+def _is_builtins_dict_attribute(
+    node,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    reference_line=0,
+):
+    """Return True for proven ``builtins.dict`` attribute references."""
     return (
         isinstance(node, ast.Attribute)
-        and node.attr == "dict"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "builtins"
+        and node.attr == 'dict'
+        and _module_alias_active_at_line(
+            node.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line or getattr(node, 'lineno', 0),
+        )
     )
 
 
-def _is_globals_class_dict_reference(node):
-    """Return True for ``globals().__class__.__dict__`` attribute prefixes."""
-    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+
+def _is_globals_class_dict_reference(node, shadow_lines=None):
+    """Return True for builtin ``globals().__class__.__dict__`` prefixes."""
+    original = node
+    if isinstance(node, ast.Attribute) and node.attr == '__dict__':
         node = node.value
+    reference_line = getattr(original, 'lineno', 0)
     return (
-        isinstance(node, ast.Attribute)
-        and node.attr == "__class__"
+        _name_is_unshadowed_builtin('globals', reference_line, shadow_lines)
+        and isinstance(node, ast.Attribute)
+        and node.attr == '__class__'
         and _is_globals_call(node.value)
     )
 
 
-def _is_globals_type_dict_update_subscript(node):
+
+def _is_globals_type_dict_update_subscript(node, shadow_lines=None):
     """Return True for ``globals().__class__.__dict__['update']`` lookups."""
     if not isinstance(node, ast.Subscript):
         return False
-    if not isinstance(node.slice, ast.Constant) or node.slice.value != "update":
+    if not isinstance(node.slice, ast.Constant) or node.slice.value != 'update':
         return False
-    return _is_globals_class_dict_reference(node.value)
+    return _is_globals_class_dict_reference(node.value, shadow_lines)
 
 
-def _is_builtins_dict_update_attribute(func):
-    """Return True for ``__builtins__['dict'].update`` attribute references."""
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "update"
-        and _is_builtins_dict_subscript(func.value)
+
+def _is_builtins_dict_update_attribute(
+    func,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    reference_line=0,
+):
+    """Return True for proven builtins-dict ``update`` attribute references."""
+    if not isinstance(func, ast.Attribute) or func.attr != 'update':
+        return False
+    if _is_builtins_dict_subscript(func.value):
+        return True
+    return _is_builtins_dict_attribute(
+        func.value,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line or getattr(func, 'lineno', 0),
     )
+
 
 
 def _is_dict_type_update_callable(
@@ -990,6 +1033,9 @@ def _is_dict_type_update_callable(
     *,
     reference_line=0,
     dict_shadow_line=None,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
 ):
     """Return True for builtin ``dict.update`` or a proven alias of it."""
     if aliases is None:
@@ -998,42 +1044,76 @@ def _is_dict_type_update_callable(
         return func.id in aliases
     if _is_direct_dict_update_attribute(func):
         return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
-    if _is_builtins_dict_update_attribute(func):
+    if _is_builtins_dict_update_attribute(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    ):
         return True
-    if _is_globals_type_dict_update_subscript(func):
+    if _is_globals_type_dict_update_subscript(func, builtin_shadow_lines):
         return True
-    target = _getattr_target_for_method(func, "update")
+    if not _name_is_unshadowed_builtin('getattr', reference_line, builtin_shadow_lines):
+        return False
+    target = _getattr_target_for_method(func, 'update')
     if target is None:
         return False
-    if isinstance(target, ast.Name) and target.id == "dict":
+    if isinstance(target, ast.Name) and target.id == 'dict':
         return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
     return (
-        _is_type_of_globals_call(target)
+        (
+            _name_is_unshadowed_builtin('type', reference_line, builtin_shadow_lines)
+            and _name_is_unshadowed_builtin('globals', reference_line, builtin_shadow_lines)
+            and _is_type_of_globals_call(target)
+        )
         or _is_builtins_dict_subscript(target)
-        or _is_builtins_dict_attribute(target)
-        or _is_globals_type_dict_update_subscript(target)
+        or _is_builtins_dict_attribute(
+            target,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+        or _is_globals_class_dict_reference(target, builtin_shadow_lines)
     )
 
 
-def _values_are_dict_update_aliases(values, aliases, dict_shadow_line=None):
+
+def _values_are_dict_update_aliases(
+    values,
+    aliases,
+    dict_shadow_line=None,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
     """Return True when every assignment resolves to builtin ``dict.update``."""
     resolved_values = [value for value in values if value is not None]
     return bool(resolved_values) and all(
         _is_dict_type_update_callable(
             value,
             aliases,
-            reference_line=getattr(value, "lineno", 0),
+            reference_line=getattr(value, 'lineno', 0),
             dict_shadow_line=dict_shadow_line,
+            builtins_aliases=builtins_aliases,
+            builtins_alias_events=builtins_alias_events,
+            builtin_shadow_lines=builtin_shadow_lines,
         )
         for value in resolved_values
     )
 
 
 
-def _collect_dict_update_aliases(tree, dict_shadow_line=None):
-    """Collect transitive aliases that are always bound to builtin ``dict.update``."""
+
+def _collect_dict_update_aliases(
+    tree,
+    dict_shadow_line=None,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
+    """Collect transitive aliases always bound to builtin ``dict.update``."""
     if dict_shadow_line is None:
-        dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
+        dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
     aliases = set()
@@ -1046,6 +1126,9 @@ def _collect_dict_update_aliases(tree, dict_shadow_line=None):
                 assignments[name],
                 aliases,
                 dict_shadow_line,
+                builtins_aliases,
+                builtins_alias_events,
+                builtin_shadow_lines,
             )
         }
         if not discovered:
@@ -1056,25 +1139,34 @@ def _collect_dict_update_aliases(tree, dict_shadow_line=None):
 
 
 
+
 def _call_is_dict_type_update_on_module_namespace(
     call,
     namespace_aliases=None,
     update_aliases=None,
     dict_shadow_line=None,
+    operator_bindings=None,
 ):
-    """Return True for builtin ``dict.update(globals(), ...)`` style mutations."""
+    """Return True for builtin ``dict.update(globals(), ...)`` mutations."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
+    builtins_aliases = operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()
+    builtins_alias_events = operator_bindings[30] if operator_bindings and len(operator_bindings) > 30 else {}
+    builtin_shadow_lines = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
     if not _is_dict_type_update_callable(
         call.func,
         update_aliases,
-        reference_line=getattr(call, "lineno", 0),
+        reference_line=getattr(call, 'lineno', 0),
         dict_shadow_line=dict_shadow_line,
+        builtins_aliases=builtins_aliases,
+        builtins_alias_events=builtins_alias_events,
+        builtin_shadow_lines=builtin_shadow_lines,
     ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
         return False
     return _update_payload_may_set_workers(call, start_index=1)
+
 
 
 
@@ -2773,43 +2865,53 @@ def _collect_partial_dict_namespace_mutator_alias_events(
             events.setdefault(name, []).append((line, method))
     return events
 
-def _call_is_getattr_partial_invocation(call, partial_aliases):
-    """Return True for ``getattr(partial, '__call__')(...)`` invocations."""
+def _call_is_getattr_partial_invocation(call, partial_aliases, builtin_shadow_lines=None):
+    """Return True for builtin ``getattr(partial, '__call__')(...)`` invocations."""
     if not isinstance(call, ast.Call):
         return False
     func = call.func
+    reference_line = getattr(call, 'lineno', 0)
     return (
-        isinstance(func, ast.Call)
+        _name_is_unshadowed_builtin('getattr', reference_line, builtin_shadow_lines)
+        and isinstance(func, ast.Call)
         and isinstance(func.func, ast.Name)
-        and func.func.id == "getattr"
+        and func.func.id == 'getattr'
         and len(func.args) >= 2
         and isinstance(func.args[0], ast.Name)
         and func.args[0].id in partial_aliases
         and isinstance(func.args[1], ast.Constant)
-        and func.args[1].value == "__call__"
+        and func.args[1].value == '__call__'
     )
 
 
-def _resolve_partial_invocation(call, partial_aliases):
+
+def _resolve_partial_invocation(call, partial_aliases, builtin_shadow_lines=None):
     """Return an invoked partial factory and where invocation payloads begin."""
     partial_call = _partial_factory_call(call.func, partial_aliases)
     if partial_call is not None:
         return partial_call, 0
     func = call.func
+    reference_line = getattr(call, 'lineno', 0)
     if (
-        isinstance(func, ast.Call)
+        _name_is_unshadowed_builtin('getattr', reference_line, builtin_shadow_lines)
+        and isinstance(func, ast.Call)
         and isinstance(func.func, ast.Name)
-        and func.func.id == "getattr"
+        and func.func.id == 'getattr'
         and len(func.args) >= 2
         and isinstance(func.args[1], ast.Constant)
-        and func.args[1].value == "__call__"
+        and func.args[1].value == '__call__'
     ):
         partial_call = _partial_factory_call(func.args[0], partial_aliases)
         if partial_call is not None:
             return partial_call, 0
-    if not _call_is_getattr_partial_invocation(call, partial_aliases) or not call.args:
+    if not _call_is_getattr_partial_invocation(
+        call,
+        partial_aliases,
+        builtin_shadow_lines,
+    ) or not call.args:
         return None, 0
     return _partial_factory_call(call.args[0], partial_aliases), 1
+
 
 
 def _partial_call_binds_namespace_workers_setter(partial_call, namespace_aliases):
@@ -2829,27 +2931,28 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     """Return True for direct or saved partial workers setters."""
     if not isinstance(call, ast.Call):
         return False
-    _, _, namespace_aliases, _, partial_aliases = _unpack_operator_bindings(
-        operator_bindings
-    )
+    _, _, namespace_aliases, _, partial_aliases = _unpack_operator_bindings(operator_bindings)
     dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
     saved_aliases = operator_bindings[12] if len(operator_bindings) > 12 else set()
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
-    partial_mutator_alias_events = (
-        operator_bindings[27] if len(operator_bindings) > 27 else {}
-    )
+    partial_mutator_alias_events = operator_bindings[27] if len(operator_bindings) > 27 else {}
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
     if isinstance(call.func, ast.Name):
         if call.func.id in saved_aliases:
             return True
         saved_method = _binding_state_at_line(
             partial_mutator_alias_events,
             call.func.id,
-            getattr(call, "lineno", 0),
+            getattr(call, 'lineno', 0),
         )
         if saved_method is not None:
             return _call_payload_may_set_workers(saved_method, call)
-    partial_call, invocation_start = _resolve_partial_invocation(call, partial_aliases)
+    partial_call, invocation_start = _resolve_partial_invocation(
+        call,
+        partial_aliases,
+        builtin_shadow_lines,
+    )
     if partial_call is None or not partial_call.args:
         return False
     if _partial_uses_unbound_dict_namespace_mutation(
@@ -2862,10 +2965,8 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
         invocation_start,
     ):
         return True
-    return _partial_call_binds_namespace_workers_setter(
-        partial_call,
-        namespace_aliases,
-    )
+    return _partial_call_binds_namespace_workers_setter(partial_call, namespace_aliases)
+
 
 
 
@@ -2996,15 +3097,35 @@ def _is_operator_setitem_callable(func, setitem_aliases, module_aliases=None):
 
 
 def _is_operator_call_factory(func, operator_bindings):
-    """Return True for ``operator.call`` or ``getattr(operator, 'call')`` factories."""
+    """Return True for a source-valid ``operator.call`` factory."""
     module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
-    if (
-        isinstance(func, ast.Attribute)
-        and func.attr == "call"
-        and _is_operator_module_reference(func.value, module_aliases)
+    module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    reference_line = getattr(func, 'lineno', 0)
+    if isinstance(func, ast.Attribute) and func.attr == 'call':
+        return _module_alias_active_at_line(
+            func.value,
+            module_aliases,
+            module_events,
+            reference_line,
+        ) or _is_operator_import(func.value)
+    if not (
+        isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin('getattr', reference_line, builtin_shadow_lines)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == 'getattr'
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == 'call'
     ):
-        return True
-    return _getattr_operator_method_name(func, module_aliases) == "call"
+        return False
+    return _module_alias_active_at_line(
+        func.args[0],
+        module_aliases,
+        module_events,
+        reference_line,
+    ) or _is_operator_import(func.args[0])
+
 
 
 def _call_is_operator_call_namespace_update(call, operator_bindings):
@@ -3041,18 +3162,46 @@ def _call_is_operator_call_namespace_update(call, operator_bindings):
     return False
 
 
-def _collect_dict_subclass_names(statements):
-    """Return class names that inherit from builtin ``dict``."""
-    names = set()
-    for node in statements:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        if any(
-            isinstance(base, ast.Name) and base.id == "dict"
-            for base in node.bases
-        ):
-            names.add(node.name)
-    return names
+def _class_overrides_update(class_node):
+    """Return True when a class body binds its own ``update`` member."""
+    for stmt in class_node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == 'update':
+            return True
+        if any(name == 'update' for name, _value in _namespace_assignment_values(stmt)):
+            return True
+    return False
+
+
+def _collect_dict_subclass_names(statements, dict_shadow_line=None):
+    """Track class names that inherit the unmodified builtin ``dict.update``."""
+    events = {}
+
+    def scan(block, *, conditional=False):
+        for node in block:
+            line = getattr(node, 'lineno', 0)
+            if isinstance(node, ast.ClassDef):
+                active = (
+                    _dict_name_is_builtin_at_line(line, dict_shadow_line)
+                    and any(isinstance(base, ast.Name) and base.id == 'dict' for base in node.bases)
+                    and not _class_overrides_update(node)
+                )
+                if active:
+                    events.setdefault(node.name, []).append((line, True))
+                elif not conditional and node.name in events:
+                    events[node.name].append((line, False))
+                continue
+            if not conditional:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in events:
+                    events[node.name].append((line, False))
+                for name, _value in _namespace_assignment_values(node):
+                    if name in events:
+                        events[name].append((line, False))
+            for nested in _compound_statement_blocks(node):
+                scan(nested, conditional=True)
+
+    scan(statements)
+    return events
+
 
 
 def _call_is_dict_subclass_update_on_module_namespace(
@@ -3060,22 +3209,31 @@ def _call_is_dict_subclass_update_on_module_namespace(
     namespace_aliases=None,
     dict_subclass_names=None,
 ):
-    """Return True for ``DictSubclass.update(globals(), ...)`` mutations."""
-    if dict_subclass_names is None:
-        dict_subclass_names = set()
+    """Return True for active ``DictSubclass.update(globals(), ...)`` mutations."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
     func = call.func
     if not (
         isinstance(func, ast.Attribute)
-        and func.attr == "update"
+        and func.attr == 'update'
         and isinstance(func.value, ast.Name)
-        and func.value.id in dict_subclass_names
     ):
+        return False
+    name = func.value.id
+    if isinstance(dict_subclass_names, dict):
+        active = _binding_state_at_line(
+            dict_subclass_names,
+            name,
+            getattr(call, 'lineno', 0),
+        )
+        if not active:
+            return False
+    elif name not in (dict_subclass_names or set()):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
         return False
     return _update_payload_may_set_workers(call)
+
 
 
 _HIGHER_ORDER_LAMBDA_BUILTINS = frozenset(
@@ -3083,46 +3241,97 @@ _HIGHER_ORDER_LAMBDA_BUILTINS = frozenset(
 )
 
 
+def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
+    """Return True when consuming a map/filter must execute a risky lambda."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        return False
+    if call.func.id not in {'map', 'filter'} or not call.args:
+        return False
+    lambda_node = call.args[0]
+    if not isinstance(lambda_node, ast.Lambda):
+        return False
+    if _lambda_mutates_workers(lambda_node, operator_bindings):
+        return True
+    if call.func.id != 'map':
+        return False
+    positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    return any(
+        _map_argument_contains_module_namespace(iterable, namespace_aliases)
+        and _lambda_param_namespace_mutation(lambda_node.body, param.arg)
+        for param, iterable in zip(positional_params, call.args[1:])
+    )
+
+
 def _call_has_mutating_lambda_argument(call, operator_bindings):
-    """Return True when a builtin consumes a lambda that mutates ``workers``."""
-    if not isinstance(call, ast.Call):
+    """Detect callbacks only where the current expression actually executes them."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
         return False
-    if not isinstance(call.func, ast.Name) or call.func.id not in _HIGHER_ORDER_LAMBDA_BUILTINS:
-        return False
-    for arg in call.args:
-        if isinstance(arg, ast.Lambda) and _expression_mutates_workers(
-            arg.body,
-            operator_bindings,
-        ):
-            return True
-    for keyword in call.keywords:
-        if isinstance(keyword.value, ast.Lambda) and _expression_mutates_workers(
-            keyword.value.body,
-            operator_bindings,
-        ):
-            return True
-    return False
-
-
-def _function_is_static_or_class_method(func_node):
-    """Return True when a function is decorated as staticmethod or classmethod."""
-    return any(
-        (isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"})
-        or (
-            isinstance(decorator, ast.Attribute)
-            and decorator.attr in {"staticmethod", "classmethod"}
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    reference_line = getattr(call, 'lineno', 0)
+    name = call.func.id
+    if name == 'sorted':
+        if not _name_is_unshadowed_builtin('sorted', reference_line, builtin_shadow_lines):
+            return False
+        return any(
+            keyword.arg == 'key'
+            and isinstance(keyword.value, ast.Lambda)
+            and _lambda_mutates_workers(keyword.value, operator_bindings)
+            for keyword in call.keywords
         )
-        for decorator in func_node.decorator_list
+    if name not in {'list', 'tuple', 'set', 'any', 'all', 'max', 'min', 'next'}:
+        return False
+    if not _name_is_unshadowed_builtin(name, reference_line, builtin_shadow_lines):
+        return False
+    return bool(call.args) and _map_or_filter_lambda_mutates_when_consumed(
+        call.args[0],
+        operator_bindings,
     )
 
 
-def _function_is_property_method(func_node):
-    """Return True when a function is decorated with ``property``."""
+
+def _decorator_resolves_to_builtin(decorator, name, operator_bindings=None):
+    """Return True only when a decorator resolves to the requested builtin."""
+    reference_line = getattr(decorator, 'lineno', 0)
+    shadow_lines = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+    if isinstance(decorator, ast.Name):
+        return decorator.id == name and _name_is_unshadowed_builtin(
+            name,
+            reference_line,
+            shadow_lines,
+        )
+    if not (
+        isinstance(decorator, ast.Attribute)
+        and decorator.attr == name
+    ):
+        return False
+    builtins_aliases = operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()
+    builtins_events = operator_bindings[30] if operator_bindings and len(operator_bindings) > 30 else {}
+    return _module_alias_active_at_line(
+        decorator.value,
+        builtins_aliases,
+        builtins_events,
+        reference_line,
+    )
+
+
+def _function_is_static_or_class_method(func_node, operator_bindings=None):
+    """Return True for proven builtin staticmethod/classmethod decorators."""
     return any(
-        (isinstance(decorator, ast.Name) and decorator.id == "property")
-        or (isinstance(decorator, ast.Attribute) and decorator.attr == "property")
+        _decorator_resolves_to_builtin(decorator, 'staticmethod', operator_bindings)
+        or _decorator_resolves_to_builtin(decorator, 'classmethod', operator_bindings)
         for decorator in func_node.decorator_list
     )
+
+
+
+def _function_is_property_method(func_node, operator_bindings=None):
+    """Return True for a proven builtin ``property`` decorator."""
+    return any(
+        _decorator_resolves_to_builtin(decorator, 'property', operator_bindings)
+        for decorator in func_node.decorator_list
+    )
+
 
 
 def _metaclass_init_mutates_workers(class_node, operator_bindings):
@@ -3175,72 +3384,113 @@ def _record_class_side_effect_target(
 ):
     """Record one class method that mutates ``workers`` when invoked."""
     if not isinstance(stmt, ast.FunctionDef):
-        return
+        return False
     if not _function_mutates_workers(stmt, operator_bindings):
-        return
-    if stmt.name == "__init__":
+        return False
+    if stmt.name == '__init__':
         constructors.add(class_name)
-        return
+        return True
     target = (class_name, stmt.name)
-    if _function_is_static_or_class_method(stmt):
+    if _function_is_static_or_class_method(stmt, operator_bindings):
         methods.add(target)
-        return
-    if _function_is_property_method(stmt):
+        return True
+    if _function_is_property_method(stmt, operator_bindings):
         properties.add(target)
+        return True
+    return False
+
 
 
 def _collect_class_side_effect_targets(tree, operator_bindings):
-    """Return class names and methods that mutate ``workers`` when invoked."""
+    """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
     properties = set()
-    metaclass_definitions = _collect_metaclass_definition_mutators(
-        tree,
-        operator_bindings,
-    )
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for stmt in node.body:
-            _record_class_side_effect_target(
-                node.name,
-                stmt,
-                operator_bindings,
-                constructors,
-                methods,
-                properties,
-            )
-    return constructors, methods, properties, metaclass_definitions
+    metaclass_definitions = _collect_metaclass_definition_mutators(tree, operator_bindings)
+    binding_events = {}
+
+    def scan(statements, *, conditional=False):
+        for node in statements:
+            line = getattr(node, 'lineno', 0)
+            if isinstance(node, ast.ClassDef):
+                risky = False
+                for stmt in node.body:
+                    risky = _record_class_side_effect_target(
+                        node.name,
+                        stmt,
+                        operator_bindings,
+                        constructors,
+                        methods,
+                        properties,
+                    ) or risky
+                if risky:
+                    binding_events.setdefault(node.name, []).append((line, True))
+                elif not conditional and node.name in binding_events:
+                    binding_events[node.name].append((line, False))
+                continue
+            if not conditional:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in binding_events:
+                    binding_events[node.name].append((line, False))
+                for name, _value in _namespace_assignment_values(node):
+                    if name in binding_events:
+                        binding_events[name].append((line, False))
+            for block in _compound_statement_blocks(node):
+                scan(block, conditional=True)
+
+    scan(tree.body)
+    return constructors, methods, properties, metaclass_definitions, binding_events
+
+
+
+def _class_binding_is_active(class_targets, class_name, reference_line):
+    """Return whether the risky class definition still owns this name."""
+    if len(class_targets) < 5:
+        return True
+    events = class_targets[4]
+    if class_name not in events:
+        return True
+    return bool(_binding_state_at_line(events, class_name, reference_line))
 
 
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
-    constructors, methods, properties, _ = class_targets
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Name)
-        and expr.func.id in constructors
-    ):
-        return True
+    constructors, methods, properties = class_targets[:3]
+    reference_line = getattr(expr, 'lineno', 0)
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        return expr.func.id in constructors and _class_binding_is_active(
+            class_targets,
+            expr.func.id,
+            reference_line,
+        )
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Attribute)
         and isinstance(expr.func.value, ast.Name)
-        and (expr.func.value.id, expr.func.attr) in methods
     ):
-        return True
-    return (
+        class_name = expr.func.value.id
+        return (
+            (class_name, expr.func.attr) in methods
+            and _class_binding_is_active(class_targets, class_name, reference_line)
+        )
+    if (
         isinstance(expr, ast.Attribute)
         and isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Name)
-        and (expr.value.func.id, expr.attr) in properties
-    )
+    ):
+        class_name = expr.value.func.id
+        return (
+            (class_name, expr.attr) in properties
+            and _class_binding_is_active(class_targets, class_name, reference_line)
+        )
+    return False
+
 
 
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     """Return True when defining the class itself mutates ``workers``."""
-    _, _, _, metaclass_definitions = class_targets
+    metaclass_definitions = class_targets[3]
     return class_node.name in metaclass_definitions
+
 
 
 def _map_argument_contains_module_namespace(arg, namespace_aliases):
@@ -3343,46 +3593,36 @@ def _call_is_partial_reduce_namespace_mutation(call, operator_bindings):
     reduce_aliases = operator_bindings[15] if len(operator_bindings) > 15 else set()
     functools_aliases = operator_bindings[14] if len(operator_bindings) > 14 else set()
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    partial_call, invocation_start = _resolve_partial_invocation(
-        call,
-        partial_aliases,
-    )
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    partial_call, invocation_start = _resolve_partial_invocation(call, partial_aliases, builtin_shadow_lines)
     if partial_call is None or len(partial_call.args) < 2:
         return False
     first = partial_call.args[0]
     is_reduce = (isinstance(first, ast.Name) and first.id in reduce_aliases) or (
         isinstance(first, ast.Attribute)
-        and first.attr == "reduce"
+        and first.attr == 'reduce'
         and isinstance(first.value, ast.Name)
         and first.value.id in functools_aliases
     )
     lambda_node = partial_call.args[1]
     if not is_reduce or not isinstance(lambda_node, ast.Lambda):
         return False
-    initializer = _partial_reduce_initializer(
-        partial_call,
-        call,
-        invocation_start,
-    )
-    if initializer is None or not _is_module_namespace_mapping(
-        initializer,
-        namespace_aliases,
-    ):
+    initializer = _partial_reduce_initializer(partial_call, call, invocation_start)
+    if initializer is None or not _is_module_namespace_mapping(initializer, namespace_aliases):
         return False
     lambda_args = lambda_node.args.args
     if not lambda_args:
         return False
-    return _lambda_param_namespace_mutation(
-        lambda_node.body,
-        lambda_args[0].arg,
-    )
+    return _lambda_param_namespace_mutation(lambda_node.body, lambda_args[0].arg)
+
 
 
 def _call_is_partial_operator_methodcaller_namespace_update(call, operator_bindings):
     """Return True for ``partial(methodcaller(...), globals())()`` mutations."""
     partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    partial_call, _ = _resolve_partial_invocation(call, partial_aliases)
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    partial_call, _ = _resolve_partial_invocation(call, partial_aliases, builtin_shadow_lines)
     if partial_call is None or len(partial_call.args) < 2:
         return False
     if not _is_module_namespace_mapping(partial_call.args[1], namespace_aliases):
@@ -3391,14 +3631,11 @@ def _call_is_partial_operator_methodcaller_namespace_update(call, operator_bindi
     if not isinstance(factory, ast.Call):
         return False
     return _call_is_operator_methodcaller_on_module_namespace(
-        ast.Call(
-            func=factory,
-            args=[partial_call.args[1]],
-            keywords=[],
-        ),
+        ast.Call(func=factory, args=[partial_call.args[1]], keywords=[]),
         operator_bindings,
         namespace_aliases,
     )
+
 
 
 def _reduce_lambda_argument(call):
@@ -3525,42 +3762,19 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
     functiontype_aliases = operator_bindings[26] if len(operator_bindings) > 26 else set()
     chainmap_aliases = operator_bindings[28] if len(operator_bindings) > 28 else set()
     return (
-        _call_is_invoked_functiontype_namespace_code(
-            expr,
-            namespace_aliases,
-            types_module_aliases,
-            functiontype_aliases,
-        )
-        or _call_is_functiontype_namespace_alias(
-            expr,
-            functiontype_namespace_aliases,
-        )
+        _call_is_invoked_functiontype_namespace_code(expr, namespace_aliases, types_module_aliases, functiontype_aliases)
+        or _call_is_functiontype_namespace_alias(expr, functiontype_namespace_aliases)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
-        or _call_is_chainmap_maps_update(
-            expr,
-            namespace_aliases,
-            chainmap_aliases,
-        )
-        or _call_is_delegated_simplenamespace_update(
-            expr,
-            delegated_update_aliases,
-            delegated_update_alias_events,
-        )
+        or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
+        or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings)
-        or _call_is_map_lambda_namespace_update(expr, operator_bindings)
         or _call_has_mutating_lambda_argument(expr, operator_bindings)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
-        or _call_is_partial_operator_methodcaller_namespace_update(
-            expr,
-            operator_bindings,
-        )
-        or _call_is_dict_subclass_update_on_module_namespace(
-            expr,
-            namespace_aliases,
-            dict_subclass_names,
-        )
+        or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
+        or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
     )
+
 
 
 def _call_expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
@@ -3671,7 +3885,7 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
     dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
-    sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else {"sys"}
+    sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else {'sys'}
     importlib_aliases = operator_bindings[16] if len(operator_bindings) > 16 else set()
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
@@ -3680,41 +3894,21 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
         _call_sets_workers_via_setitem(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
-        or _call_is_dict_type_setitem_on_module_namespace(
-            call,
-            namespace_aliases,
-            dict_shadow_line,
-        )
-        or _call_sets_workers_attribute(
-            call,
-            sys_aliases,
-            importlib_aliases,
-            importlib_module_aliases,
-        )
+        or _call_is_dict_type_setitem_on_module_namespace(call, namespace_aliases, dict_shadow_line)
+        or _call_sets_workers_attribute(call, sys_aliases, importlib_aliases, importlib_module_aliases)
         or _call_is_dict_type_update_on_module_namespace(
             call,
             namespace_aliases,
             dict_update_aliases,
             dict_shadow_line,
-        )
-        or _call_is_dict_type_ior_on_module_namespace(
-            call,
-            namespace_aliases,
-            dict_shadow_line,
-            dict_ior_aliases,
-        )
-        or _call_is_importlib_sys_namespace_mutation(call, operator_bindings)
-        or _call_is_subscript_namespace_workers_update(
-            call,
-            namespace_aliases,
-            mutator_aliases,
-        )
-        or _call_is_operator_methodcaller_on_module_namespace(
-            call,
             operator_bindings,
-            namespace_aliases,
         )
+        or _call_is_dict_type_ior_on_module_namespace(call, namespace_aliases, dict_shadow_line, dict_ior_aliases)
+        or _call_is_importlib_sys_namespace_mutation(call, operator_bindings)
+        or _call_is_subscript_namespace_workers_update(call, namespace_aliases, mutator_aliases)
+        or _call_is_operator_methodcaller_on_module_namespace(call, operator_bindings, namespace_aliases)
     )
+
 
 
 def _lambda_invocation_mutates_workers(call, operator_bindings):
@@ -3929,15 +4123,34 @@ def _statement_invokes_function(node, func_names):
     )
 
 
-def _statement_has_class_workers_side_effect(node, class_targets):
-    """Return True when a statement invokes a class hook that mutates ``workers``."""
-    if not class_targets:
+def _expression_has_class_workers_side_effect(expr, class_targets):
+    """Recursively inspect evaluated expressions without entering lambda scopes."""
+    if isinstance(expr, ast.Lambda):
         return False
+    if _expression_triggers_class_workers_side_effect(expr, class_targets):
+        return True
+    return any(
+        _expression_has_class_workers_side_effect(child, class_targets)
+        for child in ast.iter_child_nodes(expr)
+        if isinstance(child, ast.AST)
+    )
+
+
+def _statement_has_class_workers_side_effect(node, class_targets):
+    """Return True when an evaluated statement expression invokes a risky class hook."""
+    if not class_targets or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return any(
+            _expression_has_class_workers_side_effect(item.context_expr, class_targets)
+            for item in node.items
+        )
     return any(
         isinstance(child, ast.expr)
-        and _expression_triggers_class_workers_side_effect(child, class_targets)
+        and _expression_has_class_workers_side_effect(child, class_targets)
         for child in ast.iter_child_nodes(node)
     )
+
 
 
 def _statement_mutates_workers(
@@ -3946,13 +4159,17 @@ def _statement_mutates_workers(
     *,
     global_workers,
     mutator_names,
+    class_targets=None,
+    dict_subclass_names=None,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
         return True
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return False
-    if _is_dynamic_workers_mutation(node, operator_bindings):
+    if _statement_has_class_workers_side_effect(node, class_targets):
+        return True
+    if _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names):
         return True
     assigns_workers, _ = _worker_assignment_value(node)
     if global_workers and assigns_workers:
@@ -3963,9 +4180,12 @@ def _statement_mutates_workers(
             operator_bindings,
             global_workers=global_workers,
             mutator_names=mutator_names,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
         )
         for block in _compound_statement_blocks(node)
     )
+
 
 
 def _statements_mutate_workers(
@@ -3974,6 +4194,8 @@ def _statements_mutate_workers(
     *,
     global_workers=False,
     mutator_names=None,
+    class_targets=None,
+    dict_subclass_names=None,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -3984,12 +4206,21 @@ def _statements_mutate_workers(
             operator_bindings,
             global_workers=global_workers,
             mutator_names=mutator_names,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
         )
         for node in statements
     )
 
 
-def _function_mutates_workers(func_node, operator_bindings, mutator_names=None):
+
+def _function_mutates_workers(
+    func_node,
+    operator_bindings,
+    mutator_names=None,
+    class_targets=None,
+    dict_subclass_names=None,
+):
     """Return True when a function may mutate the module ``workers`` binding."""
     has_global_workers = _statements_declare_global_workers(func_node.body)
     return _statements_mutate_workers(
@@ -3997,7 +4228,10 @@ def _function_mutates_workers(func_node, operator_bindings, mutator_names=None):
         operator_bindings,
         global_workers=has_global_workers,
         mutator_names=mutator_names,
+        class_targets=class_targets,
+        dict_subclass_names=dict_subclass_names,
     )
+
 
 
 def _call_invokes_function(call_node, func_names):
@@ -4008,7 +4242,12 @@ def _call_invokes_function(call_node, func_names):
     return False
 
 
-def _collect_import_time_workers_mutators(tree, operator_bindings):
+def _collect_import_time_workers_mutators(
+    tree,
+    operator_bindings,
+    class_targets=None,
+    dict_subclass_names=None,
+):
     """Return function names that may mutate ``workers`` when called at import time."""
     functions = {
         node.name: node
@@ -4022,10 +4261,17 @@ def _collect_import_time_workers_mutators(tree, operator_bindings):
         for name, node in functions.items():
             if name in mutators:
                 continue
-            if _function_mutates_workers(node, operator_bindings, mutators):
+            if _function_mutates_workers(
+                node,
+                operator_bindings,
+                mutators,
+                class_targets,
+                dict_subclass_names,
+            ):
                 mutators.add(name)
                 changed = True
     return mutators
+
 
 
 def _parse_gunicorn_config_tree(path):
@@ -4199,6 +4445,31 @@ def _collect_functools_reduce_aliases(statements):
     return module_aliases, reduce_aliases
 
 
+def _collect_imported_module_alias_events(tree, module_name):
+    """Track unconditional module import aliases and later rebindings."""
+    events = {}
+    active = set()
+    for node in tree.body:
+        line = getattr(node, 'lineno', 0)
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name == module_name:
+                    name = imported.asname or imported.name
+                    active.add(name)
+                    events.setdefault(name, []).append((line, True))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+            if name in active or name in events:
+                active.discard(name)
+                events.setdefault(name, []).append((line, False))
+            continue
+        for name, _value in _namespace_assignment_values(node):
+            if name in active or name in events:
+                active.discard(name)
+                events.setdefault(name, []).append((line, False))
+    return events
+
+
 def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
@@ -4216,19 +4487,32 @@ def _collect_operator_setitem_bindings(tree):
         methodcaller_aliases,
         attrgetter_aliases,
     )
-    dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
-    dict_update_aliases = _collect_dict_update_aliases(tree, dict_shadow_line)
-    dict_ior_aliases = _collect_dict_ior_aliases(tree, dict_shadow_line)
+    builtin_shadow_lines = {
+        name: _collect_definite_name_shadow_line(tree, name)
+        for name in {
+            'globals', 'getattr', 'staticmethod', 'classmethod', 'property',
+            'type', 'sorted', 'list', 'tuple', 'set', 'any', 'all', 'max',
+            'min', 'next', 'map', 'filter',
+        }
+    }
+    builtin_shadow_lines = {
+        name: line for name, line in builtin_shadow_lines.items() if line is not None
+    }
     builtins_aliases = _collect_builtins_aliases(tree)
-    exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)
-    direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(
-        tree.body,
-        builtins_aliases,
-    )
-    direct_exec_eval_alias_events = _collect_builtins_exec_eval_alias_events(
+    builtins_alias_events = _collect_imported_module_alias_events(tree, 'builtins')
+    operator_module_alias_events = _collect_imported_module_alias_events(tree, 'operator')
+    dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
+    dict_update_aliases = _collect_dict_update_aliases(
         tree,
+        dict_shadow_line,
         builtins_aliases,
+        builtins_alias_events,
+        builtin_shadow_lines,
     )
+    dict_ior_aliases = _collect_dict_ior_aliases(tree, dict_shadow_line)
+    exec_eval_shadow_lines = _collect_definite_exec_eval_shadow_lines(tree)
+    direct_exec_eval_aliases = _collect_builtins_exec_eval_aliases(tree.body, builtins_aliases)
+    direct_exec_eval_alias_events = _collect_builtins_exec_eval_alias_events(tree, builtins_aliases)
     importlib_aliases = _collect_importlib_import_module_aliases(tree.body)
     importlib_alias_events = _collect_importlib_import_module_alias_events(tree)
     importlib_module_aliases = _collect_importlib_module_aliases(tree.body)
@@ -4242,77 +4526,33 @@ def _collect_operator_setitem_bindings(tree):
     )
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
-        tree,
-        namespace_aliases,
-        partial_aliases,
-        dict_update_aliases,
-        dict_shadow_line,
-        dict_ior_aliases,
+        tree, namespace_aliases, partial_aliases, dict_update_aliases, dict_shadow_line, dict_ior_aliases
     )
-    partial_dict_mutator_alias_events = (
-        _collect_partial_dict_namespace_mutator_alias_events(
-            tree,
-            namespace_aliases,
-            partial_aliases,
-            dict_update_aliases,
-            dict_ior_aliases,
-            dict_shadow_line,
-        )
+    partial_dict_mutator_alias_events = _collect_partial_dict_namespace_mutator_alias_events(
+        tree, namespace_aliases, partial_aliases, dict_update_aliases, dict_ior_aliases, dict_shadow_line
     )
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
-    delegated_update_aliases = _collect_delegated_update_namespace_aliases(
-        tree,
-        namespace_aliases,
-    )
-    delegated_update_alias_events = _collect_delegated_update_alias_events(
-        tree,
-        namespace_aliases,
-    )
-    types_module_aliases, functiontype_aliases = _collect_types_functiontype_aliases(
-        tree.body
-    )
+    delegated_update_aliases = _collect_delegated_update_namespace_aliases(tree, namespace_aliases)
+    delegated_update_alias_events = _collect_delegated_update_alias_events(tree, namespace_aliases)
+    types_module_aliases, functiontype_aliases = _collect_types_functiontype_aliases(tree.body)
     functiontype_namespace_aliases = _collect_functiontype_namespace_aliases(
-        tree,
-        namespace_aliases,
-        types_module_aliases,
-        functiontype_aliases,
+        tree, namespace_aliases, types_module_aliases, functiontype_aliases
     )
-    chainmap_namespace_aliases = _collect_chainmap_namespace_aliases(
-        tree,
-        namespace_aliases,
-    )
+    chainmap_namespace_aliases = _collect_chainmap_namespace_aliases(tree, namespace_aliases)
     return (
-        module_aliases,
-        setitem_aliases,
-        namespace_aliases,
-        ior_aliases,
-        partial_aliases,
-        mutator_aliases,
-        methodcaller_aliases,
-        dict_update_aliases,
-        builtins_aliases,
-        exec_eval_shadow_lines,
-        direct_exec_eval_aliases,
-        attrgetter_aliases,
-        partial_workers_setter_aliases,
-        sys_aliases,
-        functools_aliases,
-        reduce_aliases,
-        importlib_aliases,
-        delegated_update_aliases,
-        direct_exec_eval_alias_events,
-        importlib_alias_events,
-        delegated_update_alias_events,
-        dict_shadow_line,
-        functiontype_namespace_aliases,
-        dict_ior_aliases,
-        importlib_module_aliases,
-        types_module_aliases,
-        functiontype_aliases,
-        partial_dict_mutator_alias_events,
-        chainmap_namespace_aliases,
-        importlib_module_alias_events,
+        module_aliases, setitem_aliases, namespace_aliases, ior_aliases,
+        partial_aliases, mutator_aliases, methodcaller_aliases, dict_update_aliases,
+        builtins_aliases, exec_eval_shadow_lines, direct_exec_eval_aliases,
+        attrgetter_aliases, partial_workers_setter_aliases, sys_aliases,
+        functools_aliases, reduce_aliases, importlib_aliases,
+        delegated_update_aliases, direct_exec_eval_alias_events,
+        importlib_alias_events, delegated_update_alias_events, dict_shadow_line,
+        functiontype_namespace_aliases, dict_ior_aliases, importlib_module_aliases,
+        types_module_aliases, functiontype_aliases, partial_dict_mutator_alias_events,
+        chainmap_namespace_aliases, importlib_module_alias_events,
+        builtins_alias_events, operator_module_alias_events, builtin_shadow_lines,
     )
+
 
 
 
@@ -4381,9 +4621,10 @@ def _worker_scan_defaults(
     return (
         set() if global_workers_mutators is None else global_workers_mutators,
         (set(), set()) if operator_bindings is None else operator_bindings,
-        (set(), set(), set(), set()) if class_targets is None else class_targets,
-        set() if dict_subclass_names is None else dict_subclass_names,
+        (set(), set(), set(), set(), {}) if class_targets is None else class_targets,
+        {} if dict_subclass_names is None else dict_subclass_names,
     )
+
 
 
 def _handle_worker_scan_definition(
@@ -4496,10 +4737,14 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
-    dict_subclass_names = _collect_dict_subclass_names(tree.body)
+    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
+    dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
     import_time_workers_mutators = _collect_import_time_workers_mutators(
-        tree, operator_bindings
+        tree,
+        operator_bindings,
+        class_targets,
+        dict_subclass_names,
     )
     _walk_gunicorn_workers_statements(
         tree.body,
@@ -4512,6 +4757,7 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     configured_count = state.count if state.found else None
     return configured_count, state.dynamic, runtime_dynamic
+
 
 
 def _scan_gunicorn_config_workers(tree):
