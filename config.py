@@ -3334,12 +3334,28 @@ def _lazy_iterator_alias_is_active(expr, operator_bindings):
     )
 
 
-def _expression_is_mutating_lazy_iterator(expr, operator_bindings):
-    """Return True for a direct or saved map/filter iterator with a risky callback."""
-    return _map_or_filter_lambda_mutates_when_consumed(
-        expr,
-        operator_bindings,
-    ) or _lazy_iterator_alias_is_active(expr, operator_bindings)
+def _expression_is_mutating_lazy_iterator(
+    expr,
+    operator_bindings,
+    active_names=None,
+):
+    """Return True for a risky lazy iterator without consuming it."""
+    if _map_or_filter_lambda_mutates_when_consumed(expr, operator_bindings):
+        return True
+    if isinstance(expr, ast.Name):
+        if active_names is not None:
+            return expr.id in active_names
+        return _lazy_iterator_alias_is_active(expr, operator_bindings)
+    if not isinstance(expr, ast.GeneratorExp):
+        return False
+    return any(
+        _expression_is_mutating_lazy_iterator(
+            generator.iter,
+            operator_bindings,
+            active_names,
+        )
+        for generator in expr.generators
+    )
 
 
 def _key_lambda_mutates_workers(call, operator_bindings):
@@ -3391,9 +3407,11 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
 
 def _lazy_iterator_assignment_is_mutating(value, active_names, operator_bindings):
     """Return whether an assignment stores a risky lazy iterator."""
-    if _map_or_filter_lambda_mutates_when_consumed(value, operator_bindings):
-        return True
-    return isinstance(value, ast.Name) and value.id in active_names
+    return _expression_is_mutating_lazy_iterator(
+        value,
+        operator_bindings,
+        active_names,
+    )
 
 
 def _record_lazy_iterator_assignment_events(
