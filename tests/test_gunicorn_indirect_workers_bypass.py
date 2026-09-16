@@ -318,3 +318,140 @@ def test_codex_followup_safe_patterns_stay_static(tmp_path, config_content):
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport operator\noperator.call(globals().__setitem__, 'workers', 4)\n",
+        "workers = 1\n(globals().__class__.__dict__['update'])(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\ngetattr(builtins.dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom contextlib import contextmanager\n@contextmanager\ndef cm():\n    globals().update({'workers': 4})\n    yield\nwith cm(): pass\n",
+        "workers = 1\nclass C:\n    def __init__(self):\n        globals().update({'workers': 4})\nC()\n",
+        "workers = 1\nclass C:\n    @staticmethod\n    def f():\n        globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\nclass C:\n    @classmethod\n    def f(cls):\n        globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\nclass C:\n    @property\n    def p(self):\n        globals().update({'workers': 4})\n        return 0\nC().p\n",
+        "workers = 1\nclass M(type):\n    def __init__(cls, name, bases, ns):\n        globals().update({'workers': 4})\nclass C(metaclass=M): pass\n",
+        "workers = 1\nsorted([0], key=lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nlist(filter(lambda _: globals().update({'workers': 4}), [True]))\n",
+        "workers = 1\nimport operator\ngetattr(operator, 'call')(operator.setitem, globals(), 'workers', 4)\n",
+        "workers = 1\n__builtins__['dict'].update(globals(), {'workers': 4})\n",
+        "workers = 1\nfrom functools import partial\ngetattr(partial(globals().update, {'workers': 4}), '__call__')()\n",
+    ],
+)
+def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nbool(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nmap(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nfilter(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\nC = lambda: None\nC()\n",
+        "workers = 1\nclass dict:\n    @staticmethod\n    def update(target, payload): return target\nclass D(dict): pass\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict):\n    @staticmethod\n    def update(target, payload): return target\nD.update(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\nclass Helper:\n    class Dict:\n        @staticmethod\n        def update(target, payload): return target\n    dict = Dict\nbuiltins = Helper()\ngetattr(builtins.dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nimport operator\nclass Helper:\n    @staticmethod\n    def call(*args): return None\noperator = Helper()\noperator.call(globals().__setitem__, 'workers', 4)\n",
+        "workers = 1\nfrom functools import partial\ngetattr = lambda obj, name: (lambda: None)\ngetattr(partial(globals().update, {'workers': 4}), '__call__')()\n",
+        "workers = 1\ndef staticmethod(fn):\n    return lambda *a, **k: None\nclass C:\n    @staticmethod\n    def f(): globals().update({'workers': 4})\nC.f()\n",
+        "workers = 1\ndef globals():\n    class Mapping(dict):\n        @staticmethod\n        def update(target, payload): return target\n    return Mapping()\n(globals().__class__.__dict__['update'])(globals(), {'workers': 4})\n",
+    ],
+)
+def test_codex_review_safe_patterns_remain_static(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\nprint(C())\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\n(C(),)\n",
+        "workers = 1\nif True:\n    class C:\n        def __init__(self): globals().update({'workers': 4})\nC()\n",
+        "workers = 1\nclass C:\n    def __init__(self): globals().update({'workers': 4})\ndef helper():\n    return C()\nhelper()\n",
+        "workers = 1\nclass D(dict): pass\ndef helper():\n    D.update(globals(), {'workers': 4})\nhelper()\n",
+        "workers = 1\nimport builtins\nbuiltins.dict.update(globals(), {'workers': 4})\n",
+        "workers = 1\ngetattr(globals().__class__.__dict__, 'update')(globals(), {'workers': 4})\n",
+    ],
+)
+def test_codex_review_dynamic_patterns_are_detected(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+
+# Cursor lazy-consumer follow-up regressions
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nsorted(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfor _ in map(lambda _: globals().update({'workers': 4}), [1]):\n    pass\n",
+        "workers = 1\n[*map(lambda _: globals().update({'workers': 4}), [1])]\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\nlist(it)\n",
+        "workers = 1\nmax([1], key=lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nmin([1], key=lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_cursor_lazy_iterator_consumers_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nit = filter(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\nit = []\nlist(it)\n",
+    ],
+)
+def test_cursor_unconsumed_or_rebound_lazy_iterators_stay_static(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+
+# Cursor consumed-generator follow-up regressions
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nlist(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nany(x for x in filter(lambda _: globals().update({'workers': 4}), [True]))\n",
+        "workers = 1\nsorted(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfor _ in (x for x in map(lambda _: globals().update({'workers': 4}), [1])):\n    pass\n",
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\nlist(gen)\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\ngen = (x for x in it)\nlist(gen)\n",
+        "workers = 1\nlist(y for _ in [1] for y in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+    ],
+)
+def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\ngen = (x for x in filter(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\ngen = ()\nlist(gen)\n",
+    ],
+)
+def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
