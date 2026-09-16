@@ -3165,54 +3165,76 @@ def _collect_metaclass_definition_mutators(tree, operator_bindings):
     }
 
 
+def _record_class_side_effect_target(
+    class_name,
+    stmt,
+    operator_bindings,
+    constructors,
+    methods,
+    properties,
+):
+    """Record one class method that mutates ``workers`` when invoked."""
+    if not isinstance(stmt, ast.FunctionDef):
+        return
+    if not _function_mutates_workers(stmt, operator_bindings):
+        return
+    if stmt.name == "__init__":
+        constructors.add(class_name)
+        return
+    target = (class_name, stmt.name)
+    if _function_is_static_or_class_method(stmt):
+        methods.add(target)
+        return
+    if _function_is_property_method(stmt):
+        properties.add(target)
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Return class names and methods that mutate ``workers`` when invoked."""
     constructors = set()
     methods = set()
     properties = set()
-    metaclass_definitions = _collect_metaclass_definition_mutators(tree, operator_bindings)
+    metaclass_definitions = _collect_metaclass_definition_mutators(
+        tree,
+        operator_bindings,
+    )
     for node in tree.body:
         if not isinstance(node, ast.ClassDef):
             continue
         for stmt in node.body:
-            if not isinstance(stmt, ast.FunctionDef):
-                continue
-            if stmt.name == "__init__" and _function_mutates_workers(
+            _record_class_side_effect_target(
+                node.name,
                 stmt,
                 operator_bindings,
-            ):
-                constructors.add(node.name)
-            elif _function_is_static_or_class_method(stmt) and _function_mutates_workers(
-                stmt,
-                operator_bindings,
-            ):
-                methods.add((node.name, stmt.name))
-            elif _function_is_property_method(stmt) and _function_mutates_workers(
-                stmt,
-                operator_bindings,
-            ):
-                properties.add((node.name, stmt.name))
+                constructors,
+                methods,
+                properties,
+            )
     return constructors, methods, properties, metaclass_definitions
 
 
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
-    constructors, methods, properties, metaclass_definitions = class_targets
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-        if expr.func.id in constructors:
-            return True
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
-        if isinstance(expr.func.value, ast.Name):
-            key = (expr.func.value.id, expr.func.attr)
-            if key in methods:
-                return True
-    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Call):
-        if (
-            isinstance(expr.value.func, ast.Name)
-            and (expr.value.func.id, expr.attr) in properties
-        ):
-            return True
-    return False
+    constructors, methods, properties, _ = class_targets
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id in constructors
+    ):
+        return True
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and isinstance(expr.func.value, ast.Name)
+        and (expr.func.value.id, expr.func.attr) in methods
+    ):
+        return True
+    return (
+        isinstance(expr, ast.Attribute)
+        and isinstance(expr.value, ast.Call)
+        and isinstance(expr.value.func, ast.Name)
+        and (expr.value.func.id, expr.attr) in properties
+    )
 
 
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
@@ -4349,6 +4371,45 @@ def _node_has_worker_mutating_decorator(node, global_workers_mutators):
     )
 
 
+def _worker_scan_defaults(
+    global_workers_mutators,
+    operator_bindings,
+    class_targets,
+    dict_subclass_names,
+):
+    """Return normalized optional inputs for the recursive worker scan."""
+    return (
+        set() if global_workers_mutators is None else global_workers_mutators,
+        (set(), set()) if operator_bindings is None else operator_bindings,
+        (set(), set(), set(), set()) if class_targets is None else class_targets,
+        set() if dict_subclass_names is None else dict_subclass_names,
+    )
+
+
+def _handle_worker_scan_definition(
+    node,
+    state,
+    global_workers_mutators,
+    class_targets,
+):
+    """Handle definitions without descending into function or class bodies."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if _node_has_worker_mutating_decorator(
+            node,
+            global_workers_mutators,
+        ):
+            state.dynamic = True
+        return True
+    if not isinstance(node, ast.ClassDef):
+        return False
+    if _node_has_worker_mutating_decorator(
+        node,
+        global_workers_mutators,
+    ) or _classdef_has_import_time_workers_side_effect(node, class_targets):
+        state.dynamic = True
+    return True
+
+
 def _walk_gunicorn_workers_statements(
     statements,
     state,
@@ -4359,31 +4420,25 @@ def _walk_gunicorn_workers_statements(
     class_targets=None,
     dict_subclass_names=None,
 ) -> None:
-    if global_workers_mutators is None:
-        global_workers_mutators = set()
-    if operator_bindings is None:
-        operator_bindings = (set(), set())
-    if class_targets is None:
-        class_targets = (set(), set(), set(), set())
-    if dict_subclass_names is None:
-        dict_subclass_names = set()
+    (
+        global_workers_mutators,
+        operator_bindings,
+        class_targets,
+        dict_subclass_names,
+    ) = _worker_scan_defaults(
+        global_workers_mutators,
+        operator_bindings,
+        class_targets,
+        dict_subclass_names,
+    )
 
     for node in statements:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _node_has_worker_mutating_decorator(
-                node,
-                global_workers_mutators,
-            ):
-                state.dynamic = True
-            continue
-        if isinstance(node, ast.ClassDef):
-            if _node_has_worker_mutating_decorator(
-                node,
-                global_workers_mutators,
-            ):
-                state.dynamic = True
-            if _classdef_has_import_time_workers_side_effect(node, class_targets):
-                state.dynamic = True
+        if _handle_worker_scan_definition(
+            node,
+            state,
+            global_workers_mutators,
+            class_targets,
+        ):
             continue
         if _node_has_dynamic_workers_effect(
             node,
@@ -4393,8 +4448,16 @@ def _walk_gunicorn_workers_statements(
             dict_subclass_names=dict_subclass_names,
         ):
             state.dynamic = True
-        _record_walrus_workers_assignment(node, state, in_compound=in_compound)
-        _record_direct_workers_assignment(node, state, in_compound=in_compound)
+        _record_walrus_workers_assignment(
+            node,
+            state,
+            in_compound=in_compound,
+        )
+        _record_direct_workers_assignment(
+            node,
+            state,
+            in_compound=in_compound,
+        )
         for block in _compound_statement_blocks(node):
             _walk_gunicorn_workers_statements(
                 block,
