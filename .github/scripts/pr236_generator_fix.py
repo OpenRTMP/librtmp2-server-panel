@@ -34,9 +34,10 @@ new = '''def _expression_is_mutating_lazy_iterator(
         for generator in expr.generators
     )
 '''
-if old not in text:
+if old in text:
+    text = text.replace(old, new, 1)
+elif new not in text:
     raise SystemExit("lazy iterator helper anchor not found")
-text = text.replace(old, new, 1)
 
 old = '''def _lazy_iterator_assignment_is_mutating(value, active_names, operator_bindings):
     """Return whether an assignment stores a risky lazy iterator."""
@@ -52,9 +53,10 @@ new = '''def _lazy_iterator_assignment_is_mutating(value, active_names, operator
         active_names,
     )
 '''
-if old not in text:
+if old in text:
+    text = text.replace(old, new, 1)
+elif new not in text:
     raise SystemExit("lazy iterator assignment anchor not found")
-text = text.replace(old, new, 1)
 config_path.write_text(text)
 
 tests = Path("tests/test_gunicorn_indirect_workers_bypass.py")
