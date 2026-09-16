@@ -1,0 +1,35 @@
+name: PR 236 unused cleanup
+on:
+  push:
+    branches:
+      - cursor/application-security-review-6f28
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    if: >-
+      github.event.head_commit.message != 'fix remove unused lambda constant'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Remove unused constant
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('config.py')
+          text = path.read_text(encoding='utf-8')
+          block = '''\n_HIGHER_ORDER_LAMBDA_BUILTINS = frozenset(\n    {"map", "filter", "sorted", "any", "all", "max", "min", "list", "bool", "next"}\n)\n\n'''
+          if block not in text:
+              raise SystemExit('unused constant block not found')
+          path.write_text(text.replace(block, '\n', 1), encoding='utf-8')
+          PY
+          python -m py_compile config.py
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          git config user.name 'openrtmp-maintenance[bot]'
+          git config user.email 'openrtmp-maintenance[bot]@users.noreply.github.com'
+          git add config.py
+          git commit -m 'fix remove unused lambda constant'
+          git push
