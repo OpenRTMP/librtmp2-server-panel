@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   apply:
-    if: github.event.head_commit.message != 'fix: address PR 236 Codex findings'
+    if: >-
+      github.event.head_commit.message != 'fix: address PR 236 Codex findings'
     runs-on: ubuntu-latest
     env:
       SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
