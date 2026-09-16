@@ -20,7 +20,7 @@ jobs:
           python-version: '3.14'
 
       - name: Apply generator-expression fix and regressions
-        shell: python
+        shell: python {0}
         run: |
           from pathlib import Path
 
