@@ -1,14 +1,28 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-09-14
+Last scanned: lrtmp2_client.py — 2026-09-16
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-16 lrtmp2_client.py pass)
+
+- No critical bugs found. Re-reviewed after #213 transient poll fix:
+  `delete_stream` HTTP 202/305s drain polling with `_poll_stream_deleted`
+  fail-safe semantics (True/False/None), `_request`/`_request_json` error
+  wrapping, URL encoding, Bearer auth, cluster methods, and caller chains in
+  `app.py` (`delete_stream` sync + drain slots, `_cluster_node_action` node ID
+  validation).
+- Reviewed but not a bug: 404 on delete/delete_player treated as idempotent
+  success; non-202 deletes return without list polling (server returns 202 only
+  for active RTMP drain); `stream_stats()` unauthenticated by design (panel uses
+  `stream_stats_by_id`); `cluster_remove_node` surfaces 404; per-call 5s HTTP
+  timeout bounded inside 330s Gunicorn worker timeout.
 
 ## Findings (2026-09-14 app.py pass)
 
