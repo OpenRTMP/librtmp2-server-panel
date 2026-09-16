@@ -42,7 +42,7 @@ jobs:
         run: node --check static/js/scripts.js
 
   pr236-generator-fix:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/cursor/application-security-review-6f28' && github.event.head_commit.message != 'fix: detect consumed mutating generator expressions'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,8 +70,12 @@ jobs:
           LRTMP2_API_TOKEN: test-api-token-for-ci-only
         run: python -m pytest -q --tb=short -m "not integration"
 
-      - name: Commit fixes
+      - name: Commit fixes when needed
         run: |
+          if git diff --quiet -- config.py tests/test_gunicorn_indirect_workers_bypass.py; then
+            echo 'No fix changes to commit.'
+            exit 0
+          fi
           git config user.name 'Alexander Wagner'
           git config user.email 'github@alexanderwagnerdev.com'
           git add config.py tests/test_gunicorn_indirect_workers_bypass.py
