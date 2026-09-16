@@ -1,0 +1,146 @@
+name: PR 236 generator expression fix
+
+on:
+  push:
+    branches:
+      - cursor/application-security-review-6f28
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.head_commit.message != 'fix: detect consumed mutating generator expressions'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Apply generator-expression fix and regressions
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('config.py')
+          text = path.read_text()
+
+          old = '''def _expression_is_mutating_lazy_iterator(expr, operator_bindings):
+              """Return True for a direct or saved map/filter iterator with a risky callback."""
+              return _map_or_filter_lambda_mutates_when_consumed(
+                  expr,
+                  operator_bindings,
+              ) or _lazy_iterator_alias_is_active(expr, operator_bindings)
+          '''
+          new = '''def _expression_is_mutating_lazy_iterator(
+              expr,
+              operator_bindings,
+              active_names=None,
+          ):
+              """Return True for a risky lazy iterator without consuming it."""
+              if _map_or_filter_lambda_mutates_when_consumed(expr, operator_bindings):
+                  return True
+              if isinstance(expr, ast.Name):
+                  if active_names is not None:
+                      return expr.id in active_names
+                  return _lazy_iterator_alias_is_active(expr, operator_bindings)
+              if not isinstance(expr, ast.GeneratorExp):
+                  return False
+              return any(
+                  _expression_is_mutating_lazy_iterator(
+                      generator.iter,
+                      operator_bindings,
+                      active_names,
+                  )
+                  for generator in expr.generators
+              )
+          '''
+          if old not in text:
+              raise SystemExit('lazy iterator helper anchor not found')
+          text = text.replace(old, new, 1)
+
+          old = '''def _lazy_iterator_assignment_is_mutating(value, active_names, operator_bindings):
+              """Return whether an assignment stores a risky lazy iterator."""
+              if _map_or_filter_lambda_mutates_when_consumed(value, operator_bindings):
+                  return True
+              return isinstance(value, ast.Name) and value.id in active_names
+          '''
+          new = '''def _lazy_iterator_assignment_is_mutating(value, active_names, operator_bindings):
+              """Return whether an assignment stores a risky lazy iterator."""
+              return _expression_is_mutating_lazy_iterator(
+                  value,
+                  operator_bindings,
+                  active_names,
+              )
+          '''
+          if old not in text:
+              raise SystemExit('lazy iterator assignment anchor not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          tests = Path('tests/test_gunicorn_indirect_workers_bypass.py')
+          test_text = tests.read_text()
+          marker = '# Cursor consumed-generator follow-up regressions'
+          if marker not in test_text:
+              test_text += r'''
+
+
+# Cursor consumed-generator follow-up regressions
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\nlist(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nany(x for x in filter(lambda _: globals().update({'workers': 4}), [True]))\n",
+        "workers = 1\nsorted(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfor _ in (x for x in map(lambda _: globals().update({'workers': 4}), [1])):\n    pass\n",
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\nlist(gen)\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\ngen = (x for x in it)\nlist(gen)\n",
+        "workers = 1\nlist(y for _ in [1] for y in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+    ],
+)
+def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    'config_content',
+    [
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\ngen = (x for x in filter(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\ngen = ()\nlist(gen)\n",
+    ],
+)
+def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_content):
+    config_file = tmp_path / 'gunicorn.conf.py'
+    config_file.write_text(config_content, encoding='utf-8')
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+'''
+              tests.write_text(test_text)
+
+      - name: Compile config
+        run: python -m py_compile config.py
+
+      - name: Install test dependencies
+        run: pip install --only-binary=:all: Flask==3.1.3 gunicorn==26.0.0 requests==2.34.2 Flask-WTF==1.3.0 'Flask-Limiter[redis]==4.1.1' pytest==9.1.1
+
+      - name: Run non-integration tests
+        env:
+          SECRET_KEY: test-secret-key-for-ci-validation-only-32chars
+          PASSWORD: test-password-for-ci-only
+          LRTMP2_API_TOKEN: test-api-token-for-ci-only
+        run: python -m pytest -q --tb=short -m 'not integration'
+
+      - name: Commit fixes
+        run: |
+          git config user.name 'Alexander Wagner'
+          git config user.email 'github@alexanderwagnerdev.com'
+          git add config.py tests/test_gunicorn_indirect_workers_bypass.py
+          git commit -m 'fix: detect consumed mutating generator expressions'
+          git push
