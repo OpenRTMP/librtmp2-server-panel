@@ -23,6 +23,7 @@ jobs:
         shell: python {0}
         run: |
           from pathlib import Path
+          from textwrap import dedent
 
           path = Path('config.py')
           text = path.read_text()
@@ -84,44 +85,44 @@ jobs:
           test_text = tests.read_text()
           marker = '# Cursor consumed-generator follow-up regressions'
           if marker not in test_text:
-              test_text += r'''
+              test_text += dedent(r'''
 
 
-# Cursor consumed-generator follow-up regressions
-@pytest.mark.parametrize(
-    'config_content',
-    [
-        "workers = 1\nlist(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
-        "workers = 1\nany(x for x in filter(lambda _: globals().update({'workers': 4}), [True]))\n",
-        "workers = 1\nsorted(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
-        "workers = 1\nfor _ in (x for x in map(lambda _: globals().update({'workers': 4}), [1])):\n    pass\n",
-        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\nlist(gen)\n",
-        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\ngen = (x for x in it)\nlist(gen)\n",
-        "workers = 1\nlist(y for _ in [1] for y in map(lambda _: globals().update({'workers': 4}), [1]))\n",
-    ],
-)
-def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
-    tmp_path,
-    config_content,
-):
-    config_file = tmp_path / 'gunicorn.conf.py'
-    config_file.write_text(config_content, encoding='utf-8')
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+              # Cursor consumed-generator follow-up regressions
+              @pytest.mark.parametrize(
+                  'config_content',
+                  [
+                      "workers = 1\nlist(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+                      "workers = 1\nany(x for x in filter(lambda _: globals().update({'workers': 4}), [True]))\n",
+                      "workers = 1\nsorted(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+                      "workers = 1\nfor _ in (x for x in map(lambda _: globals().update({'workers': 4}), [1])):\n    pass\n",
+                      "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\nlist(gen)\n",
+                      "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\ngen = (x for x in it)\nlist(gen)\n",
+                      "workers = 1\nlist(y for _ in [1] for y in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+                  ],
+              )
+              def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
+                  tmp_path,
+                  config_content,
+              ):
+                  config_file = tmp_path / 'gunicorn.conf.py'
+                  config_file.write_text(config_content, encoding='utf-8')
+                  assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
-@pytest.mark.parametrize(
-    'config_content',
-    [
-        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
-        "workers = 1\ngen = (x for x in filter(lambda _: globals().update({'workers': 4}), [1]))\n",
-        "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\ngen = ()\nlist(gen)\n",
-    ],
-)
-def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_content):
-    config_file = tmp_path / 'gunicorn.conf.py'
-    config_file.write_text(config_content, encoding='utf-8')
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
-'''
+              @pytest.mark.parametrize(
+                  'config_content',
+                  [
+                      "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+                      "workers = 1\ngen = (x for x in filter(lambda _: globals().update({'workers': 4}), [1]))\n",
+                      "workers = 1\ngen = (x for x in map(lambda _: globals().update({'workers': 4}), [1]))\ngen = ()\nlist(gen)\n",
+                  ],
+              )
+              def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_content):
+                  config_file = tmp_path / 'gunicorn.conf.py'
+                  config_file.write_text(config_content, encoding='utf-8')
+                  assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+              ''')
               tests.write_text(test_text)
 
       - name: Compile config
