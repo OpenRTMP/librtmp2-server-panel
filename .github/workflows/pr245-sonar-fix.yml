@@ -24,68 +24,32 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
 
           path = Path("config.py")
           content = path.read_text(encoding="utf-8")
 
-          old_compound = '''def _compound_test_namespace_assignment_values(node):
-              """Return walrus namespace bindings from ``if`` / ``while`` tests."""
-              test = None
-              if isinstance(node, ast.If):
-                  test = node.test
-              elif isinstance(node, ast.While):
-                  test = node.test
-              if test is None:
-                  return []
-              return _namedexpr_assignment_values(test)
-          '''.replace("          ", "")
-          new_compound = '''def _compound_test_namespace_assignment_values(node):
+          compound_start = content.index("def _compound_test_namespace_assignment_values(node):")
+          compound_end = content.index("\n\n\ndef _match_namespace_capture_assignments", compound_start)
+          old_compound = content[compound_start:compound_end]
+          if "if isinstance(node, ast.If):" not in old_compound or "elif isinstance(node, ast.While):" not in old_compound:
+              raise SystemExit("Unexpected compound-test helper implementation")
+          new_compound = dedent('''\
+          def _compound_test_namespace_assignment_values(node):
               """Return walrus namespace bindings from ``if`` / ``while`` tests."""
               if not isinstance(node, (ast.If, ast.While)):
                   return []
               return _namedexpr_assignment_values(node.test)
-          '''.replace("          ", "")
+          ''').rstrip()
+          content = content[:compound_start] + new_compound + content[compound_end:]
 
-          old_dynamic = '''def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
-              """Return True for import-time mutations the AST scan cannot treat as static."""
-              if dict_subclass_names is None:
-                  dict_subclass_names = set()
-              namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-              if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
-                  return True
-              if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
-                  return True
-              if any(
-                  isinstance(child, ast.expr)
-                  and _expression_mutates_workers(
-                      child,
-                      operator_bindings,
-                      dict_subclass_names,
-                  )
-                  for child in ast.iter_child_nodes(node)
-              ):
-                  return True
-              if isinstance(node, ast.Assign):
-                  return any(
-                      _indirect_workers_assignment_target(target)
-                      for target in node.targets
-                  )
-              if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-                  return _indirect_workers_assignment_target(node.target)
-              if isinstance(node, ast.Match):
-                  for case in node.cases:
-                      guard = case.guard
-                      if guard is None:
-                          continue
-                      if _expression_mutates_workers(
-                          guard,
-                          operator_bindings,
-                          dict_subclass_names,
-                      ):
-                          return True
-              return False
-          '''.replace("          ", "")
-          new_dynamic = '''def _match_guard_mutates_workers(
+          dynamic_start = content.index("def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):")
+          dynamic_end = content.index("\n\n\ndef _statements_declare_global_workers", dynamic_start)
+          old_dynamic = content[dynamic_start:dynamic_end]
+          if "if isinstance(node, ast.Match):" not in old_dynamic or "for case in node.cases:" not in old_dynamic:
+              raise SystemExit("Unexpected dynamic-worker mutation implementation")
+          new_dynamic = dedent('''\
+          def _match_guard_mutates_workers(
               node,
               operator_bindings,
               dict_subclass_names,
@@ -135,15 +99,8 @@ jobs:
                   operator_bindings,
                   dict_subclass_names,
               )
-          '''.replace("          ", "")
-
-          for old, new, label in (
-              (old_compound, new_compound, "compound if/while branch"),
-              (old_dynamic, new_dynamic, "dynamic worker mutation function"),
-          ):
-              if content.count(old) != 1:
-                  raise SystemExit(f"Expected exactly one {label} block, found {content.count(old)}")
-              content = content.replace(old, new, 1)
+          ''').rstrip()
+          content = content[:dynamic_start] + new_dynamic + content[dynamic_end:]
 
           path.write_text(content, encoding="utf-8")
           PY
