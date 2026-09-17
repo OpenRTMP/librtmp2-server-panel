@@ -1,0 +1,163 @@
+name: Temporary PR 245 Sonar fix
+
+on:
+  push:
+    branches:
+      - cursor/ci-autofix-automation-fb4b
+    paths:
+      - .github/workflows/pr245-sonar-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/ci-autofix-automation-fb4b
+          fetch-depth: 0
+
+      - name: Refactor Sonar findings
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("config.py")
+          content = path.read_text(encoding="utf-8")
+
+          old_compound = '''def _compound_test_namespace_assignment_values(node):
+              """Return walrus namespace bindings from ``if`` / ``while`` tests."""
+              test = None
+              if isinstance(node, ast.If):
+                  test = node.test
+              elif isinstance(node, ast.While):
+                  test = node.test
+              if test is None:
+                  return []
+              return _namedexpr_assignment_values(test)
+          '''.replace("          ", "")
+          new_compound = '''def _compound_test_namespace_assignment_values(node):
+              """Return walrus namespace bindings from ``if`` / ``while`` tests."""
+              if not isinstance(node, (ast.If, ast.While)):
+                  return []
+              return _namedexpr_assignment_values(node.test)
+          '''.replace("          ", "")
+
+          old_dynamic = '''def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
+              """Return True for import-time mutations the AST scan cannot treat as static."""
+              if dict_subclass_names is None:
+                  dict_subclass_names = set()
+              namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+              if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+                  return True
+              if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
+                  return True
+              if any(
+                  isinstance(child, ast.expr)
+                  and _expression_mutates_workers(
+                      child,
+                      operator_bindings,
+                      dict_subclass_names,
+                  )
+                  for child in ast.iter_child_nodes(node)
+              ):
+                  return True
+              if isinstance(node, ast.Assign):
+                  return any(
+                      _indirect_workers_assignment_target(target)
+                      for target in node.targets
+                  )
+              if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                  return _indirect_workers_assignment_target(node.target)
+              if isinstance(node, ast.Match):
+                  for case in node.cases:
+                      guard = case.guard
+                      if guard is None:
+                          continue
+                      if _expression_mutates_workers(
+                          guard,
+                          operator_bindings,
+                          dict_subclass_names,
+                      ):
+                          return True
+              return False
+          '''.replace("          ", "")
+          new_dynamic = '''def _match_guard_mutates_workers(
+              node,
+              operator_bindings,
+              dict_subclass_names,
+          ):
+              """Return True when a ``match`` guard mutates ``workers``."""
+              if not isinstance(node, ast.Match):
+                  return False
+              return any(
+                  case.guard is not None
+                  and _expression_mutates_workers(
+                      case.guard,
+                      operator_bindings,
+                      dict_subclass_names,
+                  )
+                  for case in node.cases
+              )
+
+
+          def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
+              """Return True for import-time mutations the AST scan cannot treat as static."""
+              if dict_subclass_names is None:
+                  dict_subclass_names = set()
+              namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+              if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+                  return True
+              if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
+                  return True
+              if any(
+                  isinstance(child, ast.expr)
+                  and _expression_mutates_workers(
+                      child,
+                      operator_bindings,
+                      dict_subclass_names,
+                  )
+                  for child in ast.iter_child_nodes(node)
+              ):
+                  return True
+              if isinstance(node, ast.Assign):
+                  return any(
+                      _indirect_workers_assignment_target(target)
+                      for target in node.targets
+                  )
+              if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                  return _indirect_workers_assignment_target(node.target)
+              return _match_guard_mutates_workers(
+                  node,
+                  operator_bindings,
+                  dict_subclass_names,
+              )
+          '''.replace("          ", "")
+
+          for old, new, label in (
+              (old_compound, new_compound, "compound if/while branch"),
+              (old_dynamic, new_dynamic, "dynamic worker mutation function"),
+          ):
+              if content.count(old) != 1:
+                  raise SystemExit(f"Expected exactly one {label} block, found {content.count(old)}")
+              content = content.replace(old, new, 1)
+
+          path.write_text(content, encoding="utf-8")
+          PY
+
+          python -m py_compile config.py
+          git diff --check
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/pr245-sonar-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config.py .github/workflows/pr245-sonar-fix.yml
+          git diff --cached --check
+          git commit -m "refactor: address SonarCloud findings in worker scan"
+          git push origin HEAD:cursor/ci-autofix-automation-fb4b
