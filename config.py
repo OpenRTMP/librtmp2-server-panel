@@ -3535,7 +3535,7 @@ def _function_is_property_method(func_node, operator_bindings=None):
 
 
 def _metaclass_init_mutates_workers(class_node, operator_bindings):
-    """Return True when a ``type`` subclass ``__init__`` mutates ``workers``."""
+    """Return True when a ``type`` subclass hook mutates ``workers``."""
     if not any(
         isinstance(base, ast.Name) and base.id == "type"
         for base in class_node.bases
@@ -3544,7 +3544,7 @@ def _metaclass_init_mutates_workers(class_node, operator_bindings):
     for stmt in class_node.body:
         if (
             isinstance(stmt, ast.FunctionDef)
-            and stmt.name == "__init__"
+            and stmt.name in ("__init__", "__new__")
             and _function_mutates_workers(stmt, operator_bindings)
         ):
             return True
@@ -3587,15 +3587,20 @@ def _record_class_side_effect_target(
         return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
-    if stmt.name == '__init__':
+    if stmt.name in ("__init__", "__post_init__"):
         constructors.add(class_name)
         return True
     target = (class_name, stmt.name)
-    if _function_is_static_or_class_method(stmt, operator_bindings):
+    if stmt.name == "__init_subclass__" or _function_is_static_or_class_method(
+        stmt, operator_bindings
+    ):
         methods.add(target)
         return True
     if _function_is_property_method(stmt, operator_bindings):
         properties.add(target)
+        return True
+    if stmt.name == "__get__":
+        methods.add(target)
         return True
     return False
 
@@ -3622,6 +3627,25 @@ def _class_has_worker_side_effect_target(
         ):
             risky = True
     return risky
+
+
+def _descriptor_class_names(methods):
+    """Return classes whose ``__get__`` hook may mutate ``workers``."""
+    return {class_name for class_name, method_name in methods if method_name == "__get__"}
+
+
+def _record_descriptor_field_assignments(class_node, descriptor_classes, descriptor_fields):
+    """Record class attributes instantiated from descriptor classes."""
+    for stmt in class_node.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
+            continue
+        if stmt.value.func.id not in descriptor_classes:
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                descriptor_fields.add((class_node.name, target.id))
 
 
 def _record_class_side_effect_binding(
@@ -3691,6 +3715,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     constructors = set()
     methods = set()
     properties = set()
+    descriptor_fields = set()
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
@@ -3704,7 +3729,22 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         properties,
         binding_events,
     )
-    return constructors, methods, properties, metaclass_definitions, binding_events
+    descriptor_classes = _descriptor_class_names(methods)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            _record_descriptor_field_assignments(
+                node,
+                descriptor_classes,
+                descriptor_fields,
+            )
+    return (
+        constructors,
+        methods,
+        properties,
+        metaclass_definitions,
+        binding_events,
+        descriptor_fields,
+    )
 
 
 
@@ -3722,6 +3762,7 @@ def _class_binding_is_active(class_targets, class_name, reference_line):
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else set()
     reference_line = getattr(expr, 'lineno', 0)
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
         return expr.func.id in constructors and _class_binding_is_active(
@@ -3745,8 +3786,13 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
         and isinstance(expr.value.func, ast.Name)
     ):
         class_name = expr.value.func.id
-        return (
+        if (
             (class_name, expr.attr) in properties
+            and _class_binding_is_active(class_targets, class_name, reference_line)
+        ):
+            return True
+        return (
+            (class_name, expr.attr) in descriptor_fields
             and _class_binding_is_active(class_targets, class_name, reference_line)
         )
     return False
@@ -3755,8 +3801,14 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
 
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     """Return True when defining the class itself mutates ``workers``."""
+    methods = class_targets[1]
     metaclass_definitions = class_targets[3]
-    return class_node.name in metaclass_definitions
+    if class_node.name in metaclass_definitions:
+        return True
+    return any(
+        isinstance(base, ast.Name) and (base.id, "__init_subclass__") in methods
+        for base in class_node.bases
+    )
 
 
 
@@ -4360,10 +4412,13 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         return True
     if any(
         isinstance(child, ast.expr)
-        and _expression_mutates_workers(
-            child,
-            operator_bindings,
-            dict_subclass_names,
+        and (
+            _expression_mutates_workers(
+                child,
+                operator_bindings,
+                dict_subclass_names,
+            )
+            or _expression_has_risky_instance_update(child)
         )
         for child in ast.iter_child_nodes(node)
     ):
@@ -4375,6 +4430,17 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         )
     if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
         return _indirect_workers_assignment_target(node.target)
+    if isinstance(node, ast.Match):
+        for case in node.cases:
+            guard = case.guard
+            if guard is None:
+                continue
+            if _expression_mutates_workers(
+                guard,
+                operator_bindings,
+                dict_subclass_names,
+            ) or _expression_has_risky_instance_update(guard):
+                return True
     return False
 
 
@@ -4944,7 +5010,7 @@ def _worker_scan_defaults(
     return (
         set() if global_workers_mutators is None else global_workers_mutators,
         (set(), set()) if operator_bindings is None else operator_bindings,
-        (set(), set(), set(), set(), {}) if class_targets is None else class_targets,
+        (set(), set(), set(), set(), {}, set()) if class_targets is None else class_targets,
         {} if dict_subclass_names is None else dict_subclass_names,
     )
 
