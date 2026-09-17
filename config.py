@@ -1696,6 +1696,39 @@ def _namedexpr_assignment_values(expr):
     return values
 
 
+def _match_capture_name(pattern):
+    """Return the name from a top-level ``as`` capture pattern."""
+    if isinstance(pattern, ast.MatchAs) and pattern.name is not None and pattern.pattern is None:
+        return pattern.name
+    return None
+
+
+def _compound_test_namespace_assignment_values(node):
+    """Return walrus namespace bindings from ``if`` / ``while`` tests."""
+    test = None
+    if isinstance(node, ast.If):
+        test = node.test
+    elif isinstance(node, ast.While):
+        test = node.test
+    if test is None:
+        return []
+    return _namedexpr_assignment_values(test)
+
+
+def _match_namespace_capture_assignments(node):
+    """Return capture names when matching on the module namespace."""
+    if not isinstance(node, ast.Match):
+        return []
+    if not _is_module_namespace_mapping(node.subject, set()):
+        return []
+    captures = []
+    for case in node.cases:
+        name = _match_capture_name(case.pattern)
+        if name is not None:
+            captures.append((name, node.subject))
+    return captures
+
+
 def _namespace_assignment_values(node):
     """Return simple name assignments relevant to namespace alias tracking."""
     if isinstance(node, ast.Assign):
@@ -1724,6 +1757,10 @@ def _record_module_namespace_assignments(statements, assignments):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         for name, value in _namespace_assignment_values(node):
+            assignments.setdefault(name, []).append(value)
+        for name, value in _compound_test_namespace_assignment_values(node):
+            assignments.setdefault(name, []).append(value)
+        for name, value in _match_namespace_capture_assignments(node):
             assignments.setdefault(name, []).append(value)
         for block in _compound_statement_blocks(node):
             _record_module_namespace_assignments(block, assignments)
@@ -4412,13 +4449,10 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         return True
     if any(
         isinstance(child, ast.expr)
-        and (
-            _expression_mutates_workers(
-                child,
-                operator_bindings,
-                dict_subclass_names,
-            )
-            or _expression_has_risky_instance_update(child)
+        and _expression_mutates_workers(
+            child,
+            operator_bindings,
+            dict_subclass_names,
         )
         for child in ast.iter_child_nodes(node)
     ):
@@ -4439,7 +4473,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
                 guard,
                 operator_bindings,
                 dict_subclass_names,
-            ) or _expression_has_risky_instance_update(guard):
+            ):
                 return True
     return False
 
