@@ -1705,14 +1705,9 @@ def _match_capture_name(pattern):
 
 def _compound_test_namespace_assignment_values(node):
     """Return walrus namespace bindings from ``if`` / ``while`` tests."""
-    test = None
-    if isinstance(node, ast.If):
-        test = node.test
-    elif isinstance(node, ast.While):
-        test = node.test
-    if test is None:
+    if not isinstance(node, (ast.If, ast.While)):
         return []
-    return _namedexpr_assignment_values(test)
+    return _namedexpr_assignment_values(node.test)
 
 
 def _match_namespace_capture_assignments(node):
@@ -4438,6 +4433,25 @@ def _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
     )
 
 
+def _match_guard_mutates_workers(
+    node,
+    operator_bindings,
+    dict_subclass_names,
+):
+    """Return True when a ``match`` guard mutates ``workers``."""
+    if not isinstance(node, ast.Match):
+        return False
+    return any(
+        case.guard is not None
+        and _expression_mutates_workers(
+            case.guard,
+            operator_bindings,
+            dict_subclass_names,
+        )
+        for case in node.cases
+    )
+
+
 def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if dict_subclass_names is None:
@@ -4464,19 +4478,11 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         )
     if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
         return _indirect_workers_assignment_target(node.target)
-    if isinstance(node, ast.Match):
-        for case in node.cases:
-            guard = case.guard
-            if guard is None:
-                continue
-            if _expression_mutates_workers(
-                guard,
-                operator_bindings,
-                dict_subclass_names,
-            ):
-                return True
-    return False
-
+    return _match_guard_mutates_workers(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+    )
 
 
 def _statements_declare_global_workers(statements):
