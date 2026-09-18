@@ -3366,6 +3366,77 @@ def _lazy_iterator_alias_is_active(expr, operator_bindings):
     )
 
 
+_LAZY_ITERATOR_WRAPPER_NAMES = frozenset({"enumerate", "zip", "iter", "reversed", "islice"})
+_IMPORTED_LAZY_CONSUMER_NAMES = frozenset({"deque", "Counter"})
+
+
+def _attribute_call_wraps_mutating_lazy_iterator(call, operator_bindings, active_names=None):
+    """Return True for ``itertools.islice(...)`` and similar attribute wrappers."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "islice" or not call.args:
+        return False
+    return _expression_is_mutating_lazy_iterator(
+        call.args[0],
+        operator_bindings,
+        active_names,
+    )
+
+
+def _call_wraps_mutating_lazy_iterator(call, operator_bindings, active_names=None):
+    """Return True when a call produces another iterator over a risky source."""
+    if not isinstance(call, ast.Call):
+        return False
+    if _attribute_call_wraps_mutating_lazy_iterator(
+        call,
+        operator_bindings,
+        active_names,
+    ):
+        return True
+    if not isinstance(call.func, ast.Name):
+        return False
+    name = call.func.id
+    if name not in _LAZY_ITERATOR_WRAPPER_NAMES:
+        return False
+    if name in {"enumerate", "zip", "iter", "reversed"}:
+        shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+        if not _name_is_unshadowed_builtin(
+            name,
+            getattr(call, "lineno", 0),
+            shadow_lines,
+        ):
+            return False
+    return any(
+        _expression_is_mutating_lazy_iterator(
+            arg,
+            operator_bindings,
+            active_names,
+        )
+        for arg in call.args
+    )
+
+
+def _function_has_mutating_yield_from(func_def, operator_bindings):
+    """Return True when a generator function yields from a risky iterator."""
+    for node in ast.walk(func_def):
+        if isinstance(node, ast.YieldFrom) and _expression_is_mutating_lazy_iterator(
+            node.value,
+            operator_bindings,
+        ):
+            return True
+    return False
+
+
+def _collect_mutating_yield_from_functions(tree, operator_bindings):
+    """Return function names that ``yield from`` a risky lazy iterator."""
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _function_has_mutating_yield_from(node, operator_bindings):
+                names.add(node.name)
+    return names
+
+
 def _expression_is_mutating_lazy_iterator(
     expr,
     operator_bindings,
@@ -3374,6 +3445,18 @@ def _expression_is_mutating_lazy_iterator(
     """Return True for a risky lazy iterator without consuming it."""
     if _map_or_filter_lambda_mutates_when_consumed(expr, operator_bindings):
         return True
+    if isinstance(expr, ast.Call) and _call_wraps_mutating_lazy_iterator(
+        expr,
+        operator_bindings,
+        active_names,
+    ):
+        return True
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        mutating_generators = (
+            operator_bindings[34] if len(operator_bindings) > 34 else set()
+        )
+        if expr.func.id in mutating_generators:
+            return True
     if isinstance(expr, ast.Name):
         if active_names is not None:
             return expr.id in active_names
@@ -3410,26 +3493,90 @@ def _builtin_consumer_is_active(name, call, operator_bindings):
     )
 
 
+def _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect eager str/bytes ``.join(...)`` consumers of risky iterators."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "join" or not call.args:
+        return False
+    value = call.func.value
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, (str, bytes)):
+        return False
+    return _expression_is_mutating_lazy_iterator(
+        call.args[0],
+        operator_bindings,
+    )
+
+
+def _call_is_threading_workers_mutation(call, operator_bindings):
+    """Return True when ``threading.Thread`` is given a target that mutates workers."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "Thread":
+        thread_call = call
+    elif isinstance(func, ast.Name) and func.id == "Thread":
+        thread_call = call
+    else:
+        return False
+    targets = []
+    if len(thread_call.args) >= 2:
+        targets.append(thread_call.args[1])
+    for keyword in thread_call.keywords:
+        if keyword.arg == "target":
+            targets.append(keyword.value)
+    return any(
+        (
+            isinstance(target, ast.Lambda)
+            and _lambda_mutates_workers(target, operator_bindings)
+        )
+        or _expression_mutates_workers(target, operator_bindings)
+        for target in targets
+    )
+
+
 def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
     """Detect eager builtin consumers of direct or saved risky map/filter iterators."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+    if not isinstance(call, ast.Call):
+        return False
+    if _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
+        return True
+    if not isinstance(call.func, ast.Name):
         return False
     name = call.func.id
-    consumers = {'list', 'tuple', 'set', 'any', 'all', 'max', 'min', 'next', 'sorted'}
+    consumers = {
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "any",
+        "all",
+        "max",
+        "min",
+        "next",
+        "sorted",
+    }
+    if name in _IMPORTED_LAZY_CONSUMER_NAMES:
+        if not call.args:
+            return False
+        return _expression_is_mutating_lazy_iterator(
+            call.args[0],
+            operator_bindings,
+        )
     if name not in consumers or not _builtin_consumer_is_active(
         name,
         call,
         operator_bindings,
     ):
         return False
-    if name in {'sorted', 'max', 'min'} and _key_lambda_mutates_workers(
+    if name in {"sorted", "max", "min"} and _key_lambda_mutates_workers(
         call,
         operator_bindings,
     ):
         return True
     if not call.args:
         return False
-    if name in {'max', 'min'} and len(call.args) != 1:
+    if name in {"max", "min"} and len(call.args) != 1:
         return False
     return _expression_is_mutating_lazy_iterator(
         call.args[0],
@@ -3517,7 +3664,10 @@ def _collect_mutating_lazy_iterator_alias_events(tree, operator_bindings):
 
 def _call_has_mutating_lambda_argument(call, operator_bindings):
     """Detect callbacks only when the current call actually executes them."""
-    return _call_consumes_mutating_lazy_iterator(call, operator_bindings)
+    return (
+        _call_consumes_mutating_lazy_iterator(call, operator_bindings)
+        or _call_is_threading_workers_mutation(call, operator_bindings)
+    )
 
 
 
@@ -5170,7 +5320,15 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         operator_bindings,
     )
-    operator_bindings = (*operator_bindings, lazy_iterator_alias_events)
+    mutating_yield_from_functions = _collect_mutating_yield_from_functions(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        lazy_iterator_alias_events,
+        mutating_yield_from_functions,
+    )
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
