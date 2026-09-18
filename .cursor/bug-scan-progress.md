@@ -1,14 +1,31 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-09-14
+Last scanned: lrtmp2_client.py — 2026-09-18
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-18 lrtmp2_client.py pass)
+
+- No critical bugs found. Full module review (`Lrtmp2ApiError`, `_request` /
+  `_request_json`, `_parse_json`, `_api_error`, all public methods including
+  cluster helpers and `cluster_enabled_from_health`).
+- Reviewed but not a bug: `delete_stream()` HTTP 202 polling with
+  `_poll_stream_deleted()` — transient `list_streams` failures return `None` and
+  retry until `DELETE_STREAM_DRAIN_WAIT_SECONDS` (305s), then distinguish
+  "still listed" vs "could not confirm removal"; default wait aligns with
+  librtmp2-server `DELETE_DRAIN_TIMEOUT` (300s); Docker Gunicorn `--timeout`
+  330s covers worst-case poll overrun; 404 on delete treated as success; path
+  segments URL-encoded; Bearer token only in `Authorization` header; network /
+  JSON / malformed-success-body errors wrapped as `Lrtmp2ApiError`; per-call
+  5s HTTP timeout; `cluster_remove_node` surfaces 404 (does not treat as
+  success); no shared mutable request state; `stream_stats()` (key query param,
+  no Bearer) unused by `app.py` (panel uses `stream_stats_by_id`).
 
 ## Findings (2026-09-14 app.py pass)
 
