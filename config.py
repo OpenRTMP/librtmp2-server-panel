@@ -3353,28 +3353,47 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
 
 
 def _lazy_iterator_alias_is_active(expr, operator_bindings):
-    """Return True for a saved risky map/filter iterator at this source line."""
-    if not isinstance(expr, ast.Name) or len(operator_bindings) <= 33:
+    """Return True for a saved risky map or filter iterator at this source line."""
+    if not isinstance(expr, ast.Name) or len(operator_bindings) <= 40:
         return False
-    events = operator_bindings[33]
+    events = operator_bindings[40]
     return bool(
         _binding_state_at_line(
             events,
             expr.id,
-            getattr(expr, 'lineno', 0),
+            getattr(expr, "lineno", 0),
         )
     )
 
 
-_LAZY_ITERATOR_WRAPPER_NAMES = frozenset({"enumerate", "zip", "iter", "reversed", "islice"})
-_IMPORTED_LAZY_CONSUMER_NAMES = frozenset({"deque", "Counter"})
+_LAZY_ITERATOR_BUILTIN_WRAPPER_NAMES = frozenset(
+    {"enumerate", "zip", "iter", "reversed"}
+)
+_COLLECTIONS_LAZY_CONSUMER_NAMES = frozenset({"deque", "Counter"})
 
 
-def _attribute_call_wraps_mutating_lazy_iterator(call, operator_bindings, active_names=None):
-    """Return True for ``itertools.islice(...)`` and similar attribute wrappers."""
+def _imported_alias_is_active(events, name, reference_line):
+    """Return whether an imported callable alias is active at one source line."""
+    return bool(_binding_state_at_line(events, name, reference_line))
+
+
+def _attribute_call_wraps_mutating_lazy_iterator(
+    call,
+    operator_bindings,
+    active_names=None,
+):
+    """Return True for proven itertools.islice wrappers."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
     if call.func.attr != "islice" or not call.args:
+        return False
+    module_events = operator_bindings[35] if len(operator_bindings) > 35 else {}
+    if not _module_alias_active_at_line(
+        call.func.value,
+        set(),
+        module_events,
+        getattr(call, "lineno", 0),
+    ):
         return False
     return _expression_is_mutating_lazy_iterator(
         call.args[0],
@@ -3396,14 +3415,28 @@ def _call_wraps_mutating_lazy_iterator(call, operator_bindings, active_names=Non
     if not isinstance(call.func, ast.Name):
         return False
     name = call.func.id
-    if name not in _LAZY_ITERATOR_WRAPPER_NAMES:
-        return False
-    if name in {"enumerate", "zip", "iter", "reversed"}:
+    if name == "islice":
+        alias_events = operator_bindings[36] if len(operator_bindings) > 36 else {}
+        if not _imported_alias_is_active(
+            alias_events,
+            name,
+            getattr(call, "lineno", 0),
+        ):
+            return False
+    elif name in _LAZY_ITERATOR_BUILTIN_WRAPPER_NAMES:
         shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
         if not _name_is_unshadowed_builtin(
             name,
             getattr(call, "lineno", 0),
             shadow_lines,
+        ):
+            return False
+    else:
+        alias_events = operator_bindings[36] if len(operator_bindings) > 36 else {}
+        if not _imported_alias_is_active(
+            alias_events,
+            name,
+            getattr(call, "lineno", 0),
         ):
             return False
     return any(
@@ -3416,25 +3449,125 @@ def _call_wraps_mutating_lazy_iterator(call, operator_bindings, active_names=Non
     )
 
 
+def _function_runtime_nodes(func_def):
+    """Yield evaluated nodes in a function without crossing nested scopes."""
+    stack = list(reversed(func_def.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        yield node
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
 def _function_has_mutating_yield_from(func_def, operator_bindings):
     """Return True when a generator function yields from a risky iterator."""
-    for node in ast.walk(func_def):
-        if isinstance(node, ast.YieldFrom) and _expression_is_mutating_lazy_iterator(
+    return any(
+        isinstance(node, ast.YieldFrom)
+        and _expression_is_mutating_lazy_iterator(
             node.value,
             operator_bindings,
-        ):
-            return True
-    return False
+        )
+        for node in _function_runtime_nodes(func_def)
+    )
 
 
-def _collect_mutating_yield_from_functions(tree, operator_bindings):
-    """Return function names that ``yield from`` a risky lazy iterator."""
-    names = set()
-    for node in tree.body:
+def _scan_mutating_yield_from_functions(statements, operator_bindings, names):
+    """Collect risky generator definitions from import-time compound blocks."""
+    for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _function_has_mutating_yield_from(node, operator_bindings):
                 names.add(node.name)
+            continue
+        if isinstance(node, ast.ClassDef):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_mutating_yield_from_functions(
+                block,
+                operator_bindings,
+                names,
+            )
+
+
+def _collect_mutating_yield_from_functions(tree, operator_bindings):
+    """Return function names that yield from a risky lazy iterator."""
+    names = set()
+    _scan_mutating_yield_from_functions(
+        tree.body,
+        operator_bindings,
+        names,
+    )
     return names
+
+
+def _scan_mutating_generator_alias_events(
+    statements,
+    operator_bindings,
+    active_names,
+    events,
+    *,
+    conditional=False,
+):
+    """Track risky generator definitions, aliases, and definite rebindings."""
+    for node in statements:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            risky = _function_has_mutating_yield_from(node, operator_bindings)
+            if risky:
+                active_names.add(node.name)
+                events.setdefault(node.name, []).append((line, True))
+            elif not conditional:
+                _deactivate_imported_module_alias(
+                    node.name,
+                    active_names,
+                    events,
+                    line,
+                )
+            continue
+        if isinstance(node, ast.ClassDef):
+            if not conditional:
+                _deactivate_imported_module_alias(
+                    node.name,
+                    active_names,
+                    events,
+                    line,
+                )
+            continue
+        for name, value in _namespace_assignment_values(node):
+            risky = isinstance(value, ast.Name) and value.id in active_names
+            if risky:
+                active_names.add(name)
+                events.setdefault(name, []).append((line, True))
+            elif not conditional:
+                _deactivate_imported_module_alias(
+                    name,
+                    active_names,
+                    events,
+                    line,
+                )
+        for block in _compound_statement_blocks(node):
+            _scan_mutating_generator_alias_events(
+                block,
+                operator_bindings,
+                active_names,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_mutating_generator_alias_events(tree, operator_bindings):
+    """Collect source-ordered aliases of risky yield-from generators."""
+    events = {}
+    _scan_mutating_generator_alias_events(
+        tree.body,
+        operator_bindings,
+        set(),
+        events,
+    )
+    return events
 
 
 def _expression_is_mutating_lazy_iterator(
@@ -3452,8 +3585,19 @@ def _expression_is_mutating_lazy_iterator(
     ):
         return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        generator_alias_events = (
+            operator_bindings[42] if len(operator_bindings) > 42 else {}
+        )
+        if expr.func.id in generator_alias_events:
+            state = _binding_state_at_line(
+                generator_alias_events,
+                expr.func.id,
+                getattr(expr, "lineno", 0),
+            )
+            if state is not None:
+                return bool(state)
         mutating_generators = (
-            operator_bindings[34] if len(operator_bindings) > 34 else set()
+            operator_bindings[41] if len(operator_bindings) > 41 else set()
         )
         if expr.func.id in mutating_generators:
             return True
@@ -3493,14 +3637,27 @@ def _builtin_consumer_is_active(name, call, operator_bindings):
     )
 
 
+def _join_receiver_is_string(value, operator_bindings, reference_line):
+    """Return True for literal or source-tracked str or bytes join receivers."""
+    if isinstance(value, ast.Constant) and isinstance(value.value, (str, bytes)):
+        return True
+    if not isinstance(value, ast.Name):
+        return False
+    events = operator_bindings[37] if len(operator_bindings) > 37 else {}
+    return _imported_alias_is_active(events, value.id, reference_line)
+
+
 def _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
-    """Detect eager str/bytes ``.join(...)`` consumers of risky iterators."""
+    """Detect eager str or bytes join consumers of risky iterators."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
     if call.func.attr != "join" or not call.args:
         return False
-    value = call.func.value
-    if not isinstance(value, ast.Constant) or not isinstance(value.value, (str, bytes)):
+    if not _join_receiver_is_string(
+        call.func.value,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
         return False
     return _expression_is_mutating_lazy_iterator(
         call.args[0],
@@ -3508,30 +3665,211 @@ def _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
     )
 
 
-def _call_is_threading_workers_mutation(call, operator_bindings):
-    """Return True when ``threading.Thread`` is given a target that mutates workers."""
+def _thread_constructor_has_mutating_target(
+    call,
+    operator_bindings,
+    mutator_names=None,
+):
+    """Return True for a proven Thread constructor with a risky target."""
     if not isinstance(call, ast.Call):
         return False
+    if mutator_names is None:
+        mutator_names = set()
+    reference_line = getattr(call, "lineno", 0)
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr == "Thread":
-        thread_call = call
-    elif isinstance(func, ast.Name) and func.id == "Thread":
-        thread_call = call
+        module_events = operator_bindings[38] if len(operator_bindings) > 38 else {}
+        if not _module_alias_active_at_line(
+            func.value,
+            set(),
+            module_events,
+            reference_line,
+        ):
+            return False
+    elif isinstance(func, ast.Name):
+        alias_events = operator_bindings[39] if len(operator_bindings) > 39 else {}
+        if not _imported_alias_is_active(
+            alias_events,
+            func.id,
+            reference_line,
+        ):
+            return False
     else:
         return False
     targets = []
-    if len(thread_call.args) >= 2:
-        targets.append(thread_call.args[1])
-    for keyword in thread_call.keywords:
-        if keyword.arg == "target":
-            targets.append(keyword.value)
+    if len(call.args) >= 2:
+        targets.append(call.args[1])
+    targets.extend(
+        keyword.value
+        for keyword in call.keywords
+        if keyword.arg == "target"
+    )
     return any(
         (
             isinstance(target, ast.Lambda)
             and _lambda_mutates_workers(target, operator_bindings)
         )
-        or _expression_mutates_workers(target, operator_bindings)
+        or (
+            isinstance(target, ast.Name)
+            and target.id in mutator_names
+        )
         for target in targets
+    )
+
+
+def _expression_starts_mutating_thread(
+    expr,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+):
+    """Return True when an evaluated expression starts a risky Thread."""
+    if isinstance(expr, ast.Lambda):
+        return False
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "start"
+    ):
+        owner = expr.func.value
+        if isinstance(owner, ast.Name) and owner.id in active_thread_names:
+            return True
+        if isinstance(owner, ast.Call) and _thread_constructor_has_mutating_target(
+            owner,
+            operator_bindings,
+            mutator_names,
+        ):
+            return True
+    return any(
+        _expression_starts_mutating_thread(
+            child,
+            active_thread_names,
+            operator_bindings,
+            mutator_names,
+        )
+        for child in ast.iter_child_nodes(expr)
+        if isinstance(child, ast.AST)
+    )
+
+
+def _record_mutating_thread_assignments(
+    node,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+    *,
+    conditional,
+):
+    """Track names holding risky Thread instances after this statement."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional:
+            active_thread_names.discard(node.name)
+        return
+    for name, value in _namespace_assignment_values(node):
+        risky = (
+            isinstance(value, ast.Call)
+            and _thread_constructor_has_mutating_target(
+                value,
+                operator_bindings,
+                mutator_names,
+            )
+        ) or (
+            isinstance(value, ast.Name)
+            and value.id in active_thread_names
+        )
+        if risky:
+            active_thread_names.add(name)
+        elif not conditional:
+            active_thread_names.discard(name)
+
+
+def _scan_started_mutating_threads(
+    statements,
+    operator_bindings,
+    mutator_names,
+    active_thread_names,
+    *,
+    conditional=False,
+):
+    """Scan one import-time statement list for risky Thread.start calls."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _record_mutating_thread_assignments(
+                node,
+                active_thread_names,
+                operator_bindings,
+                mutator_names,
+                conditional=conditional,
+            )
+            continue
+        if any(
+            isinstance(child, ast.expr)
+            and _expression_starts_mutating_thread(
+                child,
+                active_thread_names,
+                operator_bindings,
+                mutator_names,
+            )
+            for child in ast.iter_child_nodes(node)
+        ):
+            return True
+        _record_mutating_thread_assignments(
+            node,
+            active_thread_names,
+            operator_bindings,
+            mutator_names,
+            conditional=conditional,
+        )
+        for block in _compound_statement_blocks(node):
+            if _scan_started_mutating_threads(
+                block,
+                operator_bindings,
+                mutator_names,
+                active_thread_names,
+                conditional=True,
+            ):
+                return True
+    return False
+
+
+def _statements_start_mutating_thread(
+    statements,
+    operator_bindings,
+    mutator_names=None,
+):
+    """Return True only when a risky Thread target is actually started."""
+    return _scan_started_mutating_threads(
+        statements,
+        operator_bindings,
+        set() if mutator_names is None else mutator_names,
+        set(),
+    )
+
+
+def _call_is_collections_lazy_consumer(call, operator_bindings):
+    """Return True for proven collections deque or Counter eager consumers."""
+    if not isinstance(call, ast.Call):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    func = call.func
+    if isinstance(func, ast.Name):
+        alias_events = operator_bindings[34] if len(operator_bindings) > 34 else {}
+        return _imported_alias_is_active(
+            alias_events,
+            func.id,
+            reference_line,
+        )
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr in _COLLECTIONS_LAZY_CONSUMER_NAMES
+    ):
+        return False
+    module_events = operator_bindings[33] if len(operator_bindings) > 33 else {}
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
     )
 
 
@@ -3541,6 +3879,13 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
         return False
     if _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
         return True
+    if _call_is_collections_lazy_consumer(call, operator_bindings):
+        if not call.args:
+            return False
+        return _expression_is_mutating_lazy_iterator(
+            call.args[0],
+            operator_bindings,
+        )
     if not isinstance(call.func, ast.Name):
         return False
     name = call.func.id
@@ -3556,13 +3901,6 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
         "next",
         "sorted",
     }
-    if name in _IMPORTED_LAZY_CONSUMER_NAMES:
-        if not call.args:
-            return False
-        return _expression_is_mutating_lazy_iterator(
-            call.args[0],
-            operator_bindings,
-        )
     if name not in consumers or not _builtin_consumer_is_active(
         name,
         call,
@@ -3664,11 +4002,7 @@ def _collect_mutating_lazy_iterator_alias_events(tree, operator_bindings):
 
 def _call_has_mutating_lambda_argument(call, operator_bindings):
     """Detect callbacks only when the current call actually executes them."""
-    return (
-        _call_consumes_mutating_lazy_iterator(call, operator_bindings)
-        or _call_is_threading_workers_mutation(call, operator_bindings)
-    )
-
+    return _call_consumes_mutating_lazy_iterator(call, operator_bindings)
 
 
 
@@ -4780,6 +5114,12 @@ def _function_mutates_workers(
     dict_subclass_names=None,
 ):
     """Return True when a function may mutate the module ``workers`` binding."""
+    if _statements_start_mutating_thread(
+        func_node.body,
+        operator_bindings,
+        mutator_names,
+    ):
+        return True
     has_global_workers = _statements_declare_global_workers(func_node.body)
     return _statements_mutate_workers(
         func_node.body,
@@ -5049,6 +5389,69 @@ def _collect_imported_module_alias_events(tree, module_name):
 
 
 
+
+def _record_imported_name_aliases(
+    node,
+    module_name,
+    imported_names,
+    active,
+    events,
+    line,
+):
+    """Record direct-import aliases for selected names from one module."""
+    if not isinstance(node, ast.ImportFrom) or node.module != module_name:
+        return
+    for imported in node.names:
+        if imported.name not in imported_names:
+            continue
+        name = imported.asname or imported.name
+        active.add(name)
+        events.setdefault(name, []).append((line, True))
+
+
+def _collect_imported_name_alias_events(tree, module_name, imported_names):
+    """Track selected direct-import aliases and later top-level rebindings."""
+    events = {}
+    active = set()
+    for node in tree.body:
+        line = getattr(node, "lineno", 0)
+        _record_imported_name_aliases(
+            node,
+            module_name,
+            imported_names,
+            active,
+            events,
+            line,
+        )
+        _invalidate_imported_module_aliases(node, active, events, line)
+    return events
+
+
+def _collect_literal_string_alias_events(tree):
+    """Track top-level names that resolve to literal str or bytes values."""
+    events = {}
+    active = set()
+    for node in tree.body:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _deactivate_imported_module_alias(node.name, active, events, line)
+            continue
+        for name, value in _namespace_assignment_values(node):
+            is_string = (
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, (str, bytes))
+            ) or (
+                isinstance(value, ast.Name)
+                and value.id in active
+            )
+            if is_string:
+                active.add(name)
+                events.setdefault(name, []).append((line, True))
+            else:
+                _deactivate_imported_module_alias(name, active, events, line)
+    return events
+
+
 def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
@@ -5070,8 +5473,9 @@ def _collect_operator_setitem_bindings(tree):
         name: _collect_definite_name_shadow_line(tree, name)
         for name in {
             'globals', 'getattr', 'staticmethod', 'classmethod', 'property',
-            'type', 'sorted', 'list', 'tuple', 'set', 'any', 'all', 'max',
-            'min', 'next', 'map', 'filter',
+            'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
+            'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
+            'iter', 'reversed',
         }
     }
     builtin_shadow_lines = {
@@ -5080,6 +5484,34 @@ def _collect_operator_setitem_bindings(tree):
     builtins_aliases = _collect_builtins_aliases(tree)
     builtins_alias_events = _collect_imported_module_alias_events(tree, 'builtins')
     operator_module_alias_events = _collect_imported_module_alias_events(tree, 'operator')
+    collections_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        'collections',
+    )
+    collections_consumer_alias_events = _collect_imported_name_alias_events(
+        tree,
+        'collections',
+        {'deque', 'Counter'},
+    )
+    itertools_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        'itertools',
+    )
+    islice_alias_events = _collect_imported_name_alias_events(
+        tree,
+        'itertools',
+        {'islice'},
+    )
+    string_literal_alias_events = _collect_literal_string_alias_events(tree)
+    threading_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        'threading',
+    )
+    thread_alias_events = _collect_imported_name_alias_events(
+        tree,
+        'threading',
+        {'Thread'},
+    )
     dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
     dict_update_aliases = _collect_dict_update_aliases(
         tree,
@@ -5130,6 +5562,10 @@ def _collect_operator_setitem_bindings(tree):
         types_module_aliases, functiontype_aliases, partial_dict_mutator_alias_events,
         chainmap_namespace_aliases, importlib_module_alias_events,
         builtins_alias_events, operator_module_alias_events, builtin_shadow_lines,
+        collections_module_alias_events, collections_consumer_alias_events,
+        itertools_module_alias_events, islice_alias_events,
+        string_literal_alias_events, threading_module_alias_events,
+        thread_alias_events,
     )
 
 
@@ -5320,14 +5756,25 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         operator_bindings,
     )
+    operator_bindings = (
+        *operator_bindings,
+        lazy_iterator_alias_events,
+    )
     mutating_yield_from_functions = _collect_mutating_yield_from_functions(
         tree,
         operator_bindings,
     )
     operator_bindings = (
         *operator_bindings,
-        lazy_iterator_alias_events,
         mutating_yield_from_functions,
+    )
+    mutating_generator_alias_events = _collect_mutating_generator_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        mutating_generator_alias_events,
     )
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
@@ -5338,6 +5785,12 @@ def _scan_gunicorn_config_worker_details(tree):
         class_targets,
         dict_subclass_names,
     )
+    if _statements_start_mutating_thread(
+        tree.body,
+        operator_bindings,
+        import_time_workers_mutators,
+    ):
+        state.dynamic = True
     _walk_gunicorn_workers_statements(
         tree.body,
         state,
