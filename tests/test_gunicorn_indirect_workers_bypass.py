@@ -421,6 +421,28 @@ def test_cursor_unconsumed_or_rebound_lazy_iterators_stay_static(tmp_path, confi
 
 
 
+# Security review 2026-09-18: alternate lazy-iterator consumers
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom collections import deque\ndeque(map(lambda _: globals().update({'workers': 4}), [1]), maxlen=1)\n",
+        "workers = 1\nlist(enumerate(map(lambda _: globals().update({'workers': 4}), [1])))\n",
+        "workers = 1\nlist(zip(map(lambda _: globals().update({'workers': 4}), [1]), [1]))\n",
+        "workers = 1\nfrozenset(x for x in map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfrom collections import Counter\nCounter(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\n''.join(map(lambda _: str(globals().update({'workers': 4})), [1]))\n",
+        "workers = 1\nimport itertools\nlist(itertools.islice(map(lambda _: globals().update({'workers': 4}), [1]), 1))\n",
+        "workers = 1\ndef g():\n    yield from map(lambda _: globals().update({'workers': 4}), [1])\nlist(g())\n",
+        "workers = 1\nimport threading\nt = threading.Thread(target=lambda: globals().update({'workers': 4}))\nt.start(); t.join()\n",
+    ],
+)
+def test_security_review_alternate_lazy_consumers_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 # Cursor consumed-generator follow-up regressions
 @pytest.mark.parametrize(
     "config_content",
@@ -455,3 +477,46 @@ def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_co
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+# Codex review follow-up 2026-09-18: alias, generator, and Thread execution gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom collections import deque as consume\nconsume(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nimport collections as c\nc.Counter(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfrom itertools import islice as take\nlist(take(map(lambda _: globals().update({'workers': 4}), [1]), 1))\n",
+        "workers = 1\nsep = ''\nsep.join(map(lambda _: str(globals().update({'workers': 4})), [1]))\n",
+        "workers = 1\nit = map(lambda _: globals().update({'workers': 4}), [1])\ndef g():\n    yield from it\nlist(g())\n",
+        "workers = 1\ndef g():\n    yield from map(lambda _: globals().update({'workers': 4}), [1])\nh = g\nlist(h())\n",
+        "workers = 1\nif True:\n    def g():\n        yield from map(lambda _: globals().update({'workers': 4}), [1])\nlist(g())\n",
+        "workers = 1\nimport threading\ndef set_workers():\n    global workers\n    workers = 4\nt = threading.Thread(target=set_workers)\nt.start(); t.join()\n",
+        "workers = 1\nfrom threading import Thread as T\nt = T(target=lambda: globals().update({'workers': 4}))\nt.start(); t.join()\n",
+    ],
+)
+def test_codex_review_alias_and_execution_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\ndef enumerate(it):\n    return []\nlist(enumerate(map(lambda _: globals().update({'workers': 4}), [1])))\n",
+        "workers = 1\ndef zip(*items):\n    return []\nlist(zip(map(lambda _: globals().update({'workers': 4}), [1]), [1]))\n",
+        "workers = 1\ndef iter(it):\n    return []\nlist(iter(map(lambda _: globals().update({'workers': 4}), [1])))\n",
+        "workers = 1\ndef reversed(it):\n    return []\nlist(reversed(map(lambda _: globals().update({'workers': 4}), [1])))\n",
+        "workers = 1\ndef frozenset(it):\n    return set()\nfrozenset(map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\ndef f():\n    def g():\n        yield from map(lambda _: globals().update({'workers': 4}), [1])\n    return []\nlist(f())\n",
+        "workers = 1\nimport threading\nt = threading.Thread(target=lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\ndef g():\n    yield from map(lambda _: globals().update({'workers': 4}), [1])\nh = g\nh = lambda: []\nlist(h())\n",
+    ],
+)
+def test_codex_review_safe_alias_and_thread_patterns_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
