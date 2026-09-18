@@ -13,6 +13,51 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-09-18
+
+### Security
+- Continued hardening of the Gunicorn `workers`-mutation AST scan added in
+  `0.1.7`: dozens of further indirect-mutation techniques are now detected
+  and fail closed instead of being read as a static single-worker config —
+  module/instance dict and namespace updates via `operator`/`functools`
+  helpers, `exec`/`eval`/`type()`-based execution, `ChainMap`/
+  `SimpleNamespace`/dataclass/metaclass side effects, decorators,
+  comprehension and context-manager side effects, and Gunicorn's
+  auto-loaded `gunicorn.conf.py` when no explicit `-c`/`--config` is
+  passed. Without this, `RATELIMIT_STORAGE_URI=memory://` and per-process
+  session stores could keep running under a deployment that Gunicorn was
+  actually forking into multiple workers, defeating the shared login
+  rate limit and session invalidation guards.
+- Unscannable Gunicorn `--config` specs (`python:MODULE` targets, a
+  missing `file:PATH`, or a relative `-c` resolved after `chdir`) now fail
+  closed instead of being treated as a single-worker deployment.
+- Redis error logs no longer include raw session values or unsanitized
+  usernames.
+
+### Fixed
+- Narrowed the worker-mutation scanner to cut false positives it had
+  picked up while being extended: unrelated local `dict.update()` calls
+  and unbound `dict.update(globals(), ...)` invocations are no longer
+  misflagged as dynamic worker mutations.
+- The live stats endpoint no longer loses its dedicated per-IP/per-stream
+  rate limit when exempted from Flask-Limiter's global `default_limits`;
+  it previously either double-counted against the global cap (blocking
+  live stats for six or more expanded streams) or, once exempted, dropped
+  its own cap entirely.
+- `delete_stream` now retries transient `list_streams` errors during the
+  server's drain window instead of surfacing a false delete failure on a
+  single timeout or connection error.
+- Frontend accessibility and maintainability fixes: labeled login form
+  inputs, semantic copy buttons, improved stream page accessibility, and
+  preserved CSRF initialization, `create_stream` template constants, and
+  the cluster-owner fallback check while addressing Sonar findings.
+
+### Added
+- MIT `LICENSE` file.
+
+### Changed
+- Changelog version `0.1.7` → `0.1.8`.
+
 ## [0.1.7] — 2026-09-03
 
 ### Security
@@ -240,7 +285,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.4...v0.1.5
