@@ -522,3 +522,41 @@ def test_codex_review_safe_alias_and_thread_patterns_stay_static(
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
+# Codex PR #253 follow-up: thread-pool alias, receiver, callback, and initializer gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool as Pool\nPool(1).map(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\npool = ThreadPool(1)\npool.map(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nwith ThreadPool(1) as pool:\n    pool.map(lambda _: globals().update({'workers': 4}), [1])\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\ndef set_workers(_):\n    global workers\n    workers = 4\nThreadPool(1).map(set_workers, [1])\n",
+        "workers = 1\nfrom concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(1) as ex:\n    ex.submit(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(1) as ex:\n    future = ex.submit(lambda: globals().update({'workers': 4}))\n    future.result()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).map(lambda value: value, map(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1, initializer=lambda: globals().update({'workers': 4})).map(lambda value: value, [1])\n",
+        "workers = 1\nfrom concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(1, initializer=lambda: globals().update({'workers': 4})) as ex:\n    ex.submit(lambda: None)\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).map(func=lambda _: globals().update({'workers': 4}), iterable=[1])\n",
+        "workers = 1\nimport multiprocessing.pool as p\np.ThreadPool(1).map(lambda _: globals().update({'workers': 4}), [1])\nimport concurrent.futures as p\n",
+    ],
+)
+def test_codex_pr253_thread_pool_followups_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr253_custom_submitter_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Submitter:\n"
+        "    def submit(self, fn):\n"
+        "        class Future:\n"
+        "            def result(self):\n"
+        "                return None\n"
+        "        return Future()\n"
+        "Submitter().submit(lambda: globals().update({'workers': 4})).result()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
