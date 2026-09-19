@@ -1,14 +1,24 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-09-14
+Last scanned: lrtmp2_client.py — 2026-09-19
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-19 lrtmp2_client.py pass)
+
+- No critical bugs found. Re-verified `delete_stream` HTTP 202 / 305s drain polling
+  (`_poll_stream_deleted` fail-closed on malformed list payloads and transient
+  `list_streams` errors), synchronous 200/404 delete paths, `_request` /
+  `_request_json` / `_parse_json` error wrapping, cluster drain/resume/remove
+  (404 on remove surfaced), URL encoding on path segments, Bearer token only in
+  headers, and all `app.py` call sites (`delete_stream` drain slots, cluster
+  node ID parsing before `int()` in client).
 
 ## Findings (2026-09-14 app.py pass)
 
