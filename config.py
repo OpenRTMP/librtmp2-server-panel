@@ -3786,7 +3786,6 @@ def _thread_constructor_has_mutating_target(
     )
 
 
-_THREAD_POOL_CLASS_NAMES = frozenset({"ThreadPool", "ThreadPoolExecutor"})
 _THREAD_POOL_DIRECT_IMPORT_KINDS = {
     ("multiprocessing.pool", "ThreadPool"): "pool",
     ("concurrent.futures", "ThreadPoolExecutor"): "executor",
