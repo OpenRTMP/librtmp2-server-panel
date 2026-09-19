@@ -3804,6 +3804,69 @@ def _record_thread_pool_alias_event(events, name, state, line):
         events[name].append((line, False))
 
 
+def _record_thread_pool_direct_import_aliases(
+    node,
+    class_events,
+    module_events,
+    line,
+):
+    """Record direct ThreadPool and ThreadPoolExecutor imports."""
+    for imported in node.names:
+        name = imported.asname or imported.name
+        kind = _THREAD_POOL_DIRECT_IMPORT_KINDS.get(
+            (node.module, imported.name)
+        )
+        _record_thread_pool_alias_event(class_events, name, kind, line)
+        _record_thread_pool_alias_event(module_events, name, None, line)
+
+
+def _record_thread_pool_module_import_aliases(
+    node,
+    class_events,
+    module_events,
+    line,
+):
+    """Record supported thread-pool module imports and alias collisions."""
+    for imported in node.names:
+        bound_name = imported.asname or imported.name.split(".", 1)[0]
+        kind = _THREAD_POOL_MODULE_IMPORT_KINDS.get(imported.name)
+        module_name = imported.asname or imported.name
+        tracked_name = module_name if kind is not None else bound_name
+        _record_thread_pool_alias_event(
+            module_events,
+            tracked_name,
+            kind,
+            line,
+        )
+        if module_name != bound_name:
+            _record_thread_pool_alias_event(
+                module_events,
+                bound_name,
+                None,
+                line,
+            )
+        _record_thread_pool_alias_event(
+            class_events,
+            bound_name,
+            None,
+            line,
+        )
+
+
+def _thread_pool_rebound_names(node):
+    """Return names definitely rebound by one non-import statement."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return (node.name,)
+    return tuple(name for name, _value in _namespace_assignment_values(node))
+
+
+def _record_thread_pool_rebindings(node, class_events, module_events, line):
+    """Deactivate tracked thread-pool aliases rebound by one statement."""
+    for name in _thread_pool_rebound_names(node):
+        _record_thread_pool_alias_event(class_events, name, None, line)
+        _record_thread_pool_alias_event(module_events, name, None, line)
+
+
 def _collect_thread_pool_alias_events(tree):
     """Track supported thread-pool imports without losing colliding aliases."""
     class_events = {}
@@ -3811,56 +3874,26 @@ def _collect_thread_pool_alias_events(tree):
     for node in tree.body:
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.ImportFrom):
-            for imported in node.names:
-                name = imported.asname or imported.name
-                kind = _THREAD_POOL_DIRECT_IMPORT_KINDS.get(
-                    (node.module, imported.name)
-                )
-                _record_thread_pool_alias_event(
-                    class_events,
-                    name,
-                    kind,
-                    line,
-                )
-                _record_thread_pool_alias_event(
-                    module_events,
-                    name,
-                    None,
-                    line,
-                )
-            continue
-        if isinstance(node, ast.Import):
-            for imported in node.names:
-                bound_name = imported.asname or imported.name.split(".", 1)[0]
-                kind = _THREAD_POOL_MODULE_IMPORT_KINDS.get(imported.name)
-                module_name = imported.asname or imported.name
-                _record_thread_pool_alias_event(
-                    module_events,
-                    module_name if kind is not None else bound_name,
-                    kind,
-                    line,
-                )
-                if module_name != bound_name:
-                    _record_thread_pool_alias_event(
-                        module_events,
-                        bound_name,
-                        None,
-                        line,
-                    )
-                _record_thread_pool_alias_event(
-                    class_events,
-                    bound_name,
-                    None,
-                    line,
-                )
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = (node.name,)
+            _record_thread_pool_direct_import_aliases(
+                node,
+                class_events,
+                module_events,
+                line,
+            )
+        elif isinstance(node, ast.Import):
+            _record_thread_pool_module_import_aliases(
+                node,
+                class_events,
+                module_events,
+                line,
+            )
         else:
-            names = tuple(name for name, _value in _namespace_assignment_values(node))
-        for name in names:
-            _record_thread_pool_alias_event(class_events, name, None, line)
-            _record_thread_pool_alias_event(module_events, name, None, line)
+            _record_thread_pool_rebindings(
+                node,
+                class_events,
+                module_events,
+                line,
+            )
     return class_events, module_events
 
 
@@ -3949,6 +3982,116 @@ def _record_thread_pool_target_binding(target, constructor, events, line):
             )
 
 
+def _record_thread_pool_definition_rebinding(
+    node,
+    events,
+    line,
+    *,
+    conditional,
+):
+    """Handle a definition that may rebind a tracked pool instance."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    if not conditional:
+        _record_thread_pool_alias_event(events, node.name, None, line)
+    return True
+
+
+def _record_thread_pool_with_alias(
+    item,
+    operator_bindings,
+    events,
+    line,
+    *,
+    conditional,
+):
+    """Record one context-managed pool instance alias."""
+    if item.optional_vars is None:
+        return
+    constructor = _thread_pool_instance_constructor_from_value(
+        item.context_expr,
+        operator_bindings,
+        events,
+    )
+    if constructor is not None:
+        _record_thread_pool_target_binding(
+            item.optional_vars,
+            constructor,
+            events,
+            line,
+        )
+        return
+    if not conditional and isinstance(item.optional_vars, ast.Name):
+        _record_thread_pool_alias_event(
+            events,
+            item.optional_vars.id,
+            None,
+            line,
+        )
+
+
+def _record_thread_pool_with_aliases(
+    node,
+    operator_bindings,
+    events,
+    line,
+    *,
+    conditional,
+):
+    """Record context-managed thread-pool aliases from one statement."""
+    if not isinstance(node, ast.With):
+        return
+    for item in node.items:
+        _record_thread_pool_with_alias(
+            item,
+            operator_bindings,
+            events,
+            line,
+            conditional=conditional,
+        )
+
+
+def _record_thread_pool_assignment_alias(
+    name,
+    value,
+    operator_bindings,
+    events,
+    line,
+    *,
+    conditional,
+):
+    """Record one assignment to a possible thread-pool instance."""
+    constructor = _thread_pool_instance_constructor_from_value(
+        value,
+        operator_bindings,
+        events,
+    )
+    if constructor is not None:
+        events.setdefault(name, []).append((line, constructor))
+    elif not conditional:
+        _record_thread_pool_alias_event(events, name, None, line)
+
+
+def _record_thread_pool_assignment_aliases(
+    node,
+    operator_bindings,
+    events,
+    line,
+    *,
+    conditional,
+):
+    """Record thread-pool aliases introduced by simple assignments."""
+    for name, value in _namespace_assignment_values(node):
+        _record_thread_pool_assignment_alias(
+            name,
+            value,
+            operator_bindings,
+            events,
+            line,
+            conditional=conditional,
+        )
+
+
 def _scan_thread_pool_instance_alias_events(
     statements,
     operator_bindings,
@@ -3959,43 +4102,27 @@ def _scan_thread_pool_instance_alias_events(
     """Track saved and context-managed pool instances in source order."""
     for node in statements:
         line = getattr(node, "lineno", 0)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not conditional:
-                _record_thread_pool_alias_event(events, node.name, None, line)
+        if _record_thread_pool_definition_rebinding(
+            node,
+            events,
+            line,
+            conditional=conditional,
+        ):
             continue
-        if isinstance(node, ast.With):
-            for item in node.items:
-                if item.optional_vars is None:
-                    continue
-                constructor = _thread_pool_instance_constructor_from_value(
-                    item.context_expr,
-                    operator_bindings,
-                    events,
-                )
-                if constructor is not None:
-                    _record_thread_pool_target_binding(
-                        item.optional_vars,
-                        constructor,
-                        events,
-                        line,
-                    )
-                elif not conditional and isinstance(item.optional_vars, ast.Name):
-                    _record_thread_pool_alias_event(
-                        events,
-                        item.optional_vars.id,
-                        None,
-                        line,
-                    )
-        for name, value in _namespace_assignment_values(node):
-            constructor = _thread_pool_instance_constructor_from_value(
-                value,
-                operator_bindings,
-                events,
-            )
-            if constructor is not None:
-                events.setdefault(name, []).append((line, constructor))
-            elif not conditional:
-                _record_thread_pool_alias_event(events, name, None, line)
+        _record_thread_pool_with_aliases(
+            node,
+            operator_bindings,
+            events,
+            line,
+            conditional=conditional,
+        )
+        _record_thread_pool_assignment_aliases(
+            node,
+            operator_bindings,
+            events,
+            line,
+            conditional=conditional,
+        )
         for nested in _compound_statement_blocks(node):
             _scan_thread_pool_instance_alias_events(
                 nested,
@@ -4335,32 +4462,8 @@ def _call_is_collections_lazy_consumer(call, operator_bindings):
     )
 
 
-def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
-    """Detect eager builtin consumers of direct or saved risky map/filter iterators."""
-    if not isinstance(call, ast.Call):
-        return False
-    if _call_is_thread_pool_constructor_initializer_mutation(
-        call,
-        operator_bindings,
-    ):
-        return True
-    if _call_is_thread_pool_map_mutation(call, operator_bindings):
-        return True
-    if _call_is_thread_pool_submit_mutation(call, operator_bindings):
-        return True
-    if _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
-        return True
-    if _call_is_collections_lazy_consumer(call, operator_bindings):
-        if not call.args:
-            return False
-        return _expression_is_mutating_lazy_iterator(
-            call.args[0],
-            operator_bindings,
-        )
-    if not isinstance(call.func, ast.Name):
-        return False
-    name = call.func.id
-    consumers = {
+_EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
+    {
         "list",
         "tuple",
         "set",
@@ -4372,15 +4475,55 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
         "next",
         "sorted",
     }
-    if name not in consumers or not _builtin_consumer_is_active(
-        name,
-        call,
+)
+
+
+def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
+    """Return True for non-builtin eager consumers handled specially."""
+    return (
+        _call_is_thread_pool_constructor_initializer_mutation(
+            call,
+            operator_bindings,
+        )
+        or _call_is_thread_pool_map_mutation(call, operator_bindings)
+        or _call_is_thread_pool_submit_mutation(call, operator_bindings)
+        or _attribute_call_consumes_mutating_lazy_iterator(
+            call,
+            operator_bindings,
+        )
+    )
+
+
+def _collections_call_consumes_mutating_lazy_iterator(
+    call,
+    operator_bindings,
+):
+    """Return whether a proven collections consumer eagerly drains a risky source."""
+    if not _call_is_collections_lazy_consumer(call, operator_bindings):
+        return False
+    return bool(call.args) and _expression_is_mutating_lazy_iterator(
+        call.args[0],
         operator_bindings,
+    )
+
+
+def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect eager builtin consumers of a risky lazy iterator."""
+    if not isinstance(call.func, ast.Name):
+        return False
+    name = call.func.id
+    if (
+        name not in _EAGER_LAZY_ITERATOR_CONSUMERS
+        or not _builtin_consumer_is_active(
+            name,
+            call,
+            operator_bindings,
+        )
     ):
         return False
-    if name in {"sorted", "max", "min"} and _key_lambda_mutates_workers(
-        call,
-        operator_bindings,
+    if (
+        name in {"sorted", "max", "min"}
+        and _key_lambda_mutates_workers(call, operator_bindings)
     ):
         return True
     if not call.args:
@@ -4390,6 +4533,23 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
     return _expression_is_mutating_lazy_iterator(
         call.args[0],
         operator_bindings,
+    )
+
+
+def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect eager consumers of direct or saved risky map/filter iterators."""
+    if not isinstance(call, ast.Call):
+        return False
+    return (
+        _call_is_special_lazy_iterator_consumer(call, operator_bindings)
+        or _collections_call_consumes_mutating_lazy_iterator(
+            call,
+            operator_bindings,
+        )
+        or _named_builtin_consumes_mutating_lazy_iterator(
+            call,
+            operator_bindings,
+        )
     )
 
 
