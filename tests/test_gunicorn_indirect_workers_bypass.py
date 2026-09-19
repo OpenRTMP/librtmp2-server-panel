@@ -491,6 +491,8 @@ def test_cursor_unconsumed_or_rebound_generator_stays_static(tmp_path, config_co
         "workers = 1\nif True:\n    def g():\n        yield from map(lambda _: globals().update({'workers': 4}), [1])\nlist(g())\n",
         "workers = 1\nimport threading\ndef set_workers():\n    global workers\n    workers = 4\nt = threading.Thread(target=set_workers)\nt.start(); t.join()\n",
         "workers = 1\nfrom threading import Thread as T\nt = T(target=lambda: globals().update({'workers': 4}))\nt.start(); t.join()\n",
+        "workers = 1\nfrom concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(1) as ex:\n    ex.submit(lambda: globals().update({'workers': 4})).result()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).map(lambda _: globals().update({'workers': 4}), [1])\n",
     ],
 )
 def test_codex_review_alias_and_execution_gaps_are_dynamic(tmp_path, config_content):

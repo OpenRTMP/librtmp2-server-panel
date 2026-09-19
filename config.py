@@ -3786,6 +3786,72 @@ def _thread_constructor_has_mutating_target(
     )
 
 
+_THREAD_POOL_CLASS_NAMES = frozenset({"ThreadPool", "ThreadPoolExecutor"})
+
+
+def _call_is_thread_pool_class_constructor(call, operator_bindings):
+    """Return True when a call constructs ThreadPool or ThreadPoolExecutor."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(func, ast.Name) and func.id in _THREAD_POOL_CLASS_NAMES:
+        alias_events = operator_bindings[43] if len(operator_bindings) > 43 else {}
+        if alias_events:
+            return _imported_alias_is_active(alias_events, func.id, reference_line)
+        return True
+    if isinstance(func, ast.Attribute) and func.attr in _THREAD_POOL_CLASS_NAMES:
+        module_events = operator_bindings[44] if len(operator_bindings) > 44 else {}
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            module_events,
+            reference_line,
+        )
+    return False
+
+
+def _call_is_thread_pool_map_mutation(call, operator_bindings):
+    """Return True when ThreadPool.map executes a workers-mutating callback."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "map"):
+        return False
+    receiver = func.value
+    if not (
+        isinstance(receiver, ast.Call)
+        and _call_is_thread_pool_class_constructor(receiver, operator_bindings)
+    ):
+        return False
+    if not call.args:
+        return False
+    if isinstance(call.args[0], ast.Lambda):
+        return _lambda_mutates_workers(call.args[0], operator_bindings)
+    return _expression_is_mutating_lazy_iterator(call.args[0], operator_bindings)
+
+
+def _call_is_executor_submit_result_mutation(call, operator_bindings):
+    """Return True when submit(...).result() runs a workers-mutating callback."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "result"):
+        return False
+    submit_call = func.value
+    if not isinstance(submit_call, ast.Call):
+        return False
+    submit_func = submit_call.func
+    if not (isinstance(submit_func, ast.Attribute) and submit_func.attr == "submit"):
+        return False
+    if not submit_call.args:
+        return False
+    target = submit_call.args[0]
+    if isinstance(target, ast.Lambda):
+        return _lambda_mutates_workers(target, operator_bindings)
+    return False
+
+
 def _expression_starts_mutating_thread(
     expr,
     active_thread_names,
@@ -3946,6 +4012,10 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
     """Detect eager builtin consumers of direct or saved risky map/filter iterators."""
     if not isinstance(call, ast.Call):
         return False
+    if _call_is_thread_pool_map_mutation(call, operator_bindings):
+        return True
+    if _call_is_executor_submit_result_mutation(call, operator_bindings):
+        return True
     if _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
         return True
     if _call_is_collections_lazy_consumer(call, operator_bindings):
@@ -5844,6 +5914,33 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         mutating_generator_alias_events,
+    )
+    thread_pool_class_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "multiprocessing.pool",
+        {"ThreadPool"},
+    )
+    thread_pool_class_alias_events.update(
+        _collect_imported_name_alias_events(
+            tree,
+            "concurrent.futures",
+            {"ThreadPoolExecutor"},
+        )
+    )
+    thread_pool_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        "multiprocessing.pool",
+    )
+    thread_pool_module_alias_events.update(
+        _collect_imported_module_alias_events(
+            tree,
+            "concurrent.futures",
+        )
+    )
+    operator_bindings = (
+        *operator_bindings,
+        thread_pool_class_alias_events,
+        thread_pool_module_alias_events,
     )
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
