@@ -3662,6 +3662,8 @@ def _expression_is_mutating_lazy_iterator(
             active_names,
         ):
             return True
+        if _call_is_thread_pool_imap_iterator(expr, operator_bindings):
+            return True
         if _call_is_mutating_generator(expr, operator_bindings):
             return True
     if _name_is_mutating_lazy_iterator(
@@ -3725,26 +3727,37 @@ def _attribute_call_consumes_mutating_lazy_iterator(call, operator_bindings):
     )
 
 
-def _thread_constructor_is_active(call, operator_bindings):
-    """Return whether a Thread constructor resolves to the threading module."""
-    func = call.func
-    reference_line = getattr(call, "lineno", 0)
-    if isinstance(func, ast.Attribute) and func.attr == "Thread":
+def _thread_class_reference_is_active(
+    reference,
+    operator_bindings,
+    reference_line,
+):
+    """Return whether an expression resolves to threading.Thread."""
+    if isinstance(reference, ast.Attribute) and reference.attr == "Thread":
         module_events = operator_bindings[38] if len(operator_bindings) > 38 else {}
         return _module_alias_active_at_line(
-            func.value,
+            reference.value,
             set(),
             module_events,
             reference_line,
         )
-    if isinstance(func, ast.Name):
+    if isinstance(reference, ast.Name):
         alias_events = operator_bindings[39] if len(operator_bindings) > 39 else {}
         return _imported_alias_is_active(
             alias_events,
-            func.id,
+            reference.id,
             reference_line,
         )
     return False
+
+
+def _thread_constructor_is_active(call, operator_bindings):
+    """Return whether a Thread constructor resolves to the threading module."""
+    return _thread_class_reference_is_active(
+        call.func,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
 
 
 def _thread_target_mutates_workers(target, operator_bindings, mutator_names):
@@ -4165,6 +4178,9 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     """Return whether one pool callback can mutate module workers."""
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if _expression_is_namespace_update_reference(callback, namespace_aliases):
+        return True
     mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
     return isinstance(callback, ast.Name) and callback.id in mutator_names
 
@@ -4222,12 +4238,20 @@ def _thread_pool_map_arguments(call):
     return callback, iterables
 
 
+_THREAD_POOL_CALLBACK_METHODS = frozenset(
+    {"map", "imap", "imap_unordered", "starmap"}
+)
+
+
 def _call_is_thread_pool_map_mutation(call, operator_bindings):
-    """Return True when a proven pool.map performs a workers mutation."""
+    """Return True when a proven pool map-like method performs a workers mutation."""
     if not isinstance(call, ast.Call):
         return False
     func = call.func
-    if not (isinstance(func, ast.Attribute) and func.attr == "map"):
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr in _THREAD_POOL_CALLBACK_METHODS
+    ):
         return False
     constructor = _thread_pool_receiver_constructor(
         func.value,
@@ -4251,6 +4275,154 @@ def _call_is_thread_pool_map_mutation(call, operator_bindings):
             operator_bindings,
         )
         for iterable in iterables
+    )
+
+
+def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
+    """Return True when apply_async schedules a workers-mutating callback."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "apply_async"
+    ):
+        return False
+    constructor = _thread_pool_receiver_constructor(
+        call.func.value,
+        operator_bindings,
+    )
+    if constructor is None:
+        return False
+    task = call.args[0] if call.args else next(
+        (
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg == "func"
+        ),
+        None,
+    )
+    if task is None:
+        return False
+    if _thread_pool_constructor_has_mutating_initializer(
+        constructor,
+        operator_bindings,
+    ):
+        return True
+    callbacks = [task]
+    callbacks.extend(
+        keyword.value
+        for keyword in call.keywords
+        if keyword.arg in {"callback", "error_callback"}
+    )
+    return any(
+        _thread_pool_callback_mutates_workers(callback, operator_bindings)
+        for callback in callbacks
+    )
+
+
+def _call_is_thread_pool_imap_iterator(expr, operator_bindings):
+    """Return True when a proven pool imap variant yields mutating callbacks."""
+    if not isinstance(expr, ast.Call):
+        return False
+    func = expr.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr in {"imap", "imap_unordered"}
+    ):
+        return False
+    constructor = _thread_pool_receiver_constructor(
+        func.value,
+        operator_bindings,
+    )
+    if constructor is None:
+        return False
+    callback, iterables = _thread_pool_map_arguments(expr)
+    if callback is None or not iterables:
+        return False
+    if _thread_pool_constructor_has_mutating_initializer(
+        constructor,
+        operator_bindings,
+    ):
+        return True
+    if _thread_pool_callback_mutates_workers(callback, operator_bindings):
+        return True
+    return any(
+        _expression_is_mutating_lazy_iterator(
+            iterable,
+            operator_bindings,
+        )
+        for iterable in iterables
+    )
+
+
+def _asyncio_module_active_at_line(node, operator_bindings, reference_line):
+    """Return True when ``node`` resolves to the asyncio module at ``reference_line``."""
+    if not isinstance(node, ast.Name):
+        return False
+    asyncio_events = operator_bindings[47] if len(operator_bindings) > 47 else {}
+    return _imported_alias_is_active(asyncio_events, node.id, reference_line)
+
+
+def _asyncio_helper_active_at_line(
+    node,
+    helper_name,
+    operator_bindings,
+    reference_line,
+):
+    """Resolve module-qualified or directly imported asyncio helpers."""
+    if isinstance(node, ast.Attribute) and node.attr == helper_name:
+        return _asyncio_module_active_at_line(
+            node.value,
+            operator_bindings,
+            reference_line,
+        )
+    if not isinstance(node, ast.Name):
+        return False
+    event_index = {"run": 48, "to_thread": 49}.get(helper_name)
+    if event_index is None or len(operator_bindings) <= event_index:
+        return False
+    return _imported_alias_is_active(
+        operator_bindings[event_index],
+        node.id,
+        reference_line,
+    )
+
+
+def _call_is_asyncio_run_to_thread_mutation(call, operator_bindings):
+    """Return True when asyncio run/to_thread execution mutates workers."""
+    if not isinstance(call, ast.Call):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _asyncio_helper_active_at_line(
+        call.func,
+        "run",
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    if not call.args:
+        return False
+    to_thread = call.args[0]
+    if not (
+        isinstance(to_thread, ast.Call)
+        and _asyncio_helper_active_at_line(
+            to_thread.func,
+            "to_thread",
+            operator_bindings,
+            reference_line,
+        )
+    ):
+        return False
+    target = to_thread.args[0] if to_thread.args else next(
+        (
+            keyword.value
+            for keyword in to_thread.keywords
+            if keyword.arg == "func"
+        ),
+        None,
+    )
+    return target is not None and _thread_pool_callback_mutates_workers(
+        target,
+        operator_bindings,
     )
 
 
@@ -4306,6 +4478,62 @@ def _call_is_thread_pool_constructor_initializer_mutation(
         )
     )
 
+def _thread_expression_is_active(
+    thread,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+):
+    """Return whether an expression resolves to a workers-mutating Thread."""
+    if isinstance(thread, ast.Name):
+        return thread.id in active_thread_names
+    return isinstance(thread, ast.Call) and _thread_constructor_has_mutating_target(
+        thread,
+        operator_bindings,
+        mutator_names,
+    )
+
+
+def _thread_call_starts_mutating_target(
+    call,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+):
+    """Return whether one Thread start/run call executes a risky target."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"start", "run"}
+    ):
+        return False
+
+    owner = call.func.value
+    if _thread_expression_is_active(
+        owner,
+        active_thread_names,
+        operator_bindings,
+        mutator_names,
+    ):
+        return True
+
+    return (
+        call.func.attr == "run"
+        and bool(call.args)
+        and _thread_class_reference_is_active(
+            owner,
+            operator_bindings,
+            getattr(call, "lineno", 0),
+        )
+        and _thread_expression_is_active(
+            call.args[0],
+            active_thread_names,
+            operator_bindings,
+            mutator_names,
+        )
+    )
+
+
 def _expression_starts_mutating_thread(
     expr,
     active_thread_names,
@@ -4315,20 +4543,13 @@ def _expression_starts_mutating_thread(
     """Return True when an evaluated expression starts a risky Thread."""
     if isinstance(expr, ast.Lambda):
         return False
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Attribute)
-        and expr.func.attr == "start"
+    if _thread_call_starts_mutating_target(
+        expr,
+        active_thread_names,
+        operator_bindings,
+        mutator_names,
     ):
-        owner = expr.func.value
-        if isinstance(owner, ast.Name) and owner.id in active_thread_names:
-            return True
-        if isinstance(owner, ast.Call) and _thread_constructor_has_mutating_target(
-            owner,
-            operator_bindings,
-            mutator_names,
-        ):
-            return True
+        return True
     return any(
         _expression_starts_mutating_thread(
             child,
@@ -4487,6 +4708,8 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         )
         or _call_is_thread_pool_map_mutation(call, operator_bindings)
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
+        or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
+        or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
         or _attribute_call_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
@@ -6438,6 +6661,26 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         import_time_workers_mutators,
+    )
+    asyncio_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        "asyncio",
+    )
+    asyncio_run_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"run"},
+    )
+    asyncio_to_thread_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"to_thread"},
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_module_alias_events,
+        asyncio_run_alias_events,
+        asyncio_to_thread_alias_events,
     )
     if _statements_start_mutating_thread(
         tree.body,
