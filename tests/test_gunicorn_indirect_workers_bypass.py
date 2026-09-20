@@ -565,6 +565,24 @@ def test_security_review_sep20_thread_asyncio_pool_gaps_are_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+# Codex review follow-up 2026-09-20: remaining Thread/asyncio/ThreadPool gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nlist(ThreadPool(1).imap_unordered(lambda _: globals().update({'workers': 4}), [1]))\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\npool = ThreadPool(1)\nresult = pool.apply_async(lambda: globals().update({'workers': 4}))\nresult.get()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).apply_async(lambda: 0, callback=lambda _: globals().update({'workers': 4})).get()\n",
+        "workers = 1\nfrom asyncio import run, to_thread\nrun(to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport threading\nt = threading.Thread(target=lambda: globals().update({'workers': 4}))\nthreading.Thread.run(t)\n",
+        "workers = 1\nimport asyncio\nasyncio.run(asyncio.to_thread(globals().update, {'workers': 4}))\n",
+    ],
+)
+def test_codex_pr258_remaining_findings_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 def test_codex_pr253_custom_submitter_stays_static(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
