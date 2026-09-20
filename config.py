@@ -4478,6 +4478,62 @@ def _call_is_thread_pool_constructor_initializer_mutation(
         )
     )
 
+def _thread_expression_is_active(
+    thread,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+):
+    """Return whether an expression resolves to a workers-mutating Thread."""
+    if isinstance(thread, ast.Name):
+        return thread.id in active_thread_names
+    return isinstance(thread, ast.Call) and _thread_constructor_has_mutating_target(
+        thread,
+        operator_bindings,
+        mutator_names,
+    )
+
+
+def _thread_call_starts_mutating_target(
+    call,
+    active_thread_names,
+    operator_bindings,
+    mutator_names,
+):
+    """Return whether one Thread start/run call executes a risky target."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"start", "run"}
+    ):
+        return False
+
+    owner = call.func.value
+    if _thread_expression_is_active(
+        owner,
+        active_thread_names,
+        operator_bindings,
+        mutator_names,
+    ):
+        return True
+
+    return (
+        call.func.attr == "run"
+        and bool(call.args)
+        and _thread_class_reference_is_active(
+            owner,
+            operator_bindings,
+            getattr(call, "lineno", 0),
+        )
+        and _thread_expression_is_active(
+            call.args[0],
+            active_thread_names,
+            operator_bindings,
+            mutator_names,
+        )
+    )
+
+
 def _expression_starts_mutating_thread(
     expr,
     active_thread_names,
@@ -4487,38 +4543,13 @@ def _expression_starts_mutating_thread(
     """Return True when an evaluated expression starts a risky Thread."""
     if isinstance(expr, ast.Lambda):
         return False
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Attribute)
-        and expr.func.attr in {"start", "run"}
+    if _thread_call_starts_mutating_target(
+        expr,
+        active_thread_names,
+        operator_bindings,
+        mutator_names,
     ):
-        owner = expr.func.value
-        if isinstance(owner, ast.Name) and owner.id in active_thread_names:
-            return True
-        if isinstance(owner, ast.Call) and _thread_constructor_has_mutating_target(
-            owner,
-            operator_bindings,
-            mutator_names,
-        ):
-            return True
-        if (
-            expr.func.attr == "run"
-            and expr.args
-            and _thread_class_reference_is_active(
-                owner,
-                operator_bindings,
-                getattr(expr, "lineno", 0),
-            )
-        ):
-            thread = expr.args[0]
-            if isinstance(thread, ast.Name) and thread.id in active_thread_names:
-                return True
-            if isinstance(thread, ast.Call) and _thread_constructor_has_mutating_target(
-                thread,
-                operator_bindings,
-                mutator_names,
-            ):
-                return True
+        return True
     return any(
         _expression_starts_mutating_thread(
             child,
