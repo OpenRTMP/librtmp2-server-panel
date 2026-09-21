@@ -653,3 +653,41 @@ def test_codex_pr261_nonexecuted_asyncio_patterns_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex PR #261 second follow-up: remaining asyncio binding and execution gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport asyncio\nasync def main():\n    from asyncio import to_thread\n    await to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    async with asyncio.timeout(1):\n        await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    for _ in [1]:\n        pending = asyncio.to_thread(lambda: globals().update({'workers': 4}))\n        alias = pending\n        await alias\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nwith asyncio.Runner() as runner:\n    runner.run(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport asyncio\nclass Jobs:\n    @staticmethod\n    async def main():\n        await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(Jobs.main())\n",
+        "workers = 1\nimport asyncio\nasync def main(dispatch):\n    await dispatch(lambda: globals().update({'workers': 4}))\nasyncio.run(main(asyncio.to_thread))\n",
+        "workers = 1\nimport asyncio\nfactory = asyncio.new_event_loop\nloop = factory()\nloop.run_until_complete(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    def mutate():\n        globals().update({'workers': 4})\n    await asyncio.to_thread(mutate)\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(*(main(),))\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(**{'main': main()})\n",
+    ],
+)
+def test_codex_pr261_second_followup_dynamic_patterns(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nfrom asyncio import sleep as main\nasyncio.run(main(0))\n",
+        "workers = 1\nimport asyncio\nclass Jobs:\n    async def main(self):\n        await asyncio.to_thread(lambda: globals().update({'workers': 4}))\ntry:\n    asyncio.run(Jobs.main())\nexcept TypeError:\n    pass\n",
+    ],
+)
+def test_codex_pr261_second_followup_safe_patterns_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
