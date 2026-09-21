@@ -4354,12 +4354,41 @@ def _call_is_thread_pool_imap_iterator(expr, operator_bindings):
     )
 
 
+# Asyncio binding indexes appended by _scan_gunicorn_config_worker_details.
+_ASYNCIO_MODULE_EVENTS_INDEX = 47
+_ASYNCIO_RUN_EVENTS_INDEX = 48
+_ASYNCIO_TO_THREAD_EVENTS_INDEX = 49
+_ASYNCIO_NEW_EVENT_LOOP_EVENTS_INDEX = 50
+_ASYNCIO_GET_EVENT_LOOP_EVENTS_INDEX = 51
+_ASYNCIO_RUNNER_EVENTS_INDEX = 52
+_ASYNCIO_GATHER_EVENTS_INDEX = 53
+_ASYNCIO_SHIELD_EVENTS_INDEX = 54
+_ASYNCIO_WAIT_FOR_EVENTS_INDEX = 55
+_ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX = 56
+_ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX = 57
+_ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX = 58
+_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX = 59
+
+
+def _asyncio_reference_line(reference):
+    """Return a source line for an AST node or numeric line reference."""
+    if isinstance(reference, ast.AST):
+        return getattr(reference, "lineno", 0)
+    return int(reference or 0)
+
+
 def _asyncio_module_active_at_line(node, operator_bindings, reference_line):
     """Return True when ``node`` resolves to the asyncio module at ``reference_line``."""
     if not isinstance(node, ast.Name):
         return False
-    asyncio_events = operator_bindings[47] if len(operator_bindings) > 47 else {}
-    return _imported_alias_is_active(asyncio_events, node.id, reference_line)
+    if len(operator_bindings) <= _ASYNCIO_MODULE_EVENTS_INDEX:
+        return False
+    asyncio_events = operator_bindings[_ASYNCIO_MODULE_EVENTS_INDEX]
+    return _imported_alias_is_active(
+        asyncio_events,
+        node.id,
+        _asyncio_reference_line(reference_line),
+    )
 
 
 def _asyncio_helper_active_at_line(
@@ -4377,18 +4406,1255 @@ def _asyncio_helper_active_at_line(
         )
     if not isinstance(node, ast.Name):
         return False
-    event_index = {"run": 48, "to_thread": 49}.get(helper_name)
+    event_index = {
+        "run": _ASYNCIO_RUN_EVENTS_INDEX,
+        "to_thread": _ASYNCIO_TO_THREAD_EVENTS_INDEX,
+        "new_event_loop": _ASYNCIO_NEW_EVENT_LOOP_EVENTS_INDEX,
+        "get_event_loop": _ASYNCIO_GET_EVENT_LOOP_EVENTS_INDEX,
+        "Runner": _ASYNCIO_RUNNER_EVENTS_INDEX,
+        "gather": _ASYNCIO_GATHER_EVENTS_INDEX,
+        "shield": _ASYNCIO_SHIELD_EVENTS_INDEX,
+        "wait_for": _ASYNCIO_WAIT_FOR_EVENTS_INDEX,
+    }.get(helper_name)
     if event_index is None or len(operator_bindings) <= event_index:
         return False
     return _imported_alias_is_active(
         operator_bindings[event_index],
         node.id,
+        _asyncio_reference_line(reference_line),
+    )
+
+
+def _asyncio_to_thread_reference_is_active(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state=None,
+):
+    """Resolve to_thread while honoring wrapper-local name shadowing."""
+    if (
+        local_state is not None
+        and isinstance(node, ast.Name)
+        and node.id in local_state["bound_names"]
+    ):
+        return node.id in local_state["to_thread_names"]
+    if (
+        local_state is not None
+        and isinstance(node, ast.Attribute)
+        and node.attr == "to_thread"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in local_state["bound_names"]
+    ):
+        return node.value.id in local_state["asyncio_modules"]
+    return _asyncio_helper_active_at_line(
+        node,
+        "to_thread",
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _asyncio_to_thread_call_mutates_workers(
+    to_thread_call,
+    operator_bindings,
+    reference_line,
+    local_state=None,
+):
+    """Return True when a resolved asyncio.to_thread call mutates workers."""
+    if not isinstance(to_thread_call, ast.Call):
+        return False
+    if not _asyncio_to_thread_reference_is_active(
+        to_thread_call.func,
+        operator_bindings,
+        reference_line,
+        local_state,
+    ):
+        return False
+    target = to_thread_call.args[0] if to_thread_call.args else next(
+        (
+            keyword.value
+            for keyword in to_thread_call.keywords
+            if keyword.arg == "func"
+        ),
+        None,
+    )
+    if (
+        target is not None
+        and local_state is not None
+        and isinstance(target, ast.Name)
+        and target.id in local_state["callback_mutators"]
+    ):
+        return True
+    return target is not None and _thread_pool_callback_mutates_workers(
+        target,
+        operator_bindings,
+    )
+
+
+def _asyncio_binding_state_at_position(events, name, reference):
+    """Resolve an asyncio binding without seeing later same-line events."""
+    if isinstance(reference, ast.AST):
+        reference_position = (
+            getattr(reference, "lineno", 0),
+            getattr(reference, "col_offset", 0),
+        )
+    else:
+        reference_position = (int(reference or 0), 10**9)
+    state = None
+    for event in events.get(name, ()):
+        if len(event) == 3:
+            event_position = (event[0], event[1])
+            value = event[2]
+        else:
+            event_position = (event[0], -1)
+            value = event[1]
+        if event_position > reference_position:
+            break
+        state = value
+    return state
+
+
+def _asyncio_positioned_event(node, value):
+    """Return a source-positioned asyncio binding event."""
+    return (
+        getattr(node, "lineno", 0),
+        getattr(node, "col_offset", 0),
+        value,
+    )
+
+
+def _asyncio_loop_factory_reference_is_active(
+    node,
+    operator_bindings,
+    reference_line,
+):
+    """Resolve asyncio loop factories and source-ordered aliases."""
+    if any(
+        _asyncio_helper_active_at_line(
+            node,
+            helper_name,
+            operator_bindings,
+            reference_line,
+        )
+        for helper_name in ("new_event_loop", "get_event_loop")
+    ):
+        return True
+    if (
+        not isinstance(node, ast.Name)
+        or len(operator_bindings) <= _ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX
+    ):
+        return False
+    events = operator_bindings[_ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX]
+    return bool(_asyncio_binding_state_at_position(events, node.id, node))
+
+
+def _asyncio_loop_factory_call_is_active(call, operator_bindings, reference_line):
+    """Return True for a proven asyncio event-loop factory call."""
+    return isinstance(call, ast.Call) and _asyncio_loop_factory_reference_is_active(
+        call.func,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _collect_asyncio_loop_factory_alias_events(tree, operator_bindings):
+    """Track aliases of asyncio event-loop factory callables."""
+    events = {}
+    for node in tree.body:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            events.setdefault(node.name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
+            continue
+        for name, value in _namespace_assignment_values(node):
+            active = _asyncio_loop_factory_reference_is_active(
+                value,
+                operator_bindings,
+                line,
+            )
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
+        for name in _import_bound_names(node):
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
+    return events
+
+
+def _asyncio_event_loop_alias_is_active(
+    node,
+    operator_bindings,
+    reference_line,
+    events=None,
+):
+    """Resolve a proven event-loop expression at one source line."""
+    if isinstance(node, ast.Call):
+        return _asyncio_loop_factory_call_is_active(
+            node,
+            operator_bindings,
+            reference_line,
+        )
+    if not isinstance(node, ast.Name):
+        return False
+    if events is None:
+        if len(operator_bindings) <= _ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX:
+            return False
+        events = operator_bindings[_ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX]
+    return bool(_asyncio_binding_state_at_position(events, node.id, node))
+
+
+def _record_asyncio_event_loop_aliases(
+    node,
+    operator_bindings,
+    events,
+    *,
+    conditional,
+):
+    """Record event-loop instance aliases introduced by one statement."""
+    line = getattr(node, "lineno", 0)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional:
+            events.setdefault(node.name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
+        return
+    for name, value in _namespace_assignment_values(node):
+        active = _asyncio_event_loop_alias_is_active(
+            value,
+            operator_bindings,
+            value if isinstance(value, ast.AST) else line,
+            events,
+        )
+        if active or not conditional:
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
+
+
+def _scan_asyncio_event_loop_alias_events(
+    statements,
+    operator_bindings,
+    events,
+    *,
+    conditional=False,
+):
+    """Track proven event-loop objects through import-time statements."""
+    for node in statements:
+        _record_asyncio_event_loop_aliases(
+            node,
+            operator_bindings,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_asyncio_event_loop_alias_events(
+                block,
+                operator_bindings,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_asyncio_event_loop_alias_events(tree, operator_bindings):
+    """Collect source-ordered aliases of known asyncio event-loop instances."""
+    events = {}
+    _scan_asyncio_event_loop_alias_events(
+        tree.body,
+        operator_bindings,
+        events,
+    )
+    return events
+
+
+def _import_bound_names(node):
+    """Return names definitely rebound by one import statement."""
+    if isinstance(node, ast.Import):
+        return {
+            imported.asname or imported.name.split(".", 1)[0]
+            for imported in node.names
+        }
+    if isinstance(node, ast.ImportFrom):
+        return {
+            imported.asname or imported.name
+            for imported in node.names
+            if imported.name != "*"
+        }
+    return set()
+
+
+def _async_wrapper_state(events, name, reference_line):
+    """Return async-function candidates bound to ``name`` at one line."""
+    state = _binding_state_at_line(events, name, reference_line)
+    return state if isinstance(state, frozenset) else frozenset()
+
+
+def _record_async_wrapper_binding(
+    events,
+    name,
+    candidates,
+    line,
+    *,
+    conditional,
+):
+    """Record one async-wrapper binding while preserving conditional risks."""
+    candidates = frozenset(candidates)
+    if conditional:
+        previous = _async_wrapper_state(events, name, line)
+        candidates = previous | candidates
+        if not candidates:
+            return
+    events.setdefault(name, []).append((line, candidates))
+
+
+def _record_class_async_wrapper_bindings(
+    node,
+    events,
+    operator_bindings,
+    *,
+    conditional,
+):
+    """Record callable static/class async methods on one module-level class."""
+    line = getattr(node, "lineno", 0)
+    prefix = f"{node.name}."
+    if not conditional:
+        for key in tuple(events):
+            if key.startswith(prefix):
+                _record_async_wrapper_binding(
+                    events,
+                    key,
+                    set(),
+                    line,
+                    conditional=False,
+                )
+    for stmt in node.body:
+        if (
+            isinstance(stmt, ast.AsyncFunctionDef)
+            and _function_is_static_or_class_method(stmt, operator_bindings)
+        ):
+            _record_async_wrapper_binding(
+                events,
+                f"{node.name}.{stmt.name}",
+                {stmt},
+                line,
+                conditional=conditional,
+            )
+
+
+def _record_async_wrapper_assignments(
+    node,
+    events,
+    operator_bindings,
+    *,
+    conditional,
+):
+    """Track async wrappers, aliases, class methods, and definite rebindings."""
+    line = getattr(node, "lineno", 0)
+    if isinstance(node, ast.AsyncFunctionDef):
+        _record_async_wrapper_binding(
+            events,
+            node.name,
+            {node},
+            line,
+            conditional=conditional,
+        )
+        return True
+    if isinstance(node, ast.ClassDef):
+        _record_class_async_wrapper_bindings(
+            node,
+            events,
+            operator_bindings,
+            conditional=conditional,
+        )
+        if not conditional:
+            _record_async_wrapper_binding(
+                events,
+                node.name,
+                set(),
+                line,
+                conditional=False,
+            )
+        return True
+    if isinstance(node, ast.FunctionDef):
+        if not conditional:
+            _record_async_wrapper_binding(
+                events,
+                node.name,
+                set(),
+                line,
+                conditional=False,
+            )
+        return True
+
+    for name in _import_bound_names(node):
+        if not conditional:
+            _record_async_wrapper_binding(
+                events,
+                name,
+                set(),
+                line,
+                conditional=False,
+            )
+    for name, value in _namespace_assignment_values(node):
+        candidates = (
+            _async_wrapper_state(events, value.id, line)
+            if isinstance(value, ast.Name)
+            else frozenset()
+        )
+        _record_async_wrapper_binding(
+            events,
+            name,
+            candidates,
+            line,
+            conditional=conditional,
+        )
+    return False
+
+
+def _scan_async_wrapper_binding_events(
+    statements,
+    events,
+    operator_bindings,
+    *,
+    conditional=False,
+):
+    """Collect async definitions and aliases without entering function bodies."""
+    for node in statements:
+        if _record_async_wrapper_assignments(
+            node,
+            events,
+            operator_bindings,
+            conditional=conditional,
+        ):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_async_wrapper_binding_events(
+                block,
+                events,
+                operator_bindings,
+                conditional=True,
+            )
+
+
+def _collect_async_wrapper_binding_events(tree, operator_bindings):
+    """Collect source-ordered bindings for import-time async wrapper calls."""
+    events = {}
+    _scan_async_wrapper_binding_events(
+        tree.body,
+        events,
+        operator_bindings,
+    )
+    return events
+
+
+def _async_wrapper_candidates_at_line(
+    func,
+    operator_bindings,
+    reference_line,
+):
+    """Resolve a called name or class-qualified method to async candidates."""
+    if len(operator_bindings) <= _ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX:
+        return frozenset()
+    if isinstance(func, ast.Name):
+        key = func.id
+    elif (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+    ):
+        key = f"{func.value.id}.{func.attr}"
+    else:
+        return frozenset()
+    events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
+    return _async_wrapper_state(events, key, reference_line)
+
+
+def _local_async_wrapper_candidates(func, local_state):
+    """Resolve a local async helper or alias within an async wrapper."""
+    if not isinstance(func, ast.Name):
+        return frozenset()
+    return local_state["wrappers"].get(func.id, frozenset())
+
+
+def _argument_value_for_parameter(call, parameter_name, position):
+    """Resolve a simple positional/keyword argument bound to one parameter."""
+    if position < len(call.args) and not isinstance(call.args[position], ast.Starred):
+        return call.args[position]
+    return next(
+        (
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg == parameter_name
+        ),
+        None,
+    )
+
+
+def _wrapper_bound_to_thread_names(
+    func_node,
+    invocation,
+    operator_bindings,
+    reference_line,
+):
+    """Return wrapper parameters bound to asyncio.to_thread at invocation."""
+    if invocation is None:
+        return set()
+    params = (*func_node.args.posonlyargs, *func_node.args.args)
+    names = set()
+    for position, parameter in enumerate(params):
+        value = _argument_value_for_parameter(
+            invocation,
+            parameter.arg,
+            position,
+        )
+        if value is not None and _asyncio_to_thread_reference_is_active(
+            value,
+            operator_bindings,
+            reference_line,
+        ):
+            names.add(parameter.arg)
+    return names
+
+
+def _new_local_async_state(
+    func_node,
+    invocation,
+    operator_bindings,
+    reference_line,
+):
+    """Create mutable source-ordered state for one async wrapper analysis."""
+    args = func_node.args
+    bound_names = {
+        arg.arg
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+    }
+    if args.vararg is not None:
+        bound_names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        bound_names.add(args.kwarg.arg)
+    return {
+        "wrappers": {},
+        "awaitables": set(),
+        "asyncio_modules": set(),
+        "to_thread_names": _wrapper_bound_to_thread_names(
+            func_node,
+            invocation,
+            operator_bindings,
+            reference_line,
+        ),
+        "consumer_names": set(),
+        "callback_mutators": set(),
+        "bound_names": bound_names,
+    }
+
+
+_ASYNCIO_AWAITABLE_CONSUMERS = frozenset({"gather", "shield", "wait_for"})
+
+
+def _asyncio_consumer_reference_is_active(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+):
+    """Resolve known asyncio awaitable consumers in global or local scope."""
+    if isinstance(node, ast.Name):
+        if node.id in local_state["bound_names"]:
+            return node.id in local_state["consumer_names"]
+        return any(
+            _asyncio_helper_active_at_line(
+                node,
+                helper_name,
+                operator_bindings,
+                reference_line,
+            )
+            for helper_name in _ASYNCIO_AWAITABLE_CONSUMERS
+        )
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.attr in _ASYNCIO_AWAITABLE_CONSUMERS
+    ):
+        if node.value.id in local_state["bound_names"]:
+            return node.value.id in local_state["asyncio_modules"]
+        return _asyncio_module_active_at_line(
+            node.value,
+            operator_bindings,
+            reference_line,
+        )
+    return False
+
+
+def _asyncio_awaitable_expression_mutates_workers(
+    expr,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Resolve a stored or nested awaitable expression."""
+    if isinstance(expr, ast.Name) and expr.id in local_state["awaitables"]:
+        return True
+    return _asyncio_awaitable_mutates_workers(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state=local_state,
+        seen=seen,
+    )
+
+
+def _asyncio_consumer_call_mutates_workers(
+    call,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Propagate mutations through known asyncio awaitable consumers."""
+    if not _asyncio_consumer_reference_is_active(
+        call.func,
+        operator_bindings,
+        reference_line,
+        local_state,
+    ):
+        return False
+    return any(
+        _asyncio_awaitable_expression_mutates_workers(
+            arg.value if isinstance(arg, ast.Starred) else arg,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        )
+        for arg in call.args
+    )
+
+
+def _asyncio_awaitable_mutates_workers(
+    expr,
+    operator_bindings,
+    reference_line,
+    *,
+    local_state=None,
+    seen=None,
+):
+    """Return True when awaiting an expression can mutate module workers."""
+    if not isinstance(expr, ast.Call):
+        return False
+    if local_state is None:
+        local_state = {
+            "wrappers": {},
+            "awaitables": set(),
+            "asyncio_modules": set(),
+            "to_thread_names": set(),
+            "consumer_names": set(),
+            "callback_mutators": set(),
+            "bound_names": set(),
+        }
+    if _asyncio_to_thread_call_mutates_workers(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state,
+    ):
+        return True
+    if _asyncio_consumer_call_mutates_workers(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+    ):
+        return True
+    candidates = _local_async_wrapper_candidates(expr.func, local_state)
+    if not candidates:
+        candidates = _async_wrapper_candidates_at_line(
+            expr.func,
+            operator_bindings,
+            reference_line,
+        )
+    return any(
+        _async_function_mutates_workers_via_asyncio(
+            candidate,
+            operator_bindings,
+            reference_line,
+            invocation=expr,
+            seen=seen,
+        )
+        for candidate in candidates
+    )
+
+
+def _expression_awaits_mutating_asyncio(
+    expr,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Inspect an evaluated expression for a risky await operation."""
+    if isinstance(expr, ast.Lambda):
+        return False
+    if isinstance(expr, ast.Await):
+        awaited = expr.value
+        if (
+            isinstance(awaited, ast.Name)
+            and awaited.id in local_state["awaitables"]
+        ):
+            return True
+        if _asyncio_awaitable_mutates_workers(
+            awaited,
+            operator_bindings,
+            reference_line,
+            local_state=local_state,
+            seen=seen,
+        ):
+            return True
+    return any(
+        _expression_awaits_mutating_asyncio(
+            child,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        )
+        for child in ast.iter_child_nodes(expr)
+        if isinstance(child, ast.AST)
+    )
+
+
+def _statement_awaits_mutating_asyncio(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Inspect only expressions evaluated by the current statement."""
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        expressions = [item.context_expr for item in node.items]
+    else:
+        expressions = [
+            child
+            for child in ast.iter_child_nodes(node)
+            if isinstance(child, ast.expr)
+        ]
+    return any(
+        _expression_awaits_mutating_asyncio(
+            expr,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        )
+        for expr in expressions
+    )
+
+
+def _clear_local_async_binding(name, local_state):
+    """Clear tracked async meanings for one newly bound local name."""
+    local_state["bound_names"].add(name)
+    local_state["to_thread_names"].discard(name)
+    local_state["consumer_names"].discard(name)
+    local_state["asyncio_modules"].discard(name)
+    local_state["wrappers"].pop(name, None)
+    local_state["awaitables"].discard(name)
+    local_state["callback_mutators"].discard(name)
+
+
+def _record_local_asyncio_module_imports(node, local_state):
+    """Record local asyncio module import aliases."""
+    if not isinstance(node, ast.Import):
+        return
+    for imported in node.names:
+        if imported.name == "asyncio":
+            local_state["asyncio_modules"].add(
+                imported.asname or imported.name
+            )
+
+
+def _record_local_asyncio_helper_imports(node, local_state):
+    """Record directly imported asyncio helpers used by async analysis."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "asyncio":
+        return
+    for imported in node.names:
+        name = imported.asname or imported.name
+        if imported.name == "to_thread":
+            local_state["to_thread_names"].add(name)
+        if imported.name in _ASYNCIO_AWAITABLE_CONSUMERS:
+            local_state["consumer_names"].add(name)
+
+
+def _record_local_asyncio_import(node, local_state):
+    """Record imports and local shadowing executed inside an async wrapper."""
+    bound_names = _import_bound_names(node)
+    if not bound_names:
+        return False
+    for name in bound_names:
+        _clear_local_async_binding(name, local_state)
+
+    _record_local_asyncio_module_imports(node, local_state)
+    _record_local_asyncio_helper_imports(node, local_state)
+    return True
+
+
+def _record_local_async_definition(
+    node,
+    operator_bindings,
+    local_state,
+    *,
+    conditional,
+):
+    """Handle local definitions and callable callback mutations."""
+    name = getattr(node, "name", None)
+    if name is not None:
+        local_state["bound_names"].add(name)
+        local_state["to_thread_names"].discard(name)
+        local_state["consumer_names"].discard(name)
+        local_state["asyncio_modules"].discard(name)
+    if isinstance(node, ast.AsyncFunctionDef):
+        candidates = frozenset({node})
+        if conditional:
+            candidates |= local_state["wrappers"].get(
+                node.name,
+                frozenset(),
+            )
+        local_state["wrappers"][node.name] = candidates
+        return True
+    if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        return False
+    if isinstance(node, ast.FunctionDef) and _function_mutates_workers(
+        node,
+        operator_bindings,
+    ):
+        local_state["callback_mutators"].add(node.name)
+    elif not conditional and name is not None:
+        local_state["callback_mutators"].discard(name)
+    if not conditional and name is not None:
+        local_state["wrappers"].pop(name, None)
+        local_state["awaitables"].discard(name)
+        local_state["to_thread_names"].discard(name)
+        local_state["asyncio_modules"].discard(name)
+    return True
+
+
+def _local_async_wrapper_candidates_for_value(
+    value,
+    operator_bindings,
+    reference_line,
+    local_state,
+):
+    """Resolve local or module-level async wrapper aliases for one value."""
+    if not isinstance(value, ast.Name):
+        return frozenset()
+    candidates = local_state["wrappers"].get(value.id, frozenset())
+    if candidates:
+        return candidates
+    return _async_wrapper_candidates_at_line(
+        value,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _record_local_async_wrapper_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    local_state,
+    *,
+    conditional,
+):
+    """Update one local async-wrapper or helper alias assignment."""
+    candidates = _local_async_wrapper_candidates_for_value(
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+    )
+    if candidates:
+        local_state["wrappers"][name] = candidates
+    elif not conditional:
+        local_state["wrappers"].pop(name, None)
+
+    if _asyncio_to_thread_reference_is_active(
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+    ):
+        local_state["to_thread_names"].add(name)
+    elif not conditional:
+        local_state["to_thread_names"].discard(name)
+
+
+def _record_local_awaitable_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Update one stored awaitable binding, including name aliases."""
+    risky_awaitable = (
+        isinstance(value, ast.Name)
+        and value.id in local_state["awaitables"]
+    ) or _asyncio_awaitable_mutates_workers(
+        value,
+        operator_bindings,
+        reference_line,
+        local_state=local_state,
+        seen=seen,
+    )
+    if risky_awaitable:
+        local_state["awaitables"].add(name)
+    elif not conditional:
+        local_state["awaitables"].discard(name)
+
+
+def _record_local_async_bindings(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Update local imports, wrappers, callbacks, and stored awaitables."""
+    if _record_local_asyncio_import(node, local_state):
+        return isinstance(node, (ast.Import, ast.ImportFrom))
+    if _record_local_async_definition(
+        node,
+        operator_bindings,
+        local_state,
+        conditional=conditional,
+    ):
+        return True
+
+    for name, value in _namespace_assignment_values(node):
+        local_state["bound_names"].add(name)
+        local_state["asyncio_modules"].discard(name)
+        local_state["consumer_names"].discard(name)
+        _record_local_async_wrapper_assignment(
+            name,
+            value,
+            operator_bindings,
+            reference_line,
+            local_state,
+            conditional=conditional,
+        )
+        _record_local_awaitable_assignment(
+            name,
+            value,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+            conditional=conditional,
+        )
+        if not conditional:
+            local_state["callback_mutators"].discard(name)
+    return False
+
+
+def _async_statements_mutate_workers_via_asyncio(
+    statements,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional=False,
+):
+    """Scan async statements while excluding uninvoked nested function bodies."""
+    for node in statements:
+        if _record_local_async_bindings(
+            node,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+            conditional=conditional,
+        ):
+            continue
+        if _statement_awaits_mutating_asyncio(
+            node,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        ):
+            return True
+        for block in _compound_statement_blocks(node):
+            if _async_statements_mutate_workers_via_asyncio(
+                block,
+                operator_bindings,
+                reference_line,
+                local_state,
+                seen,
+                conditional=True,
+            ):
+                return True
+    return False
+
+
+def _async_function_mutates_workers_via_asyncio(
+    func_node,
+    operator_bindings,
+    reference_line,
+    *,
+    invocation=None,
+    seen=None,
+):
+    """Evaluate one async wrapper using globals active when it is invoked."""
+    if not isinstance(func_node, ast.AsyncFunctionDef):
+        return False
+    seen = set() if seen is None else set(seen)
+    marker = id(func_node)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    local_state = _new_local_async_state(
+        func_node,
+        invocation,
+        operator_bindings,
+        reference_line,
+    )
+    return _async_statements_mutate_workers_via_asyncio(
+        func_node.body,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+    )
+
+
+def _single_starred_call_argument(call):
+    """Return the sole value unpacked from a one-item literal sequence."""
+    if len(call.args) != 1 or not isinstance(call.args[0], ast.Starred):
+        return None
+    value = call.args[0].value
+    if not isinstance(value, (ast.Tuple, ast.List)) or len(value.elts) != 1:
+        return None
+    return value.elts[0]
+
+
+def _dict_unpack_call_argument(call, keyword_names):
+    """Resolve a selected key from a literal unpacked mapping argument."""
+    for keyword in call.keywords:
+        if keyword.arg is not None or not isinstance(keyword.value, ast.Dict):
+            continue
+        for key, value in zip(keyword.value.keys, keyword.value.values):
+            if isinstance(key, ast.Constant) and key.value in keyword_names:
+                return value
+    return None
+
+
+def _unpacked_call_argument(call, keyword_names):
+    """Resolve a single awaitable passed through argument unpacking."""
+    positional = _single_starred_call_argument(call)
+    if positional is not None:
+        return positional
+    return _dict_unpack_call_argument(call, keyword_names)
+
+
+def _call_argument(call, keyword_names):
+    """Return the first direct or unpacked selected argument value."""
+    if call.args and not isinstance(call.args[0], ast.Starred):
+        return call.args[0]
+    direct = next(
+        (
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg in keyword_names
+        ),
+        None,
+    )
+    return direct if direct is not None else _unpacked_call_argument(
+        call,
+        keyword_names,
+    )
+
+
+def _asyncio_runner_constructor_is_active(
+    expr,
+    operator_bindings,
+    reference_line,
+):
+    """Return True for a proven asyncio.Runner constructor call."""
+    return (
+        isinstance(expr, ast.Call)
+        and _asyncio_helper_active_at_line(
+            expr.func,
+            "Runner",
+            operator_bindings,
+            reference_line,
+        )
+    )
+
+
+def _asyncio_runner_alias_is_active(
+    expr,
+    operator_bindings,
+    reference_line,
+    events=None,
+):
+    """Resolve a proven asyncio.Runner instance."""
+    if _asyncio_runner_constructor_is_active(
+        expr,
+        operator_bindings,
+        reference_line,
+    ):
+        return True
+    if not isinstance(expr, ast.Name):
+        return False
+    if events is None:
+        if len(operator_bindings) <= _ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX:
+            return False
+        events = operator_bindings[_ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX]
+    return bool(_asyncio_binding_state_at_position(events, expr.id, expr))
+
+
+def _record_asyncio_runner_aliases(
+    node,
+    operator_bindings,
+    events,
+    *,
+    conditional,
+):
+    """Record assigned and context-managed asyncio.Runner instances."""
+    line = getattr(node, "lineno", 0)
+    for name, value in _namespace_assignment_values(node):
+        active = _asyncio_runner_alias_is_active(
+            value,
+            operator_bindings,
+            line,
+            events,
+        )
+        if active or not conditional:
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
+
+    if isinstance(node, ast.With):
+        for item in node.items:
+            if (
+                isinstance(item.optional_vars, ast.Name)
+                and _asyncio_runner_constructor_is_active(
+                    item.context_expr,
+                    operator_bindings,
+                    line,
+                )
+            ):
+                events.setdefault(item.optional_vars.id, []).append(
+                    _asyncio_positioned_event(item.context_expr, True)
+                )
+
+    for name in _import_bound_names(node):
+        if not conditional:
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
+
+
+def _scan_asyncio_runner_alias_events(
+    statements,
+    operator_bindings,
+    events,
+    *,
+    conditional=False,
+):
+    """Track Runner aliases through import-time compound statements."""
+    for node in statements:
+        _record_asyncio_runner_aliases(
+            node,
+            operator_bindings,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_asyncio_runner_alias_events(
+                block,
+                operator_bindings,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_asyncio_runner_alias_events(tree, operator_bindings):
+    """Collect asyncio.Runner aliases from import-time statements."""
+    events = {}
+    _scan_asyncio_runner_alias_events(
+        tree.body,
+        operator_bindings,
+        events,
+    )
+    return events
+
+
+def _call_is_asyncio_runner_run_mutation(call, operator_bindings):
+    """Return True when asyncio.Runner.run executes a risky awaitable."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "run"
+    ):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _asyncio_runner_alias_is_active(
+        call.func.value,
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    awaitable = _call_argument(call, {"coro"})
+    return awaitable is not None and _asyncio_awaitable_mutates_workers(
+        awaitable,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _call_is_event_loop_run_until_complete_to_thread_mutation(
+    call,
+    operator_bindings,
+):
+    """Detect worker mutations executed by a proven event loop."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "run_until_complete"
+    ):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _asyncio_event_loop_alias_is_active(
+        func.value,
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    awaitable = _call_argument(call, {"future"})
+    return awaitable is not None and _asyncio_awaitable_mutates_workers(
+        awaitable,
+        operator_bindings,
         reference_line,
     )
 
 
 def _call_is_asyncio_run_to_thread_mutation(call, operator_bindings):
-    """Return True when asyncio run/to_thread execution mutates workers."""
+    """Return True when asyncio.run executes a workers-mutating awaitable."""
     if not isinstance(call, ast.Call):
         return False
     reference_line = getattr(call, "lineno", 0)
@@ -4399,30 +5665,11 @@ def _call_is_asyncio_run_to_thread_mutation(call, operator_bindings):
         reference_line,
     ):
         return False
-    if not call.args:
-        return False
-    to_thread = call.args[0]
-    if not (
-        isinstance(to_thread, ast.Call)
-        and _asyncio_helper_active_at_line(
-            to_thread.func,
-            "to_thread",
-            operator_bindings,
-            reference_line,
-        )
-    ):
-        return False
-    target = to_thread.args[0] if to_thread.args else next(
-        (
-            keyword.value
-            for keyword in to_thread.keywords
-            if keyword.arg == "func"
-        ),
-        None,
-    )
-    return target is not None and _thread_pool_callback_mutates_workers(
-        target,
+    awaitable = _call_argument(call, {"main", "coro"})
+    return awaitable is not None and _asyncio_awaitable_mutates_workers(
+        awaitable,
         operator_bindings,
+        reference_line,
     )
 
 
@@ -4710,6 +5957,11 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
         or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
+        or _call_is_asyncio_runner_run_mutation(call, operator_bindings)
+        or _call_is_event_loop_run_until_complete_to_thread_mutation(
+            call,
+            operator_bindings,
+        )
         or _attribute_call_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
@@ -6055,14 +7307,10 @@ class _GunicornWorkersScanState:
 
 def _compound_statement_blocks(node):
     """Yield statement lists from compound statement bodies."""
-    if isinstance(node, ast.If):
+    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
         yield node.body
         yield node.orelse
-    elif isinstance(node, ast.For):
-        yield node.body
-    elif isinstance(node, ast.While):
-        yield node.body
-    elif isinstance(node, ast.With):
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
         yield node.body
     elif isinstance(node, ast.Try):
         yield node.body
@@ -6676,11 +7924,79 @@ def _scan_gunicorn_config_worker_details(tree):
         "asyncio",
         {"to_thread"},
     )
+    asyncio_new_event_loop_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"new_event_loop"},
+    )
+    asyncio_get_event_loop_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"get_event_loop"},
+    )
+    asyncio_runner_import_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"Runner"},
+    )
+    asyncio_gather_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"gather"},
+    )
+    asyncio_shield_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"shield"},
+    )
+    asyncio_wait_for_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"wait_for"},
+    )
     operator_bindings = (
         *operator_bindings,
         asyncio_module_alias_events,
         asyncio_run_alias_events,
         asyncio_to_thread_alias_events,
+        asyncio_new_event_loop_alias_events,
+        asyncio_get_event_loop_alias_events,
+        asyncio_runner_import_alias_events,
+        asyncio_gather_alias_events,
+        asyncio_shield_alias_events,
+        asyncio_wait_for_alias_events,
+    )
+    asyncio_loop_factory_alias_events = _collect_asyncio_loop_factory_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_loop_factory_alias_events,
+    )
+    asyncio_event_loop_alias_events = _collect_asyncio_event_loop_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_event_loop_alias_events,
+    )
+    asyncio_runner_alias_events = _collect_asyncio_runner_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_runner_alias_events,
+    )
+    asyncio_wrapper_binding_events = _collect_async_wrapper_binding_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_wrapper_binding_events,
     )
     if _statements_start_mutating_thread(
         tree.body,
