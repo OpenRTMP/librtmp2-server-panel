@@ -4370,6 +4370,13 @@ _ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX = 58
 _ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX = 59
 
 
+def _asyncio_reference_line(reference):
+    """Return a source line for an AST node or numeric line reference."""
+    if isinstance(reference, ast.AST):
+        return getattr(reference, "lineno", 0)
+    return int(reference or 0)
+
+
 def _asyncio_module_active_at_line(node, operator_bindings, reference_line):
     """Return True when ``node`` resolves to the asyncio module at ``reference_line``."""
     if not isinstance(node, ast.Name):
@@ -4377,7 +4384,11 @@ def _asyncio_module_active_at_line(node, operator_bindings, reference_line):
     if len(operator_bindings) <= _ASYNCIO_MODULE_EVENTS_INDEX:
         return False
     asyncio_events = operator_bindings[_ASYNCIO_MODULE_EVENTS_INDEX]
-    return _imported_alias_is_active(asyncio_events, node.id, reference_line)
+    return _imported_alias_is_active(
+        asyncio_events,
+        node.id,
+        _asyncio_reference_line(reference_line),
+    )
 
 
 def _asyncio_helper_active_at_line(
@@ -4410,7 +4421,7 @@ def _asyncio_helper_active_at_line(
     return _imported_alias_is_active(
         operator_bindings[event_index],
         node.id,
-        reference_line,
+        _asyncio_reference_line(reference_line),
     )
 
 
