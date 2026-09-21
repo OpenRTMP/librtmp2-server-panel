@@ -4443,9 +4443,9 @@ def _asyncio_to_thread_reference_is_active(
         and isinstance(node, ast.Attribute)
         and node.attr == "to_thread"
         and isinstance(node.value, ast.Name)
+        and node.value.id in local_state["bound_names"]
     ):
-        if node.value.id in local_state["bound_names"]:
-            return node.value.id in local_state["asyncio_modules"]
+        return node.value.id in local_state["asyncio_modules"]
     return _asyncio_helper_active_at_line(
         node,
         "to_thread",
@@ -7307,10 +7307,7 @@ class _GunicornWorkersScanState:
 
 def _compound_statement_blocks(node):
     """Yield statement lists from compound statement bodies."""
-    if isinstance(node, ast.If):
-        yield node.body
-        yield node.orelse
-    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
         yield node.body
         yield node.orelse
     elif isinstance(node, (ast.With, ast.AsyncWith)):
