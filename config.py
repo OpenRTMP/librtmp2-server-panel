@@ -4477,6 +4477,38 @@ def _asyncio_to_thread_call_mutates_workers(
     )
 
 
+def _asyncio_binding_state_at_position(events, name, reference):
+    """Resolve an asyncio binding without seeing later same-line events."""
+    if isinstance(reference, ast.AST):
+        reference_position = (
+            getattr(reference, "lineno", 0),
+            getattr(reference, "col_offset", 0),
+        )
+    else:
+        reference_position = (int(reference or 0), 10**9)
+    state = None
+    for event in events.get(name, ()):
+        if len(event) == 3:
+            event_position = (event[0], event[1])
+            value = event[2]
+        else:
+            event_position = (event[0], -1)
+            value = event[1]
+        if event_position > reference_position:
+            break
+        state = value
+    return state
+
+
+def _asyncio_positioned_event(node, value):
+    """Return a source-positioned asyncio binding event."""
+    return (
+        getattr(node, "lineno", 0),
+        getattr(node, "col_offset", 0),
+        value,
+    )
+
+
 def _asyncio_loop_factory_reference_is_active(
     node,
     operator_bindings,
@@ -4499,7 +4531,7 @@ def _asyncio_loop_factory_reference_is_active(
     ):
         return False
     events = operator_bindings[_ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX]
-    return bool(_binding_state_at_line(events, node.id, reference_line))
+    return bool(_asyncio_binding_state_at_position(events, node.id, node))
 
 
 def _asyncio_loop_factory_call_is_active(call, operator_bindings, reference_line):
@@ -4517,7 +4549,9 @@ def _collect_asyncio_loop_factory_alias_events(tree, operator_bindings):
     for node in tree.body:
         line = getattr(node, "lineno", 0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            events.setdefault(node.name, []).append((line, False))
+            events.setdefault(node.name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
             continue
         for name, value in _namespace_assignment_values(node):
             active = _asyncio_loop_factory_reference_is_active(
@@ -4525,9 +4559,13 @@ def _collect_asyncio_loop_factory_alias_events(tree, operator_bindings):
                 operator_bindings,
                 line,
             )
-            events.setdefault(name, []).append((line, active))
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
         for name in _import_bound_names(node):
-            events.setdefault(name, []).append((line, False))
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
     return events
 
 
@@ -4550,7 +4588,7 @@ def _asyncio_event_loop_alias_is_active(
         if len(operator_bindings) <= _ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX:
             return False
         events = operator_bindings[_ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX]
-    return bool(_binding_state_at_line(events, node.id, reference_line))
+    return bool(_asyncio_binding_state_at_position(events, node.id, node))
 
 
 def _record_asyncio_event_loop_aliases(
@@ -4564,19 +4602,21 @@ def _record_asyncio_event_loop_aliases(
     line = getattr(node, "lineno", 0)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         if not conditional:
-            events.setdefault(node.name, []).append((line, False))
+            events.setdefault(node.name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
         return
     for name, value in _namespace_assignment_values(node):
         active = _asyncio_event_loop_alias_is_active(
             value,
             operator_bindings,
-            line,
+            value if isinstance(value, ast.AST) else line,
             events,
         )
-        if active:
-            events.setdefault(name, []).append((line, True))
-        elif not conditional:
-            events.setdefault(name, []).append((line, False))
+        if active or not conditional:
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
 
 
 def _scan_asyncio_event_loop_alias_events(
@@ -5440,7 +5480,7 @@ def _asyncio_runner_alias_is_active(
         if len(operator_bindings) <= _ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX:
             return False
         events = operator_bindings[_ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX]
-    return bool(_binding_state_at_line(events, expr.id, reference_line))
+    return bool(_asyncio_binding_state_at_position(events, expr.id, expr))
 
 
 def _record_asyncio_runner_aliases(
@@ -5459,10 +5499,10 @@ def _record_asyncio_runner_aliases(
             line,
             events,
         )
-        if active:
-            events.setdefault(name, []).append((line, True))
-        elif not conditional:
-            events.setdefault(name, []).append((line, False))
+        if active or not conditional:
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, active)
+            )
 
     if isinstance(node, ast.With):
         for item in node.items:
@@ -5474,11 +5514,15 @@ def _record_asyncio_runner_aliases(
                     line,
                 )
             ):
-                events.setdefault(item.optional_vars.id, []).append((line, True))
+                events.setdefault(item.optional_vars.id, []).append(
+                    _asyncio_positioned_event(item.context_expr, True)
+                )
 
     for name in _import_bound_names(node):
         if not conditional:
-            events.setdefault(name, []).append((line, False))
+            events.setdefault(name, []).append(
+                _asyncio_positioned_event(node, False)
+            )
 
 
 def _scan_asyncio_runner_alias_events(
