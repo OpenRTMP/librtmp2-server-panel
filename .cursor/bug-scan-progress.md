@@ -1,14 +1,26 @@
 # Bug scan progress
 
-Last scanned: app.py — 2026-09-14
+Last scanned: lrtmp2_client.py — 2026-09-21
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
-- [ ] `lrtmp2_client.py` — librtmp2-server REST API client
+- [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [ ] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-21 lrtmp2_client.py pass)
+
+- No critical bugs found. Traced all methods and caller chains in `app.py`
+  (`delete_stream` synchronous drain with semaphore, cluster node actions with
+  int parsing in app before client calls, `stream_stats_by_id` for JSON stats).
+  Verified `delete_stream` HTTP 202 polling: `_poll_stream_deleted` treats
+  transient `list_streams` failures as unknown (None), distinguishes
+  still-listed vs unconfirmed after `DELETE_STREAM_DRAIN_WAIT_SECONDS`, URL-encodes
+  path segments, wraps network/JSON errors in `Lrtmp2ApiError`; cluster remove
+  surfaces 404; idempotent 404 on stream/player delete; Bearer token only in
+  Authorization header.
 
 ## Findings (2026-09-14 app.py pass)
 
