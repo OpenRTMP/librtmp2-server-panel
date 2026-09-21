@@ -5315,35 +5315,78 @@ def _asyncio_runner_alias_is_active(
     return bool(_binding_state_at_line(events, expr.id, reference_line))
 
 
-def _collect_asyncio_runner_alias_events(tree, operator_bindings):
-    """Track assigned and context-managed asyncio.Runner instances."""
-    events = {}
-    for node in tree.body:
-        line = getattr(node, "lineno", 0)
-        for name, value in _namespace_assignment_values(node):
-            active = _asyncio_runner_alias_is_active(
-                value,
-                operator_bindings,
-                line,
-                events,
-            )
-            events.setdefault(name, []).append((line, active))
-        if isinstance(node, ast.With):
-            for item in node.items:
-                if (
-                    isinstance(item.optional_vars, ast.Name)
-                    and _asyncio_runner_constructor_is_active(
-                        item.context_expr,
-                        operator_bindings,
-                        line,
-                    )
-                ):
-                    name = item.optional_vars.id
-                    events.setdefault(name, []).append((line, True))
-                    end_line = getattr(node, "end_lineno", line) + 1
-                    events.setdefault(name, []).append((end_line, False))
-        for name in _import_bound_names(node):
+def _record_asyncio_runner_aliases(
+    node,
+    operator_bindings,
+    events,
+    *,
+    conditional,
+):
+    """Record assigned and context-managed asyncio.Runner instances."""
+    line = getattr(node, "lineno", 0)
+    for name, value in _namespace_assignment_values(node):
+        active = _asyncio_runner_alias_is_active(
+            value,
+            operator_bindings,
+            line,
+            events,
+        )
+        if active:
+            events.setdefault(name, []).append((line, True))
+        elif not conditional:
             events.setdefault(name, []).append((line, False))
+
+    if isinstance(node, ast.With):
+        for item in node.items:
+            if (
+                isinstance(item.optional_vars, ast.Name)
+                and _asyncio_runner_constructor_is_active(
+                    item.context_expr,
+                    operator_bindings,
+                    line,
+                )
+            ):
+                events.setdefault(item.optional_vars.id, []).append((line, True))
+
+    for name in _import_bound_names(node):
+        if not conditional:
+            events.setdefault(name, []).append((line, False))
+
+
+def _scan_asyncio_runner_alias_events(
+    statements,
+    operator_bindings,
+    events,
+    *,
+    conditional=False,
+):
+    """Track Runner aliases through import-time compound statements."""
+    for node in statements:
+        _record_asyncio_runner_aliases(
+            node,
+            operator_bindings,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_asyncio_runner_alias_events(
+                block,
+                operator_bindings,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_asyncio_runner_alias_events(tree, operator_bindings):
+    """Collect asyncio.Runner aliases from import-time statements."""
+    events = {}
+    _scan_asyncio_runner_alias_events(
+        tree.body,
+        operator_bindings,
+        events,
+    )
     return events
 
 
@@ -7057,8 +7100,10 @@ def _compound_statement_blocks(node):
         yield node.orelse
     elif isinstance(node, (ast.For, ast.AsyncFor)):
         yield node.body
+        yield node.orelse
     elif isinstance(node, ast.While):
         yield node.body
+        yield node.orelse
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         yield node.body
     elif isinstance(node, ast.Try):
