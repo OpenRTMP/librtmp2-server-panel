@@ -4756,6 +4756,94 @@ def _statement_awaits_mutating_asyncio(
     )
 
 
+def _record_local_async_definition(
+    node,
+    awaitable_names,
+    local_wrappers,
+    *,
+    conditional,
+):
+    """Handle local async definitions and definite name rebindings."""
+    if isinstance(node, ast.AsyncFunctionDef):
+        candidates = frozenset({node})
+        if conditional:
+            candidates |= local_wrappers.get(node.name, frozenset())
+        local_wrappers[node.name] = candidates
+        return True
+    if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        return False
+    if not conditional:
+        local_wrappers.pop(node.name, None)
+        awaitable_names.discard(node.name)
+    return True
+
+
+def _local_async_wrapper_candidates_for_value(
+    value,
+    operator_bindings,
+    reference_line,
+    local_wrappers,
+):
+    """Resolve local or module-level async wrapper aliases for one value."""
+    if not isinstance(value, ast.Name):
+        return frozenset()
+    candidates = local_wrappers.get(value.id, frozenset())
+    if candidates:
+        return candidates
+    return _async_wrapper_candidates_at_line(
+        value,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _record_local_async_wrapper_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    local_wrappers,
+    *,
+    conditional,
+):
+    """Update one local async-wrapper alias assignment."""
+    candidates = _local_async_wrapper_candidates_for_value(
+        value,
+        operator_bindings,
+        reference_line,
+        local_wrappers,
+    )
+    if candidates:
+        local_wrappers[name] = candidates
+    elif not conditional:
+        local_wrappers.pop(name, None)
+
+
+def _record_local_awaitable_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    awaitable_names,
+    local_wrappers,
+    seen,
+    *,
+    conditional,
+):
+    """Update one stored awaitable binding."""
+    risky_awaitable = _asyncio_awaitable_mutates_workers(
+        value,
+        operator_bindings,
+        reference_line,
+        local_wrappers=local_wrappers,
+        seen=seen,
+    )
+    if risky_awaitable:
+        awaitable_names.add(name)
+    elif not conditional:
+        awaitable_names.discard(name)
+
+
 def _record_local_async_bindings(
     node,
     operator_bindings,
@@ -4767,46 +4855,33 @@ def _record_local_async_bindings(
     conditional,
 ):
     """Update local async wrapper and stored-awaitable aliases."""
-    if isinstance(node, ast.AsyncFunctionDef):
-        candidates = frozenset({node})
-        if conditional:
-            candidates |= local_wrappers.get(node.name, frozenset())
-        local_wrappers[node.name] = candidates
-        return True
-    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-        if not conditional:
-            local_wrappers.pop(node.name, None)
-            awaitable_names.discard(node.name)
+    if _record_local_async_definition(
+        node,
+        awaitable_names,
+        local_wrappers,
+        conditional=conditional,
+    ):
         return True
 
     for name, value in _namespace_assignment_values(node):
-        wrapper_candidates = (
-            local_wrappers.get(value.id, frozenset())
-            if isinstance(value, ast.Name)
-            else frozenset()
-        )
-        if not wrapper_candidates and isinstance(value, ast.Name):
-            wrapper_candidates = _async_wrapper_candidates_at_line(
-                value,
-                operator_bindings,
-                reference_line,
-            )
-        if wrapper_candidates:
-            local_wrappers[name] = wrapper_candidates
-        elif not conditional:
-            local_wrappers.pop(name, None)
-
-        risky_awaitable = _asyncio_awaitable_mutates_workers(
+        _record_local_async_wrapper_assignment(
+            name,
             value,
             operator_bindings,
             reference_line,
-            local_wrappers=local_wrappers,
-            seen=seen,
+            local_wrappers,
+            conditional=conditional,
         )
-        if risky_awaitable:
-            awaitable_names.add(name)
-        elif not conditional:
-            awaitable_names.discard(name)
+        _record_local_awaitable_assignment(
+            name,
+            value,
+            operator_bindings,
+            reference_line,
+            awaitable_names,
+            local_wrappers,
+            seen,
+            conditional=conditional,
+        )
     return False
 
 
