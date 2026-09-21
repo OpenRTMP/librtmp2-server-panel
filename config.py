@@ -4432,9 +4432,12 @@ def _asyncio_to_thread_reference_is_active(
     local_state=None,
 ):
     """Resolve to_thread while honoring wrapper-local name shadowing."""
-    if local_state is not None and isinstance(node, ast.Name):
-        if node.id in local_state["bound_names"]:
-            return node.id in local_state["to_thread_names"]
+    if (
+        local_state is not None
+        and isinstance(node, ast.Name)
+        and node.id in local_state["bound_names"]
+    ):
+        return node.id in local_state["to_thread_names"]
     if (
         local_state is not None
         and isinstance(node, ast.Attribute)
@@ -5151,35 +5154,50 @@ def _statement_awaits_mutating_asyncio(
     )
 
 
+def _clear_local_async_binding(name, local_state):
+    """Clear tracked async meanings for one newly bound local name."""
+    local_state["bound_names"].add(name)
+    local_state["to_thread_names"].discard(name)
+    local_state["consumer_names"].discard(name)
+    local_state["asyncio_modules"].discard(name)
+    local_state["wrappers"].pop(name, None)
+    local_state["awaitables"].discard(name)
+    local_state["callback_mutators"].discard(name)
+
+
+def _record_local_asyncio_module_imports(node, local_state):
+    """Record local asyncio module import aliases."""
+    if not isinstance(node, ast.Import):
+        return
+    for imported in node.names:
+        if imported.name == "asyncio":
+            local_state["asyncio_modules"].add(
+                imported.asname or imported.name
+            )
+
+
+def _record_local_asyncio_helper_imports(node, local_state):
+    """Record directly imported asyncio helpers used by async analysis."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "asyncio":
+        return
+    for imported in node.names:
+        name = imported.asname or imported.name
+        if imported.name == "to_thread":
+            local_state["to_thread_names"].add(name)
+        if imported.name in _ASYNCIO_AWAITABLE_CONSUMERS:
+            local_state["consumer_names"].add(name)
+
+
 def _record_local_asyncio_import(node, local_state):
     """Record imports and local shadowing executed inside an async wrapper."""
     bound_names = _import_bound_names(node)
     if not bound_names:
         return False
     for name in bound_names:
-        local_state["bound_names"].add(name)
-        local_state["to_thread_names"].discard(name)
-        local_state["consumer_names"].discard(name)
-        local_state["asyncio_modules"].discard(name)
-        local_state["wrappers"].pop(name, None)
-        local_state["awaitables"].discard(name)
-        local_state["callback_mutators"].discard(name)
+        _clear_local_async_binding(name, local_state)
 
-    if isinstance(node, ast.Import):
-        for imported in node.names:
-            if imported.name == "asyncio":
-                local_state["asyncio_modules"].add(
-                    imported.asname or imported.name
-                )
-        return True
-
-    if isinstance(node, ast.ImportFrom) and node.module == "asyncio":
-        for imported in node.names:
-            name = imported.asname or imported.name
-            if imported.name == "to_thread":
-                local_state["to_thread_names"].add(name)
-            if imported.name in _ASYNCIO_AWAITABLE_CONSUMERS:
-                local_state["consumer_names"].add(name)
+    _record_local_asyncio_module_imports(node, local_state)
+    _record_local_asyncio_helper_imports(node, local_state)
     return True
 
 
@@ -5419,22 +5437,33 @@ def _async_function_mutates_workers_via_asyncio(
     )
 
 
-def _unpacked_call_argument(call, keyword_names):
-    """Resolve a single awaitable passed through argument unpacking."""
-    if len(call.args) == 1 and isinstance(call.args[0], ast.Starred):
-        value = call.args[0].value
-        if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
-            return value.elts[0]
+def _single_starred_call_argument(call):
+    """Return the sole value unpacked from a one-item literal sequence."""
+    if len(call.args) != 1 or not isinstance(call.args[0], ast.Starred):
+        return None
+    value = call.args[0].value
+    if not isinstance(value, (ast.Tuple, ast.List)) or len(value.elts) != 1:
+        return None
+    return value.elts[0]
+
+
+def _dict_unpack_call_argument(call, keyword_names):
+    """Resolve a selected key from a literal unpacked mapping argument."""
     for keyword in call.keywords:
-        if keyword.arg is not None:
+        if keyword.arg is not None or not isinstance(keyword.value, ast.Dict):
             continue
-        mapping = keyword.value
-        if not isinstance(mapping, ast.Dict):
-            continue
-        for key, value in zip(mapping.keys, mapping.values):
+        for key, value in zip(keyword.value.keys, keyword.value.values):
             if isinstance(key, ast.Constant) and key.value in keyword_names:
                 return value
     return None
+
+
+def _unpacked_call_argument(call, keyword_names):
+    """Resolve a single awaitable passed through argument unpacking."""
+    positional = _single_starred_call_argument(call)
+    if positional is not None:
+        return positional
+    return _dict_unpack_call_argument(call, keyword_names)
 
 
 def _call_argument(call, keyword_names):
@@ -7281,10 +7310,7 @@ def _compound_statement_blocks(node):
     if isinstance(node, ast.If):
         yield node.body
         yield node.orelse
-    elif isinstance(node, (ast.For, ast.AsyncFor)):
-        yield node.body
-        yield node.orelse
-    elif isinstance(node, ast.While):
+    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
         yield node.body
         yield node.orelse
     elif isinstance(node, (ast.With, ast.AsyncWith)):
