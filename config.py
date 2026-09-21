@@ -4387,6 +4387,88 @@ def _asyncio_helper_active_at_line(
     )
 
 
+def _asyncio_to_thread_call_mutates_workers(
+    to_thread_call,
+    operator_bindings,
+    reference_line,
+):
+    """Return True when a resolved asyncio.to_thread call mutates workers."""
+    if not isinstance(to_thread_call, ast.Call):
+        return False
+    if not _asyncio_helper_active_at_line(
+        to_thread_call.func,
+        "to_thread",
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    target = to_thread_call.args[0] if to_thread_call.args else next(
+        (
+            keyword.value
+            for keyword in to_thread_call.keywords
+            if keyword.arg == "func"
+        ),
+        None,
+    )
+    return target is not None and _thread_pool_callback_mutates_workers(
+        target,
+        operator_bindings,
+    )
+
+
+def _async_function_awaits_mutating_to_thread(func_node, operator_bindings):
+    """Return True when an async function awaits asyncio.to_thread with a risky target."""
+    if not isinstance(func_node, ast.AsyncFunctionDef):
+        return False
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Await):
+            continue
+        if _asyncio_to_thread_call_mutates_workers(
+            node.value,
+            operator_bindings,
+            getattr(node, "lineno", 0),
+        ):
+            return True
+    return False
+
+
+def _collect_async_to_thread_mutator_names(tree, operator_bindings):
+    """Return module-level async function names that mutate workers via to_thread."""
+    names = set()
+    for node in tree.body:
+        if _async_function_awaits_mutating_to_thread(node, operator_bindings):
+            names.add(node.name)
+    return names
+
+
+def _asyncio_to_thread_mutator_names(operator_bindings):
+    """Return async-function names collected for the current scan bindings tuple."""
+    if len(operator_bindings) < 49:
+        return set()
+    candidate = operator_bindings[-1]
+    return candidate if isinstance(candidate, set) else set()
+
+
+def _call_is_event_loop_run_until_complete_to_thread_mutation(
+    call,
+    operator_bindings,
+):
+    """Return True for ``loop.run_until_complete(asyncio.to_thread(...))`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "run_until_complete"):
+        return False
+    if not call.args:
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    return _asyncio_to_thread_call_mutates_workers(
+        call.args[0],
+        operator_bindings,
+        reference_line,
+    )
+
+
 def _call_is_asyncio_run_to_thread_mutation(call, operator_bindings):
     """Return True when asyncio run/to_thread execution mutates workers."""
     if not isinstance(call, ast.Call):
@@ -4402,27 +4484,19 @@ def _call_is_asyncio_run_to_thread_mutation(call, operator_bindings):
     if not call.args:
         return False
     to_thread = call.args[0]
-    if not (
+    mutator_names = _asyncio_to_thread_mutator_names(operator_bindings)
+    if isinstance(to_thread, ast.Name) and to_thread.id in mutator_names:
+        return True
+    if (
         isinstance(to_thread, ast.Call)
-        and _asyncio_helper_active_at_line(
-            to_thread.func,
-            "to_thread",
-            operator_bindings,
-            reference_line,
-        )
+        and isinstance(to_thread.func, ast.Name)
+        and to_thread.func.id in mutator_names
     ):
-        return False
-    target = to_thread.args[0] if to_thread.args else next(
-        (
-            keyword.value
-            for keyword in to_thread.keywords
-            if keyword.arg == "func"
-        ),
-        None,
-    )
-    return target is not None and _thread_pool_callback_mutates_workers(
-        target,
+        return True
+    return _asyncio_to_thread_call_mutates_workers(
+        to_thread,
         operator_bindings,
+        reference_line,
     )
 
 
@@ -4710,6 +4784,10 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
         or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
+        or _call_is_event_loop_run_until_complete_to_thread_mutation(
+            call,
+            operator_bindings,
+        )
         or _attribute_call_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
@@ -6681,6 +6759,14 @@ def _scan_gunicorn_config_worker_details(tree):
         asyncio_module_alias_events,
         asyncio_run_alias_events,
         asyncio_to_thread_alias_events,
+    )
+    asyncio_to_thread_mutator_names = _collect_async_to_thread_mutator_names(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        asyncio_to_thread_mutator_names,
     )
     if _statements_start_mutating_thread(
         tree.body,

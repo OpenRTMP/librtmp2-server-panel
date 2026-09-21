@@ -598,3 +598,21 @@ def test_codex_pr253_custom_submitter_stays_static(tmp_path):
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
+
+# Security review 2026-09-20: indirect asyncio.to_thread execution gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.run_until_complete(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport asyncio\nasyncio.get_event_loop().run_until_complete(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(main())\n",
+    ],
+)
+def test_security_review_sep20_asyncio_to_thread_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
