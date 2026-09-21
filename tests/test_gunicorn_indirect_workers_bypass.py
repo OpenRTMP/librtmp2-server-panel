@@ -691,3 +691,38 @@ def test_codex_pr261_second_followup_safe_patterns_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex PR #261 third follow-up: compound Runner, loop else, same-line, shadowing, combinators
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport asyncio\nif True:\n    runner = asyncio.Runner()\nrunner.run(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    for _ in []:\n        pass\n    else:\n        await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop(); loop.run_until_complete(asyncio.to_thread(lambda: globals().update({'workers': 4}))); loop = None\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.gather(asyncio.to_thread(lambda: globals().update({'workers': 4})))\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.shield(asyncio.to_thread(lambda: globals().update({'workers': 4})))\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nasync def main():\n    await asyncio.wait_for(asyncio.to_thread(lambda: globals().update({'workers': 4})), 1)\nasyncio.run(main())\n",
+        "workers = 1\nimport asyncio\nfrom asyncio import gather as consume\nasync def main():\n    await consume(asyncio.to_thread(lambda: globals().update({'workers': 4})))\nasyncio.run(main())\n",
+    ],
+)
+def test_codex_pr261_third_followup_dynamic_patterns(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr261_local_to_thread_shadow_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import asyncio\n"
+        "from asyncio import to_thread\n"
+        "async def main():\n"
+        "    async def to_thread(callback):\n"
+        "        return None\n"
+        "    await to_thread(lambda: globals().update({'workers': 4}))\n"
+        "asyncio.run(main())\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
