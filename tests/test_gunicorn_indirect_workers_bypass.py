@@ -726,3 +726,21 @@ def test_codex_pr261_local_to_thread_shadow_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-09-22: threading.Timer deferred workers mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport threading\nthreading.Timer(0, lambda: globals().update({'workers': 4})).start()\n",
+        "workers = 1\nfrom threading import Timer\nTimer(0, lambda: globals().update({'workers': 4})).start()\n",
+        "workers = 1\nimport threading\nt = threading.Timer(0.0, lambda: globals().update({'workers': 4}))\nt.start()\n",
+    ],
+)
+def test_security_review_sep22_threading_timer_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
