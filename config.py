@@ -3771,12 +3771,12 @@ def _thread_target_mutates_workers(target, operator_bindings, mutator_names):
 
 
 def _thread_targets(call):
-    """Return positional and keyword Thread target expressions."""
+    """Return positional and keyword Thread/Timer callback expressions."""
     targets = list(call.args[1:2])
     targets.extend(
         keyword.value
         for keyword in call.keywords
-        if keyword.arg == "target"
+        if keyword.arg in {"target", "function"}
     )
     return targets
 
