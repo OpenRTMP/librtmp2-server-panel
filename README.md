@@ -1,5 +1,9 @@
 # librtmp2-server-panel
 
+![librtmp2-server-panel dashboard: a stream expanded showing publish/play URLs and live bitrate, codec, resolution, FPS, RTT and player-count stats](docs/screenshots/dashboard.png)
+
+*The dashboard with a stream expanded. Publish/play URLs and keys are blurred until clicked to copy — sample data, from a local run against a mocked backend.*
+
 [![Project status: alpha](https://img.shields.io/badge/status-alpha-red)](https://openrtmp.org/)
 ![GitHub Release](https://img.shields.io/github/v/release/OpenRTMP/librtmp2-server-panel)
 ![Language](https://img.shields.io/badge/language-Python-orange)
