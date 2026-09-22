@@ -3732,8 +3732,11 @@ def _thread_class_reference_is_active(
     operator_bindings,
     reference_line,
 ):
-    """Return whether an expression resolves to threading.Thread."""
-    if isinstance(reference, ast.Attribute) and reference.attr == "Thread":
+    """Return whether an expression resolves to threading.Thread or Timer."""
+    if isinstance(reference, ast.Attribute) and reference.attr in {
+        "Thread",
+        "Timer",
+    }:
         module_events = operator_bindings[38] if len(operator_bindings) > 38 else {}
         return _module_alias_active_at_line(
             reference.value,
@@ -3768,12 +3771,12 @@ def _thread_target_mutates_workers(target, operator_bindings, mutator_names):
 
 
 def _thread_targets(call):
-    """Return positional and keyword Thread target expressions."""
+    """Return positional and keyword Thread/Timer callback expressions."""
     targets = list(call.args[1:2])
     targets.extend(
         keyword.value
         for keyword in call.keywords
-        if keyword.arg == "target"
+        if keyword.arg in {"target", "function"}
     )
     return targets
 
@@ -7612,7 +7615,7 @@ def _collect_operator_setitem_bindings(tree):
     thread_alias_events = _collect_imported_name_alias_events(
         tree,
         'threading',
-        {'Thread'},
+        {'Thread', 'Timer'},
     )
     dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
     dict_update_aliases = _collect_dict_update_aliases(
