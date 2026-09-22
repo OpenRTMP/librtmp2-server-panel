@@ -735,6 +735,8 @@ def test_codex_pr261_local_to_thread_shadow_stays_static(tmp_path):
         "workers = 1\nimport threading\nthreading.Timer(0, lambda: globals().update({'workers': 4})).start()\n",
         "workers = 1\nfrom threading import Timer\nTimer(0, lambda: globals().update({'workers': 4})).start()\n",
         "workers = 1\nimport threading\nt = threading.Timer(0.0, lambda: globals().update({'workers': 4}))\nt.start()\n",
+        "workers = 1\nimport threading\nthreading.Timer(interval=0, function=lambda: globals().update({'workers': 4})).start()\n",
+        "workers = 1\nfrom threading import Timer as DeferredTimer\nDeferredTimer(interval=0, function=lambda: globals().update({'workers': 4})).start()\n",
     ],
 )
 def test_security_review_sep22_threading_timer_gaps_are_dynamic(
