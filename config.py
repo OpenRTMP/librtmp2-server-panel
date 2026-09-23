@@ -4696,12 +4696,13 @@ def _future_completion_instances_in_statement(
 
 
 def _future_import_time_nested_blocks(node):
-    """Return nested statement blocks that execute during module import."""
+    """Yield nested statement blocks that execute during module import."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return ()
+        return
     if isinstance(node, ast.ClassDef):
-        return (node.body,)
-    return tuple(_compound_statement_blocks(node))
+        yield node.body
+        return
+    yield from _compound_statement_blocks(node)
 
 
 def _collect_future_completed_instances(tree, operator_bindings, analysis):
