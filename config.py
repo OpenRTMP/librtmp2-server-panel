@@ -3802,13 +3802,16 @@ def _thread_constructor_has_mutating_target(
     )
 
 
+_CONCURRENT_FUTURES_MODULE = "concurrent.futures"
+
+
 _THREAD_POOL_DIRECT_IMPORT_KINDS = {
     ("multiprocessing.pool", "ThreadPool"): "pool",
-    ("concurrent.futures", "ThreadPoolExecutor"): "executor",
+    (_CONCURRENT_FUTURES_MODULE, "ThreadPoolExecutor"): "executor",
 }
 _THREAD_POOL_MODULE_IMPORT_KINDS = {
     "multiprocessing.pool": "pool",
-    "concurrent.futures": "executor",
+    _CONCURRENT_FUTURES_MODULE: "executor",
 }
 
 
@@ -4177,6 +4180,40 @@ def _thread_pool_receiver_constructor(receiver, operator_bindings):
     return state if isinstance(state, ast.Call) else None
 
 
+_FUTURE_ANALYSIS_INDEX = 60
+
+
+def _ordered_binding_state_at_position(events, name, reference):
+    """Resolve a source-ordered binding without seeing later same-line events."""
+    if isinstance(reference, ast.AST):
+        reference_position = (
+            getattr(reference, "lineno", 0),
+            getattr(reference, "col_offset", 0),
+        )
+    else:
+        reference_position = (int(reference or 0), 10**9)
+    state = None
+    for event in events.get(name, ()):
+        if len(event) == 3:
+            event_position = (event[0], event[1])
+            value = event[2]
+        else:
+            event_position = (event[0], -1)
+            value = event[1]
+        if event_position > reference_position:
+            break
+        state = value
+    return state
+
+
+def _future_analysis_state(operator_bindings):
+    """Return collected concurrent.futures analysis state."""
+    if len(operator_bindings) <= _FUTURE_ANALYSIS_INDEX:
+        return {}
+    state = operator_bindings[_FUTURE_ANALYSIS_INDEX]
+    return state if isinstance(state, dict) else {}
+
+
 def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     """Return whether one pool callback can mutate module workers."""
     if isinstance(callback, ast.Lambda):
@@ -4184,8 +4221,22 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
         return True
+    if not isinstance(callback, ast.Name):
+        return False
     mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
-    return isinstance(callback, ast.Name) and callback.id in mutator_names
+    if callback.id in mutator_names:
+        return True
+    callback_events = _future_analysis_state(operator_bindings).get(
+        "callback_alias_events",
+        {},
+    )
+    return bool(
+        _ordered_binding_state_at_position(
+            callback_events,
+            callback.id,
+            callback,
+        )
+    )
 
 
 def _thread_pool_constructor_initializer(constructor, operator_bindings):
@@ -4278,6 +4329,669 @@ def _call_is_thread_pool_map_mutation(call, operator_bindings):
             operator_bindings,
         )
         for iterable in iterables
+    )
+
+
+def _future_module_binding_name(reference):
+    """Return the tracked binding name for concurrent.futures module references."""
+    if isinstance(reference, ast.Name):
+        return reference.id
+    if (
+        isinstance(reference, ast.Attribute)
+        and reference.attr == "futures"
+        and isinstance(reference.value, ast.Name)
+    ):
+        return reference.value.id
+    return None
+
+
+def _future_module_reference_is_active(reference, module_events):
+    """Return whether an expression resolves to the imported futures module."""
+    name = _future_module_binding_name(reference)
+    return (
+        name is not None
+        and bool(
+            _ordered_binding_state_at_position(
+                module_events,
+                name,
+                reference,
+            )
+        )
+    )
+
+
+def _future_reference_is_active(reference, operator_bindings, analysis=None):
+    """Return whether an expression resolves to concurrent.futures.Future."""
+    analysis = analysis or _future_analysis_state(operator_bindings)
+    if isinstance(reference, ast.Name):
+        return bool(
+            _ordered_binding_state_at_position(
+                analysis.get("class_events", {}),
+                reference.id,
+                reference,
+            )
+        )
+    return (
+        isinstance(reference, ast.Attribute)
+        and reference.attr == "Future"
+        and _future_module_reference_is_active(
+            reference.value,
+            analysis.get("module_events", {}),
+        )
+    )
+
+
+def _record_future_direct_import(node, class_events):
+    """Record a direct Future import and return its handled binding names."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module == _CONCURRENT_FUTURES_MODULE
+    ):
+        return set()
+    handled = set()
+    for imported in node.names:
+        if imported.name == "Future":
+            name = imported.asname or imported.name
+            class_events.setdefault(name, []).append(
+                _future_binding_event(node, True)
+            )
+            handled.add(name)
+    return handled
+
+
+def _record_future_from_concurrent_import(node, module_events):
+    """Record from concurrent import futures bindings."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module == "concurrent"
+    ):
+        return set()
+    handled = set()
+    for imported in node.names:
+        if imported.name == "futures":
+            name = imported.asname or imported.name
+            module_events.setdefault(name, []).append(
+                _future_binding_event(node, True)
+            )
+            handled.add(name)
+    return handled
+
+
+def _record_future_module_import(node, module_events):
+    """Record import concurrent.futures bindings."""
+    if not isinstance(node, ast.Import):
+        return set()
+    handled = set()
+    for imported in node.names:
+        if imported.name == _CONCURRENT_FUTURES_MODULE:
+            name = imported.asname or "concurrent"
+            module_events.setdefault(name, []).append(
+                _future_binding_event(node, True)
+            )
+            handled.add(name)
+    return handled
+
+
+def _record_future_constructor_imports(
+    node,
+    class_events,
+    module_events,
+):
+    """Record Future constructor and module imports at source position."""
+    handled = _record_future_direct_import(node, class_events)
+    handled.update(
+        _record_future_from_concurrent_import(node, module_events)
+    )
+    handled.update(
+        _record_future_module_import(node, module_events)
+    )
+    return handled
+
+
+def _record_future_constructor_assignment(
+    node,
+    name,
+    value,
+    class_events,
+    module_events,
+):
+    """Record Future constructor/module aliases introduced by one assignment."""
+    class_active = _future_reference_is_active(
+        value,
+        (),
+        {
+            "class_events": class_events,
+            "module_events": module_events,
+        },
+    )
+    module_active = _future_module_reference_is_active(
+        value,
+        module_events,
+    )
+    class_events.setdefault(name, []).append(
+        _future_binding_event(node, class_active)
+    )
+    module_events.setdefault(name, []).append(
+        _future_binding_event(node, module_active)
+    )
+
+
+def _collect_future_constructor_alias_events(tree):
+    """Track Future constructors and futures-module aliases in source order."""
+    class_events = {}
+    module_events = {}
+    for node in tree.body:
+        handled_imports = _record_future_constructor_imports(
+            node,
+            class_events,
+            module_events,
+        )
+        for name, value in _namespace_assignment_values(node):
+            _record_future_constructor_assignment(
+                node,
+                name,
+                value,
+                class_events,
+                module_events,
+            )
+        rebound_names = set(_import_bound_names(node)) - handled_imports
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            rebound_names.add(node.name)
+        for name in rebound_names:
+            class_events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+            module_events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+    return class_events, module_events
+
+
+def _future_submit_call_is_active(call, operator_bindings):
+    """Return whether a call is a proven ThreadPoolExecutor.submit."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "submit"
+    ):
+        return False
+    constructor = _thread_pool_receiver_constructor(
+        call.func.value,
+        operator_bindings,
+    )
+    return (
+        constructor is not None
+        and _thread_pool_constructor_kind(constructor, operator_bindings)
+        == "executor"
+    )
+
+
+def _future_instance_from_value(
+    value,
+    operator_bindings,
+    analysis,
+    events=None,
+):
+    """Resolve an expression to a proven Future-producing call."""
+    if isinstance(value, ast.Call):
+        if _future_reference_is_active(
+            value.func,
+            operator_bindings,
+            analysis,
+        ):
+            return value
+        if _future_submit_call_is_active(value, operator_bindings):
+            return value
+    if not isinstance(value, ast.Name):
+        return None
+    events = analysis.get("instance_events", {}) if events is None else events
+    state = _ordered_binding_state_at_position(
+        events,
+        value.id,
+        value,
+    )
+    return state if isinstance(state, ast.Call) else None
+
+
+def _future_binding_event(node, value):
+    """Create a source-positioned Future binding event."""
+    return (
+        getattr(node, "lineno", 0),
+        getattr(node, "col_offset", 0),
+        value,
+    )
+
+
+def _record_future_instance_aliases(
+    node,
+    operator_bindings,
+    analysis,
+    events,
+    *,
+    conditional,
+):
+    """Track assignments that bind names to proven Future instances."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional:
+            events.setdefault(node.name, []).append(
+                _future_binding_event(node, False)
+            )
+        return
+    for name, value in _namespace_assignment_values(node):
+        instance = _future_instance_from_value(
+            value,
+            operator_bindings,
+            analysis,
+            events,
+        )
+        if instance is not None:
+            events.setdefault(name, []).append(
+                _future_binding_event(node, instance)
+            )
+        elif not conditional:
+            events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+    if not conditional:
+        for name in _import_bound_names(node):
+            events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+
+
+def _scan_future_instance_alias_events(
+    statements,
+    operator_bindings,
+    analysis,
+    events,
+    *,
+    conditional=False,
+):
+    """Collect Future instance aliases from import-time statements."""
+    for node in statements:
+        _record_future_instance_aliases(
+            node,
+            operator_bindings,
+            analysis,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_future_instance_alias_events(
+                block,
+                operator_bindings,
+                analysis,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_future_instance_alias_events(tree, operator_bindings, analysis):
+    """Collect names that resolve to proven Future instances."""
+    events = {}
+    _scan_future_instance_alias_events(
+        tree.body,
+        operator_bindings,
+        analysis,
+        events,
+    )
+    return events
+
+
+def _statement_import_time_expression_nodes(node):
+    """Yield evaluated expression nodes without descending into nested scopes."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return
+    stack = [
+        child
+        for child in ast.iter_child_nodes(node)
+        if not isinstance(child, ast.stmt)
+    ]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Lambda):
+            continue
+        yield current
+        stack.extend(
+            child
+            for child in ast.iter_child_nodes(current)
+            if not isinstance(child, ast.stmt)
+        )
+
+
+def _future_completion_instance(call, operator_bindings, analysis):
+    """Return the Future instance completed by one explicit call."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"set_result", "set_exception", "cancel"}
+    ):
+        return None
+    return _future_instance_from_value(
+        call.func.value,
+        operator_bindings,
+        analysis,
+    )
+
+
+def _future_completion_instances_in_statement(
+    node,
+    operator_bindings,
+    analysis,
+):
+    """Return Future instances completed by one import-time statement."""
+    completed = set()
+    expressions = _statement_import_time_expression_nodes(node) or ()
+    for expression in expressions:
+        instance = _future_completion_instance(
+            expression,
+            operator_bindings,
+            analysis,
+        )
+        if instance is not None:
+            completed.add(instance)
+    return completed
+
+
+def _future_import_time_nested_blocks(node):
+    """Yield nested statement blocks that execute during module import."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return
+    if isinstance(node, ast.ClassDef):
+        yield node.body
+        return
+    yield from _compound_statement_blocks(node)
+
+
+def _collect_future_completed_instances(tree, operator_bindings, analysis):
+    """Collect proven Future instances that can become done at import time."""
+    completed = set()
+    pending_blocks = [tree.body]
+    while pending_blocks:
+        statements = pending_blocks.pop()
+        for node in statements:
+            completed.update(
+                _future_completion_instances_in_statement(
+                    node,
+                    operator_bindings,
+                    analysis,
+                )
+            )
+            pending_blocks.extend(
+                _future_import_time_nested_blocks(node)
+            )
+    return completed
+
+
+def _callback_alias_value_mutates_workers(
+    value,
+    operator_bindings,
+    events,
+):
+    """Resolve a callback value, including aliases to saved lambdas."""
+    if value is None:
+        return False
+    if _thread_pool_callback_mutates_workers(value, operator_bindings):
+        return True
+    return (
+        isinstance(value, ast.Name)
+        and bool(
+            _ordered_binding_state_at_position(
+                events,
+                value.id,
+                value,
+            )
+        )
+    )
+
+
+def _record_callback_alias_events(
+    node,
+    operator_bindings,
+    events,
+    *,
+    conditional,
+):
+    """Track names assigned to callbacks that mutate module workers."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional:
+            events.setdefault(node.name, []).append(
+                _future_binding_event(node, False)
+            )
+        return
+    for name, value in _namespace_assignment_values(node):
+        mutates = _callback_alias_value_mutates_workers(
+            value,
+            operator_bindings,
+            events,
+        )
+        if mutates or not conditional:
+            events.setdefault(name, []).append(
+                _future_binding_event(node, mutates)
+            )
+    if not conditional:
+        for name in _import_bound_names(node):
+            events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+
+
+def _scan_callback_alias_events(
+    statements,
+    operator_bindings,
+    events,
+    *,
+    conditional=False,
+):
+    """Collect source-ordered aliases to workers-mutating callbacks."""
+    for node in statements:
+        _record_callback_alias_events(
+            node,
+            operator_bindings,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_callback_alias_events(
+                block,
+                operator_bindings,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_callback_alias_events(tree, operator_bindings):
+    """Collect callback aliases needed by Future.add_done_callback analysis."""
+    events = {}
+    _scan_callback_alias_events(
+        tree.body,
+        operator_bindings,
+        events,
+    )
+    return events
+
+
+def _future_starred_callback_values(value):
+    """Extract the sole positional callback from a literal expanded argument."""
+    if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
+        return [value.elts[0]]
+    return []
+
+
+def _future_expanded_keyword_callbacks(value):
+    """Extract fn from a literal expanded keyword mapping."""
+    if not isinstance(value, ast.Dict):
+        return []
+    callbacks = []
+    for key, callback in zip(value.keys, value.values):
+        if isinstance(key, ast.Constant) and key.value == "fn":
+            callbacks.append(callback)
+    return callbacks
+
+
+def _future_add_done_callback_arguments(call):
+    """Return statically provable callbacks supplied to add_done_callback."""
+    callbacks = []
+    if call.args:
+        first = call.args[0]
+        if isinstance(first, ast.Starred):
+            callbacks.extend(_future_starred_callback_values(first.value))
+        else:
+            callbacks.append(first)
+    for keyword in call.keywords:
+        if keyword.arg == "fn":
+            callbacks.append(keyword.value)
+        elif keyword.arg is None:
+            callbacks.extend(
+                _future_expanded_keyword_callbacks(keyword.value)
+            )
+    return callbacks
+
+
+def _future_instance_can_complete(instance, operator_bindings, analysis):
+    """Return whether a proven Future can run callbacks during config import."""
+    if _future_submit_call_is_active(instance, operator_bindings):
+        return True
+    return instance in analysis.get("completed_instances", set())
+
+
+def _future_callback_method_instance(value, operator_bindings, analysis, events):
+    """Resolve a saved or direct add_done_callback method to its Future."""
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr == "add_done_callback"
+    ):
+        return _future_instance_from_value(
+            value.value,
+            operator_bindings,
+            analysis,
+        )
+    if not isinstance(value, ast.Name):
+        return None
+    state = _ordered_binding_state_at_position(
+        events,
+        value.id,
+        value,
+    )
+    return state if isinstance(state, ast.Call) else None
+
+
+def _record_future_callback_method_aliases(
+    node,
+    operator_bindings,
+    analysis,
+    events,
+    *,
+    conditional,
+):
+    """Track names assigned to bound Future.add_done_callback methods."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if not conditional:
+            events.setdefault(node.name, []).append(
+                _future_binding_event(node, False)
+            )
+        return
+    for name, value in _namespace_assignment_values(node):
+        instance = _future_callback_method_instance(
+            value,
+            operator_bindings,
+            analysis,
+            events,
+        )
+        if instance is not None:
+            events.setdefault(name, []).append(
+                _future_binding_event(node, instance)
+            )
+        elif not conditional:
+            events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+    if not conditional:
+        for name in _import_bound_names(node):
+            events.setdefault(name, []).append(
+                _future_binding_event(node, False)
+            )
+
+
+def _scan_future_callback_method_alias_events(
+    statements,
+    operator_bindings,
+    analysis,
+    events,
+    *,
+    conditional=False,
+):
+    """Collect aliases of bound Future.add_done_callback methods."""
+    for node in statements:
+        _record_future_callback_method_aliases(
+            node,
+            operator_bindings,
+            analysis,
+            events,
+            conditional=conditional,
+        )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for block in _compound_statement_blocks(node):
+            _scan_future_callback_method_alias_events(
+                block,
+                operator_bindings,
+                analysis,
+                events,
+                conditional=True,
+            )
+
+
+def _collect_future_callback_method_alias_events(
+    tree,
+    operator_bindings,
+    analysis,
+):
+    """Collect source-ordered bound add_done_callback method aliases."""
+    events = {}
+    _scan_future_callback_method_alias_events(
+        tree.body,
+        operator_bindings,
+        analysis,
+        events,
+    )
+    return events
+
+
+def _future_add_done_callback_instance(call, operator_bindings, analysis):
+    """Resolve direct and saved add_done_callback call targets."""
+    if not isinstance(call, ast.Call):
+        return None
+    method_events = analysis.get("callback_method_events", {})
+    return _future_callback_method_instance(
+        call.func,
+        operator_bindings,
+        analysis,
+        method_events,
+    )
+
+
+def _call_is_future_add_done_callback_mutation(call, operator_bindings):
+    """Return True for a completed proven Future with a mutating callback."""
+    analysis = _future_analysis_state(operator_bindings)
+    instance = _future_add_done_callback_instance(
+        call,
+        operator_bindings,
+        analysis,
+    )
+    if instance is None or not _future_instance_can_complete(
+        instance,
+        operator_bindings,
+        analysis,
+    ):
+        return False
+    return any(
+        _thread_pool_callback_mutates_workers(callback, operator_bindings)
+        for callback in _future_add_done_callback_arguments(call)
     )
 
 
@@ -5959,6 +6673,7 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         or _call_is_thread_pool_map_mutation(call, operator_bindings)
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
+        or _call_is_future_add_done_callback_mutation(call, operator_bindings)
         or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
         or _call_is_asyncio_runner_run_mutation(call, operator_bindings)
         or _call_is_event_loop_run_until_complete_to_thread_mutation(
@@ -8000,6 +8715,39 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         asyncio_wrapper_binding_events,
+    )
+    (
+        future_class_events,
+        future_module_events,
+    ) = _collect_future_constructor_alias_events(tree)
+    future_analysis = {
+        "class_events": future_class_events,
+        "module_events": future_module_events,
+    }
+    future_analysis["instance_events"] = _collect_future_instance_alias_events(
+        tree,
+        operator_bindings,
+        future_analysis,
+    )
+    future_analysis["completed_instances"] = _collect_future_completed_instances(
+        tree,
+        operator_bindings,
+        future_analysis,
+    )
+    future_analysis["callback_alias_events"] = _collect_callback_alias_events(
+        tree,
+        operator_bindings,
+    )
+    future_analysis["callback_method_events"] = (
+        _collect_future_callback_method_alias_events(
+            tree,
+            operator_bindings,
+            future_analysis,
+        )
+    )
+    operator_bindings = (
+        *operator_bindings,
+        future_analysis,
     )
     if _statements_start_mutating_thread(
         tree.body,

@@ -728,6 +728,78 @@ def test_codex_pr261_local_to_thread_shadow_stays_static(tmp_path):
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
+# Security review 2026-09-23: concurrent.futures.Future.add_done_callback mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future as CF\nf = CF()\nf.set_result(0)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_security_review_sep23_future_add_done_callback_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #267 follow-up: Future receiver, completion, callback aliases, expansions
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\ncb = lambda _: globals().update({'workers': 4})\nf.add_done_callback(cb)\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\nf.add_done_callback(*(lambda _: globals().update({'workers': 4}),))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\ncb = lambda _: globals().update({'workers': 4})\nf.add_done_callback(**{'fn': cb})\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\ncb = lambda _: globals().update({'workers': 4})\nf.add_done_callback(cb)\nf.set_result(None)\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\ng = f\ng.set_result(None)\ng.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(1) as ex:\n    f = ex.submit(lambda: None)\n    f.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_codex_pr267_future_callback_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #267 second follow-up: import/alias/class-body/method-alias gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport concurrent.futures\nf = concurrent.futures.Future()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future; f = Future(); Future = object\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nclass Complete:\n    f.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nF = Future\nf = F()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\nregister = f.add_done_callback\nregister(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_codex_pr267_second_followup_future_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nclass Holder:\n    def add_done_callback(self, fn):\n        self.fn = fn\nHolder().add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf = object()\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_codex_pr267_nonexecuting_callback_patterns_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
 # Security review 2026-09-22: threading.Timer deferred workers mutation
 @pytest.mark.parametrize(
     "config_content",
