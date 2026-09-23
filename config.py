@@ -4281,6 +4281,26 @@ def _call_is_thread_pool_map_mutation(call, operator_bindings):
     )
 
 
+def _call_is_future_add_done_callback_mutation(call, operator_bindings):
+    """Return True when add_done_callback runs a workers-mutating callback eagerly."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "add_done_callback"
+    ):
+        return False
+    callbacks = list(call.args[:1])
+    callbacks.extend(
+        keyword.value
+        for keyword in call.keywords
+        if keyword.arg in {"fn", "callback"}
+    )
+    return any(
+        _thread_pool_callback_mutates_workers(callback, operator_bindings)
+        for callback in callbacks
+    )
+
+
 def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
     """Return True when apply_async schedules a workers-mutating callback."""
     if not (
@@ -5959,6 +5979,7 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         or _call_is_thread_pool_map_mutation(call, operator_bindings)
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
+        or _call_is_future_add_done_callback_mutation(call, operator_bindings)
         or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
         or _call_is_asyncio_runner_run_mutation(call, operator_bindings)
         or _call_is_event_loop_run_until_complete_to_thread_mutation(

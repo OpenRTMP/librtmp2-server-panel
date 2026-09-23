@@ -728,6 +728,23 @@ def test_codex_pr261_local_to_thread_shadow_stays_static(tmp_path):
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
+# Security review 2026-09-23: concurrent.futures.Future.add_done_callback mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future as CF\nf = CF()\nf.set_result(0)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_security_review_sep23_future_add_done_callback_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 # Security review 2026-09-22: threading.Timer deferred workers mutation
 @pytest.mark.parametrize(
     "config_content",
