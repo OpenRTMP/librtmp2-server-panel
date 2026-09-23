@@ -13,6 +13,22 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-09-23
+
+### Security
+- Further hardened Gunicorn `workers` mutation detection so import-time worker-count changes hidden behind thread pools, `Thread.run()`, `asyncio.to_thread()`, `threading.Timer`, and `Future.add_done_callback()` are treated as dynamic instead of being accepted as a static single-worker configuration. This keeps the `RATELIMIT_STORAGE_URI=memory://` and per-process session-store safeguards fail-closed for additional callback and concurrency patterns.
+
+### Fixed
+- Improved the worker-mutation scanner's handling of callback bindings, imports, aliases, nested control flow, and async/threaded execution paths, with regression coverage for the newly detected bypass techniques.
+- Refactored the expanded Gunicorn AST scanner to keep its complexity and maintainability checks within project limits while preserving the security behavior.
+
+### Documentation
+- Added a real dashboard screenshot to the README, showing an expanded stream with publish/play URLs and live stream statistics.
+- Marked the `lrtmp2_client.py` bug-scan pass as completed in the repository's scan-progress documentation.
+
+### Changed
+- Changelog version `0.1.8` → `0.1.9`.
+
 ## [0.1.8] — 2026-09-18
 
 ### Security
@@ -285,7 +301,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.5...v0.1.6
