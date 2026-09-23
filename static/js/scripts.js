@@ -69,13 +69,18 @@ function initializeStats() {
     setInterval(loadVisibleStats, 3000);
 }
 
-function escapeHtml(value) {
-    return String(value)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
+function createStatColumn(label, value) {
+    const column = document.createElement('div');
+    column.className = 'col-md-4 col-6';
+
+    const paragraph = document.createElement('p');
+    paragraph.textContent = label;
+
+    const strong = document.createElement('strong');
+    strong.textContent = String(value);
+
+    column.append(paragraph, strong);
+    return column;
 }
 
 function getClusterProxy(data) {
@@ -83,24 +88,25 @@ function getClusterProxy(data) {
 }
 
 function buildPlayersByNodeRows(playersByNode) {
-    return Object.keys(playersByNode)
-        .map((nid) => {
-            const count = Number(playersByNode[nid]);
-            return `<div class="col-md-4 col-6"><p>Players on node ${escapeHtml(nid)}:</p><strong>${Number.isFinite(count) ? count : 0}</strong></div>`;
-        })
-        .join('');
+    return Object.keys(playersByNode).map((nid) => {
+        const count = Number(playersByNode[nid]);
+        return createStatColumn(
+            `Players on node ${nid}:`,
+            Number.isFinite(count) ? count : 0,
+        );
+    });
 }
 
 function buildClusterRows(clusterEnabled, data, clusterProxy, relayMbps, playersByNode) {
     if (!clusterEnabled) {
-        return '';
+        return [];
     }
     const tagged = data.owner_node_id !== undefined
         || data.cluster_proxy !== undefined
         || Object.keys(playersByNode).length > 0
         || Number.isFinite(relayMbps);
     if (!tagged) {
-        return '';
+        return [];
     }
 
     const ownerNode = data.owner_node_id !== undefined && data.owner_node_id !== null
@@ -108,15 +114,16 @@ function buildClusterRows(clusterEnabled, data, clusterProxy, relayMbps, players
         : clusterProxy.owner_node_id;
     const ownerLabel = ownerNode === undefined || ownerNode === null
         ? 'unavailable'
-        : escapeHtml(ownerNode);
+        : ownerNode;
     const relayLabel = Number.isFinite(relayMbps)
         ? `${relayMbps.toFixed(1)} Mbps`
         : 'n/a';
-    const playerByNodeRows = buildPlayersByNodeRows(playersByNode);
 
-    return `<div class="col-md-4 col-6"><p>Owner node:</p><strong>${ownerLabel}</strong></div>
-       <div class="col-md-4 col-6"><p>Relay bandwidth:</p><strong>${relayLabel}</strong></div>
-       ${playerByNodeRows}`;
+    return [
+        createStatColumn('Owner node:', ownerLabel),
+        createStatColumn('Relay bandwidth:', relayLabel),
+        ...buildPlayersByNodeRows(playersByNode),
+    ];
 }
 
 function buildPlayerRows(players) {
@@ -124,23 +131,31 @@ function buildPlayerRows(players) {
         .map((pl, index) => {
             const plRtt = Number(pl.rtt_ms);
             if (!Number.isFinite(plRtt) || plRtt <= 0) {
-                return '';
+                return null;
             }
             const label = players.length > 1 ? `Player ${index + 1} RTT` : 'Player RTT';
-            return `<div class="col-md-4 col-6"><p>${escapeHtml(label)}:</p><strong>${plRtt.toFixed(1)} ms</strong></div>`;
+            return createStatColumn(`${label}:`, `${plRtt.toFixed(1)} ms`);
         })
-        .join('');
+        .filter(Boolean);
 }
 
 function renderStats(statsContainer, data) {
     if (data.error) {
-        statsContainer.innerHTML = `<p class="text-danger">${escapeHtml(data.error)}</p>`;
+        const error = document.createElement('p');
+        error.className = 'text-danger';
+        error.textContent = String(data.error);
+        statsContainer.replaceChildren(error);
         return;
     }
 
     const streams = Array.isArray(data.streams) ? data.streams : [];
     if (streams.length === 0) {
-        statsContainer.innerHTML = '<p class="text-muted"><em>Stream offline</em></p>';
+        const offline = document.createElement('p');
+        offline.className = 'text-muted';
+        const emphasis = document.createElement('em');
+        emphasis.textContent = 'Stream offline';
+        offline.append(emphasis);
+        statsContainer.replaceChildren(offline);
         return;
     }
 
@@ -170,43 +185,38 @@ function renderStats(statsContainer, data) {
     );
     const playerRows = buildPlayerRows(Array.isArray(data.players) ? data.players : []);
 
-    statsContainer.innerHTML = `
-        <div class="mt-2 p-2 bg-dark bg-opacity-50 rounded">
-            <h6 class="mb-2">Stream Statistics</h6>
-            <div class="row g-2">
-                <div class="col-md-4 col-6">
-                    <p>Bitrate:</p>
-                    <strong>${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>Publisher RTT:</p>
-                    <strong>${Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a'}</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>Uptime:</p>
-                    <strong>${formatUptime(stream.uptime || 0)}</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>Codec:</p>
-                    <strong>${escapeHtml(video.codec || 'n/a')}</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>Resolution:</p>
-                    <strong>${Number.isFinite(width) ? width : 0}x${Number.isFinite(height) ? height : 0}</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>FPS:</p>
-                    <strong>${Number.isFinite(fps) ? fps : 0}</strong>
-                </div>
-                <div class="col-md-4 col-6">
-                    <p>Players:</p>
-                    <strong>${Number.isFinite(players) ? players : 0}</strong>
-                </div>
-                ${clusterRows}
-                ${playerRows}
-            </div>
-        </div>
-    `;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'mt-2 p-2 bg-dark bg-opacity-50 rounded';
+
+    const title = document.createElement('h6');
+    title.className = 'mb-2';
+    title.textContent = 'Stream Statistics';
+
+    const rows = document.createElement('div');
+    rows.className = 'row g-2';
+    rows.append(
+        createStatColumn(
+            'Bitrate:',
+            `${Number.isFinite(bitrate) ? bitrate.toFixed(1) : '0.0'} kbps`,
+        ),
+        createStatColumn(
+            'Publisher RTT:',
+            Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a',
+        ),
+        createStatColumn('Uptime:', formatUptime(stream.uptime || 0)),
+        createStatColumn('Codec:', video.codec || 'n/a'),
+        createStatColumn(
+            'Resolution:',
+            `${Number.isFinite(width) ? width : 0}x${Number.isFinite(height) ? height : 0}`,
+        ),
+        createStatColumn('FPS:', Number.isFinite(fps) ? fps : 0),
+        createStatColumn('Players:', Number.isFinite(players) ? players : 0),
+        ...clusterRows,
+        ...playerRows,
+    );
+
+    wrapper.append(title, rows);
+    statsContainer.replaceChildren(wrapper);
 }
 
 function loadStats(streamId) {
@@ -231,7 +241,11 @@ function loadStats(streamId) {
         .then(data => renderStats(statsContainer, data))
         .catch((err) => {
             console.warn('Stats request failed', err);
-            statsContainer.innerHTML = '<p><em>Stats not available</em></p>';
+            const unavailable = document.createElement('p');
+            const emphasis = document.createElement('em');
+            emphasis.textContent = 'Stats not available';
+            unavailable.append(emphasis);
+            statsContainer.replaceChildren(unavailable);
         })
         .finally(() => {
             clearTimeout(timeoutId);
