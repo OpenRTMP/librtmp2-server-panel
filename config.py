@@ -3802,13 +3802,16 @@ def _thread_constructor_has_mutating_target(
     )
 
 
+_CONCURRENT_FUTURES_MODULE = "concurrent.futures"
+
+
 _THREAD_POOL_DIRECT_IMPORT_KINDS = {
     ("multiprocessing.pool", "ThreadPool"): "pool",
-    ("concurrent.futures", "ThreadPoolExecutor"): "executor",
+    (_CONCURRENT_FUTURES_MODULE, "ThreadPoolExecutor"): "executor",
 }
 _THREAD_POOL_MODULE_IMPORT_KINDS = {
     "multiprocessing.pool": "pool",
-    "concurrent.futures": "executor",
+    _CONCURRENT_FUTURES_MODULE: "executor",
 }
 
 
@@ -4378,40 +4381,70 @@ def _future_reference_is_active(reference, operator_bindings, analysis=None):
     )
 
 
-def _record_future_constructor_imports(
-    node,
-    class_events,
-    module_events,
-):
-    """Record direct Future and concurrent.futures imports at source position."""
+def _record_future_direct_import(node, class_events):
+    """Record a direct Future import and return its handled binding names."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module == _CONCURRENT_FUTURES_MODULE
+    ):
+        return set()
     handled = set()
-    if isinstance(node, ast.ImportFrom) and node.module == "concurrent.futures":
-        for imported in node.names:
-            if imported.name != "Future":
-                continue
+    for imported in node.names:
+        if imported.name == "Future":
             name = imported.asname or imported.name
             class_events.setdefault(name, []).append(
                 _future_binding_event(node, True)
             )
             handled.add(name)
-    elif isinstance(node, ast.ImportFrom) and node.module == "concurrent":
-        for imported in node.names:
-            if imported.name != "futures":
-                continue
+    return handled
+
+
+def _record_future_from_concurrent_import(node, module_events):
+    """Record from concurrent import futures bindings."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module == "concurrent"
+    ):
+        return set()
+    handled = set()
+    for imported in node.names:
+        if imported.name == "futures":
             name = imported.asname or imported.name
             module_events.setdefault(name, []).append(
                 _future_binding_event(node, True)
             )
             handled.add(name)
-    elif isinstance(node, ast.Import):
-        for imported in node.names:
-            if imported.name != "concurrent.futures":
-                continue
+    return handled
+
+
+def _record_future_module_import(node, module_events):
+    """Record import concurrent.futures bindings."""
+    if not isinstance(node, ast.Import):
+        return set()
+    handled = set()
+    for imported in node.names:
+        if imported.name == _CONCURRENT_FUTURES_MODULE:
             name = imported.asname or "concurrent"
             module_events.setdefault(name, []).append(
                 _future_binding_event(node, True)
             )
             handled.add(name)
+    return handled
+
+
+def _record_future_constructor_imports(
+    node,
+    class_events,
+    module_events,
+):
+    """Record Future constructor and module imports at source position."""
+    handled = _record_future_direct_import(node, class_events)
+    handled.update(
+        _record_future_from_concurrent_import(node, module_events)
+    )
+    handled.update(
+        _record_future_module_import(node, module_events)
+    )
     return handled
 
 
@@ -4643,29 +4676,51 @@ def _future_completion_instance(call, operator_bindings, analysis):
     )
 
 
+def _future_completion_instances_in_statement(
+    node,
+    operator_bindings,
+    analysis,
+):
+    """Return Future instances completed by one import-time statement."""
+    completed = set()
+    expressions = _statement_import_time_expression_nodes(node) or ()
+    for expression in expressions:
+        instance = _future_completion_instance(
+            expression,
+            operator_bindings,
+            analysis,
+        )
+        if instance is not None:
+            completed.add(instance)
+    return completed
+
+
+def _future_import_time_nested_blocks(node):
+    """Return nested statement blocks that execute during module import."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return ()
+    if isinstance(node, ast.ClassDef):
+        return (node.body,)
+    return tuple(_compound_statement_blocks(node))
+
+
 def _collect_future_completed_instances(tree, operator_bindings, analysis):
     """Collect proven Future instances that can become done at import time."""
     completed = set()
-
-    def scan(statements):
+    pending_blocks = [tree.body]
+    while pending_blocks:
+        statements = pending_blocks.pop()
         for node in statements:
-            for expression in _statement_import_time_expression_nodes(node) or ():
-                instance = _future_completion_instance(
-                    expression,
+            completed.update(
+                _future_completion_instances_in_statement(
+                    node,
                     operator_bindings,
                     analysis,
                 )
-                if instance is not None:
-                    completed.add(instance)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if isinstance(node, ast.ClassDef):
-                scan(node.body)
-                continue
-            for block in _compound_statement_blocks(node):
-                scan(block)
-
-    scan(tree.body)
+            )
+            pending_blocks.extend(
+                _future_import_time_nested_blocks(node)
+            )
     return completed
 
 
