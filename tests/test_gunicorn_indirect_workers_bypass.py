@@ -763,6 +763,26 @@ def test_codex_pr267_future_callback_gaps_are_dynamic(tmp_path, config_content):
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+# Codex PR #267 second follow-up: import/alias/class-body/method-alias gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport concurrent.futures\nf = concurrent.futures.Future()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future; f = Future(); Future = object\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nclass Complete:\n    f.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nF = Future\nf = F()\nf.set_result(None)\nf.add_done_callback(lambda _: globals().update({'workers': 4}))\n",
+        "workers = 1\nfrom concurrent.futures import Future\nf = Future()\nf.set_result(None)\nregister = f.add_done_callback\nregister(lambda _: globals().update({'workers': 4}))\n",
+    ],
+)
+def test_codex_pr267_second_followup_future_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 @pytest.mark.parametrize(
     "config_content",
     [
