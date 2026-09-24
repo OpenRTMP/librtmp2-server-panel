@@ -818,3 +818,22 @@ def test_security_review_sep22_threading_timer_gaps_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-24: synchronous container dispatch workers mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\nq.get()()\n",
+        "workers = 1\nimport collections\nd = collections.deque()\nd.append(lambda: globals().update({'workers': 4}))\nd.popleft()()\n",
+        "workers = 1\nlist(map(lambda f: f(), [lambda: globals().update({'workers': 4})]))\n",
+        "workers = 1\nnext(iter([lambda: globals().update({'workers': 4})]))()\n",
+    ],
+)
+def test_security_review_sep24_sync_container_dispatch_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

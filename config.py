@@ -3320,6 +3320,47 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 
+def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
+    """Return True when a literal list/tuple holds a workers-mutating lambda."""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return False
+    return any(
+        isinstance(element, ast.Lambda)
+        and _lambda_mutates_workers(element, operator_bindings)
+        for element in node.elts
+    )
+
+
+def _lambda_invokes_first_positional_param(lambda_node):
+    """Return True when a lambda body calls its first positional parameter."""
+    if not isinstance(lambda_node, ast.Lambda):
+        return False
+    positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
+    if len(positional_params) != 1:
+        return False
+    param_name = positional_params[0].arg
+    body = lambda_node.body
+    return (
+        isinstance(body, ast.Call)
+        and isinstance(body.func, ast.Name)
+        and body.func.id == param_name
+        and not body.args
+        and not body.keywords
+    )
+
+
+def _call_invokes_zero_arg_method_result(call, method_names):
+    """Return True for ``receiver.method()()`` style eager callback invocation."""
+    if not isinstance(call, ast.Call) or call.args or call.keywords:
+        return False
+    inner = call.func
+    if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
+        return False
+    if not isinstance(inner.func, ast.Attribute):
+        return False
+    return inner.func.attr in method_names
+
+
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     """Return True when consuming a map/filter must execute a risky lambda."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
@@ -3343,11 +3384,18 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
         return False
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    return any(
+    if any(
         _map_argument_contains_module_namespace(iterable, namespace_aliases)
         and _lambda_param_namespace_mutation(lambda_node.body, param.arg)
         for param, iterable in zip(positional_params, call.args[1:])
-    )
+    ):
+        return True
+    if _lambda_invokes_first_positional_param(lambda_node):
+        return any(
+            _iterable_literal_contains_mutating_lambda(arg, operator_bindings)
+            for arg in call.args[1:]
+        )
+    return False
 
 
 
@@ -3653,6 +3701,8 @@ def _expression_is_mutating_lazy_iterator(
     active_names=None,
 ):
     """Return True for a risky lazy iterator without consuming it."""
+    if _iterable_literal_contains_mutating_lambda(expr, operator_bindings):
+        return True
     if _map_or_filter_lambda_mutates_when_consumed(expr, operator_bindings):
         return True
     if isinstance(expr, ast.Call):
@@ -7428,6 +7478,7 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings)
         or _call_has_mutating_lambda_argument(expr, operator_bindings)
+        or _call_invokes_zero_arg_method_result(expr, {"get", "popleft", "pop"})
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
