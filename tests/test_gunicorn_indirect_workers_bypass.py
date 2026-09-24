@@ -818,3 +818,69 @@ def test_security_review_sep22_threading_timer_gaps_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-24: synchronous container dispatch workers mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\nq.get()()\n",
+        "workers = 1\nimport collections\nd = collections.deque()\nd.append(lambda: globals().update({'workers': 4}))\nd.popleft()()\n",
+        "workers = 1\nlist(map(lambda f: f(), [lambda: globals().update({'workers': 4})]))\n",
+        "workers = 1\nnext(iter([lambda: globals().update({'workers': 4})]))()\n",
+    ],
+)
+def test_security_review_sep24_sync_container_dispatch_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_security_review_sep24_unrelated_get_result_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    def get(self):\n"
+        "        return lambda: None\n"
+        "Holder().get()()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex PR #271 follow-up: callback dispatch provenance and execution semantics
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: None)\nq.get()()\n",
+        "workers = 1\nfor callback in [lambda: globals().update({'workers': 4})]:\n    pass\n",
+        "workers = 1\nfor callback in iter([lambda: globals().update({'workers': 4})]):\n    pass\n",
+        "workers = 1\nlist([lambda: globals().update({'workers': 4})])\n",
+    ],
+)
+def test_codex_pr271_nonexecuted_callbacks_stay_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\nq.get(False)()\n",
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\nq.get(block=False)()\n",
+        "workers = 1\nlist(map(lambda callback, _: callback(), [lambda: globals().update({'workers': 4})], [None]))\n",
+        "workers = 1\ncallback = lambda: globals().update({'workers': 4})\nlist(map(lambda fn: fn(), [callback]))\n",
+        "workers = 1\nlist(map(lambda fn: fn(), {lambda: globals().update({'workers': 4})}))\n",
+        "workers = 1\ncallback = lambda: globals().update({'workers': 4})\nnext(iter([callback]))()\n",
+        "workers = 1\ncallbacks = (lambda: globals().update({'workers': 4}),)\nnext(iter(callbacks))()\n",
+    ],
+)
+def test_codex_pr271_executed_callbacks_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
