@@ -837,3 +837,16 @@ def test_security_review_sep24_sync_container_dispatch_is_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_security_review_sep24_unrelated_get_result_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    def get(self):\n"
+        "        return lambda: None\n"
+        "Holder().get()()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
