@@ -3349,18 +3349,6 @@ def _lambda_invokes_first_positional_param(lambda_node):
     )
 
 
-def _call_invokes_zero_arg_method_result(call, method_names):
-    """Return True for ``receiver.method()()`` style eager callback invocation."""
-    if not isinstance(call, ast.Call) or call.args or call.keywords:
-        return False
-    inner = call.func
-    if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
-        return False
-    if not isinstance(inner.func, ast.Attribute):
-        return False
-    return inner.func.attr in method_names
-
-
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     """Return True when consuming a map/filter must execute a risky lambda."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
@@ -7478,7 +7466,6 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings)
         or _call_has_mutating_lambda_argument(expr, operator_bindings)
-        or _call_invokes_zero_arg_method_result(expr, {"get", "popleft", "pop"})
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
@@ -8074,6 +8061,210 @@ class _GunicornWorkersScanState:
             self.count = value
 
 
+def _sync_callback_tracking(scan_state):
+    """Return source-ordered tracking state for synchronous callback containers."""
+    tracking = getattr(scan_state, "_sync_callback_tracking", None)
+    if tracking is None:
+        tracking = {
+            "queue_modules": set(),
+            "collections_modules": set(),
+            "queue_constructors": set(),
+            "deque_constructors": set(),
+            "containers": {},
+            "mutating": set(),
+        }
+        scan_state._sync_callback_tracking = tracking
+    return tracking
+
+
+def _simple_assignment_names(node):
+    """Return simple names definitely rebound by one assignment statement."""
+    targets = []
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    elif isinstance(node, ast.NamedExpr):
+        targets = [node.target]
+    names = set()
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+    return names
+
+
+def _record_sync_callback_imports(node, tracking):
+    """Track queue/deque constructor aliases used for callback containers."""
+    if isinstance(node, ast.Import):
+        for imported in node.names:
+            name = imported.asname or imported.name
+            if imported.name == "queue":
+                tracking["queue_modules"].add(name)
+            elif imported.name == "collections":
+                tracking["collections_modules"].add(name)
+        return
+    if not isinstance(node, ast.ImportFrom):
+        return
+    if node.module == "queue":
+        for imported in node.names:
+            if imported.name in {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"}:
+                tracking["queue_constructors"].add(imported.asname or imported.name)
+    elif node.module == "collections":
+        for imported in node.names:
+            if imported.name == "deque":
+                tracking["deque_constructors"].add(imported.asname or imported.name)
+
+
+def _sync_callback_constructor_kind(value, tracking):
+    """Return the proven callback-container kind created by an expression."""
+    if isinstance(value, ast.List):
+        return "list"
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    if isinstance(func, ast.Name):
+        if func.id in tracking["queue_constructors"]:
+            return "queue"
+        if func.id in tracking["deque_constructors"]:
+            return "deque"
+        return None
+    if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+        return None
+    if (
+        func.value.id in tracking["queue_modules"]
+        and func.attr in {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"}
+    ):
+        return "queue"
+    if func.value.id in tracking["collections_modules"] and func.attr == "deque":
+        return "deque"
+    return None
+
+
+def _sync_callback_value_contains_mutating_lambda(value, operator_bindings):
+    """Return True when a new container starts with a workers-mutating lambda."""
+    if isinstance(value, ast.List):
+        return _iterable_literal_contains_mutating_lambda(value, operator_bindings)
+    if isinstance(value, ast.Call) and value.args:
+        return _iterable_literal_contains_mutating_lambda(
+            value.args[0],
+            operator_bindings,
+        )
+    return False
+
+
+def _record_sync_callback_assignment(node, tracking, operator_bindings):
+    """Track proven callback-container instances and definite rebindings."""
+    names = _simple_assignment_names(node)
+    if not names:
+        return
+
+    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) else None
+    existing_kind = None
+    existing_mutating = False
+    if isinstance(value, ast.Name):
+        existing_kind = tracking["containers"].get(value.id)
+        existing_mutating = value.id in tracking["mutating"]
+
+    kind = existing_kind or _sync_callback_constructor_kind(value, tracking)
+    starts_mutating = existing_mutating or (
+        kind is not None
+        and _sync_callback_value_contains_mutating_lambda(value, operator_bindings)
+    )
+
+    for name in names:
+        tracking["containers"].pop(name, None)
+        tracking["mutating"].discard(name)
+        tracking["queue_modules"].discard(name)
+        tracking["collections_modules"].discard(name)
+        tracking["queue_constructors"].discard(name)
+        tracking["deque_constructors"].discard(name)
+        if kind is not None:
+            tracking["containers"][name] = kind
+            if starts_mutating:
+                tracking["mutating"].add(name)
+
+
+def _statement_value_expression(node):
+    """Return the import-time expression directly executed by a statement."""
+    if isinstance(node, ast.Expr):
+        return node.value
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return node.value
+    return None
+
+
+def _record_sync_callback_insert(node, tracking, operator_bindings):
+    """Remember containers that receive a workers-mutating callback."""
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call) or not isinstance(expr.func, ast.Attribute):
+        return
+    receiver = expr.func.value
+    if not isinstance(receiver, ast.Name):
+        return
+    kind = tracking["containers"].get(receiver.id)
+    if kind is None or not expr.args:
+        return
+
+    method = expr.func.attr
+    direct_callback_methods = {
+        "queue": {"put", "put_nowait"},
+        "deque": {"append", "appendleft"},
+        "list": {"append"},
+    }
+    iterable_callback_methods = {
+        "deque": {"extend", "extendleft"},
+        "list": {"extend"},
+    }
+
+    mutates = False
+    if method in direct_callback_methods.get(kind, set()):
+        callback = expr.args[0]
+        mutates = (
+            isinstance(callback, ast.Lambda)
+            and _lambda_mutates_workers(callback, operator_bindings)
+        )
+    elif method in iterable_callback_methods.get(kind, set()):
+        mutates = _iterable_literal_contains_mutating_lambda(
+            expr.args[0],
+            operator_bindings,
+        )
+    if mutates:
+        tracking["mutating"].add(receiver.id)
+
+
+def _sync_callback_dispatch_mutates(node, tracking):
+    """Return True only for dispatch from a proven mutating callback container."""
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call) or expr.args or expr.keywords:
+        return False
+    inner = expr.func
+    if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
+        return False
+    if not isinstance(inner.func, ast.Attribute):
+        return False
+    receiver = inner.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+
+    kind = tracking["containers"].get(receiver.id)
+    dispatch_methods = {
+        "queue": {"get", "get_nowait"},
+        "deque": {"pop", "popleft"},
+        "list": {"pop"},
+    }
+    return inner.func.attr in dispatch_methods.get(kind, set())
+
+
+def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
+    """Update container tracking and report proven synchronous callback execution."""
+    tracking = _sync_callback_tracking(scan_state)
+    dispatch_mutates = _sync_callback_dispatch_mutates(node, tracking)
+    _record_sync_callback_imports(node, tracking)
+    _record_sync_callback_insert(node, tracking, operator_bindings)
+    _record_sync_callback_assignment(node, tracking, operator_bindings)
+    return dispatch_mutates
+
+
 def _compound_statement_blocks(node):
     """Yield statement lists from compound statement bodies."""
     if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
@@ -8567,6 +8758,8 @@ def _walk_gunicorn_workers_statements(
             class_targets,
         ):
             continue
+        if _track_sync_callback_dispatch(node, state, operator_bindings):
+            state.dynamic = True
         if _node_has_dynamic_workers_effect(
             node,
             global_workers_mutators,
