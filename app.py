@@ -466,8 +466,12 @@ class _PanelRuntime:
         if request.method == "POST":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            user_ok = hmac.compare_digest(username, self.app.config["USERNAME"])
-            pass_ok = hmac.compare_digest(password, self.app.config["PASSWORD"])
+            user_ok = hmac.compare_digest(
+                username.encode("utf-8"), str(self.app.config["USERNAME"]).encode("utf-8")
+            )
+            pass_ok = hmac.compare_digest(
+                password.encode("utf-8"), str(self.app.config["PASSWORD"]).encode("utf-8")
+            )
             if user_ok and pass_ok:
                 return self._complete_login()
             error = "Invalid credentials"
