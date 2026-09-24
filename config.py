@@ -3336,7 +3336,7 @@ def _lambda_invokes_first_positional_param(lambda_node):
     if not isinstance(lambda_node, ast.Lambda):
         return False
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
-    if len(positional_params) != 1:
+    if not positional_params:
         return False
     param_name = positional_params[0].arg
     body = lambda_node.body
