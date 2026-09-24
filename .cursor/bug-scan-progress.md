@@ -1,14 +1,29 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-09-21
+Last scanned: config.py — 2026-09-24
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-24 config.py pass)
+
+- No critical bugs found. Traced `_validate_config()` (SECRET_KEY length/placeholders,
+  `REQUIRE_LOGIN` fail-closed parsing, `ALLOW_INSECURE_NO_LOGIN` gate,
+  `LRTMP2_API_TOKEN` placeholders, `TRUSTED_PROXY_IPS` required when
+  `TRUSTED_PROXY_COUNT>0`), `_parse_trusted_proxy_networks()` (per-entry /0 and
+  /1 rejection, union covering full IPv4/IPv6), `client_ip_for_rate_limit()` with
+  `app.py` `_PreserveDirectRemoteAddr` + `ProxyFix` caller chain, and
+  `_ratelimit_storage_error()` / `_detect_worker_settings()` (memory:// blocked for
+  multi-worker, dynamic gunicorn worker assignments, `WEB_CONCURRENCY` max,
+  non-shared Redis schemes). Reviewed `SESSION_COOKIE_SECURE` auto-detect
+  (`PANEL_PUBLIC_URL`, explicit env, `TRUSTED_PROXY_COUNT>0` — intentional per
+  tests; HTTP edge deployments should set `SESSION_COOKIE_SECURE=False` or
+  `PANEL_PUBLIC_URL=http://…`).
 
 ## Findings (2026-09-21 lrtmp2_client.py pass)
 
