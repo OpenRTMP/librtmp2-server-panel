@@ -8156,26 +8156,42 @@ def _simple_assignment_names(node):
     return names
 
 
+def _record_sync_callback_module_imports(node, tracking):
+    """Track queue and collections module aliases."""
+    destinations = {
+        "queue": tracking["queue_modules"],
+        "collections": tracking["collections_modules"],
+    }
+    for imported in node.names:
+        destination = destinations.get(imported.name)
+        if destination is not None:
+            destination.add(imported.asname or imported.name)
+
+
+def _record_sync_callback_direct_imports(node, tracking):
+    """Track direct queue/deque constructor aliases."""
+    supported = {
+        "queue": (
+            {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"},
+            tracking["queue_constructors"],
+        ),
+        "collections": ({"deque"}, tracking["deque_constructors"]),
+    }
+    entry = supported.get(node.module)
+    if entry is None:
+        return
+    names, destination = entry
+    for imported in node.names:
+        if imported.name in names:
+            destination.add(imported.asname or imported.name)
+
+
 def _record_sync_callback_imports(node, tracking):
     """Track queue/deque constructor aliases used for callback containers."""
     if isinstance(node, ast.Import):
-        for imported in node.names:
-            name = imported.asname or imported.name
-            if imported.name == "queue":
-                tracking["queue_modules"].add(name)
-            elif imported.name == "collections":
-                tracking["collections_modules"].add(name)
-        return
-    if not isinstance(node, ast.ImportFrom):
-        return
-    if node.module == "queue":
-        for imported in node.names:
-            if imported.name in {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"}:
-                tracking["queue_constructors"].add(imported.asname or imported.name)
-    elif node.module == "collections":
-        for imported in node.names:
-            if imported.name == "deque":
-                tracking["deque_constructors"].add(imported.asname or imported.name)
+        _record_sync_callback_module_imports(node, tracking)
+    elif isinstance(node, ast.ImportFrom):
+        _record_sync_callback_direct_imports(node, tracking)
 
 
 def _sync_callback_constructor_kind(value, tracking):
