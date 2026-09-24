@@ -3320,15 +3320,80 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 
+_MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
+
+
+def _mutating_callback_alias_is_active(node, operator_bindings):
+    """Return True when a name resolves to a tracked workers-mutating callback."""
+    if not isinstance(node, ast.Name):
+        return False
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    events = shadow_lines.get(_MUTATING_CALLBACK_ALIAS_EVENTS_KEY, {})
+    return bool(
+        _binding_state_at_line(
+            events,
+            node.id,
+            getattr(node, "lineno", 0),
+        )
+    )
+
+
 def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
-    """Return True when a literal list/tuple holds a workers-mutating lambda."""
+    """Return True when a literal iterable holds a workers-mutating callback."""
     if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return False
     return any(
-        isinstance(element, ast.Lambda)
-        and _lambda_mutates_workers(element, operator_bindings)
+        (
+            isinstance(element, ast.Lambda)
+            and _lambda_mutates_workers(element, operator_bindings)
+        )
+        or _mutating_callback_alias_is_active(element, operator_bindings)
         for element in node.elts
     )
+
+
+def _collect_mutating_callback_alias_events(tree, operator_bindings):
+    """Track top-level names bound to workers-mutating lambdas and their aliases."""
+    events = {}
+    active = set()
+
+    def scan(statements, *, conditional=False):
+        for node in statements:
+            line = getattr(node, "lineno", 0)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not conditional:
+                    _deactivate_imported_module_alias(
+                        node.name,
+                        active,
+                        events,
+                        line,
+                    )
+                continue
+
+            for name, value in _namespace_assignment_values(node):
+                is_mutating = (
+                    isinstance(value, ast.Lambda)
+                    and _lambda_mutates_workers(value, operator_bindings)
+                ) or (
+                    isinstance(value, ast.Name)
+                    and value.id in active
+                )
+                if is_mutating:
+                    active.add(name)
+                    events.setdefault(name, []).append((line, True))
+                elif not conditional:
+                    _deactivate_imported_module_alias(
+                        name,
+                        active,
+                        events,
+                        line,
+                    )
+
+            for block in _compound_statement_blocks(node):
+                scan(block, conditional=True)
+
+    scan(tree.body)
+    return events
 
 
 def _lambda_invokes_first_positional_param(lambda_node):
@@ -3689,8 +3754,6 @@ def _expression_is_mutating_lazy_iterator(
     active_names=None,
 ):
     """Return True for a risky lazy iterator without consuming it."""
-    if _iterable_literal_contains_mutating_lambda(expr, operator_bindings):
-        return True
     if _map_or_filter_lambda_mutates_when_consumed(expr, operator_bindings):
         return True
     if isinstance(expr, ast.Call):
@@ -8119,6 +8182,8 @@ def _sync_callback_constructor_kind(value, tracking):
     """Return the proven callback-container kind created by an expression."""
     if isinstance(value, ast.List):
         return "list"
+    if isinstance(value, (ast.Tuple, ast.Set)):
+        return "literal"
     if not isinstance(value, ast.Call):
         return None
     func = value.func
@@ -8141,8 +8206,8 @@ def _sync_callback_constructor_kind(value, tracking):
 
 
 def _sync_callback_value_contains_mutating_lambda(value, operator_bindings):
-    """Return True when a new container starts with a workers-mutating lambda."""
-    if isinstance(value, ast.List):
+    """Return True when a new container starts with a workers-mutating callback."""
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
         return _iterable_literal_contains_mutating_lambda(value, operator_bindings)
     if isinstance(value, ast.Call) and value.args:
         return _iterable_literal_contains_mutating_lambda(
@@ -8232,14 +8297,89 @@ def _record_sync_callback_insert(node, tracking, operator_bindings):
         tracking["mutating"].add(receiver.id)
 
 
-def _sync_callback_dispatch_mutates(node, tracking):
-    """Return True only for dispatch from a proven mutating callback container."""
+def _queue_get_arguments_are_valid(call):
+    """Return True for argument shapes accepted by Queue.get."""
+    if len(call.args) > 2:
+        return False
+    keyword_names = []
+    for keyword in call.keywords:
+        if keyword.arg not in {"block", "timeout"}:
+            return False
+        keyword_names.append(keyword.arg)
+    if len(keyword_names) != len(set(keyword_names)):
+        return False
+    positional_names = {"block", "timeout"} if len(call.args) == 2 else (
+        {"block"} if len(call.args) == 1 else set()
+    )
+    return not positional_names.intersection(keyword_names)
+
+
+def _sync_callback_accessor_arguments_are_valid(call, kind, method):
+    """Return True when a proven callback-container accessor can execute."""
+    if kind == "queue" and method == "get":
+        return _queue_get_arguments_are_valid(call)
+    if kind == "queue" and method == "get_nowait":
+        return not call.args and not call.keywords
+    if kind == "list" and method == "pop":
+        return len(call.args) <= 1 and not call.keywords
+    if kind == "deque" and method in {"pop", "popleft"}:
+        return not call.args and not call.keywords
+    return False
+
+
+def _builtin_call_is_active(call, name, operator_bindings):
+    """Return True when one call resolves to the requested unshadowed builtin."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == name
+    ):
+        return False
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    return _name_is_unshadowed_builtin(
+        name,
+        getattr(call, "lineno", 0),
+        shadow_lines,
+    )
+
+
+def _next_iter_callback_source_mutates(inner, tracking, operator_bindings):
+    """Return True for next(iter(callback_source)) when its result is invoked."""
+    if not _builtin_call_is_active(inner, "next", operator_bindings):
+        return False
+    if len(inner.args) != 1 or inner.keywords:
+        return False
+    iterator = inner.args[0]
+    if not _builtin_call_is_active(iterator, "iter", operator_bindings):
+        return False
+    if len(iterator.args) != 1 or iterator.keywords:
+        return False
+
+    source = iterator.args[0]
+    if isinstance(source, ast.Name):
+        return source.id in tracking["mutating"]
+    return _iterable_literal_contains_mutating_lambda(
+        source,
+        operator_bindings,
+    )
+
+
+def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
+    """Return True only for proven synchronous execution of a mutating callback."""
     expr = _statement_value_expression(node)
     if not isinstance(expr, ast.Call) or expr.args or expr.keywords:
         return False
     inner = expr.func
-    if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
+    if not isinstance(inner, ast.Call):
         return False
+
+    if _next_iter_callback_source_mutates(
+        inner,
+        tracking,
+        operator_bindings,
+    ):
+        return True
+
     if not isinstance(inner.func, ast.Attribute):
         return False
     receiver = inner.func.value
@@ -8247,18 +8387,26 @@ def _sync_callback_dispatch_mutates(node, tracking):
         return False
 
     kind = tracking["containers"].get(receiver.id)
+    method = inner.func.attr
     dispatch_methods = {
         "queue": {"get", "get_nowait"},
         "deque": {"pop", "popleft"},
         "list": {"pop"},
     }
-    return inner.func.attr in dispatch_methods.get(kind, set())
+    return (
+        method in dispatch_methods.get(kind, set())
+        and _sync_callback_accessor_arguments_are_valid(inner, kind, method)
+    )
 
 
 def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
     """Update container tracking and report proven synchronous callback execution."""
     tracking = _sync_callback_tracking(scan_state)
-    dispatch_mutates = _sync_callback_dispatch_mutates(node, tracking)
+    dispatch_mutates = _sync_callback_dispatch_mutates(
+        node,
+        tracking,
+        operator_bindings,
+    )
     _record_sync_callback_imports(node, tracking)
     _record_sync_callback_insert(node, tracking, operator_bindings)
     _record_sync_callback_assignment(node, tracking, operator_bindings)
@@ -8816,6 +8964,13 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    callback_alias_events = _collect_mutating_callback_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings[32][_MUTATING_CALLBACK_ALIAS_EVENTS_KEY] = (
+        callback_alias_events
+    )
     lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
         tree,
         operator_bindings,
