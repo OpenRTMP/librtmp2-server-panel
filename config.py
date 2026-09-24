@@ -3352,47 +3352,88 @@ def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
     )
 
 
+def _callback_assignment_is_mutating(value, active, operator_bindings):
+    """Return True when an assignment value resolves to a risky callback."""
+    if isinstance(value, ast.Lambda):
+        return _lambda_mutates_workers(value, operator_bindings)
+    return isinstance(value, ast.Name) and value.id in active
+
+
+def _record_mutating_callback_assignment(
+    name,
+    value,
+    line,
+    active,
+    events,
+    operator_bindings,
+    *,
+    conditional,
+):
+    """Record one callback alias assignment or definite rebinding."""
+    if _callback_assignment_is_mutating(value, active, operator_bindings):
+        active.add(name)
+        events.setdefault(name, []).append((line, True))
+    elif not conditional:
+        _deactivate_imported_module_alias(
+            name,
+            active,
+            events,
+            line,
+        )
+
+
+def _scan_mutating_callback_alias_events(
+    statements,
+    operator_bindings,
+    active,
+    events,
+    *,
+    conditional=False,
+):
+    """Track risky callback aliases through import-time compound blocks."""
+    definition_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in statements:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, definition_types):
+            if not conditional:
+                _deactivate_imported_module_alias(
+                    node.name,
+                    active,
+                    events,
+                    line,
+                )
+            continue
+
+        for name, value in _namespace_assignment_values(node):
+            _record_mutating_callback_assignment(
+                name,
+                value,
+                line,
+                active,
+                events,
+                operator_bindings,
+                conditional=conditional,
+            )
+
+        for block in _compound_statement_blocks(node):
+            _scan_mutating_callback_alias_events(
+                block,
+                operator_bindings,
+                active,
+                events,
+                conditional=True,
+            )
+
+
 def _collect_mutating_callback_alias_events(tree, operator_bindings):
     """Track top-level names bound to workers-mutating lambdas and their aliases."""
     events = {}
-    active = set()
-
-    def scan(statements, *, conditional=False):
-        for node in statements:
-            line = getattr(node, "lineno", 0)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if not conditional:
-                    _deactivate_imported_module_alias(
-                        node.name,
-                        active,
-                        events,
-                        line,
-                    )
-                continue
-
-            for name, value in _namespace_assignment_values(node):
-                is_mutating = (
-                    isinstance(value, ast.Lambda)
-                    and _lambda_mutates_workers(value, operator_bindings)
-                ) or (
-                    isinstance(value, ast.Name)
-                    and value.id in active
-                )
-                if is_mutating:
-                    active.add(name)
-                    events.setdefault(name, []).append((line, True))
-                elif not conditional:
-                    _deactivate_imported_module_alias(
-                        name,
-                        active,
-                        events,
-                        line,
-                    )
-
-            for block in _compound_statement_blocks(node):
-                scan(block, conditional=True)
-
-    scan(tree.body)
+    _scan_mutating_callback_alias_events(
+        tree.body,
+        operator_bindings,
+        set(),
+        events,
+    )
     return events
 
 
@@ -8324,9 +8365,11 @@ def _queue_get_arguments_are_valid(call):
         keyword_names.append(keyword.arg)
     if len(keyword_names) != len(set(keyword_names)):
         return False
-    positional_names = {"block", "timeout"} if len(call.args) == 2 else (
-        {"block"} if len(call.args) == 1 else set()
-    )
+    positional_names = set()
+    if len(call.args) == 2:
+        positional_names = {"block", "timeout"}
+    elif len(call.args) == 1:
+        positional_names = {"block"}
     return not positional_names.intersection(keyword_names)
 
 
