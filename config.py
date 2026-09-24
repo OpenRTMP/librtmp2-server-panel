@@ -3322,7 +3322,7 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
     """Return True when a literal list/tuple holds a workers-mutating lambda."""
-    if not isinstance(node, (ast.List, ast.Tuple)):
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return False
     return any(
         isinstance(element, ast.Lambda)
