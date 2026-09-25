@@ -884,3 +884,57 @@ def test_codex_pr271_executed_callbacks_are_dynamic(tmp_path, config_content):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-25: direct callback invocation, getattr queue dispatch, asyncio scheduling
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfor callback in [lambda: globals().update({'workers': 4})]:\n    callback()\n",
+        "workers = 1\nlst = [lambda: globals().update({'workers': 4})]\nlst[0]()\n",
+        "workers = 1\ns = {lambda: globals().update({'workers': 4})}\ns.pop()()\n",
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\ngetattr(q, 'get')()()\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.call_soon(lambda: globals().update({'workers': 4}))\nloop.run_until_complete(asyncio.sleep(0))\n",
+    ],
+)
+def test_security_review_sep25_callback_and_asyncio_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #276 follow-up: callback provenance, Queue.get arguments, asyncio aliases
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfor cb in [lambda: globals().update({'workers': 4})]:\n    result = cb()\n",
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\ngetattr(q, 'get')(False)()\n",
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\ngetattr(q, 'get')(block=False)()\n",
+        "workers = 1\ncallbacks = [lambda: globals().update({'workers': 4})]\ncallback = callbacks[0]\ncallback()\n",
+        "workers = 1\ncallback = lambda: globals().update({'workers': 4})\ncallback()\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.call_soon(lambda: globals().update({'workers': 4}))\nalias = loop\nalias.run_until_complete(asyncio.sleep(0))\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.call_soon_threadsafe(lambda: globals().update({'workers': 4}))\nloop.run_until_complete(asyncio.sleep(0))\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.call_soon(lambda: globals().update({'workers': 4}))\nloop.call_soon(loop.stop)\nloop.run_forever()\n",
+    ],
+)
+def test_codex_pr276_callback_and_asyncio_followups_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr276_standalone_callback_pop_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "callbacks = {lambda: globals().update({'workers': 4})}\n"
+        "callbacks.pop()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
