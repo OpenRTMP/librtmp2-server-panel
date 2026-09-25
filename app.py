@@ -418,7 +418,7 @@ class _PanelRuntime:
     def build_urls(self, stream, rtmps_on, rtmps_port):
         domain = _format_url_host(self.app.config["LRTMP2_DOMAIN"])
         port = self.app.config["LRTMP2_RTMP_PORT"]
-        app_name = stream["app"]
+        app_name = stream.get("app") or ""
         publish_url = f"rtmp://{domain}:{port}/{app_name}"  # nosonar python:S5332
         raw_players = stream.get("players")
         if not isinstance(raw_players, list):
@@ -629,6 +629,8 @@ class _PanelRuntime:
             return {}, _append_api_error(api_error, exc)
         cluster_by_stream = {}
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             sid = entry.get("stream_id") or entry.get("id")
             if sid:
                 cluster_by_stream[sid] = entry
