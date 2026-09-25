@@ -884,3 +884,23 @@ def test_codex_pr271_executed_callbacks_are_dynamic(tmp_path, config_content):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-25: direct callback invocation, getattr queue dispatch, asyncio scheduling
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfor callback in [lambda: globals().update({'workers': 4})]:\n    callback()\n",
+        "workers = 1\nlst = [lambda: globals().update({'workers': 4})]\nlst[0]()\n",
+        "workers = 1\ns = {lambda: globals().update({'workers': 4})}\ns.pop()()\n",
+        "workers = 1\nimport queue\nq = queue.Queue()\nq.put(lambda: globals().update({'workers': 4}))\ngetattr(q, 'get')()()\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nloop.call_soon(lambda: globals().update({'workers': 4}))\nloop.run_until_complete(asyncio.sleep(0))\n",
+    ],
+)
+def test_security_review_sep25_callback_and_asyncio_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

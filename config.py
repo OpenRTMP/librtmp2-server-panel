@@ -3356,6 +3356,8 @@ def _callback_assignment_is_mutating(value, active, operator_bindings):
     """Return True when an assignment value resolves to a risky callback."""
     if isinstance(value, ast.Lambda):
         return _lambda_mutates_workers(value, operator_bindings)
+    if _iterable_literal_contains_mutating_lambda(value, operator_bindings):
+        return True
     return isinstance(value, ast.Name) and value.id in active
 
 
@@ -7574,6 +7576,7 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
         or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
+        or _call_is_literal_callback_invocation(expr, operator_bindings)
     )
 
 
@@ -7908,6 +7911,8 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         dict_subclass_names = set()
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
+        return True
+    if _for_loop_invokes_mutating_callback(node, operator_bindings):
         return True
     if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
         return True
@@ -8402,6 +8407,185 @@ def _builtin_call_is_active(call, name, operator_bindings):
     )
 
 
+def _expression_is_zero_arg_call_of_name(expr, name):
+    """Return True for a direct zero-argument call like ``callback()``."""
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == name
+        and not expr.args
+        and not expr.keywords
+    )
+
+
+def _statement_zero_arg_calls_name(node, name):
+    """Return True when a statement evaluates ``name()``."""
+    if isinstance(node, ast.Expr):
+        return _expression_is_zero_arg_call_of_name(node.value, name)
+    return False
+
+
+def _for_loop_invokes_mutating_callback(node, operator_bindings):
+    """Return True when a for-loop eagerly invokes a mutating literal callback."""
+    if not isinstance(node, (ast.For, ast.AsyncFor)):
+        return False
+    if not isinstance(node.target, ast.Name):
+        return False
+    if not _iterable_literal_contains_mutating_lambda(node.iter, operator_bindings):
+        return False
+    loop_name = node.target.id
+    return any(_statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body)
+
+
+def _callback_container_expression_is_mutating(value, operator_bindings):
+    """Return True when an expression holds workers-mutating callbacks."""
+    if _iterable_literal_contains_mutating_lambda(value, operator_bindings):
+        return True
+    return (
+        isinstance(value, ast.Name)
+        and _mutating_callback_alias_is_active(value, operator_bindings)
+    )
+
+
+def _call_is_literal_callback_invocation(call, operator_bindings):
+    """Return True for ``source[index]()`` or ``source.pop()`` callback execution."""
+    if not isinstance(call, ast.Call) or call.args or call.keywords:
+        return False
+    if isinstance(call.func, ast.Subscript):
+        return _callback_container_expression_is_mutating(
+            call.func.value,
+            operator_bindings,
+        )
+    if isinstance(call.func, ast.Attribute) and call.func.attr == "pop":
+        return _callback_container_expression_is_mutating(
+            call.func.value,
+            operator_bindings,
+        )
+    inner = call.func
+    if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
+        return False
+    if isinstance(inner.func, ast.Subscript):
+        return _callback_container_expression_is_mutating(
+            inner.func.value,
+            operator_bindings,
+        )
+    if isinstance(inner.func, ast.Attribute) and inner.func.attr == "pop":
+        return _callback_container_expression_is_mutating(
+            inner.func.value,
+            operator_bindings,
+        )
+    return False
+
+
+def _unshadowed_builtin_call(call, name, operator_bindings):
+    """Return True when ``call`` is a direct builtin invocation."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == name
+    ):
+        return False
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    return _name_is_unshadowed_builtin(
+        name,
+        getattr(call, "lineno", 0),
+        shadow_lines,
+    )
+
+
+def _getattr_call_targets_queue_get(call, operator_bindings):
+    """Return True when ``getattr(receiver, 'get')`` targets Queue.get."""
+    if not _unshadowed_builtin_call(call, "getattr", operator_bindings):
+        return False
+    if len(call.args) != 2:
+        return False
+    key = call.args[1]
+    return isinstance(key, ast.Constant) and key.value == "get"
+
+
+def _getattr_queue_receiver_mutates(getattr_call, tracking, operator_bindings):
+    """Return True when getattr targets Queue.get on a mutating queue container."""
+    if not _getattr_call_targets_queue_get(getattr_call, operator_bindings):
+        return False
+    receiver = getattr_call.args[0]
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    return tracking["containers"].get(receiver.id) == "queue"
+
+
+def _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
+    """Return True for ``getattr(queue, 'get')()`` callback execution forms."""
+    if _getattr_queue_receiver_mutates(inner, tracking, operator_bindings):
+        return True
+    if (
+        isinstance(inner, ast.Call)
+        and not inner.args
+        and not inner.keywords
+        and isinstance(inner.func, ast.Call)
+    ):
+        return _getattr_queue_receiver_mutates(
+            inner.func,
+            tracking,
+            operator_bindings,
+        )
+    return False
+
+
+def _asyncio_loop_schedule_tracking(scan_state):
+    """Return source-ordered asyncio loop scheduling state."""
+    tracking = getattr(scan_state, "_asyncio_loop_schedule_tracking", None)
+    if tracking is None:
+        tracking = {"loops_with_pending": set()}
+        scan_state._asyncio_loop_schedule_tracking = tracking
+    return tracking
+
+
+def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
+    """Return True when an asyncio loop schedules a workers-mutating callback."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    method = call.func.attr
+    if method == "call_soon":
+        callback_index = 0
+    elif method in {"call_later", "call_at"}:
+        callback_index = 1
+    else:
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _asyncio_event_loop_alias_is_active(
+        call.func.value,
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    if len(call.args) <= callback_index:
+        return False
+    return _thread_pool_callback_mutates_workers(
+        call.args[callback_index],
+        operator_bindings,
+    )
+
+
+def _track_asyncio_loop_schedule(node, scan_state, operator_bindings):
+    """Track asyncio loop scheduling and detect run_until_complete execution."""
+    tracking = _asyncio_loop_schedule_tracking(scan_state)
+    mutates = False
+    expr = _statement_value_expression(node)
+    if isinstance(expr, ast.Call):
+        if _call_schedules_mutating_callback_on_loop(expr, operator_bindings):
+            receiver = expr.func.value
+            if isinstance(receiver, ast.Name):
+                tracking["loops_with_pending"].add(receiver.id)
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "run_until_complete"
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id in tracking["loops_with_pending"]
+        ):
+            mutates = True
+    return mutates
+
+
 def _next_iter_callback_source_mutates(inner, tracking, operator_bindings):
     """Return True for next(iter(callback_source)) when its result is invoked."""
     if not _builtin_call_is_active(inner, "next", operator_bindings):
@@ -8437,6 +8621,9 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         tracking,
         operator_bindings,
     ):
+        return True
+
+    if _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
         return True
 
     if not isinstance(inner.func, ast.Attribute):
@@ -8966,6 +9153,8 @@ def _walk_gunicorn_workers_statements(
         ):
             continue
         if _track_sync_callback_dispatch(node, state, operator_bindings):
+            state.dynamic = True
+        if _track_asyncio_loop_schedule(node, state, operator_bindings):
             state.dynamic = True
         if _node_has_dynamic_workers_effect(
             node,
