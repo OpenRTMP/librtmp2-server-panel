@@ -1,14 +1,26 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-09-21
+Last scanned: config.py — 2026-09-25
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-25 config.py pass)
+
+- No critical bugs found. Traced startup validation (`_validate_config`,
+  `_parse_require_login`, `_is_insecure_secret` / weak `PASSWORD`, `ALLOW_INSECURE_NO_LOGIN`,
+  `LRTMP2_API_TOKEN`), `_ratelimit_storage_error()` + `_detect_worker_settings()` /
+  Gunicorn AST worker scanner (fail-closed on dynamic/unscannable configs), and
+  `shared_session_store_supported()` vs multi-worker `memory://`. Reviewed trusted-proxy
+  parsing (`_is_overly_broad_proxy_network`, union `/0` rejection), requirement for
+  `TRUSTED_PROXY_IPS` when `TRUSTED_PROXY_COUNT > 0`, and `client_ip_for_rate_limit()`
+  caller chain in `app.py` (`_PreserveDirectRemoteAddr` + `ProxyFix` + limiter key).
+  Verified `SESSION_COOKIE_SECURE` detection and stats rate-limit env bounds.
 
 ## Findings (2026-09-21 lrtmp2_client.py pass)
 
