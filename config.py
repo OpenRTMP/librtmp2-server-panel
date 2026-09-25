@@ -3321,20 +3321,39 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 _MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
+_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
 
-def _mutating_callback_alias_is_active(node, operator_bindings):
-    """Return True when a name resolves to a tracked workers-mutating callback."""
+def _mutating_callback_binding_is_active(node, operator_bindings, key):
+    """Return True when a name resolves to one tracked callback binding kind."""
     if not isinstance(node, ast.Name):
         return False
     shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    events = shadow_lines.get(_MUTATING_CALLBACK_ALIAS_EVENTS_KEY, {})
+    events = shadow_lines.get(key, {})
     return bool(
         _binding_state_at_line(
             events,
             node.id,
             getattr(node, "lineno", 0),
         )
+    )
+
+
+def _mutating_callback_alias_is_active(node, operator_bindings):
+    """Return True when a name resolves to a tracked workers-mutating callback."""
+    return _mutating_callback_binding_is_active(
+        node,
+        operator_bindings,
+        _MUTATING_CALLBACK_ALIAS_EVENTS_KEY,
+    )
+
+
+def _mutating_callback_container_is_active(node, operator_bindings):
+    """Return True when a name resolves to a tracked callback container."""
+    return _mutating_callback_binding_is_active(
+        node,
+        operator_bindings,
+        _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY,
     )
 
 
@@ -3352,57 +3371,172 @@ def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
     )
 
 
-def _callback_assignment_is_mutating(value, active, operator_bindings):
-    """Return True when an assignment value resolves to a risky callback."""
-    if isinstance(value, ast.Lambda):
-        return _lambda_mutates_workers(value, operator_bindings)
-    if _iterable_literal_contains_mutating_lambda(value, operator_bindings):
-        return True
-    return isinstance(value, ast.Name) and value.id in active
+def _iterable_literal_contains_active_mutating_callback(
+    node,
+    active_callbacks,
+    operator_bindings,
+):
+    """Return True when a literal contains a currently tracked risky callback."""
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return False
+    return any(
+        (
+            isinstance(element, ast.Lambda)
+            and _lambda_mutates_workers(element, operator_bindings)
+        )
+        or (
+            isinstance(element, ast.Name)
+            and element.id in active_callbacks
+        )
+        for element in node.elts
+    )
+
+
+def _callback_assignment_kind(
+    value,
+    active_callbacks,
+    active_containers,
+    operator_bindings,
+):
+    """Classify an assignment as a risky callback or callback container."""
+    if isinstance(value, ast.Lambda) and _lambda_mutates_workers(
+        value,
+        operator_bindings,
+    ):
+        return "callback"
+    if isinstance(value, ast.Name):
+        if value.id in active_callbacks:
+            return "callback"
+        if value.id in active_containers:
+            return "container"
+    if _iterable_literal_contains_active_mutating_callback(
+        value,
+        active_callbacks,
+        operator_bindings,
+    ):
+        return "container"
+    if isinstance(value, ast.Subscript):
+        source = value.value
+        if (
+            isinstance(source, ast.Name)
+            and source.id in active_containers
+        ) or _iterable_literal_contains_active_mutating_callback(
+            source,
+            active_callbacks,
+            operator_bindings,
+        ):
+            return "callback"
+    return None
+
+
+def _record_callback_binding_state(name, line, active, events, enabled):
+    """Record one source-ordered callback binding state."""
+    if enabled:
+        active.add(name)
+    else:
+        active.discard(name)
+    events.setdefault(name, []).append((line, enabled))
 
 
 def _record_mutating_callback_assignment(
     name,
     value,
     line,
-    active,
-    events,
+    active_callbacks,
+    active_containers,
+    callback_events,
+    container_events,
     operator_bindings,
     *,
     conditional,
 ):
-    """Record one callback alias assignment or definite rebinding."""
-    if _callback_assignment_is_mutating(value, active, operator_bindings):
-        active.add(name)
-        events.setdefault(name, []).append((line, True))
-    elif not conditional:
-        _deactivate_imported_module_alias(
+    """Record callback/container provenance for one assignment."""
+    kind = _callback_assignment_kind(
+        value,
+        active_callbacks,
+        active_containers,
+        operator_bindings,
+    )
+    if kind == "callback":
+        _record_callback_binding_state(
             name,
-            active,
-            events,
             line,
+            active_callbacks,
+            callback_events,
+            True,
+        )
+        if not conditional:
+            _record_callback_binding_state(
+                name,
+                line,
+                active_containers,
+                container_events,
+                False,
+            )
+        return
+    if kind == "container":
+        _record_callback_binding_state(
+            name,
+            line,
+            active_containers,
+            container_events,
+            True,
+        )
+        if not conditional:
+            _record_callback_binding_state(
+                name,
+                line,
+                active_callbacks,
+                callback_events,
+                False,
+            )
+        return
+    if not conditional:
+        _record_callback_binding_state(
+            name,
+            line,
+            active_callbacks,
+            callback_events,
+            False,
+        )
+        _record_callback_binding_state(
+            name,
+            line,
+            active_containers,
+            container_events,
+            False,
         )
 
 
 def _scan_mutating_callback_alias_events(
     statements,
     operator_bindings,
-    active,
-    events,
+    active_callbacks,
+    active_containers,
+    callback_events,
+    container_events,
     *,
     conditional=False,
 ):
-    """Track risky callback aliases through import-time compound blocks."""
+    """Track risky callback and callback-container aliases."""
     definition_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     for node in statements:
         line = getattr(node, "lineno", 0)
         if isinstance(node, definition_types):
             if not conditional:
-                _deactivate_imported_module_alias(
+                _record_callback_binding_state(
                     node.name,
-                    active,
-                    events,
                     line,
+                    active_callbacks,
+                    callback_events,
+                    False,
+                )
+                _record_callback_binding_state(
+                    node.name,
+                    line,
+                    active_containers,
+                    container_events,
+                    False,
                 )
             continue
 
@@ -3411,8 +3545,10 @@ def _scan_mutating_callback_alias_events(
                 name,
                 value,
                 line,
-                active,
-                events,
+                active_callbacks,
+                active_containers,
+                callback_events,
+                container_events,
                 operator_bindings,
                 conditional=conditional,
             )
@@ -3421,23 +3557,27 @@ def _scan_mutating_callback_alias_events(
             _scan_mutating_callback_alias_events(
                 block,
                 operator_bindings,
-                active,
-                events,
+                active_callbacks,
+                active_containers,
+                callback_events,
+                container_events,
                 conditional=True,
             )
 
 
 def _collect_mutating_callback_alias_events(tree, operator_bindings):
-    """Track top-level names bound to workers-mutating lambdas and their aliases."""
-    events = {}
+    """Track risky callbacks separately from containers that hold them."""
+    callback_events = {}
+    container_events = {}
     _scan_mutating_callback_alias_events(
         tree.body,
         operator_bindings,
         set(),
-        events,
+        set(),
+        callback_events,
+        container_events,
     )
-    return events
-
+    return callback_events, container_events
 
 def _lambda_invokes_first_positional_param(lambda_node):
     """Return True when a lambda body calls its first positional parameter."""
@@ -8408,20 +8548,39 @@ def _builtin_call_is_active(call, name, operator_bindings):
 
 
 def _expression_is_zero_arg_call_of_name(expr, name):
-    """Return True for a direct zero-argument call like ``callback()``."""
-    return (
+    """Return True when an evaluated expression invokes ``name()``."""
+    if isinstance(expr, ast.Lambda):
+        return False
+    if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Name)
         and expr.func.id == name
         and not expr.args
         and not expr.keywords
+    ):
+        return True
+    return any(
+        _expression_is_zero_arg_call_of_name(child, name)
+        for child in ast.iter_child_nodes(expr)
+        if isinstance(child, ast.expr)
     )
 
 
 def _statement_zero_arg_calls_name(node, name):
-    """Return True when a statement evaluates ``name()``."""
-    if isinstance(node, ast.Expr):
-        return _expression_is_zero_arg_call_of_name(node.value, name)
+    """Return True when an evaluated part of a statement invokes ``name()``."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr) and _expression_is_zero_arg_call_of_name(
+            child,
+            name,
+        ):
+            return True
+        if isinstance(child, ast.stmt) and _statement_zero_arg_calls_name(
+            child,
+            name,
+        ):
+            return True
     return False
 
 
@@ -8441,26 +8600,21 @@ def _callback_container_expression_is_mutating(value, operator_bindings):
     """Return True when an expression holds workers-mutating callbacks."""
     if _iterable_literal_contains_mutating_lambda(value, operator_bindings):
         return True
-    return (
-        isinstance(value, ast.Name)
-        and _mutating_callback_alias_is_active(value, operator_bindings)
-    )
+    return _mutating_callback_container_is_active(value, operator_bindings)
 
 
 def _call_is_literal_callback_invocation(call, operator_bindings):
-    """Return True for ``source[index]()`` or ``source.pop()`` callback execution."""
+    """Return True for proven direct callback/container callback execution."""
     if not isinstance(call, ast.Call) or call.args or call.keywords:
         return False
+    if _mutating_callback_alias_is_active(call.func, operator_bindings):
+        return True
     if isinstance(call.func, ast.Subscript):
         return _callback_container_expression_is_mutating(
             call.func.value,
             operator_bindings,
         )
-    if isinstance(call.func, ast.Attribute) and call.func.attr == "pop":
-        return _callback_container_expression_is_mutating(
-            call.func.value,
-            operator_bindings,
-        )
+
     inner = call.func
     if not isinstance(inner, ast.Call) or inner.args or inner.keywords:
         return False
@@ -8475,7 +8629,6 @@ def _call_is_literal_callback_invocation(call, operator_bindings):
             operator_bindings,
         )
     return False
-
 
 def _unshadowed_builtin_call(call, name, operator_bindings):
     """Return True when ``call`` is a direct builtin invocation."""
@@ -8514,13 +8667,12 @@ def _getattr_queue_receiver_mutates(getattr_call, tracking, operator_bindings):
 
 
 def _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
-    """Return True for ``getattr(queue, 'get')()`` callback execution forms."""
+    """Return True for getattr-based Queue.get callback execution forms."""
     if _getattr_queue_receiver_mutates(inner, tracking, operator_bindings):
         return True
     if (
         isinstance(inner, ast.Call)
-        and not inner.args
-        and not inner.keywords
+        and _queue_get_arguments_are_valid(inner)
         and isinstance(inner.func, ast.Call)
     ):
         return _getattr_queue_receiver_mutates(
@@ -8530,14 +8682,78 @@ def _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
         )
     return False
 
-
 def _asyncio_loop_schedule_tracking(scan_state):
     """Return source-ordered asyncio loop scheduling state."""
     tracking = getattr(scan_state, "_asyncio_loop_schedule_tracking", None)
     if tracking is None:
-        tracking = {"loops_with_pending": set()}
+        tracking = {
+            "loop_ids": {},
+            "pending_loop_ids": set(),
+            "next_loop_id": 1,
+        }
         scan_state._asyncio_loop_schedule_tracking = tracking
     return tracking
+
+
+def _new_asyncio_loop_id(tracking):
+    """Allocate one scanner-local identity for a proven event-loop object."""
+    loop_id = tracking["next_loop_id"]
+    tracking["next_loop_id"] += 1
+    return loop_id
+
+
+def _asyncio_loop_ids_for_value(value, tracking, operator_bindings):
+    """Resolve tracked event-loop identities for one assignment value."""
+    if isinstance(value, ast.Name):
+        return set(tracking["loop_ids"].get(value.id, ()))
+    reference_line = value if isinstance(value, ast.AST) else 0
+    if _asyncio_loop_factory_call_is_active(
+        value,
+        operator_bindings,
+        reference_line,
+    ):
+        return {_new_asyncio_loop_id(tracking)}
+    return set()
+
+
+def _record_asyncio_loop_alias_assignment(
+    node,
+    tracking,
+    operator_bindings,
+    *,
+    conditional,
+):
+    """Track event-loop identity through simple source-ordered aliases."""
+    for name, value in _namespace_assignment_values(node):
+        loop_ids = _asyncio_loop_ids_for_value(
+            value,
+            tracking,
+            operator_bindings,
+        )
+        if conditional:
+            if loop_ids:
+                tracking["loop_ids"].setdefault(name, set()).update(loop_ids)
+        elif loop_ids:
+            tracking["loop_ids"][name] = loop_ids
+        else:
+            tracking["loop_ids"].pop(name, None)
+
+
+def _asyncio_receiver_loop_ids(receiver, tracking, operator_bindings):
+    """Return tracked identities for a proven event-loop receiver."""
+    if not isinstance(receiver, ast.Name):
+        return set()
+    loop_ids = set(tracking["loop_ids"].get(receiver.id, ()))
+    if loop_ids:
+        return loop_ids
+    if _asyncio_event_loop_alias_is_active(
+        receiver,
+        operator_bindings,
+        receiver,
+    ):
+        loop_ids = {_new_asyncio_loop_id(tracking)}
+        tracking["loop_ids"][receiver.id] = set(loop_ids)
+    return loop_ids
 
 
 def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
@@ -8545,7 +8761,7 @@ def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
     method = call.func.attr
-    if method == "call_soon":
+    if method in {"call_soon", "call_soon_threadsafe"}:
         callback_index = 0
     elif method in {"call_later", "call_at"}:
         callback_index = 1
@@ -8566,25 +8782,45 @@ def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
     )
 
 
-def _track_asyncio_loop_schedule(node, scan_state, operator_bindings):
-    """Track asyncio loop scheduling and detect run_until_complete execution."""
+def _track_asyncio_loop_schedule(
+    node,
+    scan_state,
+    operator_bindings,
+    *,
+    conditional=False,
+):
+    """Track scheduled mutators and executions across event-loop aliases."""
     tracking = _asyncio_loop_schedule_tracking(scan_state)
-    mutates = False
-    expr = _statement_value_expression(node)
-    if isinstance(expr, ast.Call):
-        if _call_schedules_mutating_callback_on_loop(expr, operator_bindings):
-            receiver = expr.func.value
-            if isinstance(receiver, ast.Name):
-                tracking["loops_with_pending"].add(receiver.id)
-        if (
-            isinstance(expr.func, ast.Attribute)
-            and expr.func.attr == "run_until_complete"
-            and isinstance(expr.func.value, ast.Name)
-            and expr.func.value.id in tracking["loops_with_pending"]
-        ):
-            mutates = True
-    return mutates
+    _record_asyncio_loop_alias_assignment(
+        node,
+        tracking,
+        operator_bindings,
+        conditional=conditional,
+    )
 
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call):
+        return False
+
+    if _call_schedules_mutating_callback_on_loop(expr, operator_bindings):
+        tracking["pending_loop_ids"].update(
+            _asyncio_receiver_loop_ids(
+                expr.func.value,
+                tracking,
+                operator_bindings,
+            )
+        )
+
+    if not isinstance(expr.func, ast.Attribute):
+        return False
+    if expr.func.attr not in {"run_until_complete", "run_forever"}:
+        return False
+    receiver_ids = _asyncio_receiver_loop_ids(
+        expr.func.value,
+        tracking,
+        operator_bindings,
+    )
+    return bool(receiver_ids.intersection(tracking["pending_loop_ids"]))
 
 def _next_iter_callback_source_mutates(inner, tracking, operator_bindings):
     """Return True for next(iter(callback_source)) when its result is invoked."""
@@ -9154,7 +9390,12 @@ def _walk_gunicorn_workers_statements(
             continue
         if _track_sync_callback_dispatch(node, state, operator_bindings):
             state.dynamic = True
-        if _track_asyncio_loop_schedule(node, state, operator_bindings):
+        if _track_asyncio_loop_schedule(
+            node,
+            state,
+            operator_bindings,
+            conditional=in_compound,
+        ):
             state.dynamic = True
         if _node_has_dynamic_workers_effect(
             node,
@@ -9212,12 +9453,18 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
-    callback_alias_events = _collect_mutating_callback_alias_events(
+    (
+        callback_alias_events,
+        callback_container_events,
+    ) = _collect_mutating_callback_alias_events(
         tree,
         operator_bindings,
     )
     operator_bindings[32][_MUTATING_CALLBACK_ALIAS_EVENTS_KEY] = (
         callback_alias_events
+    )
+    operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
+        callback_container_events
     )
     lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
         tree,
