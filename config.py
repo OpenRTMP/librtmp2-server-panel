@@ -3191,6 +3191,8 @@ def _call_is_operator_call_namespace_update(call, operator_bindings):
         and _key_may_be_workers(call.args[2])
     ):
         return True
+    if _thread_pool_callback_mutates_workers(callee, operator_bindings):
+        return True
     return False
 
 
@@ -8590,10 +8592,18 @@ def _for_loop_invokes_mutating_callback(node, operator_bindings):
         return False
     if not isinstance(node.target, ast.Name):
         return False
-    if not _iterable_literal_contains_mutating_lambda(node.iter, operator_bindings):
-        return False
     loop_name = node.target.id
-    return any(_statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body)
+    invokes_loop_target = any(
+        _statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body
+    )
+    if not invokes_loop_target:
+        return False
+    if _iterable_literal_contains_mutating_lambda(node.iter, operator_bindings):
+        return True
+    return isinstance(node.iter, ast.Name) and _mutating_callback_container_is_active(
+        node.iter,
+        operator_bindings,
+    )
 
 
 def _callback_container_expression_is_mutating(value, operator_bindings):

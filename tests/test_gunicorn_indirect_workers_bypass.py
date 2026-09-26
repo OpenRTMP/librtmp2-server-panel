@@ -929,6 +929,25 @@ def test_codex_pr276_callback_and_asyncio_followups_are_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+# Security review 2026-09-26: operator.call(lambda) and for-over-container callbacks
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport operator\noperator.call(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nimport operator\ngetattr(operator, 'call')(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\ncallbacks = [lambda: globals().update({'workers': 4})]\nfor cb in callbacks:\n    cb()\n",
+        "workers = 1\nlst = [lambda: globals().update({'workers': 4})]\nfor x in lst:\n    x()\n",
+    ],
+)
+def test_security_review_sep26_operator_call_and_for_container_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 def test_codex_pr276_standalone_callback_pop_stays_static(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
