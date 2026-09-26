@@ -3134,6 +3134,15 @@ def _is_operator_call_factory(func, operator_bindings):
     module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
     reference_line = getattr(func, 'lineno', 0)
+    call_alias_events = builtin_shadow_lines.get(_OPERATOR_CALL_ALIAS_EVENTS_KEY, {})
+    if isinstance(func, ast.Name):
+        return bool(
+            _binding_state_at_line(
+                call_alias_events,
+                func.id,
+                reference_line,
+            )
+        )
     if isinstance(func, ast.Attribute) and func.attr == 'call':
         return _module_alias_active_at_line(
             func.value,
@@ -3158,6 +3167,41 @@ def _is_operator_call_factory(func, operator_bindings):
         reference_line,
     ) or _is_operator_import(func.args[0])
 
+
+
+def _call_is_operator_call_mutating_callback(call, operator_bindings):
+    """Return True when ``operator.call`` eagerly executes a workers-mutating callback."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    if not _is_operator_call_factory(call.func, operator_bindings):
+        return False
+    callee = call.args[0]
+    if isinstance(callee, ast.Lambda):
+        return _lambda_mutates_workers(callee, operator_bindings)
+    if isinstance(callee, ast.Name):
+        return _mutating_callback_alias_is_active(callee, operator_bindings)
+    return False
+
+
+def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
+    """Return True when a partial(...)() call executes a workers-mutating callback."""
+    if not isinstance(call, ast.Call):
+        return False
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    partial_call, _ = _resolve_partial_invocation(
+        call,
+        partial_aliases,
+        builtin_shadow_lines,
+    )
+    if partial_call is None or len(partial_call.args) != 1:
+        return False
+    callback = partial_call.args[0]
+    if isinstance(callback, ast.Lambda):
+        return _lambda_mutates_workers(callback, operator_bindings)
+    if isinstance(callback, ast.Name):
+        return _mutating_callback_alias_is_active(callback, operator_bindings)
+    return False
 
 
 def _call_is_operator_call_namespace_update(call, operator_bindings):
@@ -3320,6 +3364,7 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 
 
+_OPERATOR_CALL_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
@@ -3392,6 +3437,58 @@ def _iterable_literal_contains_active_mutating_callback(
     )
 
 
+def _value_is_active_mutating_callback(
+    value,
+    active_callbacks,
+    operator_bindings,
+):
+    """Return True when a value resolves to a currently mutating callback."""
+    if isinstance(value, ast.Lambda):
+        return _lambda_mutates_workers(value, operator_bindings)
+    return isinstance(value, ast.Name) and value.id in active_callbacks
+
+
+def _partial_wraps_active_mutating_callback(
+    value,
+    active_callbacks,
+    operator_bindings,
+):
+    """Return True when a partial stores one active mutating callback."""
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    partial_call = _partial_factory_call(value, partial_aliases)
+    if (
+        partial_call is None
+        or len(partial_call.args) != 1
+        or partial_call.keywords
+    ):
+        return False
+    return _value_is_active_mutating_callback(
+        partial_call.args[0],
+        active_callbacks,
+        operator_bindings,
+    )
+
+
+def _subscript_selects_mutating_callback(
+    value,
+    active_callbacks,
+    active_containers,
+    operator_bindings,
+):
+    """Return True when a subscript reads from a mutating callback container."""
+    if not isinstance(value, ast.Subscript):
+        return False
+    source = value.value
+    return (
+        isinstance(source, ast.Name)
+        and source.id in active_containers
+    ) or _iterable_literal_contains_active_mutating_callback(
+        source,
+        active_callbacks,
+        operator_bindings,
+    )
+
+
 def _callback_assignment_kind(
     value,
     active_callbacks,
@@ -3399,33 +3496,33 @@ def _callback_assignment_kind(
     operator_bindings,
 ):
     """Classify an assignment as a risky callback or callback container."""
-    if isinstance(value, ast.Lambda) and _lambda_mutates_workers(
+    if _value_is_active_mutating_callback(
         value,
+        active_callbacks,
         operator_bindings,
     ):
         return "callback"
-    if isinstance(value, ast.Name):
-        if value.id in active_callbacks:
-            return "callback"
-        if value.id in active_containers:
-            return "container"
+    if isinstance(value, ast.Name) and value.id in active_containers:
+        return "container"
+    if _partial_wraps_active_mutating_callback(
+        value,
+        active_callbacks,
+        operator_bindings,
+    ):
+        return "callback"
     if _iterable_literal_contains_active_mutating_callback(
         value,
         active_callbacks,
         operator_bindings,
     ):
         return "container"
-    if isinstance(value, ast.Subscript):
-        source = value.value
-        if (
-            isinstance(source, ast.Name)
-            and source.id in active_containers
-        ) or _iterable_literal_contains_active_mutating_callback(
-            source,
-            active_callbacks,
-            operator_bindings,
-        ):
-            return "callback"
+    if _subscript_selects_mutating_callback(
+        value,
+        active_callbacks,
+        active_containers,
+        operator_bindings,
+    ):
+        return "callback"
     return None
 
 
@@ -4464,7 +4561,7 @@ def _thread_pool_receiver_constructor(receiver, operator_bindings):
     return state if isinstance(state, ast.Call) else None
 
 
-_FUTURE_ANALYSIS_INDEX = 60
+_FUTURE_ANALYSIS_INDEX = 62
 
 
 def _ordered_binding_state_at_position(events, name, reference):
@@ -5365,10 +5462,12 @@ _ASYNCIO_RUNNER_EVENTS_INDEX = 52
 _ASYNCIO_GATHER_EVENTS_INDEX = 53
 _ASYNCIO_SHIELD_EVENTS_INDEX = 54
 _ASYNCIO_WAIT_FOR_EVENTS_INDEX = 55
-_ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX = 56
-_ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX = 57
-_ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX = 58
-_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX = 59
+_ASYNCIO_CREATE_TASK_EVENTS_INDEX = 56
+_ASYNCIO_ENSURE_FUTURE_EVENTS_INDEX = 57
+_ASYNCIO_LOOP_FACTORY_ALIAS_EVENTS_INDEX = 58
+_ASYNCIO_EVENT_LOOP_ALIAS_EVENTS_INDEX = 59
+_ASYNCIO_RUNNER_ALIAS_EVENTS_INDEX = 60
+_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX = 61
 
 
 def _asyncio_reference_line(reference):
@@ -5416,6 +5515,8 @@ def _asyncio_helper_active_at_line(
         "gather": _ASYNCIO_GATHER_EVENTS_INDEX,
         "shield": _ASYNCIO_SHIELD_EVENTS_INDEX,
         "wait_for": _ASYNCIO_WAIT_FOR_EVENTS_INDEX,
+        "create_task": _ASYNCIO_CREATE_TASK_EVENTS_INDEX,
+        "ensure_future": _ASYNCIO_ENSURE_FUTURE_EVENTS_INDEX,
     }.get(helper_name)
     if event_index is None or len(operator_bindings) <= event_index:
         return False
@@ -6366,6 +6467,57 @@ def _record_local_async_bindings(
     return False
 
 
+def _asyncio_task_factory_call_mutates_workers(
+    call,
+    operator_bindings,
+    reference_line,
+    *,
+    local_state=None,
+    seen=None,
+):
+    """Return True when create_task/ensure_future schedules a mutating awaitable."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    helper_names = ("create_task", "ensure_future")
+    if not any(
+        _asyncio_helper_active_at_line(
+            call.func,
+            helper_name,
+            operator_bindings,
+            reference_line,
+        )
+        for helper_name in helper_names
+    ):
+        return False
+    return _asyncio_awaitable_mutates_workers(
+        call.args[0],
+        operator_bindings,
+        reference_line,
+        local_state=local_state,
+        seen=seen,
+    )
+
+
+def _statement_schedules_mutating_asyncio_task(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Return True when a statement schedules a risky asyncio task/future."""
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call):
+        return False
+    return _asyncio_task_factory_call_mutates_workers(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state=local_state,
+        seen=seen,
+    )
+
+
 def _async_statements_mutate_workers_via_asyncio(
     statements,
     operator_bindings,
@@ -6387,6 +6539,14 @@ def _async_statements_mutate_workers_via_asyncio(
         ):
             continue
         if _statement_awaits_mutating_asyncio(
+            node,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        ):
+            return True
+        if _statement_schedules_mutating_asyncio_task(
             node,
             operator_bindings,
             reference_line,
@@ -7717,6 +7877,8 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
         or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
         or _call_is_literal_callback_invocation(expr, operator_bindings)
+        or _call_is_operator_call_mutating_callback(expr, operator_bindings)
+        or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
     )
 
 
@@ -7757,6 +7919,8 @@ def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=Non
     if isinstance(expr, ast.Lambda):
         return False
     if _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
+        return True
+    if _comprehension_invokes_mutating_callback(expr, operator_bindings):
         return True
     if isinstance(expr, ast.Call) and _call_expression_mutates_workers(
         expr,
@@ -8584,13 +8748,69 @@ def _statement_zero_arg_calls_name(node, name):
     return False
 
 
+def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
+    """Return True when a for-loop iterates a proven mutating callback container."""
+    iterator = node.iter
+    if _iterable_literal_contains_mutating_lambda(iterator, operator_bindings):
+        return True
+    if isinstance(iterator, ast.Name):
+        return _mutating_callback_container_is_active(
+            iterator,
+            operator_bindings,
+        )
+    if (
+        isinstance(iterator, ast.Subscript)
+        and isinstance(iterator.slice, ast.Slice)
+        and iterator.slice.lower is None
+        and iterator.slice.upper is None
+        and iterator.slice.step is None
+    ):
+        return _callback_container_expression_is_mutating(
+            iterator.value,
+            operator_bindings,
+        )
+    if (
+        _unshadowed_builtin_call(iterator, "iter", operator_bindings)
+        and len(iterator.args) == 1
+        and not iterator.keywords
+    ):
+        return _callback_container_expression_is_mutating(
+            iterator.args[0],
+            operator_bindings,
+        )
+    return False
+
+
+def _comprehension_invokes_mutating_callback(node, operator_bindings):
+    """Return True when a comprehension eagerly calls a mutating loop callback."""
+    if not isinstance(node, (ast.ListComp, ast.SetComp)):
+        return False
+    if len(node.generators) != 1:
+        return False
+    generator = node.generators[0]
+    if generator.ifs or generator.is_async:
+        return False
+    if not isinstance(generator.target, ast.Name):
+        return False
+    loop_name = generator.target.id
+    if not _for_loop_iter_holds_mutating_callbacks(generator, operator_bindings):
+        return False
+    if not isinstance(node.elt, ast.Call):
+        return False
+    if node.elt.args or node.elt.keywords:
+        return False
+    if not isinstance(node.elt.func, ast.Name) or node.elt.func.id != loop_name:
+        return False
+    return True
+
+
 def _for_loop_invokes_mutating_callback(node, operator_bindings):
     """Return True when a for-loop eagerly invokes a mutating literal callback."""
     if not isinstance(node, (ast.For, ast.AsyncFor)):
         return False
     if not isinstance(node.target, ast.Name):
         return False
-    if not _iterable_literal_contains_mutating_lambda(node.iter, operator_bindings):
+    if not _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
         return False
     loop_name = node.target.id
     return any(_statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body)
@@ -9453,6 +9673,14 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    operator_call_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "operator",
+        {"call"},
+    )
+    operator_bindings[32][_OPERATOR_CALL_ALIAS_EVENTS_KEY] = (
+        operator_call_alias_events
+    )
     (
         callback_alias_events,
         callback_container_events,
@@ -9566,6 +9794,16 @@ def _scan_gunicorn_config_worker_details(tree):
         "asyncio",
         {"wait_for"},
     )
+    asyncio_create_task_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"create_task"},
+    )
+    asyncio_ensure_future_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "asyncio",
+        {"ensure_future"},
+    )
     operator_bindings = (
         *operator_bindings,
         asyncio_module_alias_events,
@@ -9577,6 +9815,8 @@ def _scan_gunicorn_config_worker_details(tree):
         asyncio_gather_alias_events,
         asyncio_shield_alias_events,
         asyncio_wait_for_alias_events,
+        asyncio_create_task_alias_events,
+        asyncio_ensure_future_alias_events,
     )
     asyncio_loop_factory_alias_events = _collect_asyncio_loop_factory_alias_events(
         tree,

@@ -1,14 +1,40 @@
 # Bug scan progress
 
-Last scanned: lrtmp2_client.py — 2026-09-21
+Last scanned: config.py — 2026-09-26
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
-- [ ] `config.py` — startup validation and environment configuration
+- [x] `config.py` — startup validation and environment configuration
 - [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-26 config.py pass)
+
+- **Bug (fixed):** Gunicorn config AST scan treated several import-time callback
+  executions as static `workers = 1` while the config module actually mutated
+  `workers` before Gunicorn finished loading. Patterns missed: `for cb in
+  callbacks: cb()` when `callbacks` held mutating lambdas (only inline literal
+  iterables were detected), list/set comprehensions that call the loop variable,
+  `operator.call(mutating_lambda)`, `partial(mutating_lambda)()`, and
+  `asyncio.create_task(asyncio.to_thread(...))` inside `asyncio.run(main())`
+  without awaiting the task. Scenario: operator keeps
+  `RATELIMIT_STORAGE_URI=memory://` and uses a `gunicorn.conf.py` that
+  statically assigns `workers = 1` then synchronously bumps workers to 4 via
+  one of these patterns; panel startup sees a single worker and accepts
+  `memory://`, but Gunicorn forks four processes — per-worker login rate limits
+  and in-memory session tokens diverge (brute-force bypass and broken logout).
+  Fixed by extending callback-container for-loop detection, comprehension
+  handling, operator/partial callback invocation checks, and asyncio task
+  scheduling analysis.
+- Reviewed but not a bug: `_validate_config()` / trusted-proxy union rejection,
+  `client_ip_for_rate_limit()` trusted-network pinning, session-store URI guards
+  for multi-worker deployments, `REQUIRE_LOGIN`/`PASSWORD`/`SECRET_KEY` fail
+  closed, `SESSION_COOKIE_SECURE` auto-detect; remaining multiprocessing
+  `Pool`/`ProcessPoolExecutor` patterns in config files are out of scope for
+  typical Gunicorn configs and still fail closed when combined with explicit
+  static `workers > 1` assignments.
 
 ## Findings (2026-09-21 lrtmp2_client.py pass)
 
