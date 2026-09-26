@@ -938,3 +938,36 @@ def test_codex_pr276_standalone_callback_pop_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug scan 2026-09-26: callback provenance and asyncio task scheduling gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\n"
+        "callbacks = [lambda: globals().update({'workers': 4})]\n"
+        "for cb in callbacks:\n"
+        "    cb()\n",
+        "workers = 1\n"
+        "[callback() for callback in [lambda: globals().update({'workers': 4})]]\n",
+        "workers = 1\n"
+        "import operator\n"
+        "operator.call(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\n"
+        "from functools import partial\n"
+        "partial(lambda: globals().update({'workers': 4}))()\n",
+        "workers = 1\n"
+        "import asyncio\n"
+        "async def main():\n"
+        "    asyncio.create_task(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n"
+        "    await asyncio.sleep(0)\n"
+        "asyncio.run(main())\n",
+    ],
+)
+def test_bugscan_sep26_callback_and_asyncio_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
