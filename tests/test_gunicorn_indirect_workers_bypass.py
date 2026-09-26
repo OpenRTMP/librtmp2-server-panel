@@ -944,24 +944,75 @@ def test_codex_pr276_standalone_callback_pop_stays_static(tmp_path):
 @pytest.mark.parametrize(
     "config_content",
     [
-        "workers = 1\n"
-        "callbacks = [lambda: globals().update({'workers': 4})]\n"
-        "for cb in callbacks:\n"
-        "    cb()\n",
-        "workers = 1\n"
-        "[callback() for callback in [lambda: globals().update({'workers': 4})]]\n",
-        "workers = 1\n"
-        "import operator\n"
-        "operator.call(lambda: globals().update({'workers': 4}))\n",
-        "workers = 1\n"
-        "from functools import partial\n"
-        "partial(lambda: globals().update({'workers': 4}))()\n",
-        "workers = 1\n"
-        "import asyncio\n"
-        "async def main():\n"
-        "    asyncio.create_task(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n"
-        "    await asyncio.sleep(0)\n"
-        "asyncio.run(main())\n",
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "for cb in callbacks:\n",
+            "    cb()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "[callback() for callback in [lambda: globals().update({'workers': 4})]]\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import operator\n",
+            "operator.call(lambda: globals().update({'workers': 4}))\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from operator import call as invoke\n",
+            "invoke(lambda: globals().update({'workers': 4}))\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from functools import partial\n",
+            "partial(lambda: globals().update({'workers': 4}))()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from functools import partial\n",
+            "cb = partial(lambda: globals().update({'workers': 4}))\n",
+            "cb()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "results = [cb() for cb in callbacks]\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "tuple([cb() for cb in callbacks])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "for cb in iter(callbacks):\n",
+            "    cb()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "for cb in callbacks[:]:\n",
+            "    cb()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import asyncio\n",
+            "async def main():\n",
+            "    asyncio.create_task(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+            "    await asyncio.sleep(0)\n",
+            "asyncio.run(main())\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import asyncio\n",
+            "async def main():\n",
+            "    task = asyncio.create_task(asyncio.to_thread(lambda: globals().update({'workers': 4})))\n",
+            "    await asyncio.sleep(0)\n",
+            "asyncio.run(main())\n",
+        )),
     ],
 )
 def test_bugscan_sep26_callback_and_asyncio_gaps_are_dynamic(
