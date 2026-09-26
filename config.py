@@ -3437,6 +3437,58 @@ def _iterable_literal_contains_active_mutating_callback(
     )
 
 
+def _value_is_active_mutating_callback(
+    value,
+    active_callbacks,
+    operator_bindings,
+):
+    """Return True when a value resolves to a currently mutating callback."""
+    if isinstance(value, ast.Lambda):
+        return _lambda_mutates_workers(value, operator_bindings)
+    return isinstance(value, ast.Name) and value.id in active_callbacks
+
+
+def _partial_wraps_active_mutating_callback(
+    value,
+    active_callbacks,
+    operator_bindings,
+):
+    """Return True when a partial stores one active mutating callback."""
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    partial_call = _partial_factory_call(value, partial_aliases)
+    if (
+        partial_call is None
+        or len(partial_call.args) != 1
+        or partial_call.keywords
+    ):
+        return False
+    return _value_is_active_mutating_callback(
+        partial_call.args[0],
+        active_callbacks,
+        operator_bindings,
+    )
+
+
+def _subscript_selects_mutating_callback(
+    value,
+    active_callbacks,
+    active_containers,
+    operator_bindings,
+):
+    """Return True when a subscript reads from a mutating callback container."""
+    if not isinstance(value, ast.Subscript):
+        return False
+    source = value.value
+    return (
+        isinstance(source, ast.Name)
+        and source.id in active_containers
+    ) or _iterable_literal_contains_active_mutating_callback(
+        source,
+        active_callbacks,
+        operator_bindings,
+    )
+
+
 def _callback_assignment_kind(
     value,
     active_callbacks,
@@ -3444,49 +3496,33 @@ def _callback_assignment_kind(
     operator_bindings,
 ):
     """Classify an assignment as a risky callback or callback container."""
-    if isinstance(value, ast.Lambda) and _lambda_mutates_workers(
+    if _value_is_active_mutating_callback(
         value,
+        active_callbacks,
         operator_bindings,
     ):
         return "callback"
-    if isinstance(value, ast.Name):
-        if value.id in active_callbacks:
-            return "callback"
-        if value.id in active_containers:
-            return "container"
-    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
-    partial_call = _partial_factory_call(value, partial_aliases)
-    if (
-        partial_call is not None
-        and len(partial_call.args) == 1
-        and not partial_call.keywords
+    if isinstance(value, ast.Name) and value.id in active_containers:
+        return "container"
+    if _partial_wraps_active_mutating_callback(
+        value,
+        active_callbacks,
+        operator_bindings,
     ):
-        callback = partial_call.args[0]
-        if (
-            isinstance(callback, ast.Lambda)
-            and _lambda_mutates_workers(callback, operator_bindings)
-        ) or (
-            isinstance(callback, ast.Name)
-            and callback.id in active_callbacks
-        ):
-            return "callback"
+        return "callback"
     if _iterable_literal_contains_active_mutating_callback(
         value,
         active_callbacks,
         operator_bindings,
     ):
         return "container"
-    if isinstance(value, ast.Subscript):
-        source = value.value
-        if (
-            isinstance(source, ast.Name)
-            and source.id in active_containers
-        ) or _iterable_literal_contains_active_mutating_callback(
-            source,
-            active_callbacks,
-            operator_bindings,
-        ):
-            return "callback"
+    if _subscript_selects_mutating_callback(
+        value,
+        active_callbacks,
+        active_containers,
+        operator_bindings,
+    ):
+        return "callback"
     return None
 
 
