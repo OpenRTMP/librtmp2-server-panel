@@ -3128,7 +3128,7 @@ def _is_operator_setitem_callable(func, setitem_aliases, module_aliases=None):
     )
 
 
-def _is_operator_call_factory(func, operator_bindings):
+def _is_operator_call_factory(func, operator_bindings, bound_names=None):
     """Return True for a source-valid ``operator.call`` factory."""
     module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
     module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
@@ -3136,6 +3136,8 @@ def _is_operator_call_factory(func, operator_bindings):
     reference_line = getattr(func, 'lineno', 0)
     call_alias_events = builtin_shadow_lines.get(_OPERATOR_CALL_ALIAS_EVENTS_KEY, {})
     if isinstance(func, ast.Name):
+        if bound_names and func.id in bound_names:
+            return False
         return bool(
             _binding_state_at_line(
                 call_alias_events,
@@ -3169,11 +3171,11 @@ def _is_operator_call_factory(func, operator_bindings):
 
 
 
-def _call_is_operator_call_mutating_callback(call, operator_bindings):
+def _call_is_operator_call_mutating_callback(call, operator_bindings, bound_names=None):
     """Return True when ``operator.call`` eagerly executes a workers-mutating callback."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
-    if not _is_operator_call_factory(call.func, operator_bindings):
+    if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
         return False
     callee = call.args[0]
     if isinstance(callee, ast.Lambda):
@@ -3214,14 +3216,14 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
     return False
 
 
-def _call_is_operator_call_namespace_update(call, operator_bindings):
+def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names=None):
     """Return True for ``operator.call(globals().update, ...)`` mutations."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     setitem_aliases = operator_bindings[1] if len(operator_bindings) > 1 else set()
     module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
-    if not _is_operator_call_factory(call.func, operator_bindings):
+    if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
         return False
     callee = call.args[0]
     if (
@@ -7859,7 +7861,12 @@ def _call_is_functiontype_namespace_alias(expr, aliases):
     return isinstance(expr.func, ast.Name) and expr.func.id in aliases
 
 
-def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_names=None):
+def _call_has_secondary_worker_mutation(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Check extended FunctionType/ChainMap/partial mutation forms."""
     if dict_subclass_names is None:
         dict_subclass_names = set()
@@ -7876,20 +7883,25 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
         or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
-        or _call_is_operator_call_namespace_update(expr, operator_bindings)
+        or _call_is_operator_call_namespace_update(expr, operator_bindings, bound_names)
         or _call_has_mutating_lambda_argument(expr, operator_bindings)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
         or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
         or _call_is_literal_callback_invocation(expr, operator_bindings)
-        or _call_is_operator_call_mutating_callback(expr, operator_bindings)
+        or _call_is_operator_call_mutating_callback(expr, operator_bindings, bound_names)
         or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
     )
 
 
 
-def _call_expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
+def _call_expression_mutates_workers(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True when one call expression can mutate module workers."""
     return _call_has_primary_worker_mutation(
         expr,
@@ -7898,6 +7910,7 @@ def _call_expression_mutates_workers(expr, operator_bindings, dict_subclass_name
         expr,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     )
 
 
@@ -7920,7 +7933,12 @@ def _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
     return False
 
 
-def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
+def _expression_mutates_workers(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
         return False
@@ -7932,10 +7950,16 @@ def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=Non
         expr,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     ):
         return True
     return any(
-        _expression_mutates_workers(child, operator_bindings, dict_subclass_names)
+        _expression_mutates_workers(
+            child,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
         for child in ast.iter_child_nodes(expr)
     )
 
@@ -8200,6 +8224,7 @@ def _match_guard_mutates_workers(
     node,
     operator_bindings,
     dict_subclass_names,
+    bound_names=None,
 ):
     """Return True when a ``match`` guard mutates ``workers``."""
     if not isinstance(node, ast.Match):
@@ -8210,12 +8235,18 @@ def _match_guard_mutates_workers(
             case.guard,
             operator_bindings,
             dict_subclass_names,
+            bound_names,
         )
         for case in node.cases
     )
 
 
-def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
+def _is_dynamic_workers_mutation(
+    node,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if dict_subclass_names is None:
         dict_subclass_names = set()
@@ -8232,6 +8263,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
             child,
             operator_bindings,
             dict_subclass_names,
+            bound_names,
         )
         for child in ast.iter_child_nodes(node)
     ):
@@ -8247,6 +8279,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         node,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     )
 
 
@@ -8334,6 +8367,7 @@ def _statement_mutates_workers(
     mutator_names,
     class_targets=None,
     dict_subclass_names=None,
+    bound_names=None,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
@@ -8342,7 +8376,12 @@ def _statement_mutates_workers(
         return False
     if _statement_has_class_workers_side_effect(node, class_targets):
         return True
-    if _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names):
+    if _is_dynamic_workers_mutation(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
         return True
     assigns_workers, _ = _worker_assignment_value(node)
     if global_workers and assigns_workers:
@@ -8355,6 +8394,7 @@ def _statement_mutates_workers(
             mutator_names=mutator_names,
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
+            bound_names=bound_names,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -8369,6 +8409,7 @@ def _statements_mutate_workers(
     mutator_names=None,
     class_targets=None,
     dict_subclass_names=None,
+    bound_names=None,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -8381,10 +8422,51 @@ def _statements_mutate_workers(
             mutator_names=mutator_names,
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
+            bound_names=bound_names,
         )
         for node in statements
     )
 
+
+
+def _function_local_bound_names(func_node):
+    """Return names bound by one function's own scope, excluding nested scopes."""
+    args = func_node.args
+    names = {
+        arg.arg
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+    }
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    module_names = set()
+    stack = list(func_node.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Global):
+            module_names.update(node.names)
+            continue
+        if isinstance(node, ast.Nonlocal):
+            names.update(node.names)
+            continue
+        for name, _value in _namespace_assignment_values(node):
+            names.add(name)
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            names.update(_loop_target_names(node.target))
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    names.update(_loop_target_names(item.optional_vars))
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        stack.extend(ast.iter_child_nodes(node))
+    return names - module_names
 
 
 def _function_mutates_workers(
@@ -8409,6 +8491,7 @@ def _function_mutates_workers(
         mutator_names=mutator_names,
         class_targets=class_targets,
         dict_subclass_names=dict_subclass_names,
+        bound_names=_function_local_bound_names(func_node),
     )
 
 
