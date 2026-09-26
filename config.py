@@ -7114,6 +7114,8 @@ _EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
     }
 )
 
+_EAGER_GENERATOR_CONSUMER_BUILTINS = _EAGER_LAZY_ITERATOR_CONSUMERS | {"sum"}
+
 
 def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
     """Return True for non-builtin eager consumers handled specially."""
@@ -7903,14 +7905,18 @@ def _call_expression_mutates_workers(
     bound_names=None,
 ):
     """Return True when one call expression can mutate module workers."""
-    return _call_has_primary_worker_mutation(
-        expr,
-        operator_bindings,
-    ) or _call_has_secondary_worker_mutation(
-        expr,
-        operator_bindings,
-        dict_subclass_names,
-        bound_names,
+    return (
+        _call_consumes_mutating_generator(expr, operator_bindings)
+        or _call_has_primary_worker_mutation(
+            expr,
+            operator_bindings,
+        )
+        or _call_has_secondary_worker_mutation(
+            expr,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
     )
 
 
@@ -8910,11 +8916,17 @@ def _expression_is_direct_zero_arg_call_of_names(expr, names):
     )
 
 
-def _comprehension_invokes_mutating_callback(node, operator_bindings):
+def _comprehension_invokes_mutating_callback(
+    node,
+    operator_bindings,
+    eager_consumer=False,
+):
     """Return True when a comprehension eagerly calls a mutating loop callback."""
     if isinstance(node, ast.DictComp):
         elements = (node.key, node.value)
-    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+    elif isinstance(node, (ast.ListComp, ast.SetComp)) or (
+        eager_consumer and isinstance(node, ast.GeneratorExp)
+    ):
         elements = (node.elt,)
     else:
         return False
@@ -8931,6 +8943,25 @@ def _comprehension_invokes_mutating_callback(node, operator_bindings):
     return any(
         _expression_is_direct_zero_arg_call_of_names(element, loop_names)
         for element in elements
+    )
+
+
+def _call_consumes_mutating_generator(call, operator_bindings):
+    """Return True when an eager builtin consumes a mutating generator expression."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    if not any(
+        _unshadowed_builtin_call(call, name, operator_bindings)
+        for name in _EAGER_GENERATOR_CONSUMER_BUILTINS
+    ):
+        return False
+    return any(
+        _comprehension_invokes_mutating_callback(
+            arg,
+            operator_bindings,
+            eager_consumer=True,
+        )
+        for arg in call.args
     )
 
 
