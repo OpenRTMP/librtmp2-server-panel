@@ -8784,17 +8784,46 @@ def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
             iterator.args[0],
             operator_bindings,
         )
+    if _unshadowed_builtin_call(iterator, "zip", operator_bindings) and iterator.args:
+        return any(
+            _callback_container_expression_is_mutating(arg, operator_bindings)
+            for arg in iterator.args
+        )
+    if (
+        isinstance(iterator, ast.Call)
+        and iterator.args
+        and any(
+            _unshadowed_builtin_call(iterator, name, operator_bindings)
+            for name in ("reversed", "enumerate", "sorted")
+        )
+    ):
+        return _callback_container_expression_is_mutating(
+            iterator.args[0],
+            operator_bindings,
+        )
     return False
 
 
-def _expression_is_direct_zero_arg_call_of_name(expr, name):
-    """Return True when ``expr`` directly invokes ``name`` with no arguments."""
+def _loop_target_names(target):
+    """Return names bound by a for-loop or comprehension target."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = set()
+        for element in target.elts:
+            names.update(_loop_target_names(element))
+        return names
+    return set()
+
+
+def _expression_is_direct_zero_arg_call_of_names(expr, names):
+    """Return True when ``expr`` directly invokes one of ``names`` with no arguments."""
     return (
         isinstance(expr, ast.Call)
         and not expr.args
         and not expr.keywords
         and isinstance(expr.func, ast.Name)
-        and expr.func.id == name
+        and expr.func.id in names
     )
 
 
@@ -8811,13 +8840,13 @@ def _comprehension_invokes_mutating_callback(node, operator_bindings):
     generator = node.generators[0]
     if generator.ifs or generator.is_async:
         return False
-    if not isinstance(generator.target, ast.Name):
+    loop_names = _loop_target_names(generator.target)
+    if not loop_names:
         return False
-    loop_name = generator.target.id
     if not _for_loop_iter_holds_mutating_callbacks(generator, operator_bindings):
         return False
     return any(
-        _expression_is_direct_zero_arg_call_of_name(element, loop_name)
+        _expression_is_direct_zero_arg_call_of_names(element, loop_names)
         for element in elements
     )
 
@@ -8826,12 +8855,16 @@ def _for_loop_invokes_mutating_callback(node, operator_bindings):
     """Return True when a for-loop eagerly invokes a mutating literal callback."""
     if not isinstance(node, (ast.For, ast.AsyncFor)):
         return False
-    if not isinstance(node.target, ast.Name):
+    loop_names = _loop_target_names(node.target)
+    if not loop_names:
         return False
     if not _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
         return False
-    loop_name = node.target.id
-    return any(_statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body)
+    return any(
+        _statement_zero_arg_calls_name(stmt, name)
+        for stmt in node.body
+        for name in loop_names
+    )
 
 
 def _callback_container_expression_is_mutating(value, operator_bindings):
