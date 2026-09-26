@@ -9372,12 +9372,43 @@ def _record_imported_name_aliases(
         events.setdefault(name, []).append((line, True))
 
 
+def _record_imported_name_alias_propagation(
+    node,
+    module_aliases,
+    imported_names,
+    active,
+    events,
+    line,
+):
+    """Propagate active imported-name aliases through simple assignments."""
+    for name, value in _namespace_assignment_values(node):
+        alias_active = (
+            isinstance(value, ast.Name)
+            and value.id in active
+        ) or (
+            isinstance(value, ast.Attribute)
+            and value.attr in imported_names
+            and isinstance(value.value, ast.Name)
+            and value.value.id in module_aliases
+        )
+        if alias_active:
+            active.add(name)
+            events.setdefault(name, []).append((line, True))
+
+
 def _collect_imported_name_alias_events(tree, module_name, imported_names):
     """Track selected direct-import aliases and later top-level rebindings."""
     events = {}
     active = set()
+    module_aliases = set()
     for node in tree.body:
         line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Import):
+            module_aliases.update(
+                imported.asname or imported.name
+                for imported in node.names
+                if imported.name == module_name
+            )
         _record_imported_name_aliases(
             node,
             module_name,
@@ -9387,6 +9418,14 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names):
             line,
         )
         _invalidate_imported_module_aliases(node, active, events, line)
+        _record_imported_name_alias_propagation(
+            node,
+            module_aliases,
+            imported_names,
+            active,
+            events,
+            line,
+        )
     return events
 
 
