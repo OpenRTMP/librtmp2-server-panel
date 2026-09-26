@@ -3194,7 +3194,7 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
         partial_aliases,
         builtin_shadow_lines,
     )
-    if partial_call is None or len(partial_call.args) != 1:
+    if partial_call is None or not partial_call.args:
         return False
     callback = partial_call.args[0]
     if isinstance(callback, ast.Lambda):
@@ -3456,11 +3456,7 @@ def _partial_wraps_active_mutating_callback(
     """Return True when a partial stores one active mutating callback."""
     partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
     partial_call = _partial_factory_call(value, partial_aliases)
-    if (
-        partial_call is None
-        or len(partial_call.args) != 1
-        or partial_call.keywords
-    ):
+    if partial_call is None or not partial_call.args:
         return False
     return _value_is_active_mutating_callback(
         partial_call.args[0],
