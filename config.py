@@ -8435,8 +8435,8 @@ def _statements_mutate_workers(
 
 
 
-def _function_local_bound_names(func_node):
-    """Return names bound by one function's own scope, excluding nested scopes."""
+def _function_argument_bound_names(func_node):
+    """Return names bound by a function's arguments."""
     args = func_node.args
     names = {
         arg.arg
@@ -8446,32 +8446,51 @@ def _function_local_bound_names(func_node):
         names.add(args.vararg.arg)
     if args.kwarg is not None:
         names.add(args.kwarg.arg)
+    return names
+
+
+def _statement_scope_bound_names(node):
+    """Return names bound directly by one statement in the current scope."""
+    names = {
+        name
+        for name, _value in _namespace_assignment_values(node)
+    }
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        names.update(_loop_target_names(node.target))
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                names.update(_loop_target_names(item.optional_vars))
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        names.add(node.name)
+    return names
+
+
+def _function_scope_node_bindings(node):
+    """Return local/global bindings and whether to inspect child nodes."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}, set(), False
+    if isinstance(node, ast.Lambda):
+        return set(), set(), False
+    if isinstance(node, ast.Global):
+        return set(), set(node.names), False
+    if isinstance(node, ast.Nonlocal):
+        return set(node.names), set(), False
+    return _statement_scope_bound_names(node), set(), True
+
+
+def _function_local_bound_names(func_node):
+    """Return names bound by one function's own scope, excluding nested scopes."""
+    names = _function_argument_bound_names(func_node)
     module_names = set()
     stack = list(func_node.body)
     while stack:
         node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if isinstance(node, ast.Global):
-            module_names.update(node.names)
-            continue
-        if isinstance(node, ast.Nonlocal):
-            names.update(node.names)
-            continue
-        for name, _value in _namespace_assignment_values(node):
-            names.add(name)
-        if isinstance(node, (ast.For, ast.AsyncFor)):
-            names.update(_loop_target_names(node.target))
-        if isinstance(node, (ast.With, ast.AsyncWith)):
-            for item in node.items:
-                if item.optional_vars is not None:
-                    names.update(_loop_target_names(item.optional_vars))
-        if isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        stack.extend(ast.iter_child_nodes(node))
+        local_names, global_names, inspect_children = _function_scope_node_bindings(node)
+        names.update(local_names)
+        module_names.update(global_names)
+        if inspect_children:
+            stack.extend(ast.iter_child_nodes(node))
     return names - module_names
 
 
