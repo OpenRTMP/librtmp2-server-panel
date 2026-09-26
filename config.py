@@ -3179,7 +3179,12 @@ def _call_is_operator_call_mutating_callback(call, operator_bindings):
     if isinstance(callee, ast.Lambda):
         return _lambda_mutates_workers(callee, operator_bindings)
     if isinstance(callee, ast.Name):
-        return _mutating_callback_alias_is_active(callee, operator_bindings)
+        return _mutating_callback_alias_is_active(
+            callee,
+            operator_bindings,
+        ) or callee.id in (
+            operator_bindings[46] if len(operator_bindings) > 46 else set()
+        )
     return False
 
 
@@ -3200,7 +3205,12 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
     if isinstance(callback, ast.Name):
-        return _mutating_callback_alias_is_active(callback, operator_bindings)
+        return _mutating_callback_alias_is_active(
+            callback,
+            operator_bindings,
+        ) or callback.id in (
+            operator_bindings[46] if len(operator_bindings) > 46 else set()
+        )
     return False
 
 
