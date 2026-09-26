@@ -8787,9 +8787,24 @@ def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
     return False
 
 
+def _expression_is_direct_zero_arg_call_of_name(expr, name):
+    """Return True when ``expr`` directly invokes ``name`` with no arguments."""
+    return (
+        isinstance(expr, ast.Call)
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == name
+    )
+
+
 def _comprehension_invokes_mutating_callback(node, operator_bindings):
     """Return True when a comprehension eagerly calls a mutating loop callback."""
-    if not isinstance(node, (ast.ListComp, ast.SetComp)):
+    if isinstance(node, ast.DictComp):
+        elements = (node.key, node.value)
+    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        elements = (node.elt,)
+    else:
         return False
     if len(node.generators) != 1:
         return False
@@ -8801,13 +8816,10 @@ def _comprehension_invokes_mutating_callback(node, operator_bindings):
     loop_name = generator.target.id
     if not _for_loop_iter_holds_mutating_callbacks(generator, operator_bindings):
         return False
-    if not isinstance(node.elt, ast.Call):
-        return False
-    if node.elt.args or node.elt.keywords:
-        return False
-    if not isinstance(node.elt.func, ast.Name) or node.elt.func.id != loop_name:
-        return False
-    return True
+    return any(
+        _expression_is_direct_zero_arg_call_of_name(element, loop_name)
+        for element in elements
+    )
 
 
 def _for_loop_invokes_mutating_callback(node, operator_bindings):
