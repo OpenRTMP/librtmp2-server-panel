@@ -6489,7 +6489,7 @@ def _asyncio_task_factory_call_mutates_workers(
         for helper_name in helper_names
     ):
         return False
-    return _asyncio_awaitable_mutates_workers(
+    return _asyncio_awaitable_expression_mutates_workers(
         call.args[0],
         operator_bindings,
         reference_line,
