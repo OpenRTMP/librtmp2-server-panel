@@ -4499,7 +4499,7 @@ def _thread_pool_receiver_constructor(receiver, operator_bindings):
     return state if isinstance(state, ast.Call) else None
 
 
-_FUTURE_ANALYSIS_INDEX = 60
+_FUTURE_ANALYSIS_INDEX = 62
 
 
 def _ordered_binding_state_at_position(events, name, reference):
