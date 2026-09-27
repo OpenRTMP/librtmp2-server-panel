@@ -1022,3 +1022,32 @@ def test_bugscan_sep26_callback_and_asyncio_gaps_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-27: additional import-time workers mutation gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport sched\ns = sched.scheduler()\ns.enter(0, 1, lambda: globals().update({'workers': 4}))\ns.run(blocking=False)\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda _, f: f(), [lambda: globals().update({'workers': 4})], None)\n",
+        "workers = 1\nimport inspect\nframe = inspect.currentframe()\nframe.f_globals.update({'workers': 4})\n",
+        "workers = 1\nany(cb() or True for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nsum(cb() or 0 for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nmatch [lambda: globals().update({'workers': 4})]:\n    case [cb]: cb()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).apply(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nimport builtins\nvars(builtins)['exec']('workers=4')\n",
+        "workers = 1\n[(cb := lambda: globals().update({'workers': 4}))() for _ in [1]]\n",
+        "workers = 1\nimport queue\nq = queue.PriorityQueue()\nq.put((0, lambda: globals().update({'workers': 4})))\nq.get()[1]()\n",
+        "workers = 1\nimport heapq\nh = []\nheapq.heappush(h, (0, lambda: globals().update({'workers': 4})))\nheapq.heappop(h)[1]()\n",
+        "workers = 1\nimport collections\nd = collections.UserList([lambda: globals().update({'workers': 4})])\nd.pop(0)()\n",
+        "workers = 1\nit = iter([lambda: globals().update({'workers': 4})])\nwhile True:\n    try:\n        it.__next__()()\n    except StopIteration:\n        break\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nasyncio.set_event_loop(loop)\nasync def coro():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nloop.create_task(coro())\nloop.run_until_complete(asyncio.sleep(0))\n",
+    ],
+)
+def test_security_review_sep27_worker_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
