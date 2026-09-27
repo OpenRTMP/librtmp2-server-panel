@@ -10633,7 +10633,7 @@ def _collect_operator_setitem_bindings(tree):
             'globals', 'getattr', 'staticmethod', 'classmethod', 'property',
             'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
-            'iter', 'reversed', 'vars',
+            'iter', 'reversed', 'vars', 'sum',
         }
     }
     builtin_shadow_lines = {
