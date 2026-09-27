@@ -1307,3 +1307,48 @@ def test_codex_pr283_positive_callback_patterns_remain_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# CodeRabbit PR #283 follow-up: a user-defined `sum` is not the eager builtin consumer
+def test_coderabbit_pr283_shadowed_sum_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "".join((
+            "workers = 1\n",
+            "def sum(values):\n",
+            "    return 0\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "answer = sum(cb() for cb in callbacks)\n",
+        )),
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_coderabbit_pr283_builtin_sum_consumer_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "answer = sum(cb() for cb in callbacks)\n",
+        )),
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_coderabbit_pr292_sum_rebound_to_builtin_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "".join((
+            "import builtins\n",
+            "workers = 1\n",
+            "sum = lambda values: 0\n",
+            "sum = builtins.sum\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "answer = sum(cb() for cb in callbacks)\n",
+        )),
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
