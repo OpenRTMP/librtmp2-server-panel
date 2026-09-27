@@ -9338,6 +9338,12 @@ def _comprehension_invokes_mutating_callback(
     )
     if not loop_names:
         return False
+    if eager_consumer and isinstance(node, ast.GeneratorExp):
+        return any(
+            _expression_invokes_loop_callback(element, loop_name)
+            for element in elements
+            for loop_name in loop_names
+        )
     return any(
         _expression_is_direct_zero_arg_call_of_names(element, loop_names)
         for element in elements
@@ -9402,7 +9408,9 @@ def _short_circuit_generator_mutates_workers(
         generator_expr.elt,
         {generator.target.id},
     ):
-        return False
+        # Complex generator elements such as cb() or True still execute the
+        # callback. Let the eager-consumer fallback inspect them conservatively.
+        return None
     if not isinstance(generator.iter, (ast.List, ast.Tuple)):
         return None
 
