@@ -8915,25 +8915,20 @@ def _sync_callback_value_contains_mutating_lambda(value, operator_bindings):
     return False
 
 
-def _record_sync_callback_assignment(node, tracking, operator_bindings):
-    """Track proven callback-container instances and definite rebindings."""
-    names = _simple_assignment_names(node)
-    if not names:
-        return
+def _sync_callback_assignment_source_state(value, tracking):
+    """Return tracked state copied from a simple callback-container alias."""
+    if not isinstance(value, ast.Name):
+        return None, False, set()
+    return (
+        tracking["containers"].get(value.id),
+        value.id in tracking["mutating"],
+        set(tracking["mutating_subscript_indexes"].get(value.id, ())),
+    )
 
-    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) else None
-    existing_kind = None
-    existing_mutating = False
-    existing_subscript_indexes = set()
-    if isinstance(value, ast.Name):
-        existing_kind = tracking["containers"].get(value.id)
-        existing_mutating = value.id in tracking["mutating"]
-        existing_subscript_indexes = set(
-            tracking["mutating_subscript_indexes"].get(value.id, ())
-        )
 
-    kind = existing_kind or _sync_callback_constructor_kind(value, tracking)
-    if (
+def _assignment_creates_callback_iterator(value, operator_bindings):
+    """Return True when an assignment creates a mutating callback iterator."""
+    return (
         isinstance(value, ast.Call)
         and _builtin_call_is_active(value, "iter", operator_bindings)
         and len(value.args) == 1
@@ -8942,9 +8937,29 @@ def _record_sync_callback_assignment(node, tracking, operator_bindings):
             value.args[0],
             operator_bindings,
         )
-    ):
-        kind = "callback_iter"
-    starts_mutating = existing_mutating or (
+    )
+
+
+def _sync_callback_assignment_kind(
+    value,
+    existing_kind,
+    tracking,
+    operator_bindings,
+):
+    """Resolve the callback-container kind assigned by one statement."""
+    if _assignment_creates_callback_iterator(value, operator_bindings):
+        return "callback_iter"
+    return existing_kind or _sync_callback_constructor_kind(value, tracking)
+
+
+def _sync_callback_assignment_starts_mutating(
+    value,
+    kind,
+    existing_mutating,
+    operator_bindings,
+):
+    """Return True when the assigned callback container is mutating."""
+    return existing_mutating or (
         kind is not None
         and (
             kind == "callback_iter"
@@ -8955,31 +8970,86 @@ def _record_sync_callback_assignment(node, tracking, operator_bindings):
         )
     )
 
+
+def _clear_sync_callback_name_tracking(name, tracking):
+    """Clear stale callback-container state after a definite rebinding."""
+    tracking["containers"].pop(name, None)
+    tracking["mutating"].discard(name)
+    tracking["queue_modules"].discard(name)
+    tracking["collections_modules"].discard(name)
+    tracking["sched_modules"].discard(name)
+    tracking["heapq_modules"].discard(name)
+    tracking["queue_constructors"].discard(name)
+    tracking["deque_constructors"].discard(name)
+    tracking["userlist_constructors"].discard(name)
+    tracking["mutating_subscript_indexes"].pop(name, None)
+    tracking["sched_event_ids"].pop(name, None)
+    if name in tracking["sched_pending_events"]:
+        tracking["sched_pending_events"].pop(name, None)
+        tracking["sched_event_ids"] = {
+            event_name: event_data
+            for event_name, event_data in tracking["sched_event_ids"].items()
+            if event_data[0] != name
+        }
+
+
+def _apply_sync_callback_assignment(
+    name,
+    tracking,
+    kind,
+    starts_mutating,
+    existing_subscript_indexes,
+):
+    """Apply resolved callback-container state to one assigned name."""
+    _clear_sync_callback_name_tracking(name, tracking)
+    if kind is None:
+        return
+    tracking["containers"][name] = kind
+    if starts_mutating:
+        tracking["mutating"].add(name)
+    if existing_subscript_indexes:
+        tracking["mutating_subscript_indexes"][name] = set(
+            existing_subscript_indexes
+        )
+
+
+def _record_sync_callback_assignment(node, tracking, operator_bindings):
+    """Track proven callback-container instances and definite rebindings."""
+    names = _simple_assignment_names(node)
+    if not names:
+        return
+
+    value = (
+        node.value
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+        else None
+    )
+    (
+        existing_kind,
+        existing_mutating,
+        existing_subscript_indexes,
+    ) = _sync_callback_assignment_source_state(value, tracking)
+    kind = _sync_callback_assignment_kind(
+        value,
+        existing_kind,
+        tracking,
+        operator_bindings,
+    )
+    starts_mutating = _sync_callback_assignment_starts_mutating(
+        value,
+        kind,
+        existing_mutating,
+        operator_bindings,
+    )
+
     for name in names:
-        tracking["containers"].pop(name, None)
-        tracking["mutating"].discard(name)
-        tracking["queue_modules"].discard(name)
-        tracking["collections_modules"].discard(name)
-        tracking["sched_modules"].discard(name)
-        tracking["heapq_modules"].discard(name)
-        tracking["queue_constructors"].discard(name)
-        tracking["deque_constructors"].discard(name)
-        tracking["userlist_constructors"].discard(name)
-        tracking["mutating_subscript_indexes"].pop(name, None)
-        tracking["sched_event_ids"].pop(name, None)
-        if name in tracking["sched_pending_events"]:
-            tracking["sched_pending_events"].pop(name, None)
-            for event_name, event_data in list(tracking["sched_event_ids"].items()):
-                if event_data[0] == name:
-                    tracking["sched_event_ids"].pop(event_name, None)
-        if kind is not None:
-            tracking["containers"][name] = kind
-            if starts_mutating:
-                tracking["mutating"].add(name)
-            if existing_subscript_indexes:
-                tracking["mutating_subscript_indexes"][name] = set(
-                    existing_subscript_indexes
-                )
+        _apply_sync_callback_assignment(
+            name,
+            tracking,
+            kind,
+            starts_mutating,
+            existing_subscript_indexes,
+        )
 
 
 def _statement_value_expression(node):
@@ -9936,9 +10006,11 @@ def _record_asyncio_task_cancel(node, tracking, *, conditional):
     if pending_id is None:
         return
     tracking["pending_work"].pop(pending_id, None)
-    for task_name, task_pending_id in list(tracking["task_tokens"].items()):
-        if task_pending_id == pending_id:
-            tracking["task_tokens"].pop(task_name, None)
+    tracking["task_tokens"] = {
+        task_name: task_pending_id
+        for task_name, task_pending_id in tracking["task_tokens"].items()
+        if task_pending_id != pending_id
+    }
     _refresh_asyncio_pending_loop_ids(tracking)
 
 
@@ -10159,9 +10231,11 @@ def _record_sync_callback_cancel(node, tracking):
     event_id = event_data[1]
     pending = tracking["sched_pending_events"].get(scheduler_name, set())
     pending.discard(event_id)
-    for event_name, known_event in list(tracking["sched_event_ids"].items()):
-        if known_event == event_data:
-            tracking["sched_event_ids"].pop(event_name, None)
+    tracking["sched_event_ids"] = {
+        event_name: known_event
+        for event_name, known_event in tracking["sched_event_ids"].items()
+        if known_event != event_data
+    }
     if not pending:
         tracking["sched_pending_events"].pop(scheduler_name, None)
         tracking["mutating"].discard(scheduler_name)
