@@ -958,8 +958,17 @@ def _module_alias_active_at_line(node, aliases, events, reference_line=0):
 
 def _name_is_unshadowed_builtin(name, reference_line, shadow_lines=None):
     """Return whether a builtin name is still visible at one source line."""
-    shadow_line = (shadow_lines or {}).get(name)
-    return shadow_line is None or not reference_line or reference_line < shadow_line
+    shadow_state = (shadow_lines or {}).get(name)
+    if shadow_state is None or not reference_line:
+        return True
+    if isinstance(shadow_state, list):
+        is_shadowed = False
+        for event_line, event_is_shadowed in shadow_state:
+            if event_line > reference_line:
+                break
+            is_shadowed = event_is_shadowed
+        return not is_shadowed
+    return reference_line < shadow_state
 
 
 def _is_builtins_dict_attribute(
@@ -2174,18 +2183,34 @@ def _collect_definite_exec_eval_shadow_lines(tree):
 
 
 def _collect_definite_name_shadow_line(tree, name):
-    """Return the first unconditional top-level binding line for ``name``."""
+    """Return top-level shadow state for ``name`` across source lines."""
+    events = []
+    builtins_alias_events = _collect_imported_module_alias_events(tree, 'builtins')
     for node in tree.body:
+        line = getattr(node, "lineno", None)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name == name:
-                return getattr(node, "lineno", None)
+                events.append((line, True))
             continue
-        if any(
-            bound_name == name
-            for bound_name, _value in _namespace_assignment_values(node)
-        ):
-            return getattr(node, "lineno", None)
-    return None
+        for bound_name, value in _namespace_assignment_values(node):
+            if bound_name != name:
+                continue
+            restores_builtin = (
+                isinstance(value, ast.Attribute)
+                and value.attr == name
+                and _module_alias_active_at_line(
+                    value.value,
+                    set(),
+                    builtins_alias_events,
+                    line or 0,
+                )
+            )
+            events.append((line, not restores_builtin))
+    if not events:
+        return None
+    if all(is_shadowed for _line, is_shadowed in events):
+        return events[0][0]
+    return events
 
 
 
