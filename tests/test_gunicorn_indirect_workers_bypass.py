@@ -465,6 +465,35 @@ def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+# Security review 2026-09-27: additional import-time workers mutation gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport sched\ns = sched.scheduler()\ns.enter(0, 1, lambda: globals().update({'workers': 4}))\ns.run(blocking=False)\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda _, f: f(), [lambda: globals().update({'workers': 4})], None)\n",
+        "workers = 1\nimport inspect\nframe = inspect.currentframe()\nframe.f_globals.update({'workers': 4})\n",
+        "workers = 1\nany(cb() or True for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nsum(cb() or 0 for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nmatch [lambda: globals().update({'workers': 4})]:\n    case [cb]: cb()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).apply(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nimport builtins\nvars(builtins)['exec']('workers=4')\n",
+        "workers = 1\n[(cb := lambda: globals().update({'workers': 4}))() for _ in [1]]\n",
+        "workers = 1\nimport queue\nq = queue.PriorityQueue()\nq.put((0, lambda: globals().update({'workers': 4})))\nq.get()[1]()\n",
+        "workers = 1\nimport heapq\nh = []\nheapq.heappush(h, (0, lambda: globals().update({'workers': 4})))\nheapq.heappop(h)[1]()\n",
+        "workers = 1\nimport collections\nd = collections.UserList([lambda: globals().update({'workers': 4})])\nd.pop(0)()\n",
+        "workers = 1\nit = iter([lambda: globals().update({'workers': 4})])\nwhile True:\n    try:\n        it.__next__()()\n    except StopIteration:\n        break\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nasyncio.set_event_loop(loop)\nasync def coro():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nloop.create_task(coro())\nloop.run_until_complete(asyncio.sleep(0))\n",
+    ],
+)
+def test_security_review_sep27_worker_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
 @pytest.mark.parametrize(
     "config_content",
     [
@@ -1024,27 +1053,124 @@ def test_bugscan_sep26_callback_and_asyncio_gaps_are_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
-# Security review 2026-09-27: additional import-time workers mutation gaps
+# Codex PR #283: source-ordered callback provenance and consumer semantics
 @pytest.mark.parametrize(
     "config_content",
     [
-        "workers = 1\nimport sched\ns = sched.scheduler()\ns.enter(0, 1, lambda: globals().update({'workers': 4}))\ns.run(blocking=False)\n",
-        "workers = 1\nfrom functools import reduce\nreduce(lambda _, f: f(), [lambda: globals().update({'workers': 4})], None)\n",
-        "workers = 1\nimport inspect\nframe = inspect.currentframe()\nframe.f_globals.update({'workers': 4})\n",
-        "workers = 1\nany(cb() or True for cb in [lambda: globals().update({'workers': 4})])\n",
-        "workers = 1\nsum(cb() or 0 for cb in [lambda: globals().update({'workers': 4})])\n",
-        "workers = 1\nmatch [lambda: globals().update({'workers': 4})]:\n    case [cb]: cb()\n",
-        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).apply(lambda: globals().update({'workers': 4}))\n",
-        "workers = 1\nimport builtins\nvars(builtins)['exec']('workers=4')\n",
-        "workers = 1\n[(cb := lambda: globals().update({'workers': 4}))() for _ in [1]]\n",
-        "workers = 1\nimport queue\nq = queue.PriorityQueue()\nq.put((0, lambda: globals().update({'workers': 4})))\nq.get()[1]()\n",
-        "workers = 1\nimport heapq\nh = []\nheapq.heappush(h, (0, lambda: globals().update({'workers': 4})))\nheapq.heappop(h)[1]()\n",
-        "workers = 1\nimport collections\nd = collections.UserList([lambda: globals().update({'workers': 4})])\nd.pop(0)()\n",
-        "workers = 1\nit = iter([lambda: globals().update({'workers': 4})])\nwhile True:\n    try:\n        it.__next__()()\n    except StopIteration:\n        break\n",
-        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nasyncio.set_event_loop(loop)\nasync def coro():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nloop.create_task(coro())\nloop.run_until_complete(asyncio.sleep(0))\n",
+        "".join((
+            "workers = 1\n",
+            "import operator as op\n",
+            "class Fake:\n",
+            "    @staticmethod\n",
+            "    def call(*args, **kwargs):\n",
+            "        return None\n",
+            "op = Fake()\n",
+            "invoke = op.call\n",
+            "invoke(globals().update, {'workers': 4})\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import operator\n",
+            "def cb():\n",
+            "    globals().update({'workers': 4})\n",
+            "cb = lambda: None\n",
+            "operator.call(cb)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from functools import partial\n",
+            "def cb():\n",
+            "    globals().update({'workers': 4})\n",
+            "cb = lambda: None\n",
+            "partial(cb)()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "for name, cb in zip([lambda: None], callbacks):\n",
+            "    name()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "max((cb() for cb in callbacks), object(), key=lambda _: 0)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "def run(list):\n",
+            "    list(cb() for cb in [lambda: globals().update({'workers': 4})])\n",
+            "run(lambda gen: None)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "any(cb() for cb in [lambda: True, lambda: globals().update({'workers': 4})])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "all(cb() for cb in [lambda: False, lambda: globals().update({'workers': 4})])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "next(cb() for cb in [lambda: None, lambda: globals().update({'workers': 4})])\n",
+        )),
     ],
 )
-def test_security_review_sep27_worker_scan_gaps_are_dynamic(
+def test_codex_pr283_false_positive_patterns_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "".join((
+            "workers = 1\n",
+            "import operator\n",
+            "def cb():\n",
+            "    globals().update({'workers': 4})\n",
+            "operator.call(cb)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from functools import partial\n",
+            "def cb():\n",
+            "    globals().update({'workers': 4})\n",
+            "partial(cb)()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "for name, cb in zip([lambda: None], callbacks):\n",
+            "    cb()\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "max(cb() for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "list(cb() for cb in [lambda: globals().update({'workers': 4})])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "any(cb() for cb in [lambda: globals().update({'workers': 4}), lambda: True])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "all(cb() for cb in [lambda: globals().update({'workers': 4}), lambda: False])\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "next(cb() for cb in [lambda: globals().update({'workers': 4}), lambda: None])\n",
+        )),
+    ],
+)
+def test_codex_pr283_positive_callback_patterns_remain_dynamic(
     tmp_path,
     config_content,
 ):

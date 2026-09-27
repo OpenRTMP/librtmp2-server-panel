@@ -738,6 +738,11 @@ class _PanelRuntime:
             cluster = self._load_cluster_status(health, api_errors)
         try:
             nodes = self.client.cluster_nodes() or []
+            if not isinstance(nodes, list):
+                raise Lrtmp2ApiError(
+                    "cluster_nodes failed: received an invalid response "
+                    "from librtmp2-server"
+                )
         except Lrtmp2ApiError as exc:
             api_errors.append(str(exc))
             nodes = []
@@ -745,10 +750,19 @@ class _PanelRuntime:
 
     def _load_cluster_status(self, health, api_errors):
         try:
-            return self.client.cluster_status()
+            status = self.client.cluster_status()
+            if not isinstance(status, dict):
+                raise Lrtmp2ApiError(
+                    "cluster_status failed: received an invalid response "
+                    "from librtmp2-server"
+                )
         except Lrtmp2ApiError as exc:
             api_errors.append(str(exc))
-            return (health or {}).get("cluster")
+            fallback = (
+                (health or {}).get("cluster") if isinstance(health, dict) else None
+            )
+            return fallback if isinstance(fallback, dict) else None
+        return status
 
     @staticmethod
     def _resolve_cluster_enabled(cluster, nodes, cluster_on, detect_error):

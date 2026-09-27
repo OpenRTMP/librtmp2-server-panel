@@ -3144,7 +3144,7 @@ def _is_operator_setitem_callable(func, setitem_aliases, module_aliases=None):
     )
 
 
-def _is_operator_call_factory(func, operator_bindings):
+def _is_operator_call_factory(func, operator_bindings, bound_names=None):
     """Return True for a source-valid ``operator.call`` factory."""
     module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
     module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
@@ -3152,6 +3152,8 @@ def _is_operator_call_factory(func, operator_bindings):
     reference_line = getattr(func, 'lineno', 0)
     call_alias_events = builtin_shadow_lines.get(_OPERATOR_CALL_ALIAS_EVENTS_KEY, {})
     if isinstance(func, ast.Name):
+        if bound_names and func.id in bound_names:
+            return False
         return bool(
             _binding_state_at_line(
                 call_alias_events,
@@ -3185,17 +3187,20 @@ def _is_operator_call_factory(func, operator_bindings):
 
 
 
-def _call_is_operator_call_mutating_callback(call, operator_bindings):
+def _call_is_operator_call_mutating_callback(call, operator_bindings, bound_names=None):
     """Return True when ``operator.call`` eagerly executes a workers-mutating callback."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
-    if not _is_operator_call_factory(call.func, operator_bindings):
+    if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
         return False
     callee = call.args[0]
     if isinstance(callee, ast.Lambda):
         return _lambda_mutates_workers(callee, operator_bindings)
     if isinstance(callee, ast.Name):
-        return _mutating_callback_alias_is_active(callee, operator_bindings)
+        return _mutating_callback_alias_is_active(
+            callee,
+            operator_bindings,
+        )
     return False
 
 
@@ -3210,24 +3215,27 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
         partial_aliases,
         builtin_shadow_lines,
     )
-    if partial_call is None or len(partial_call.args) != 1:
+    if partial_call is None or not partial_call.args:
         return False
     callback = partial_call.args[0]
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
     if isinstance(callback, ast.Name):
-        return _mutating_callback_alias_is_active(callback, operator_bindings)
+        return _mutating_callback_alias_is_active(
+            callback,
+            operator_bindings,
+        )
     return False
 
 
-def _call_is_operator_call_namespace_update(call, operator_bindings):
+def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names=None):
     """Return True for ``operator.call(globals().update, ...)`` mutations."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     setitem_aliases = operator_bindings[1] if len(operator_bindings) > 1 else set()
     module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
-    if not _is_operator_call_factory(call.func, operator_bindings):
+    if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
         return False
     callee = call.args[0]
     if (
@@ -3472,11 +3480,7 @@ def _partial_wraps_active_mutating_callback(
     """Return True when a partial stores one active mutating callback."""
     partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
     partial_call = _partial_factory_call(value, partial_aliases)
-    if (
-        partial_call is None
-        or len(partial_call.args) != 1
-        or partial_call.keywords
-    ):
+    if partial_call is None or not partial_call.args:
         return False
     return _value_is_active_mutating_callback(
         partial_call.args[0],
@@ -3637,12 +3641,21 @@ def _scan_mutating_callback_alias_events(
         line = getattr(node, "lineno", 0)
         if isinstance(node, definition_types):
             if not conditional:
+                mutator_names = (
+                    operator_bindings[46]
+                    if len(operator_bindings) > 46
+                    else set()
+                )
+                is_mutating_function = (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in mutator_names
+                )
                 _record_callback_binding_state(
                     node.name,
                     line,
                     active_callbacks,
                     callback_events,
-                    False,
+                    is_mutating_function,
                 )
                 _record_callback_binding_state(
                     node.name,
@@ -6535,7 +6548,7 @@ def _asyncio_task_factory_call_mutates_workers(
         for helper_name in helper_names
     ):
         return False
-    return _asyncio_awaitable_mutates_workers(
+    return _asyncio_awaitable_expression_mutates_workers(
         call.args[0],
         operator_bindings,
         reference_line,
@@ -7149,9 +7162,10 @@ _EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
         "min",
         "next",
         "sorted",
-        "sum",
     }
 )
+
+_EAGER_GENERATOR_CONSUMER_BUILTINS = _EAGER_LAZY_ITERATOR_CONSUMERS | {"sum"}
 
 
 def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
@@ -7906,7 +7920,12 @@ def _call_is_functiontype_namespace_alias(expr, aliases):
     return isinstance(expr.func, ast.Name) and expr.func.id in aliases
 
 
-def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_names=None):
+def _call_has_secondary_worker_mutation(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Check extended FunctionType/ChainMap/partial mutation forms."""
     if dict_subclass_names is None:
         dict_subclass_names = set()
@@ -7925,28 +7944,42 @@ def _call_has_secondary_worker_mutation(expr, operator_bindings, dict_subclass_n
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
         or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
-        or _call_is_operator_call_namespace_update(expr, operator_bindings)
+        or _call_is_operator_call_namespace_update(expr, operator_bindings, bound_names)
         or _call_has_mutating_lambda_argument(expr, operator_bindings)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
         or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
         or _call_is_literal_callback_invocation(expr, operator_bindings)
-        or _call_is_operator_call_mutating_callback(expr, operator_bindings)
+        or _call_is_operator_call_mutating_callback(expr, operator_bindings, bound_names)
         or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
     )
 
 
 
-def _call_expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
+def _call_expression_mutates_workers(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True when one call expression can mutate module workers."""
-    return _call_has_primary_worker_mutation(
-        expr,
-        operator_bindings,
-    ) or _call_has_secondary_worker_mutation(
-        expr,
-        operator_bindings,
-        dict_subclass_names,
+    return (
+        _call_consumes_mutating_generator(
+            expr,
+            operator_bindings,
+            bound_names,
+        )
+        or _call_has_primary_worker_mutation(
+            expr,
+            operator_bindings,
+        )
+        or _call_has_secondary_worker_mutation(
+            expr,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
     )
 
 
@@ -7969,7 +8002,12 @@ def _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
     return False
 
 
-def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=None):
+def _expression_mutates_workers(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
         return False
@@ -7977,16 +8015,20 @@ def _expression_mutates_workers(expr, operator_bindings, dict_subclass_names=Non
         return True
     if _comprehension_invokes_mutating_callback(expr, operator_bindings):
         return True
-    if _generator_expression_invokes_mutating_callback(expr, operator_bindings):
-        return True
     if isinstance(expr, ast.Call) and _call_expression_mutates_workers(
         expr,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     ):
         return True
     return any(
-        _expression_mutates_workers(child, operator_bindings, dict_subclass_names)
+        _expression_mutates_workers(
+            child,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
         for child in ast.iter_child_nodes(expr)
     )
 
@@ -8017,7 +8059,11 @@ def _lambda_mutates_workers(lambda_node, operator_bindings):
         _lambda_bound_names(lambda_node),
     ):
         return True
-    return _expression_mutates_workers(lambda_node.body, operator_bindings)
+    return _expression_mutates_workers(
+        lambda_node.body,
+        operator_bindings,
+        bound_names=_lambda_bound_names(lambda_node),
+    )
 
 
 def _call_is_subscript_namespace_workers_update(
@@ -8251,6 +8297,7 @@ def _match_guard_mutates_workers(
     node,
     operator_bindings,
     dict_subclass_names,
+    bound_names=None,
 ):
     """Return True when a ``match`` guard mutates ``workers``."""
     if not isinstance(node, ast.Match):
@@ -8261,6 +8308,7 @@ def _match_guard_mutates_workers(
             case.guard,
             operator_bindings,
             dict_subclass_names,
+            bound_names,
         )
         for case in node.cases
     )
@@ -8291,6 +8339,7 @@ def _compound_statement_body_mutates_workers(
     node,
     operator_bindings,
     dict_subclass_names,
+    bound_names=None,
 ):
     """Return True when a compound statement body performs import-time mutations."""
     if isinstance(node, ast.Match):
@@ -8313,22 +8362,27 @@ def _compound_statement_body_mutates_workers(
         bodies = [node.body]
     elif isinstance(node, ast.Try):
         bodies = [node.body, node.orelse, node.finalbody]
-        for handler in node.handlers:
-            bodies.append(handler.body)
+        bodies.extend(handler.body for handler in node.handlers)
     else:
         return False
-    for body in bodies:
-        for stmt in body:
-            if _is_dynamic_workers_mutation(
-                stmt,
-                operator_bindings,
-                dict_subclass_names,
-            ):
-                return True
-    return False
+    return any(
+        _is_dynamic_workers_mutation(
+            stmt,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
+        for body in bodies
+        for stmt in body
+    )
 
 
-def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=None):
+def _is_dynamic_workers_mutation(
+    node,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
     """Return True for import-time mutations the AST scan cannot treat as static."""
     if dict_subclass_names is None:
         dict_subclass_names = set()
@@ -8343,6 +8397,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         node,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     ):
         return True
     if any(
@@ -8351,6 +8406,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
             child,
             operator_bindings,
             dict_subclass_names,
+            bound_names,
         )
         for child in ast.iter_child_nodes(node)
     ):
@@ -8366,6 +8422,7 @@ def _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names=No
         node,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     )
 
 
@@ -8453,6 +8510,7 @@ def _statement_mutates_workers(
     mutator_names,
     class_targets=None,
     dict_subclass_names=None,
+    bound_names=None,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
@@ -8461,7 +8519,12 @@ def _statement_mutates_workers(
         return False
     if _statement_has_class_workers_side_effect(node, class_targets):
         return True
-    if _is_dynamic_workers_mutation(node, operator_bindings, dict_subclass_names):
+    if _is_dynamic_workers_mutation(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
         return True
     assigns_workers, _ = _worker_assignment_value(node)
     if global_workers and assigns_workers:
@@ -8474,6 +8537,7 @@ def _statement_mutates_workers(
             mutator_names=mutator_names,
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
+            bound_names=bound_names,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -8488,6 +8552,7 @@ def _statements_mutate_workers(
     mutator_names=None,
     class_targets=None,
     dict_subclass_names=None,
+    bound_names=None,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -8500,10 +8565,70 @@ def _statements_mutate_workers(
             mutator_names=mutator_names,
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
+            bound_names=bound_names,
         )
         for node in statements
     )
 
+
+
+def _function_argument_bound_names(func_node):
+    """Return names bound by a function's arguments."""
+    args = func_node.args
+    names = {
+        arg.arg
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+    }
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _statement_scope_bound_names(node):
+    """Return names bound directly by one statement in the current scope."""
+    names = {
+        name
+        for name, _value in _namespace_assignment_values(node)
+    }
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        names.update(_loop_target_names(node.target))
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                names.update(_loop_target_names(item.optional_vars))
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        names.add(node.name)
+    return names
+
+
+def _function_scope_node_bindings(node):
+    """Return local/global bindings and whether to inspect child nodes."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}, set(), False
+    if isinstance(node, ast.Lambda):
+        return set(), set(), False
+    if isinstance(node, ast.Global):
+        return set(), set(node.names), False
+    if isinstance(node, ast.Nonlocal):
+        return set(node.names), set(), False
+    return _statement_scope_bound_names(node), set(), True
+
+
+def _function_local_bound_names(func_node):
+    """Return names bound by one function's own scope, excluding nested scopes."""
+    names = _function_argument_bound_names(func_node)
+    module_names = set()
+    stack = list(func_node.body)
+    while stack:
+        node = stack.pop()
+        local_names, global_names, inspect_children = _function_scope_node_bindings(node)
+        names.update(local_names)
+        module_names.update(global_names)
+        if inspect_children:
+            stack.extend(ast.iter_child_nodes(node))
+    return names - module_names
 
 
 def _function_mutates_workers(
@@ -8528,6 +8653,7 @@ def _function_mutates_workers(
         mutator_names=mutator_names,
         class_targets=class_targets,
         dict_subclass_names=dict_subclass_names,
+        bound_names=_function_local_bound_names(func_node),
     )
 
 
@@ -9019,46 +9145,28 @@ def _iter_expression_holds_mutating_callbacks(iterator, operator_bindings):
             iterator.args[0],
             operator_bindings,
         )
+    if _unshadowed_builtin_call(iterator, "zip", operator_bindings) and iterator.args:
+        return any(
+            _callback_container_expression_is_mutating(arg, operator_bindings)
+            for arg in iterator.args
+        )
+    if (
+        isinstance(iterator, ast.Call)
+        and iterator.args
+        and any(
+            _unshadowed_builtin_call(iterator, name, operator_bindings)
+            for name in ("reversed", "enumerate", "sorted")
+        )
+    ):
+        return _callback_container_expression_is_mutating(
+            iterator.args[0],
+            operator_bindings,
+        )
     return False
 
 
-def _comprehension_generator_invokes_mutating_loop_callback(
-    generators,
-    element,
-    operator_bindings,
-):
-    """Return True when a single-generator comp/genexp calls mutating loop callbacks."""
-    if len(generators) != 1:
-        return False
-    generator = generators[0]
-    if generator.ifs or generator.is_async:
-        return False
-    if not isinstance(generator.target, ast.Name):
-        return False
-    if not _iter_expression_holds_mutating_callbacks(
-        generator.iter,
-        operator_bindings,
-    ):
-        return False
-    return _expression_invokes_loop_callback(
-        element,
-        generator.target.id,
-    )
-
-
-def _generator_expression_invokes_mutating_callback(expr, operator_bindings):
-    """Return True when a generator expression calls mutating loop callbacks."""
-    if not isinstance(expr, ast.GeneratorExp):
-        return False
-    return _comprehension_generator_invokes_mutating_loop_callback(
-        expr.generators,
-        expr.elt,
-        operator_bindings,
-    )
-
-
 def _reduce_lambda_invokes_mutating_iterable_callback(call, operator_bindings):
-    """Return True for ``reduce(lambda _, f: f(), [mutator], ...)`` forms."""
+    """Return True for reduce(lambda _, f: f(), [mutator], ...) forms."""
     lambda_node = _reduce_lambda_argument(call)
     if lambda_node is None or len(call.args) < 2:
         return False
@@ -9077,7 +9185,7 @@ def _reduce_lambda_invokes_mutating_iterable_callback(call, operator_bindings):
 
 
 def _call_is_frame_globals_update(call, operator_bindings):
-    """Return True for ``<frame>.f_globals.update({'workers': ...})`` mutations."""
+    """Return True for frame f_globals update mutations."""
     if not (
         isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
@@ -9091,7 +9199,7 @@ def _call_is_frame_globals_update(call, operator_bindings):
 
 
 def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
-    """Return True for direct ``inspect.currentframe().f_globals.update(...)``."""
+    """Return True for direct inspect.currentframe f_globals updates."""
     if not _call_is_frame_globals_update(call, operator_bindings):
         return False
     base = call.func.value
@@ -9116,12 +9224,71 @@ def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
     )
 
 
-def _comprehension_invokes_mutating_callback(node, operator_bindings):
+def _loop_target_names(target):
+    """Return names bound by a for-loop or comprehension target."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = set()
+        for element in target.elts:
+            names.update(_loop_target_names(element))
+        return names
+    return set()
+
+
+def _zip_mutating_callback_target_names(node, operator_bindings):
+    """Return tuple-target names fed by mutating callback zip iterables."""
+    iterator = node.iter
+    target = node.target
+    if not (
+        _unshadowed_builtin_call(iterator, "zip", operator_bindings)
+        and isinstance(target, (ast.Tuple, ast.List))
+        and len(target.elts) == len(iterator.args)
+    ):
+        return None
+    names = set()
+    for target_element, iterable in zip(target.elts, iterator.args):
+        if _callback_container_expression_is_mutating(
+            iterable,
+            operator_bindings,
+        ):
+            names.update(_loop_target_names(target_element))
+    return names
+
+
+def _mutating_callback_loop_target_names(node, operator_bindings):
+    """Return loop-target names that can hold workers-mutating callbacks."""
+    zip_names = _zip_mutating_callback_target_names(
+        node,
+        operator_bindings,
+    )
+    if zip_names is not None:
+        return zip_names
+    if _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
+        return _loop_target_names(node.target)
+    return set()
+
+
+def _expression_is_direct_zero_arg_call_of_names(expr, names):
+    """Return True when ``expr`` directly invokes one of ``names`` with no arguments."""
+    return (
+        isinstance(expr, ast.Call)
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id in names
+    )
+
+
+def _comprehension_invokes_mutating_callback(
+    node,
+    operator_bindings,
+    eager_consumer=False,
+):
     """Return True when a comprehension eagerly calls a mutating loop callback."""
-    if not isinstance(node, (ast.ListComp, ast.SetComp)):
-        return False
     if (
-        isinstance(node.elt, ast.Call)
+        isinstance(node, (ast.ListComp, ast.SetComp))
+        and isinstance(node.elt, ast.Call)
         and not node.elt.args
         and not node.elt.keywords
         and isinstance(node.elt.func, ast.NamedExpr)
@@ -9129,47 +9296,158 @@ def _comprehension_invokes_mutating_callback(node, operator_bindings):
         and _lambda_mutates_workers(node.elt.func.value, operator_bindings)
     ):
         return True
-    if _comprehension_generator_invokes_mutating_loop_callback(
-        node.generators,
-        node.elt,
-        operator_bindings,
+    if isinstance(node, ast.DictComp):
+        elements = (node.key, node.value)
+    elif isinstance(node, (ast.ListComp, ast.SetComp)) or (
+        eager_consumer and isinstance(node, ast.GeneratorExp)
     ):
-        return True
+        elements = (node.elt,)
+    else:
+        return False
     if len(node.generators) != 1:
         return False
     generator = node.generators[0]
     if generator.ifs or generator.is_async:
         return False
-    if not isinstance(generator.target, ast.Name):
-        return False
-    loop_name = generator.target.id
-    if not _iter_expression_holds_mutating_callbacks(
-        generator.iter,
+    loop_names = _mutating_callback_loop_target_names(
+        generator,
         operator_bindings,
+    )
+    if not loop_names:
+        return False
+    return any(
+        _expression_is_direct_zero_arg_call_of_names(element, loop_names)
+        for element in elements
+    )
+
+
+def _generator_consumer_name(call, operator_bindings, bound_names=None):
+    """Return the active eager builtin consuming the first positional argument."""
+    if not (
+        isinstance(call, ast.Call)
+        and call.args
+        and isinstance(call.func, ast.Name)
+    ):
+        return None
+    name = call.func.id
+    if name not in _EAGER_GENERATOR_CONSUMER_BUILTINS:
+        return None
+    if bound_names and name in bound_names:
+        return None
+    if not _unshadowed_builtin_call(call, name, operator_bindings):
+        return None
+    if name in {"max", "min"} and len(call.args) != 1:
+        return None
+    return name
+
+
+def _callback_expression_mutates_workers(callback, operator_bindings):
+    """Return True when invoking one callback expression mutates workers."""
+    if isinstance(callback, ast.Lambda):
+        return _lambda_mutates_workers(callback, operator_bindings)
+    return _mutating_callback_alias_is_active(
+        callback,
+        operator_bindings,
+    )
+
+
+def _callback_literal_truthiness(callback):
+    """Return statically known callback truthiness, or None when unknown."""
+    if not isinstance(callback, ast.Lambda):
+        return None
+    try:
+        value = ast.literal_eval(callback.body)
+    except (ValueError, TypeError):
+        return None
+    return bool(value)
+
+
+def _short_circuit_generator_mutates_workers(
+    generator_expr,
+    operator_bindings,
+    consumer_name,
+):
+    """Resolve ordered literal callbacks for any/all/next consumers."""
+    if not isinstance(generator_expr, ast.GeneratorExp):
+        return None
+    if len(generator_expr.generators) != 1:
+        return None
+    generator = generator_expr.generators[0]
+    if generator.ifs or generator.is_async or not isinstance(generator.target, ast.Name):
+        return None
+    if not _expression_is_direct_zero_arg_call_of_names(
+        generator_expr.elt,
+        {generator.target.id},
     ):
         return False
-    if not isinstance(node.elt, ast.Call):
-        return False
-    if node.elt.args or node.elt.keywords:
-        return False
-    if _comprehension_call_targets_loop_name(node.elt, loop_name):
-        return True
-    func = node.elt.func
-    if isinstance(func, ast.NamedExpr) and isinstance(func.value, ast.Lambda):
-        return _lambda_mutates_workers(func.value, operator_bindings)
+    if not isinstance(generator.iter, (ast.List, ast.Tuple)):
+        return None
+
+    callbacks = generator.iter.elts
+    if consumer_name == "next":
+        callbacks = callbacks[:1]
+    for callback in callbacks:
+        if _callback_expression_mutates_workers(
+            callback,
+            operator_bindings,
+        ):
+            return True
+        truthiness = _callback_literal_truthiness(callback)
+        if (
+            consumer_name == "any"
+            and truthiness is True
+        ) or (
+            consumer_name == "all"
+            and truthiness is False
+        ):
+            return False
     return False
+
+
+def _call_consumes_mutating_generator(
+    call,
+    operator_bindings,
+    bound_names=None,
+):
+    """Return True when an eager builtin consumes a mutating generator expression."""
+    consumer_name = _generator_consumer_name(
+        call,
+        operator_bindings,
+        bound_names,
+    )
+    if consumer_name is None:
+        return False
+    generator_expr = call.args[0]
+    if consumer_name in {"any", "all", "next"}:
+        short_circuit_result = _short_circuit_generator_mutates_workers(
+            generator_expr,
+            operator_bindings,
+            consumer_name,
+        )
+        if short_circuit_result is not None:
+            return short_circuit_result
+    return _comprehension_invokes_mutating_callback(
+        generator_expr,
+        operator_bindings,
+        eager_consumer=True,
+    )
 
 
 def _for_loop_invokes_mutating_callback(node, operator_bindings):
     """Return True when a for-loop eagerly invokes a mutating literal callback."""
     if not isinstance(node, (ast.For, ast.AsyncFor)):
         return False
-    if not isinstance(node.target, ast.Name):
+    loop_names = _mutating_callback_loop_target_names(
+        node,
+        operator_bindings,
+    )
+    if not loop_names:
         return False
-    if not _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
-        return False
-    loop_name = node.target.id
-    return any(_statement_zero_arg_calls_name(stmt, loop_name) for stmt in node.body)
+    return any(
+        _statement_zero_arg_calls_name(stmt, name)
+        for stmt in node.body
+        for name in loop_names
+    )
 
 
 def _callback_container_expression_is_mutating(value, operator_bindings):
@@ -9820,12 +10098,45 @@ def _record_imported_name_aliases(
         events.setdefault(name, []).append((line, True))
 
 
+def _record_imported_name_alias_propagation(
+    node,
+    module_aliases,
+    imported_names,
+    active,
+    events,
+    line,
+):
+    """Propagate active imported-name aliases through simple assignments."""
+    for name, value in _namespace_assignment_values(node):
+        alias_active = (
+            isinstance(value, ast.Name)
+            and value.id in active
+        ) or (
+            isinstance(value, ast.Attribute)
+            and value.attr in imported_names
+            and isinstance(value.value, ast.Name)
+            and value.value.id in module_aliases
+        )
+        if alias_active:
+            active.add(name)
+            events.setdefault(name, []).append((line, True))
+
+
 def _collect_imported_name_alias_events(tree, module_name, imported_names):
     """Track selected direct-import aliases and later top-level rebindings."""
     events = {}
     active = set()
+    module_aliases = set()
+    module_events = {}
     for node in tree.body:
         line = getattr(node, "lineno", 0)
+        _record_imported_module_aliases(
+            node,
+            module_name,
+            module_aliases,
+            module_events,
+            line,
+        )
         _record_imported_name_aliases(
             node,
             module_name,
@@ -9835,6 +10146,20 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names):
             line,
         )
         _invalidate_imported_module_aliases(node, active, events, line)
+        _record_imported_name_alias_propagation(
+            node,
+            module_aliases,
+            imported_names,
+            active,
+            events,
+            line,
+        )
+        _invalidate_imported_module_aliases(
+            node,
+            module_aliases,
+            module_events,
+            line,
+        )
     return events
 
 
@@ -10248,6 +10573,19 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         import_time_workers_mutators,
+    )
+    (
+        callback_alias_events,
+        callback_container_events,
+    ) = _collect_mutating_callback_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings[32][_MUTATING_CALLBACK_ALIAS_EVENTS_KEY] = (
+        callback_alias_events
+    )
+    operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
+        callback_container_events
     )
     asyncio_module_alias_events = _collect_imported_module_alias_events(
         tree,
