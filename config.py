@@ -2234,7 +2234,11 @@ def _getattr_is_dynamic_exec_eval(func, builtins_aliases):
     )
 
 
-def _subscript_is_dynamic_exec_eval(func, builtins_aliases):
+def _subscript_is_dynamic_exec_eval(
+    func,
+    builtins_aliases,
+    builtin_shadow_lines=None,
+):
     """Return True for ``builtins.__dict__['exec'/'eval']`` callables."""
     if not isinstance(func, ast.Subscript):
         return False
@@ -2249,7 +2253,37 @@ def _subscript_is_dynamic_exec_eval(func, builtins_aliases):
         and base.attr == "__dict__"
         and _is_known_builtins_module(base.value, builtins_aliases)
         and _constant_is_exec_eval(func.slice)
+    ) or _subscript_is_vars_builtins_exec(
+        func,
+        builtins_aliases,
+        builtin_shadow_lines,
     )
+
+
+def _subscript_is_vars_builtins_exec(
+    func,
+    builtins_aliases,
+    builtin_shadow_lines=None,
+):
+    """Return True for ``vars(builtins)['exec'/'eval']`` callables."""
+    if not isinstance(func, ast.Subscript) or not _constant_is_exec_eval(func.slice):
+        return False
+    value = func.value
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "vars"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return False
+    if not _name_is_unshadowed_builtin(
+        "vars",
+        getattr(value, "lineno", 0),
+        builtin_shadow_lines,
+    ):
+        return False
+    return _is_known_builtins_module(value.args[0], builtins_aliases)
 
 
 def _attribute_is_dynamic_exec_eval(func, builtins_aliases):
@@ -2579,6 +2613,11 @@ def _call_is_dynamic_exec_eval(
         else {}
     )
     func = call.func
+    builtin_shadow_lines = (
+        operator_bindings[32]
+        if operator_bindings is not None and len(operator_bindings) > 32
+        else {}
+    )
     hidden_exec = False
     if operator_bindings is not None:
         hidden_exec = _subscript_is_hidden_exec_eval(func, operator_bindings)
@@ -2592,7 +2631,11 @@ def _call_is_dynamic_exec_eval(
             direct_alias_events,
         )
         or _getattr_is_dynamic_exec_eval(func, builtins_aliases)
-        or _subscript_is_dynamic_exec_eval(func, builtins_aliases)
+        or _subscript_is_dynamic_exec_eval(
+            func,
+            builtins_aliases,
+            builtin_shadow_lines,
+        )
         or _attribute_is_dynamic_exec_eval(func, builtins_aliases)
         or _attribute_is_sys_modules_builtins_exec(func, sys_aliases)
         or _call_is_importlib_builtins_exec_eval(
@@ -5389,12 +5432,28 @@ def _call_is_future_add_done_callback_mutation(call, operator_bindings):
     )
 
 
-def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
-    """Return True when apply_async schedules a workers-mutating callback."""
+def _thread_pool_apply_task_argument(call):
+    """Return the primary task callable from a pool apply/apply_async call."""
+    if call.args:
+        return call.args[0]
+    return next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "func"),
+        None,
+    )
+
+
+def _call_is_thread_pool_apply_method_mutation(
+    call,
+    operator_bindings,
+    method_name,
+    *,
+    extra_callback_keyword_names=(),
+):
+    """Return True when apply/apply_async runs workers-mutating pool callbacks."""
     if not (
         isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "apply_async"
+        and call.func.attr == method_name
     ):
         return False
     constructor = _thread_pool_receiver_constructor(
@@ -5403,14 +5462,7 @@ def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
     )
     if constructor is None:
         return False
-    task = call.args[0] if call.args else next(
-        (
-            keyword.value
-            for keyword in call.keywords
-            if keyword.arg == "func"
-        ),
-        None,
-    )
+    task = _thread_pool_apply_task_argument(call)
     if task is None:
         return False
     if _thread_pool_constructor_has_mutating_initializer(
@@ -5419,14 +5471,35 @@ def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
     ):
         return True
     callbacks = [task]
-    callbacks.extend(
-        keyword.value
-        for keyword in call.keywords
-        if keyword.arg in {"callback", "error_callback"}
-    )
+    if extra_callback_keyword_names:
+        extra_names = frozenset(extra_callback_keyword_names)
+        callbacks.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg in extra_names
+        )
     return any(
         _thread_pool_callback_mutates_workers(callback, operator_bindings)
         for callback in callbacks
+    )
+
+
+def _call_is_thread_pool_apply_mutation(call, operator_bindings):
+    """Return True when apply synchronously runs a workers-mutating callback."""
+    return _call_is_thread_pool_apply_method_mutation(
+        call,
+        operator_bindings,
+        "apply",
+    )
+
+
+def _call_is_thread_pool_apply_async_mutation(call, operator_bindings):
+    """Return True when apply_async schedules a workers-mutating callback."""
+    return _call_is_thread_pool_apply_method_mutation(
+        call,
+        operator_bindings,
+        "apply_async",
+        extra_callback_keyword_names=("callback", "error_callback"),
     )
 
 
@@ -7132,6 +7205,7 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
         or _call_is_thread_pool_map_mutation(call, operator_bindings)
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
+        or _call_is_thread_pool_apply_mutation(call, operator_bindings)
         or _call_is_future_add_done_callback_mutation(call, operator_bindings)
         or _call_is_asyncio_run_to_thread_mutation(call, operator_bindings)
         or _call_is_asyncio_runner_run_mutation(call, operator_bindings)
@@ -7805,6 +7879,11 @@ def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
         return False
     if _lambda_mutates_workers(lambda_node, operator_bindings):
         return True
+    if _reduce_lambda_invokes_mutating_iterable_callback(
+        call,
+        operator_bindings,
+    ):
+        return True
     initializer = _reduce_initializer(call)
     if initializer is None:
         return False
@@ -7885,7 +7964,8 @@ def _call_has_secondary_worker_mutation(
     functiontype_aliases = operator_bindings[26] if len(operator_bindings) > 26 else set()
     chainmap_aliases = operator_bindings[28] if len(operator_bindings) > 28 else set()
     return (
-        _call_is_invoked_functiontype_namespace_code(expr, namespace_aliases, types_module_aliases, functiontype_aliases)
+        _call_is_inspect_currentframe_globals_update(expr, operator_bindings)
+        or _call_is_invoked_functiontype_namespace_code(expr, namespace_aliases, types_module_aliases, functiontype_aliases)
         or _call_is_functiontype_namespace_alias(expr, functiontype_namespace_aliases)
         or _call_mutates_workers_via_indirection(expr, operator_bindings)
         or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
@@ -8260,6 +8340,91 @@ def _match_guard_mutates_workers(
     )
 
 
+def _static_sequence_length(node):
+    """Return the length of a statically known sequence subject."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return len(node.elts)
+    return None
+
+
+def _expression_is_statically_false(expr):
+    """Return True only when an expression is provably false without execution."""
+    try:
+        return not bool(ast.literal_eval(expr))
+    except (ValueError, TypeError):
+        return False
+
+
+def _match_case_invokes_mutating_callback(
+    case,
+    subject,
+    subject_holds_mutating_callbacks,
+):
+    """Return True when a reachable match case calls a bound mutating callback."""
+    if not subject_holds_mutating_callbacks:
+        return False
+    if case.guard is not None and _expression_is_statically_false(case.guard):
+        return False
+    if not (
+        isinstance(case.pattern, ast.MatchSequence)
+        and len(case.pattern.patterns) == 1
+        and isinstance(case.pattern.patterns[0], ast.MatchAs)
+    ):
+        return False
+    subject_length = _static_sequence_length(subject)
+    if subject_length is not None and subject_length != 1:
+        return False
+    capture = case.pattern.patterns[0].name
+    if capture is None:
+        return False
+    return any(
+        _statement_zero_arg_calls_name(stmt, capture) for stmt in case.body
+    )
+
+
+def _compound_statement_body_mutates_workers(
+    node,
+    operator_bindings,
+    dict_subclass_names,
+    bound_names=None,
+):
+    """Return True when a compound statement body performs import-time mutations."""
+    if isinstance(node, ast.Match):
+        subject_holds_mutating_callbacks = (
+            _iter_expression_holds_mutating_callbacks(
+                node.subject,
+                operator_bindings,
+            )
+        )
+        if any(
+            _match_case_invokes_mutating_callback(
+                case,
+                node.subject,
+                subject_holds_mutating_callbacks,
+            )
+            for case in node.cases
+        ):
+            return True
+        bodies = [case.body for case in node.cases]
+    elif isinstance(node, ast.While):
+        bodies = [node.body]
+    elif isinstance(node, ast.Try):
+        bodies = [node.body, node.orelse, node.finalbody]
+        bodies.extend(handler.body for handler in node.handlers)
+    else:
+        return False
+    return any(
+        _is_dynamic_workers_mutation(
+            stmt,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
+        for body in bodies
+        for stmt in body
+    )
+
+
 def _is_dynamic_workers_mutation(
     node,
     operator_bindings,
@@ -8275,6 +8440,13 @@ def _is_dynamic_workers_mutation(
     if _for_loop_invokes_mutating_callback(node, operator_bindings):
         return True
     if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
+        return True
+    if _compound_statement_body_mutates_workers(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
         return True
     if any(
         isinstance(child, ast.expr)
@@ -8608,10 +8780,17 @@ def _sync_callback_tracking(scan_state):
         tracking = {
             "queue_modules": set(),
             "collections_modules": set(),
+            "sched_modules": set(),
+            "heapq_modules": set(),
             "queue_constructors": set(),
             "deque_constructors": set(),
+            "userlist_constructors": set(),
             "containers": {},
             "mutating": set(),
+            "mutating_subscript_indexes": {},
+            "sched_event_ids": {},
+            "sched_pending_events": {},
+            "next_sched_event_id": 1,
         }
         scan_state._sync_callback_tracking = tracking
     return tracking
@@ -8638,6 +8817,8 @@ def _record_sync_callback_module_imports(node, tracking):
     destinations = {
         "queue": tracking["queue_modules"],
         "collections": tracking["collections_modules"],
+        "sched": tracking["sched_modules"],
+        "heapq": tracking["heapq_modules"],
     }
     for imported in node.names:
         destination = destinations.get(imported.name)
@@ -8646,21 +8827,23 @@ def _record_sync_callback_module_imports(node, tracking):
 
 
 def _record_sync_callback_direct_imports(node, tracking):
-    """Track direct queue/deque constructor aliases."""
-    supported = {
-        "queue": (
-            {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"},
-            tracking["queue_constructors"],
-        ),
-        "collections": ({"deque"}, tracking["deque_constructors"]),
-    }
-    entry = supported.get(node.module)
-    if entry is None:
+    """Track direct callback-container constructor aliases."""
+    if node.module == "collections":
+        destinations = {
+            "deque": tracking["deque_constructors"],
+            "UserList": tracking["userlist_constructors"],
+        }
+        for imported in node.names:
+            destination = destinations.get(imported.name)
+            if destination is not None:
+                destination.add(imported.asname or imported.name)
         return
-    names, destination = entry
+    if node.module != "queue":
+        return
+    queue_names = {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"}
     for imported in node.names:
-        if imported.name in names:
-            destination.add(imported.asname or imported.name)
+        if imported.name in queue_names:
+            tracking["queue_constructors"].add(imported.asname or imported.name)
 
 
 def _record_sync_callback_imports(node, tracking):
@@ -8669,6 +8852,39 @@ def _record_sync_callback_imports(node, tracking):
         _record_sync_callback_module_imports(node, tracking)
     elif isinstance(node, ast.ImportFrom):
         _record_sync_callback_direct_imports(node, tracking)
+
+
+def _sync_callback_named_constructor_kind(func, tracking):
+    """Return the callback-container kind for a directly imported constructor."""
+    constructor_groups = (
+        ("queue", tracking["queue_constructors"]),
+        ("deque", tracking["deque_constructors"]),
+        ("userlist", tracking["userlist_constructors"]),
+    )
+    for kind, constructors in constructor_groups:
+        if func.id in constructors:
+            return kind
+    return None
+
+
+def _sync_callback_attribute_constructor_kind(func, tracking):
+    """Return the callback-container kind for a module-qualified constructor."""
+    module_name = func.value.id
+    constructor_name = func.attr
+    constructor_groups = (
+        (
+            tracking["queue_modules"],
+            {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"},
+            "queue",
+        ),
+        (tracking["collections_modules"], {"deque"}, "deque"),
+        (tracking["collections_modules"], {"UserList"}, "userlist"),
+        (tracking["sched_modules"], {"scheduler"}, "sched"),
+    )
+    for module_aliases, constructor_names, kind in constructor_groups:
+        if module_name in module_aliases and constructor_name in constructor_names:
+            return kind
+    return None
 
 
 def _sync_callback_constructor_kind(value, tracking):
@@ -8681,20 +8897,9 @@ def _sync_callback_constructor_kind(value, tracking):
         return None
     func = value.func
     if isinstance(func, ast.Name):
-        if func.id in tracking["queue_constructors"]:
-            return "queue"
-        if func.id in tracking["deque_constructors"]:
-            return "deque"
-        return None
-    if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
-        return None
-    if (
-        func.value.id in tracking["queue_modules"]
-        and func.attr in {"Queue", "LifoQueue", "PriorityQueue", "SimpleQueue"}
-    ):
-        return "queue"
-    if func.value.id in tracking["collections_modules"] and func.attr == "deque":
-        return "deque"
+        return _sync_callback_named_constructor_kind(func, tracking)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return _sync_callback_attribute_constructor_kind(func, tracking)
     return None
 
 
@@ -8710,36 +8915,141 @@ def _sync_callback_value_contains_mutating_lambda(value, operator_bindings):
     return False
 
 
+def _sync_callback_assignment_source_state(value, tracking):
+    """Return tracked state copied from a simple callback-container alias."""
+    if not isinstance(value, ast.Name):
+        return None, False, set()
+    return (
+        tracking["containers"].get(value.id),
+        value.id in tracking["mutating"],
+        set(tracking["mutating_subscript_indexes"].get(value.id, ())),
+    )
+
+
+def _assignment_creates_callback_iterator(value, operator_bindings):
+    """Return True when an assignment creates a mutating callback iterator."""
+    return (
+        isinstance(value, ast.Call)
+        and _builtin_call_is_active(value, "iter", operator_bindings)
+        and len(value.args) == 1
+        and not value.keywords
+        and _iter_expression_holds_mutating_callbacks(
+            value.args[0],
+            operator_bindings,
+        )
+    )
+
+
+def _sync_callback_assignment_kind(
+    value,
+    existing_kind,
+    tracking,
+    operator_bindings,
+):
+    """Resolve the callback-container kind assigned by one statement."""
+    if _assignment_creates_callback_iterator(value, operator_bindings):
+        return "callback_iter"
+    return existing_kind or _sync_callback_constructor_kind(value, tracking)
+
+
+def _sync_callback_assignment_starts_mutating(
+    value,
+    kind,
+    existing_mutating,
+    operator_bindings,
+):
+    """Return True when the assigned callback container is mutating."""
+    return existing_mutating or (
+        kind is not None
+        and (
+            kind == "callback_iter"
+            or _sync_callback_value_contains_mutating_lambda(
+                value,
+                operator_bindings,
+            )
+        )
+    )
+
+
+def _clear_sync_callback_name_tracking(name, tracking):
+    """Clear stale callback-container state after a definite rebinding."""
+    tracking["containers"].pop(name, None)
+    tracking["mutating"].discard(name)
+    tracking["queue_modules"].discard(name)
+    tracking["collections_modules"].discard(name)
+    tracking["sched_modules"].discard(name)
+    tracking["heapq_modules"].discard(name)
+    tracking["queue_constructors"].discard(name)
+    tracking["deque_constructors"].discard(name)
+    tracking["userlist_constructors"].discard(name)
+    tracking["mutating_subscript_indexes"].pop(name, None)
+    tracking["sched_event_ids"].pop(name, None)
+    if name in tracking["sched_pending_events"]:
+        tracking["sched_pending_events"].pop(name, None)
+        tracking["sched_event_ids"] = {
+            event_name: event_data
+            for event_name, event_data in tracking["sched_event_ids"].items()
+            if event_data[0] != name
+        }
+
+
+def _apply_sync_callback_assignment(
+    name,
+    tracking,
+    kind,
+    starts_mutating,
+    existing_subscript_indexes,
+):
+    """Apply resolved callback-container state to one assigned name."""
+    _clear_sync_callback_name_tracking(name, tracking)
+    if kind is None:
+        return
+    tracking["containers"][name] = kind
+    if starts_mutating:
+        tracking["mutating"].add(name)
+    if existing_subscript_indexes:
+        tracking["mutating_subscript_indexes"][name] = set(
+            existing_subscript_indexes
+        )
+
+
 def _record_sync_callback_assignment(node, tracking, operator_bindings):
     """Track proven callback-container instances and definite rebindings."""
     names = _simple_assignment_names(node)
     if not names:
         return
 
-    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) else None
-    existing_kind = None
-    existing_mutating = False
-    if isinstance(value, ast.Name):
-        existing_kind = tracking["containers"].get(value.id)
-        existing_mutating = value.id in tracking["mutating"]
-
-    kind = existing_kind or _sync_callback_constructor_kind(value, tracking)
-    starts_mutating = existing_mutating or (
-        kind is not None
-        and _sync_callback_value_contains_mutating_lambda(value, operator_bindings)
+    value = (
+        node.value
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+        else None
+    )
+    (
+        existing_kind,
+        existing_mutating,
+        existing_subscript_indexes,
+    ) = _sync_callback_assignment_source_state(value, tracking)
+    kind = _sync_callback_assignment_kind(
+        value,
+        existing_kind,
+        tracking,
+        operator_bindings,
+    )
+    starts_mutating = _sync_callback_assignment_starts_mutating(
+        value,
+        kind,
+        existing_mutating,
+        operator_bindings,
     )
 
     for name in names:
-        tracking["containers"].pop(name, None)
-        tracking["mutating"].discard(name)
-        tracking["queue_modules"].discard(name)
-        tracking["collections_modules"].discard(name)
-        tracking["queue_constructors"].discard(name)
-        tracking["deque_constructors"].discard(name)
-        if kind is not None:
-            tracking["containers"][name] = kind
-            if starts_mutating:
-                tracking["mutating"].add(name)
+        _apply_sync_callback_assignment(
+            name,
+            tracking,
+            kind,
+            starts_mutating,
+            existing_subscript_indexes,
+        )
 
 
 def _statement_value_expression(node):
@@ -8751,8 +9061,130 @@ def _statement_value_expression(node):
     return None
 
 
+def _mutating_lambda_subscript_indexes(payload, operator_bindings):
+    """Return literal indexes whose callback mutates workers."""
+    if not isinstance(payload, (ast.Tuple, ast.List)):
+        return set()
+    indexes = set()
+    length = len(payload.elts)
+    for index, element in enumerate(payload.elts):
+        if isinstance(element, ast.Lambda) and _lambda_mutates_workers(
+            element,
+            operator_bindings,
+        ):
+            indexes.add(index)
+            indexes.add(index - length)
+    return indexes
+
+
+def _record_heapq_heappush_mutating_callback(node, tracking, operator_bindings):
+    """Track list heaps that receive a workers-mutating callback via heapq.heappush."""
+    expr = _statement_value_expression(node)
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "heappush"
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id in tracking["heapq_modules"]
+        and len(expr.args) >= 2
+    ):
+        return
+    receiver = expr.args[0]
+    payload = expr.args[1]
+    if not isinstance(receiver, ast.Name) or not isinstance(
+        payload,
+        (ast.Tuple, ast.List),
+    ):
+        return
+    indexes = _mutating_lambda_subscript_indexes(
+        payload,
+        operator_bindings,
+    )
+    if not indexes:
+        return
+    tracking["containers"][receiver.id] = "heap"
+    tracking["mutating"].add(receiver.id)
+    tracking["mutating_subscript_indexes"].setdefault(
+        receiver.id,
+        set(),
+    ).update(indexes)
+
+
+def _sync_callback_direct_insert_argument(expr, kind):
+    """Return the callback argument for direct container insertion methods."""
+    direct_callback_methods = {
+        "queue": {"put", "put_nowait"},
+        "deque": {"append", "appendleft"},
+        "list": {"append"},
+        "userlist": {"append"},
+        "sched": {"enter"},
+    }
+    if expr.func.attr not in direct_callback_methods.get(kind, set()):
+        return None
+    callback_index = 2 if kind == "sched" else 0
+    if len(expr.args) <= callback_index:
+        return None
+    callback = expr.args[callback_index]
+    if isinstance(callback, (ast.Tuple, ast.List)) and callback.elts:
+        return callback.elts[-1]
+    return callback
+
+
+def _sync_callback_insert_mutates(expr, kind, operator_bindings):
+    """Return True when one supported insertion stores a mutating callback."""
+    callback = _sync_callback_direct_insert_argument(expr, kind)
+    if callback is not None:
+        return (
+            isinstance(callback, ast.Lambda)
+            and _lambda_mutates_workers(callback, operator_bindings)
+        )
+    iterable_callback_methods = {
+        "deque": {"extend", "extendleft"},
+        "list": {"extend"},
+    }
+    if expr.func.attr in iterable_callback_methods.get(kind, set()):
+        return _iterable_literal_contains_mutating_lambda(
+            expr.args[0],
+            operator_bindings,
+        )
+    return False
+
+
+def _record_sched_mutating_event(node, scheduler_name, tracking):
+    """Track a mutating scheduler event and any simple assigned handle."""
+    event_id = tracking["next_sched_event_id"]
+    tracking["next_sched_event_id"] += 1
+    tracking["sched_pending_events"].setdefault(
+        scheduler_name,
+        set(),
+    ).add(event_id)
+    for event_name in _simple_assignment_names(node):
+        tracking["sched_event_ids"][event_name] = (scheduler_name, event_id)
+
+
+def _record_queue_mutating_subscript_indexes(
+    expr,
+    receiver_name,
+    tracking,
+    operator_bindings,
+):
+    """Track tuple/list callback positions inserted into a queue."""
+    if not expr.args:
+        return
+    indexes = _mutating_lambda_subscript_indexes(
+        expr.args[0],
+        operator_bindings,
+    )
+    if indexes:
+        tracking["mutating_subscript_indexes"].setdefault(
+            receiver_name,
+            set(),
+        ).update(indexes)
+
+
 def _record_sync_callback_insert(node, tracking, operator_bindings):
     """Remember containers that receive a workers-mutating callback."""
+    _record_heapq_heappush_mutating_callback(node, tracking, operator_bindings)
     expr = _statement_value_expression(node)
     if not isinstance(expr, ast.Call) or not isinstance(expr.func, ast.Attribute):
         return
@@ -8762,32 +9194,17 @@ def _record_sync_callback_insert(node, tracking, operator_bindings):
     kind = tracking["containers"].get(receiver.id)
     if kind is None or not expr.args:
         return
-
-    method = expr.func.attr
-    direct_callback_methods = {
-        "queue": {"put", "put_nowait"},
-        "deque": {"append", "appendleft"},
-        "list": {"append"},
-    }
-    iterable_callback_methods = {
-        "deque": {"extend", "extendleft"},
-        "list": {"extend"},
-    }
-
-    mutates = False
-    if method in direct_callback_methods.get(kind, set()):
-        callback = expr.args[0]
-        mutates = (
-            isinstance(callback, ast.Lambda)
-            and _lambda_mutates_workers(callback, operator_bindings)
-        )
-    elif method in iterable_callback_methods.get(kind, set()):
-        mutates = _iterable_literal_contains_mutating_lambda(
-            expr.args[0],
+    if kind == "queue":
+        _record_queue_mutating_subscript_indexes(
+            expr,
+            receiver.id,
+            tracking,
             operator_bindings,
         )
-    if mutates:
+    if _sync_callback_insert_mutates(expr, kind, operator_bindings):
         tracking["mutating"].add(receiver.id)
+        if kind == "sched":
+            _record_sched_mutating_event(node, receiver.id, tracking)
 
 
 def _queue_get_arguments_are_valid(call):
@@ -8811,15 +9228,23 @@ def _queue_get_arguments_are_valid(call):
 
 def _sync_callback_accessor_arguments_are_valid(call, kind, method):
     """Return True when a proven callback-container accessor can execute."""
-    if kind == "queue" and method == "get":
+    accessor = (kind, method)
+    if accessor == ("queue", "get"):
         return _queue_get_arguments_are_valid(call)
-    if kind == "queue" and method == "get_nowait":
+    zero_arg_accessors = {
+        ("queue", "get_nowait"),
+        ("deque", "pop"),
+        ("deque", "popleft"),
+    }
+    if accessor in zero_arg_accessors:
         return not call.args and not call.keywords
-    if kind == "list" and method == "pop":
+    optional_index_accessors = {
+        ("list", "pop"),
+        ("userlist", "pop"),
+    }
+    if accessor in optional_index_accessors:
         return len(call.args) <= 1 and not call.keywords
-    if kind == "deque" and method in {"pop", "popleft"}:
-        return not call.args and not call.keywords
-    return False
+    return accessor == ("sched", "run")
 
 
 def _builtin_call_is_active(call, name, operator_bindings):
@@ -8877,7 +9302,68 @@ def _statement_zero_arg_calls_name(node, name):
 
 def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
     """Return True when a for-loop iterates a proven mutating callback container."""
-    iterator = node.iter
+    return _iter_expression_holds_mutating_callbacks(
+        node.iter,
+        operator_bindings,
+    )
+
+
+def _comprehension_call_targets_loop_name(call, loop_name):
+    """Return True when a zero-arg call invokes the comprehension loop variable."""
+    if not isinstance(call, ast.Call) or call.args or call.keywords:
+        return False
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id == loop_name
+    if isinstance(func, ast.NamedExpr) and isinstance(func.target, ast.Name):
+        return func.target.id == loop_name
+    return False
+
+
+def _literal_expression_truthiness(expr):
+    """Return statically known truthiness, or None when it is not literal."""
+    try:
+        return bool(ast.literal_eval(expr))
+    except (ValueError, TypeError):
+        return None
+
+
+def _boolop_invokes_loop_callback(expr, loop_name):
+    """Respect literal short-circuiting while scanning a boolean expression."""
+    for value in expr.values:
+        if _expression_invokes_loop_callback(value, loop_name):
+            return True
+        truthiness = _literal_expression_truthiness(value)
+        if isinstance(expr.op, ast.Or) and truthiness is True:
+            return False
+        if isinstance(expr.op, ast.And) and truthiness is False:
+            return False
+    return False
+
+
+def _expression_invokes_loop_callback(expr, loop_name):
+    """Return True when evaluating an expression can invoke ``loop_name()``."""
+    if _comprehension_call_targets_loop_name(expr, loop_name):
+        return True
+    if isinstance(expr, ast.BoolOp):
+        return _boolop_invokes_loop_callback(expr, loop_name)
+    if isinstance(expr, ast.IfExp):
+        test_truthiness = _literal_expression_truthiness(expr.test)
+        if test_truthiness is True:
+            return _expression_invokes_loop_callback(expr.body, loop_name)
+        if test_truthiness is False:
+            return _expression_invokes_loop_callback(expr.orelse, loop_name)
+        return (
+            _expression_invokes_loop_callback(expr.body, loop_name)
+            or _expression_invokes_loop_callback(expr.orelse, loop_name)
+        )
+    if isinstance(expr, ast.UnaryOp):
+        return _expression_invokes_loop_callback(expr.operand, loop_name)
+    return False
+
+
+def _iter_expression_holds_mutating_callbacks(iterator, operator_bindings):
+    """Return True when an iterable expression holds mutating callbacks."""
     if _iterable_literal_contains_mutating_lambda(iterator, operator_bindings):
         return True
     if isinstance(iterator, ast.Name):
@@ -8921,6 +9407,120 @@ def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
         return _callback_container_expression_is_mutating(
             iterator.args[0],
             operator_bindings,
+        )
+    return False
+
+
+def _reduce_lambda_invokes_mutating_iterable_callback(call, operator_bindings):
+    """Return True for reduce(lambda _, f: f(), [mutator], ...) forms."""
+    lambda_node = _reduce_lambda_argument(call)
+    if lambda_node is None or len(call.args) < 2:
+        return False
+    iterable = call.args[1]
+    if isinstance(iterable, (ast.List, ast.Tuple)):
+        minimum_items = 1 if len(call.args) >= 3 else 2
+        if len(iterable.elts) < minimum_items:
+            return False
+    if not _iter_expression_holds_mutating_callbacks(
+        iterable,
+        operator_bindings,
+    ):
+        return False
+    lambda_args = lambda_node.args.args
+    if len(lambda_args) < 2:
+        return False
+    return _expression_invokes_loop_callback(
+        lambda_node.body,
+        lambda_args[1].arg,
+    )
+
+
+def _call_is_frame_globals_update(call):
+    """Return True for frame f_globals update mutations."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "update"
+    ):
+        return False
+    base = call.func.value
+    if not (isinstance(base, ast.Attribute) and base.attr == "f_globals"):
+        return False
+    return _update_payload_may_set_workers(call)
+
+
+def _inspect_currentframe_call_is_active(frame_call, inspect_analysis):
+    """Return True when a call resolves to the real inspect.currentframe."""
+    if not (
+        isinstance(frame_call, ast.Call)
+        and not frame_call.args
+        and not frame_call.keywords
+    ):
+        return False
+    reference_line = getattr(frame_call, "lineno", 0)
+    func = frame_call.func
+    if isinstance(func, ast.Attribute) and func.attr == "currentframe":
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            inspect_analysis.get("module_alias_events", {}),
+            reference_line,
+        )
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            inspect_analysis.get("currentframe_alias_events", {}),
+            func.id,
+            reference_line,
+        )
+    return False
+
+
+def _collect_inspect_frame_alias_events(tree, inspect_analysis):
+    """Track names proven to hold frames returned by inspect.currentframe."""
+    events = {}
+    active = set()
+    for node in tree.body:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _deactivate_imported_module_alias(node.name, active, events, line)
+            continue
+        for name, value in _namespace_assignment_values(node):
+            is_frame = _inspect_currentframe_call_is_active(
+                value,
+                inspect_analysis,
+            )
+            if isinstance(value, ast.Name) and value.id in active:
+                is_frame = True
+            if is_frame:
+                active.add(name)
+                events.setdefault(name, []).append((line, True))
+            else:
+                _deactivate_imported_module_alias(name, active, events, line)
+    return events
+
+
+def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
+    """Return True only for f_globals updates on a proven inspect frame."""
+    if not _call_is_frame_globals_update(call):
+        return False
+    inspect_analysis = (
+        operator_bindings[-1]
+        if operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "frame_alias_events" in operator_bindings[-1]
+        else {}
+    )
+    frame_value = call.func.value.value
+    if isinstance(frame_value, ast.Call):
+        return _inspect_currentframe_call_is_active(
+            frame_value,
+            inspect_analysis,
+        )
+    if isinstance(frame_value, ast.Name):
+        return _imported_alias_is_active(
+            inspect_analysis.get("frame_alias_events", {}),
+            frame_value.id,
+            getattr(call, "lineno", 0),
         )
     return False
 
@@ -8987,6 +9587,16 @@ def _comprehension_invokes_mutating_callback(
     eager_consumer=False,
 ):
     """Return True when a comprehension eagerly calls a mutating loop callback."""
+    if (
+        isinstance(node, (ast.ListComp, ast.SetComp))
+        and isinstance(node.elt, ast.Call)
+        and not node.elt.args
+        and not node.elt.keywords
+        and isinstance(node.elt.func, ast.NamedExpr)
+        and isinstance(node.elt.func.value, ast.Lambda)
+        and _lambda_mutates_workers(node.elt.func.value, operator_bindings)
+    ):
+        return True
     if isinstance(node, ast.DictComp):
         elements = (node.key, node.value)
     elif isinstance(node, (ast.ListComp, ast.SetComp)) or (
@@ -9006,6 +9616,12 @@ def _comprehension_invokes_mutating_callback(
     )
     if not loop_names:
         return False
+    if eager_consumer and isinstance(node, ast.GeneratorExp):
+        return any(
+            _expression_invokes_loop_callback(element, loop_name)
+            for element in elements
+            for loop_name in loop_names
+        )
     return any(
         _expression_is_direct_zero_arg_call_of_names(element, loop_names)
         for element in elements
@@ -9070,7 +9686,9 @@ def _short_circuit_generator_mutates_workers(
         generator_expr.elt,
         {generator.target.id},
     ):
-        return False
+        # Complex generator elements such as cb() or True still execute the
+        # callback. Let the eager-consumer fallback inspect them conservatively.
+        return None
     if not isinstance(generator.iter, (ast.List, ast.Tuple)):
         return None
 
@@ -9234,7 +9852,10 @@ def _asyncio_loop_schedule_tracking(scan_state):
         tracking = {
             "loop_ids": {},
             "pending_loop_ids": set(),
+            "pending_work": {},
+            "task_tokens": {},
             "next_loop_id": 1,
+            "next_pending_id": 1,
         }
         scan_state._asyncio_loop_schedule_tracking = tracking
     return tracking
@@ -9310,6 +9931,21 @@ def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
         callback_index = 0
     elif method in {"call_later", "call_at"}:
         callback_index = 1
+    elif method == "create_task":
+        if not call.args:
+            return False
+        reference_line = getattr(call, "lineno", 0)
+        if not _asyncio_event_loop_alias_is_active(
+            call.func.value,
+            operator_bindings,
+            reference_line,
+        ):
+            return False
+        return _asyncio_awaitable_mutates_workers(
+            call.args[0],
+            operator_bindings,
+            reference_line,
+        )
     else:
         return False
     reference_line = getattr(call, "lineno", 0)
@@ -9327,6 +9963,57 @@ def _call_schedules_mutating_callback_on_loop(call, operator_bindings):
     )
 
 
+def _refresh_asyncio_pending_loop_ids(tracking):
+    """Rebuild loop IDs that still have pending mutating work."""
+    pending_loop_ids = set()
+    for loop_ids in tracking["pending_work"].values():
+        pending_loop_ids.update(loop_ids)
+    tracking["pending_loop_ids"] = pending_loop_ids
+
+
+def _drop_rebound_asyncio_task_aliases(node, tracking):
+    """Forget task handles that are definitely rebound without canceling work."""
+    for name in _simple_assignment_names(node):
+        tracking["task_tokens"].pop(name, None)
+
+
+def _record_asyncio_pending_work(node, expr, tracking, loop_ids):
+    """Track one scheduled mutating callback or task."""
+    pending_id = tracking["next_pending_id"]
+    tracking["next_pending_id"] += 1
+    tracking["pending_work"][pending_id] = set(loop_ids)
+    if expr.func.attr == "create_task":
+        for task_name in _simple_assignment_names(node):
+            tracking["task_tokens"][task_name] = pending_id
+    _refresh_asyncio_pending_loop_ids(tracking)
+
+
+def _record_asyncio_task_cancel(node, tracking, *, conditional):
+    """Remove a proven task canceled before an unconditional loop run."""
+    if conditional:
+        return
+    expr = _statement_value_expression(node)
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "cancel"
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func.value, ast.Name)
+    ):
+        return
+    pending_id = tracking["task_tokens"].get(expr.func.value.id)
+    if pending_id is None:
+        return
+    tracking["pending_work"].pop(pending_id, None)
+    tracking["task_tokens"] = {
+        task_name: task_pending_id
+        for task_name, task_pending_id in tracking["task_tokens"].items()
+        if task_pending_id != pending_id
+    }
+    _refresh_asyncio_pending_loop_ids(tracking)
+
+
 def _track_asyncio_loop_schedule(
     node,
     scan_state,
@@ -9342,19 +10029,31 @@ def _track_asyncio_loop_schedule(
         operator_bindings,
         conditional=conditional,
     )
+    _drop_rebound_asyncio_task_aliases(node, tracking)
+    _record_asyncio_task_cancel(
+        node,
+        tracking,
+        conditional=conditional,
+    )
 
     expr = _statement_value_expression(node)
     if not isinstance(expr, ast.Call):
         return False
 
     if _call_schedules_mutating_callback_on_loop(expr, operator_bindings):
-        tracking["pending_loop_ids"].update(
-            _asyncio_receiver_loop_ids(
-                expr.func.value,
-                tracking,
-                operator_bindings,
-            )
+        loop_ids = _asyncio_receiver_loop_ids(
+            expr.func.value,
+            tracking,
+            operator_bindings,
         )
+        _record_asyncio_pending_work(
+            node,
+            expr,
+            tracking,
+            loop_ids,
+        )
+        if expr.func.attr == "create_task":
+            return False
 
     if not isinstance(expr.func, ast.Attribute):
         return False
@@ -9388,14 +10087,186 @@ def _next_iter_callback_source_mutates(inner, tracking, operator_bindings):
     )
 
 
+def _sync_callback_sched_run_mutates(expr, tracking):
+    """Return True for ``scheduler.run(...)`` on a mutating sched container."""
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "run"
+    ):
+        return False
+    receiver = expr.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    return (
+        receiver.id in tracking["mutating"]
+        and tracking["containers"].get(receiver.id) == "sched"
+    )
+
+
+def _sync_callback_iterator_next_invocation_mutates(inner, tracking):
+    """Return True for ``iterator.__next__()()`` callback execution."""
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Attribute)
+        and inner.func.attr == "__next__"
+        and not inner.args
+        and not inner.keywords
+    ):
+        return False
+    receiver = inner.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    return tracking["containers"].get(receiver.id) == "callback_iter"
+
+
+def _sync_callback_pop_result_invocation_mutates(inner, tracking):
+    """Return True for ``container.pop(...)()`` callback execution."""
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Attribute)
+        and inner.func.attr == "pop"
+    ):
+        return False
+    receiver = inner.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    kind = tracking["containers"].get(receiver.id)
+    if kind not in {"list", "deque", "userlist"}:
+        return False
+    return len(inner.args) <= 1 and not inner.keywords
+
+
+def _sync_callback_zero_arg_subscript_invocation(expr):
+    """Return inner accessor call and literal index for ``accessor()[index]()``."""
+    if not (
+        isinstance(expr, ast.Call)
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func, ast.Subscript)
+        and isinstance(expr.func.value, ast.Call)
+    ):
+        return None, None
+    index_node = expr.func.slice
+    index = (
+        index_node.value
+        if isinstance(index_node, ast.Constant)
+        and isinstance(index_node.value, int)
+        and not isinstance(index_node.value, bool)
+        else None
+    )
+    return expr.func.value, index
+
+
+def _sync_callback_heap_heappop_subscript_mutates(expr, tracking):
+    """Return True for ``heapq.heappop(heap)[1]()`` callback execution."""
+    heappop_call, selected_index = _sync_callback_zero_arg_subscript_invocation(expr)
+    if heappop_call is None or selected_index is None:
+        return False
+    if not (
+        isinstance(heappop_call.func, ast.Attribute)
+        and heappop_call.func.attr == "heappop"
+        and isinstance(heappop_call.func.value, ast.Name)
+        and heappop_call.func.value.id in tracking["heapq_modules"]
+        and len(heappop_call.args) == 1
+        and isinstance(heappop_call.args[0], ast.Name)
+    ):
+        return False
+    heap_name = heappop_call.args[0].id
+    return (
+        heap_name in tracking["mutating"]
+        and tracking["containers"].get(heap_name) == "heap"
+        and selected_index
+        in tracking["mutating_subscript_indexes"].get(heap_name, set())
+    )
+
+
+def _sync_callback_queue_get_subscript_mutates(expr, tracking):
+    """Return True for ``queue.get()[1]()`` PriorityQueue callback execution."""
+    get_call, selected_index = _sync_callback_zero_arg_subscript_invocation(expr)
+    if (
+        get_call is None
+        or selected_index is None
+        or not isinstance(get_call.func, ast.Attribute)
+    ):
+        return False
+    receiver = get_call.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    if tracking["containers"].get(receiver.id) != "queue":
+        return False
+    method = get_call.func.attr
+    if method not in {"get", "get_nowait"}:
+        return False
+    return (
+        selected_index
+        in tracking["mutating_subscript_indexes"].get(receiver.id, set())
+        and _sync_callback_accessor_arguments_are_valid(
+            get_call,
+            "queue",
+            method,
+        )
+    )
+
+
+def _record_sync_callback_cancel(node, tracking):
+    """Remove a proven mutating scheduler event canceled before run()."""
+    expr = _statement_value_expression(node)
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "cancel"
+        and len(expr.args) == 1
+        and not expr.keywords
+        and isinstance(expr.func.value, ast.Name)
+        and isinstance(expr.args[0], ast.Name)
+    ):
+        return
+    scheduler_name = expr.func.value.id
+    if tracking["containers"].get(scheduler_name) != "sched":
+        return
+    event_data = tracking["sched_event_ids"].get(expr.args[0].id)
+    if event_data is None or event_data[0] != scheduler_name:
+        return
+    event_id = event_data[1]
+    pending = tracking["sched_pending_events"].get(scheduler_name, set())
+    pending.discard(event_id)
+    tracking["sched_event_ids"] = {
+        event_name: known_event
+        for event_name, known_event in tracking["sched_event_ids"].items()
+        if known_event != event_data
+    }
+    if not pending:
+        tracking["sched_pending_events"].pop(scheduler_name, None)
+        tracking["mutating"].discard(scheduler_name)
+
+
 def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     """Return True only for proven synchronous execution of a mutating callback."""
     expr = _statement_value_expression(node)
-    if not isinstance(expr, ast.Call) or expr.args or expr.keywords:
+    if not isinstance(expr, ast.Call):
         return False
+    if _sync_callback_sched_run_mutates(expr, tracking):
+        return True
+    if expr.args or expr.keywords:
+        return False
+    if _sync_callback_heap_heappop_subscript_mutates(
+        expr,
+        tracking,
+    ):
+        return True
+    if _sync_callback_queue_get_subscript_mutates(
+        expr,
+        tracking,
+    ):
+        return True
     inner = expr.func
     if not isinstance(inner, ast.Call):
         return False
+    if _sync_callback_pop_result_invocation_mutates(inner, tracking):
+        return True
+    if _sync_callback_iterator_next_invocation_mutates(inner, tracking):
+        return True
 
     if _next_iter_callback_source_mutates(
         inner,
@@ -9419,6 +10290,8 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         "queue": {"get", "get_nowait"},
         "deque": {"pop", "popleft"},
         "list": {"pop"},
+        "userlist": {"pop"},
+        "sched": {"run"},
     }
     return (
         method in dispatch_methods.get(kind, set())
@@ -9429,14 +10302,15 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
 def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
     """Update container tracking and report proven synchronous callback execution."""
     tracking = _sync_callback_tracking(scan_state)
+    _record_sync_callback_imports(node, tracking)
+    _record_sync_callback_cancel(node, tracking)
     dispatch_mutates = _sync_callback_dispatch_mutates(
         node,
         tracking,
         operator_bindings,
     )
-    _record_sync_callback_imports(node, tracking)
-    _record_sync_callback_insert(node, tracking, operator_bindings)
     _record_sync_callback_assignment(node, tracking, operator_bindings)
+    _record_sync_callback_insert(node, tracking, operator_bindings)
     return dispatch_mutates
 
 
@@ -9759,7 +10633,7 @@ def _collect_operator_setitem_bindings(tree):
             'globals', 'getattr', 'staticmethod', 'classmethod', 'property',
             'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
-            'iter', 'reversed',
+            'iter', 'reversed', 'vars',
         }
     }
     builtin_shadow_lines = {
@@ -10267,6 +11141,27 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         future_analysis,
+    )
+    inspect_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        "inspect",
+    )
+    inspect_currentframe_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "inspect",
+        {"currentframe"},
+    )
+    inspect_analysis = {
+        "module_alias_events": inspect_module_alias_events,
+        "currentframe_alias_events": inspect_currentframe_alias_events,
+    }
+    inspect_analysis["frame_alias_events"] = _collect_inspect_frame_alias_events(
+        tree,
+        inspect_analysis,
+    )
+    operator_bindings = (
+        *operator_bindings,
+        inspect_analysis,
     )
     if _statements_start_mutating_thread(
         tree.body,

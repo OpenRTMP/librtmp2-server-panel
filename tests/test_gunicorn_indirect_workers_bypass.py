@@ -465,6 +465,165 @@ def test_cursor_consumed_generator_over_mutating_lazy_iterator_is_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+# Security review 2026-09-27: additional import-time workers mutation gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport sched\ns = sched.scheduler()\ns.enter(0, 1, lambda: globals().update({'workers': 4}))\ns.run(blocking=False)\n",
+        "workers = 1\nfrom functools import reduce\nreduce(lambda _, f: f(), [lambda: globals().update({'workers': 4})], None)\n",
+        "workers = 1\nimport inspect\nframe = inspect.currentframe()\nframe.f_globals.update({'workers': 4})\n",
+        "workers = 1\nany(cb() or True for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nsum(cb() or 0 for cb in [lambda: globals().update({'workers': 4})])\n",
+        "workers = 1\nmatch [lambda: globals().update({'workers': 4})]:\n    case [cb]: cb()\n",
+        "workers = 1\nfrom multiprocessing.pool import ThreadPool\nThreadPool(1).apply(lambda: globals().update({'workers': 4}))\n",
+        "workers = 1\nimport builtins\nvars(builtins)['exec']('workers=4')\n",
+        "workers = 1\n[(cb := lambda: globals().update({'workers': 4}))() for _ in [1]]\n",
+        "workers = 1\nimport queue\nq = queue.PriorityQueue()\nq.put((0, lambda: globals().update({'workers': 4})))\nq.get()[1]()\n",
+        "workers = 1\nimport heapq\nh = []\nheapq.heappush(h, (0, lambda: globals().update({'workers': 4})))\nheapq.heappop(h)[1]()\n",
+        "workers = 1\nimport collections\nd = collections.UserList([lambda: globals().update({'workers': 4})])\nd.pop(0)()\n",
+        "workers = 1\nit = iter([lambda: globals().update({'workers': 4})])\nwhile True:\n    try:\n        it.__next__()()\n    except StopIteration:\n        break\n",
+        "workers = 1\nimport asyncio\nloop = asyncio.new_event_loop()\nasyncio.set_event_loop(loop)\nasync def coro():\n    await asyncio.to_thread(lambda: globals().update({'workers': 4}))\nloop.create_task(coro())\nloop.run_until_complete(asyncio.sleep(0))\n",
+    ],
+)
+def test_security_review_sep27_worker_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr290_direct_userlist_import_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "from collections import UserList\n"
+        "d = UserList([lambda: globals().update({'workers': 4})])\n"
+        "d.pop(0)()\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "def vars(_):\n"
+            "    return {'exec': lambda _: None}\n"
+            "vars(builtins)['exec']('workers=4')\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Frame:\n"
+            "    pass\n"
+            "frame = Frame()\n"
+            "frame.f_globals = {}\n"
+            "frame.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "any(True or cb() for cb in "
+            "[lambda: globals().update({'workers': 4})])\n"
+        ),
+        (
+            "workers = 1\n"
+            "import queue\n"
+            "q = queue.PriorityQueue()\n"
+            "q.put((lambda: None, "
+            "lambda: globals().update({'workers': 4})))\n"
+            "q.get()[0]()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import heapq\n"
+            "h = []\n"
+            "heapq.heappush(h, (lambda: None, "
+            "lambda: globals().update({'workers': 4})))\n"
+            "heapq.heappop(h)[0]()\n"
+        ),
+        (
+            "workers = 1\n"
+            "from functools import reduce\n"
+            "reduce(lambda _, f: f(), "
+            "[lambda: globals().update({'workers': 4})])\n"
+        ),
+        (
+            "workers = 1\n"
+            "match [lambda: globals().update({'workers': 4}), lambda: None]:\n"
+            "    case [cb]: cb()\n"
+        ),
+        (
+            "workers = 1\n"
+            "match [lambda: globals().update({'workers': 4})]:\n"
+            "    case [cb] if False: cb()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import heapq\n"
+            "class SafeHeap:\n"
+            "    def heappush(self, *args):\n"
+            "        return None\n"
+            "    def heappop(self, *args):\n"
+            "        return (0, lambda: None)\n"
+            "heapq = SafeHeap()\n"
+            "h = []\n"
+            "heapq.heappush(h, (0, "
+            "lambda: globals().update({'workers': 4})))\n"
+            "heapq.heappop(h)[1]()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sched\n"
+            "class SafeSched:\n"
+            "    def scheduler(self):\n"
+            "        return self\n"
+            "    def enter(self, *args):\n"
+            "        return object()\n"
+            "    def run(self, *args, **kwargs):\n"
+            "        return None\n"
+            "sched = SafeSched()\n"
+            "s = sched.scheduler()\n"
+            "s.enter(0, 1, lambda: globals().update({'workers': 4}))\n"
+            "s.run()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sched\n"
+            "s = sched.scheduler()\n"
+            "event = s.enter(0, 1, "
+            "lambda: globals().update({'workers': 4}))\n"
+            "s.cancel(event)\n"
+            "s.run(blocking=False)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import asyncio\n"
+            "loop = asyncio.new_event_loop()\n"
+            "asyncio.set_event_loop(loop)\n"
+            "async def coro():\n"
+            "    await asyncio.to_thread("
+            "lambda: globals().update({'workers': 4}))\n"
+            "task = loop.create_task(coro())\n"
+            "task.cancel()\n"
+            "loop.run_until_complete(asyncio.sleep(0))\n"
+        ),
+    ],
+)
+def test_codex_pr290_false_positive_patterns_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
 @pytest.mark.parametrize(
     "config_content",
     [
