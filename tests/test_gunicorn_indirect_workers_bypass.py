@@ -1352,3 +1352,48 @@ def test_coderabbit_pr292_sum_rebound_to_builtin_stays_dynamic(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-09-28: builtins-module eager consumer indirection
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "builtins.sum(cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "builtins.any(cb() or True for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "getattr(builtins, 'sum')(cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "builtins.__dict__['sum'](cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "from importlib import import_module\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "import_module('builtins').sum(cb() or 0 for cb in callbacks)\n",
+        )),
+    ],
+)
+def test_security_review_sep28_builtins_module_consumers_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
