@@ -11513,6 +11513,8 @@ def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
             continue
         if token.startswith("--config="):
             config_path = token.split("=", 1)[1]
+        if token.startswith("-c") and len(token) > 2:
+            config_path = token[2:]
         i += 1
     return config_path
 
