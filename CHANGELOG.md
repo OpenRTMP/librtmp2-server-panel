@@ -13,6 +13,19 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-09-28
+
+### Security
+- Hardened the Gunicorn `workers` scanner against additional builtins-module indirection that could execute mutating generators at import time, including `builtins.sum(...)`, `builtins.getattr(...)`, `builtins.__dict__['sum'](...)`, and `importlib.import_module('builtins').sum(...)`. These paths now correctly fail closed so hidden multi-worker configurations cannot bypass the `RATELIMIT_STORAGE_URI=memory://` and per-process session-store safeguards.
+
+### Fixed
+- Made builtins and `importlib` resolution source-order aware so later rebinding of imported module aliases no longer causes false positives.
+- Respect shadowing of builtin `getattr` while still recognizing module-qualified `builtins.getattr`, and corrected the importlib alias/event binding slots used by the scanner.
+- Added regression coverage for the newly detected bypasses and shadowing/rebinding cases.
+
+### Changed
+- Changelog version `0.1.9` → `0.1.10`.
+
 ## [0.1.9] — 2026-09-23
 
 ### Security

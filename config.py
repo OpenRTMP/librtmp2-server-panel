@@ -7258,20 +7258,233 @@ def _collections_call_consumes_mutating_lazy_iterator(
     )
 
 
-def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
-    """Detect eager builtin consumers of a risky lazy iterator."""
-    if not isinstance(call.func, ast.Name):
+def _constant_is_eager_generator_consumer(node):
+    return isinstance(node, ast.Constant) and node.value in _EAGER_GENERATOR_CONSUMER_BUILTINS
+
+
+def _builtins_module_is_active_at_line(
+    node,
+    builtins_aliases,
+    builtins_alias_events=None,
+    reference_line=0,
+):
+    """Return whether an expression resolves to builtins at this source line."""
+    if _is_builtins_import(node) or _is_builtins_reference(node, builtins_aliases):
+        return True
+    return _module_alias_active_at_line(
+        node,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line or getattr(node, "lineno", 0),
+    )
+
+
+def _getattr_is_builtin_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
+    """Return True for builtin getattr resolving an eager consumer."""
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
         return False
-    name = call.func.id
-    if (
-        name not in _EAGER_LAZY_ITERATOR_CONSUMERS
-        or not _builtin_consumer_is_active(
-            name,
-            call,
-            operator_bindings,
+    reference_line = getattr(func, "lineno", 0)
+    resolver = func.func
+    direct_getattr = (
+        isinstance(resolver, ast.Name)
+        and resolver.id == "getattr"
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
         )
+    )
+    module_getattr = (
+        isinstance(resolver, ast.Attribute)
+        and resolver.attr == "getattr"
+        and _builtins_module_is_active_at_line(
+            resolver.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+    )
+    return (
+        (direct_getattr or module_getattr)
+        and _builtins_module_is_active_at_line(
+            func.args[0],
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+        and _constant_is_eager_generator_consumer(func.args[1])
+    )
+
+
+def _subscript_is_vars_builtins_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
+    """Return True for ``vars(builtins)['sum'/'any'/...]`` callables."""
+    if not isinstance(func, ast.Subscript) or not _constant_is_eager_generator_consumer(
+        func.slice
     ):
         return False
+    value = func.value
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "vars"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return False
+    reference_line = getattr(value, "lineno", 0)
+    if not _name_is_unshadowed_builtin(
+        "vars",
+        reference_line,
+        builtin_shadow_lines,
+    ):
+        return False
+    return _builtins_module_is_active_at_line(
+        value.args[0],
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    )
+
+
+def _subscript_is_builtin_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
+    """Return True for ``builtins.__dict__['sum'/'any'/...]`` callables."""
+    if not isinstance(func, ast.Subscript) or not _constant_is_eager_generator_consumer(
+        func.slice
+    ):
+        return False
+    reference_line = getattr(func, "lineno", 0)
+    base = _subscript_base_node(func)
+    if _builtins_module_is_active_at_line(
+        base,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    ):
+        return True
+    return (
+        isinstance(base, ast.Attribute)
+        and base.attr == "__dict__"
+        and _builtins_module_is_active_at_line(
+            base.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+    ) or _subscript_is_vars_builtins_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+        builtin_shadow_lines,
+    )
+
+
+def _attribute_is_builtin_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+):
+    """Return True for ``builtins.sum`` / ``builtins.any`` / ... callables."""
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _EAGER_GENERATOR_CONSUMER_BUILTINS
+        and _builtins_module_is_active_at_line(
+            func.value,
+            builtins_aliases,
+            builtins_alias_events,
+            getattr(func, "lineno", 0),
+        )
+    )
+
+
+def _call_is_importlib_builtins_eager_consumer(call, operator_bindings):
+    """Return True for ``import_module('builtins').sum(...)`` style calls."""
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not isinstance(func, ast.Attribute) or func.attr not in _EAGER_GENERATOR_CONSUMER_BUILTINS:
+        return False
+    base = func.value
+    if not isinstance(base, ast.Call) or not base.args:
+        return False
+    importlib_aliases = (
+        operator_bindings[16] if len(operator_bindings) > 16 else set()
+    )
+    importlib_alias_events = (
+        operator_bindings[19] if len(operator_bindings) > 19 else {}
+    )
+    importlib_module_aliases = (
+        operator_bindings[24] if len(operator_bindings) > 24 else set()
+    )
+    importlib_module_alias_events = (
+        operator_bindings[29] if len(operator_bindings) > 29 else {}
+    )
+    if not _call_uses_importlib_import_module(
+        base,
+        importlib_aliases,
+        importlib_alias_events,
+        importlib_module_aliases,
+        importlib_module_alias_events,
+        getattr(call, "lineno", 0),
+    ):
+        return False
+    module_name = base.args[0]
+    return isinstance(module_name, ast.Constant) and module_name.value == "builtins"
+
+
+def _resolved_builtin_eager_consumer_name(call, operator_bindings):
+    """Return an eager consumer name when ``call`` resolves via the builtins module."""
+    if not isinstance(call, ast.Call):
+        return None
+    func = call.func
+    builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+    builtins_alias_events = (
+        operator_bindings[30] if len(operator_bindings) > 30 else {}
+    )
+    builtin_shadow_lines = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    if _attribute_is_builtin_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+    ):
+        return func.attr
+    if _getattr_is_builtin_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+        builtin_shadow_lines,
+    ):
+        return func.args[1].value
+    if isinstance(func, ast.Subscript) and _subscript_is_builtin_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+        builtin_shadow_lines,
+    ):
+        return func.slice.value
+    if _call_is_importlib_builtins_eager_consumer(call, operator_bindings):
+        return call.func.attr
+    return None
+
+
+def _eager_consumer_drains_mutating_lazy_iterator(name, call, operator_bindings):
+    """Shared argument checks for direct and builtins-module eager consumers."""
     if (
         name in {"sorted", "max", "min"}
         and _key_lambda_mutates_workers(call, operator_bindings)
@@ -7287,6 +7500,39 @@ def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
     )
 
 
+def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect eager builtin consumers of a risky lazy iterator."""
+    if not isinstance(call.func, ast.Name):
+        return False
+    name = call.func.id
+    if (
+        name not in _EAGER_LAZY_ITERATOR_CONSUMERS
+        or not _builtin_consumer_is_active(
+            name,
+            call,
+            operator_bindings,
+        )
+    ):
+        return False
+    return _eager_consumer_drains_mutating_lazy_iterator(
+        name,
+        call,
+        operator_bindings,
+    )
+
+
+def _builtin_module_consumes_mutating_lazy_iterator(call, operator_bindings):
+    """Detect builtins-module indirection for eager generator consumers."""
+    name = _resolved_builtin_eager_consumer_name(call, operator_bindings)
+    if not name:
+        return False
+    return _eager_consumer_drains_mutating_lazy_iterator(
+        name,
+        call,
+        operator_bindings,
+    )
+
+
 def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
     """Detect eager consumers of direct or saved risky map/filter iterators."""
     if not isinstance(call, ast.Call):
@@ -7298,6 +7544,10 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
             operator_bindings,
         )
         or _named_builtin_consumes_mutating_lazy_iterator(
+            call,
+            operator_bindings,
+        )
+        or _builtin_module_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
         )
@@ -9655,19 +9905,21 @@ def _comprehension_invokes_mutating_callback(
 
 def _generator_consumer_name(call, operator_bindings, bound_names=None):
     """Return the active eager builtin consuming the first positional argument."""
-    if not (
-        isinstance(call, ast.Call)
-        and call.args
-        and isinstance(call.func, ast.Name)
-    ):
+    if not isinstance(call, ast.Call) or not call.args:
         return None
-    name = call.func.id
-    if name not in _EAGER_GENERATOR_CONSUMER_BUILTINS:
-        return None
-    if bound_names and name in bound_names:
-        return None
-    if not _unshadowed_builtin_call(call, name, operator_bindings):
-        return None
+    name = None
+    if isinstance(call.func, ast.Name):
+        name = call.func.id
+        if name not in _EAGER_GENERATOR_CONSUMER_BUILTINS:
+            return None
+        if bound_names and name in bound_names:
+            return None
+        if not _unshadowed_builtin_call(call, name, operator_bindings):
+            return None
+    else:
+        name = _resolved_builtin_eager_consumer_name(call, operator_bindings)
+        if not name:
+            return None
     if name in {"max", "min"} and len(call.args) != 1:
         return None
     return name
