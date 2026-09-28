@@ -7262,14 +7262,61 @@ def _constant_is_eager_generator_consumer(node):
     return isinstance(node, ast.Constant) and node.value in _EAGER_GENERATOR_CONSUMER_BUILTINS
 
 
-def _getattr_is_builtin_eager_consumer(func, builtins_aliases):
-    """Return True for ``getattr(builtins, 'sum'/'any'/...)`` callables."""
+def _builtins_module_is_active_at_line(
+    node,
+    builtins_aliases,
+    builtins_alias_events=None,
+    reference_line=0,
+):
+    """Return whether an expression resolves to builtins at this source line."""
+    if _is_builtins_import(node) or _is_builtins_reference(node, builtins_aliases):
+        return True
+    return _module_alias_active_at_line(
+        node,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line or getattr(node, "lineno", 0),
+    )
+
+
+def _getattr_is_builtin_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+    builtin_shadow_lines=None,
+):
+    """Return True for builtin getattr resolving an eager consumer."""
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return False
+    reference_line = getattr(func, "lineno", 0)
+    resolver = func.func
+    direct_getattr = (
+        isinstance(resolver, ast.Name)
+        and resolver.id == "getattr"
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
+        )
+    )
+    module_getattr = (
+        isinstance(resolver, ast.Attribute)
+        and resolver.attr == "getattr"
+        and _builtins_module_is_active_at_line(
+            resolver.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+    )
     return (
-        isinstance(func, ast.Call)
-        and isinstance(func.func, ast.Name)
-        and func.func.id == "getattr"
-        and len(func.args) >= 2
-        and _is_known_builtins_module(func.args[0], builtins_aliases)
+        (direct_getattr or module_getattr)
+        and _builtins_module_is_active_at_line(
+            func.args[0],
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
         and _constant_is_eager_generator_consumer(func.args[1])
     )
 
@@ -7277,6 +7324,7 @@ def _getattr_is_builtin_eager_consumer(func, builtins_aliases):
 def _subscript_is_vars_builtins_eager_consumer(
     func,
     builtins_aliases,
+    builtins_alias_events=None,
     builtin_shadow_lines=None,
 ):
     """Return True for ``vars(builtins)['sum'/'any'/...]`` callables."""
@@ -7293,18 +7341,25 @@ def _subscript_is_vars_builtins_eager_consumer(
         and not value.keywords
     ):
         return False
+    reference_line = getattr(value, "lineno", 0)
     if not _name_is_unshadowed_builtin(
         "vars",
-        getattr(value, "lineno", 0),
+        reference_line,
         builtin_shadow_lines,
     ):
         return False
-    return _is_known_builtins_module(value.args[0], builtins_aliases)
+    return _builtins_module_is_active_at_line(
+        value.args[0],
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    )
 
 
 def _subscript_is_builtin_eager_consumer(
     func,
     builtins_aliases,
+    builtins_alias_events=None,
     builtin_shadow_lines=None,
 ):
     """Return True for ``builtins.__dict__['sum'/'any'/...]`` callables."""
@@ -7312,26 +7367,47 @@ def _subscript_is_builtin_eager_consumer(
         func.slice
     ):
         return False
+    reference_line = getattr(func, "lineno", 0)
     base = _subscript_base_node(func)
-    if _is_known_builtins_module(base, builtins_aliases):
+    if _builtins_module_is_active_at_line(
+        base,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    ):
         return True
     return (
         isinstance(base, ast.Attribute)
         and base.attr == "__dict__"
-        and _is_known_builtins_module(base.value, builtins_aliases)
+        and _builtins_module_is_active_at_line(
+            base.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
     ) or _subscript_is_vars_builtins_eager_consumer(
         func,
         builtins_aliases,
+        builtins_alias_events,
         builtin_shadow_lines,
     )
 
 
-def _attribute_is_builtin_eager_consumer(func, builtins_aliases):
+def _attribute_is_builtin_eager_consumer(
+    func,
+    builtins_aliases,
+    builtins_alias_events=None,
+):
     """Return True for ``builtins.sum`` / ``builtins.any`` / ... callables."""
     return (
         isinstance(func, ast.Attribute)
         and func.attr in _EAGER_GENERATOR_CONSUMER_BUILTINS
-        and _is_known_builtins_module(func.value, builtins_aliases)
+        and _builtins_module_is_active_at_line(
+            func.value,
+            builtins_aliases,
+            builtins_alias_events,
+            getattr(func, "lineno", 0),
+        )
     )
 
 
@@ -7349,13 +7425,13 @@ def _call_is_importlib_builtins_eager_consumer(call, operator_bindings):
         operator_bindings[16] if len(operator_bindings) > 16 else set()
     )
     importlib_alias_events = (
-        operator_bindings[18] if len(operator_bindings) > 18 else {}
+        operator_bindings[19] if len(operator_bindings) > 19 else {}
     )
     importlib_module_aliases = (
-        operator_bindings[23] if len(operator_bindings) > 23 else set()
+        operator_bindings[24] if len(operator_bindings) > 24 else set()
     )
     importlib_module_alias_events = (
-        operator_bindings[25] if len(operator_bindings) > 25 else {}
+        operator_bindings[29] if len(operator_bindings) > 29 else {}
     )
     if not _call_uses_importlib_import_module(
         base,
@@ -7376,16 +7452,29 @@ def _resolved_builtin_eager_consumer_name(call, operator_bindings):
         return None
     func = call.func
     builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+    builtins_alias_events = (
+        operator_bindings[30] if len(operator_bindings) > 30 else {}
+    )
     builtin_shadow_lines = (
         operator_bindings[32] if len(operator_bindings) > 32 else {}
     )
-    if _attribute_is_builtin_eager_consumer(func, builtins_aliases):
+    if _attribute_is_builtin_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+    ):
         return func.attr
-    if _getattr_is_builtin_eager_consumer(func, builtins_aliases):
+    if _getattr_is_builtin_eager_consumer(
+        func,
+        builtins_aliases,
+        builtins_alias_events,
+        builtin_shadow_lines,
+    ):
         return func.args[1].value
     if isinstance(func, ast.Subscript) and _subscript_is_builtin_eager_consumer(
         func,
         builtins_aliases,
+        builtins_alias_events,
         builtin_shadow_lines,
     ):
         return func.slice.value

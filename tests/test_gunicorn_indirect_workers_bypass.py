@@ -1397,3 +1397,63 @@ def test_security_review_sep28_builtins_module_consumers_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+
+# Codex PR #294: source-ordered builtins/importlib resolution
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "".join((
+            "workers = 1\n",
+            "import importlib\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "importlib.import_module('builtins').sum(cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import importlib as il\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "il.import_module('builtins').sum(cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "builtins.getattr(builtins, 'sum')(cb() or 0 for cb in callbacks)\n",
+        )),
+    ],
+)
+def test_codex_pr294_builtin_module_resolution_is_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "getattr = lambda obj, name: (lambda values: 0)\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "getattr(builtins, 'sum')(cb() or 0 for cb in callbacks)\n",
+        )),
+        "".join((
+            "workers = 1\n",
+            "import builtins\n",
+            "class Helper:\n",
+            "    @staticmethod\n",
+            "    def sum(values):\n",
+            "        return 0\n",
+            "builtins = Helper()\n",
+            "callbacks = [lambda: globals().update({'workers': 4})]\n",
+            "builtins.sum(cb() or 0 for cb in callbacks)\n",
+        )),
+    ],
+)
+def test_codex_pr294_shadowed_builtin_helpers_stay_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
