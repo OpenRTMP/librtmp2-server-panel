@@ -35,6 +35,9 @@ APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 VIEWER_ID_RE = re.compile(r"^vi_[0-9a-f]{32}$")
 DISPLAY_NAME_MAX_LEN = 128
 MIN_ACCESS_KEY_LEN = 32
+# Upstream stream/node ids are Rust Strings; anything else (an object or an
+# array) is a malformed payload and cannot be used as a dict key.
+CLUSTER_KEY_TYPES = (str, int, float, bool)
 CLUSTER_TEMPLATE = "cluster.html"
 INDEX_HTML = "index.html"
 CREATE_STREAM_HTML = "create_stream.html"
@@ -637,7 +640,7 @@ class _PanelRuntime:
             if not isinstance(entry, dict):
                 continue
             sid = entry.get("stream_id") or entry.get("id")
-            if sid:
+            if isinstance(sid, CLUSTER_KEY_TYPES):
                 cluster_by_stream[sid] = entry
         return cluster_by_stream, api_error
 
