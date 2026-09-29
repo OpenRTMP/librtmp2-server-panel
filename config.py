@@ -11666,7 +11666,10 @@ def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
         if token.startswith("--config="):
             config_path = token.split("=", 1)[1]
         if token.startswith("-c") and len(token) > 2:
-            config_path = token[2:].lstrip("=")
+            # argparse gives ``-c==prod.py`` the value ``=prod.py``, so only the
+            # single option separator may be dropped here.
+            value = token[2:]
+            config_path = value[1:] if value.startswith("=") else value
         i += 1
     return config_path
 
