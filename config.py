@@ -11453,8 +11453,8 @@ def _class_body_global_names(node):
     )
 
 
-def _gunicorn_config_has_runtime_hooks(tree):
-    """Return True when the config defines hooks that can mutate workers at runtime.
+def _is_live_gunicorn_hook_binding(child, class_globals):
+    """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
     nested in any block and a binding of any kind count just like a top-level
@@ -11462,20 +11462,31 @@ def _gunicorn_config_has_runtime_hooks(tree):
     ``def`` or a plain store in a class body is the exception: both bind a class
     attribute, which Gunicorn never installs because it only reads the module
     namespace. A class-body store declared ``global`` still reaches it, so that
-    form keeps counting.
+    form keeps counting. ``class_globals`` is ``None`` outside a class body and
+    otherwise the ``global`` names the enclosing class body declared.
+    """
+    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return child.name in _GUNICORN_RUNTIME_HOOK_NAMES and class_globals is None
+    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+        return child.id in _GUNICORN_RUNTIME_HOOK_NAMES and (
+            class_globals is None or child.id in class_globals
+        )
+    return False
+
+
+def _gunicorn_config_has_runtime_hooks(tree):
+    """Return True when the config defines hooks that can mutate workers at runtime.
+
+    Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
+    count, and ``class_globals`` carries the enclosing class body's ``global``
+    names into the nodes below it.
     """
     stack = [(tree, None)]
     while stack:
         node, class_globals = stack.pop()
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if child.name in _GUNICORN_RUNTIME_HOOK_NAMES and class_globals is None:
-                    return True
-            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                if child.id in _GUNICORN_RUNTIME_HOOK_NAMES and (
-                    class_globals is None or child.id in class_globals
-                ):
-                    return True
+            if _is_live_gunicorn_hook_binding(child, class_globals):
+                return True
             stack.append(
                 (
                     child,
