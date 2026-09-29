@@ -402,9 +402,19 @@ def _is_globals_call(node):
     )
 
 
-def _globals_workers_subscript(node):
+def _globals_workers_subscript(node, operator_bindings=None):
     """Return True for ``globals()['workers']``-style subscript targets."""
-    return _subscript_slice_is_workers(node) and _is_globals_call(node.value)
+    if not _subscript_slice_is_workers(node):
+        return False
+    base = _subscript_base_node(node)
+    if not _globals_name_is_unshadowed_at(base, operator_bindings):
+        return False
+    namespace_aliases = (
+        operator_bindings[2]
+        if operator_bindings is not None and len(operator_bindings) > 2
+        else set()
+    )
+    return _is_module_namespace_mapping(base, namespace_aliases)
 
 
 def _dict_literal_sets_workers(node):
@@ -989,6 +999,35 @@ def _is_builtins_dict_attribute(
         )
     )
 
+
+
+def _globals_name_is_unshadowed_at(node, operator_bindings=None):
+    """Return True when a rebound ``globals`` has not hidden the builtin yet.
+
+    ``_is_globals_call`` only checks the call syntax, so a config that binds its
+    own ``globals`` would otherwise be read as mutating the module namespace
+    when it only touches a temporary mapping. An alias bound from that rebound
+    name is no more trustworthy, so the same shadow state is consulted for
+    every receiver.
+    """
+    builtin_shadow_lines = (
+        operator_bindings[32]
+        if operator_bindings is not None and len(operator_bindings) > 32
+        else {}
+    )
+    return _name_is_unshadowed_builtin(
+        "globals",
+        getattr(node, "lineno", 0),
+        builtin_shadow_lines,
+    )
+
+
+def _globals_call_is_unshadowed(node, operator_bindings=None):
+    """Return True for a ``globals()`` call that still names the builtin."""
+    return _is_globals_call(node) and _globals_name_is_unshadowed_at(
+        node,
+        operator_bindings,
+    )
 
 
 def _is_globals_class_dict_reference(node, shadow_lines=None):
@@ -8549,20 +8588,54 @@ def _import_from_binds_workers(node):
     )
 
 
-def _globals_workers_pop(node):
-    """Return True for ``globals().pop('workers')``-style binding removals."""
+def _namespace_workers_removal(node, operator_bindings=None):
+    """Return True for a call that empties the module ``workers`` name.
+
+    ``pop('workers')`` names the key directly, while ``popitem()``, ``clear()``
+    and ``__delitem__('workers')`` drop the binding it refers to, so all of
+    them leave Gunicorn without a ``workers`` setting to install.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    namespace_aliases = (
+        operator_bindings[2]
+        if operator_bindings is not None and len(operator_bindings) > 2
+        else set()
+    )
+    receiver = node.func.value
+    if not (
+        _globals_name_is_unshadowed_at(receiver, operator_bindings)
+        and _is_module_namespace_mapping(receiver, namespace_aliases)
+    ):
+        return False
+    method = node.func.attr
+    if method in ("popitem", "clear"):
+        return True
     return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "pop"
+        method in ("pop", "__delitem__")
         and bool(node.args)
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "workers"
-        and _is_globals_call(node.func.value)
     )
 
 
-def _workers_binding_removal(node):
+def _statement_removes_namespace_workers(node, operator_bindings=None):
+    """Return True when a statement removes ``workers`` via the namespace mapping.
+
+    Unlike a bare ``del workers``, a removal through ``globals()`` names the
+    module namespace directly, so it applies from any function scope.
+    """
+    if isinstance(node, ast.Delete):
+        return any(
+            _globals_workers_subscript(target, operator_bindings)
+            for target in node.targets
+        )
+    if isinstance(node, ast.Expr):
+        return _namespace_workers_removal(node.value, operator_bindings)
+    return False
+
+
+def _workers_binding_removal(node, operator_bindings=None):
     """Return True when a statement removes the module ``workers`` name.
 
     Gunicorn installs only the names present in the module namespace
@@ -8573,21 +8646,23 @@ def _workers_binding_removal(node):
     """
     if isinstance(node, ast.Delete):
         return any(
-            _target_assigns_workers(target) or _globals_workers_subscript(target)
+            _target_assigns_workers(target)
+            or _globals_workers_subscript(target, operator_bindings)
             for target in node.targets
         )
     if isinstance(node, ast.Expr):
-        return _globals_workers_pop(node.value)
+        return _namespace_workers_removal(node.value, operator_bindings)
     return False
 
 
-def _worker_assignment_value(node):
+def _worker_assignment_value(node, operator_bindings=None):
     """Return whether node assigns workers and its static value when available."""
-    if _workers_binding_removal(node):
+    if _workers_binding_removal(node, operator_bindings):
         return True, None
     if isinstance(node, ast.Assign):
         targets_workers = any(
-            _target_assigns_workers(target) or _globals_workers_subscript(target)
+            _target_assigns_workers(target)
+            or _globals_workers_subscript(target, operator_bindings)
             for target in node.targets
         )
         if not targets_workers:
@@ -8595,12 +8670,14 @@ def _worker_assignment_value(node):
         return True, _static_int_from_ast(node.value)
 
     if isinstance(node, ast.AnnAssign) and node.target and (
-        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
+        _target_assigns_workers(node.target)
+        or _globals_workers_subscript(node.target, operator_bindings)
     ):
         return True, _static_int_from_ast(node.value)
 
     if isinstance(node, ast.AugAssign) and (
-        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
+        _target_assigns_workers(node.target)
+        or _globals_workers_subscript(node.target, operator_bindings)
     ):
         return True, None
 
@@ -8900,8 +8977,12 @@ def _statement_mutates_workers(
         bound_names,
     ):
         return True
-    assigns_workers, _ = _worker_assignment_value(node)
+    assigns_workers, _ = _worker_assignment_value(node, operator_bindings)
     if global_workers and assigns_workers:
+        return True
+    if _statement_removes_namespace_workers(node, operator_bindings):
+        # ``globals()`` names the module namespace from any function scope, so a
+        # removal through it needs no ``global workers`` declaration to apply.
         return True
     return any(
         _statements_mutate_workers(
@@ -11110,15 +11191,15 @@ def _record_walrus_workers_assignment(node, state, *, in_compound):
     )
 
 
-def _record_direct_workers_assignment(node, state, *, in_compound):
+def _record_direct_workers_assignment(node, state, *, in_compound, operator_bindings=None):
     """Record direct assignments to workers."""
-    if _workers_binding_removal(node) and not in_compound:
+    if _workers_binding_removal(node, operator_bindings) and not in_compound:
         # An unconditional top-level removal is the only shape that provably
         # empties the module namespace, so the stale static count is dropped and
         # the WEB_CONCURRENCY default Gunicorn would actually apply is used.
         state.clear_workers_assignment()
         return
-    assigns_workers, value = _worker_assignment_value(node)
+    assigns_workers, value = _worker_assignment_value(node, operator_bindings)
     if assigns_workers:
         state.record_workers_assignment(value, in_compound=in_compound)
 
@@ -11313,6 +11394,7 @@ def _walk_gunicorn_workers_statements(
             node,
             state,
             in_compound=in_compound,
+            operator_bindings=operator_bindings,
         )
         for block in _compound_statement_blocks(node):
             _walk_gunicorn_workers_statements(
