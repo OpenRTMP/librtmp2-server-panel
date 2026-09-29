@@ -91,6 +91,17 @@ def _is_valid_access_key(value):
     return _is_valid_stream_id(value) and len(value) >= MIN_ACCESS_KEY_LEN
 
 
+def _cluster_key(value):
+    """Return a dict key that keeps equally-valued ids of different types apart.
+
+    ``1``, ``1.0`` and ``True`` are equal and hash-equal in Python, so a plain
+    id would let one entry overwrite another and attach its cluster metadata to
+    the wrong stream. Qualifying by type keeps them distinct; the caller still
+    rejects ids that are not hashable scalars.
+    """
+    return (type(value).__name__, value)
+
+
 def _optional_form_value(raw):
     if raw is None:
         return None
@@ -641,7 +652,7 @@ class _PanelRuntime:
                 continue
             sid = entry.get("stream_id") or entry.get("id")
             if isinstance(sid, CLUSTER_KEY_TYPES):
-                cluster_by_stream[sid] = entry
+                cluster_by_stream[_cluster_key(sid)] = entry
         return cluster_by_stream, api_error
 
     def _decorate_streams(
@@ -657,7 +668,7 @@ class _PanelRuntime:
             if cluster_on:
                 stream_id = stream.get("id")
                 stream["cluster"] = (
-                    cluster_by_stream.get(stream_id, {})
+                    cluster_by_stream.get(_cluster_key(stream_id), {})
                     if isinstance(stream_id, CLUSTER_KEY_TYPES)
                     else {}
                 )
