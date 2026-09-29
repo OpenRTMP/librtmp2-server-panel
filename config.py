@@ -11439,11 +11439,32 @@ _GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
 )
 
 
+# Calls that can obtain a callable the config file never names. They are what
+# stops the walk from treating an unreferenced function as one that can never
+# run, so every one of them keeps the hook detection fail-closed.
+_DYNAMIC_NAME_LOOKUP_CALLS = frozenset(
+    {
+        "__import__",
+        "compile",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "importlib",
+        "locals",
+        "setattr",
+        "vars",
+    }
+)
+
+
 def _class_body_global_names(node):
     """Return the names a class body binds to the module scope via ``global``.
 
     ``global`` is legal in a class body, and a name it declares keeps binding
-    into the module namespace rather than becoming a class attribute.
+    into the module namespace rather than becoming a class attribute. The same
+    is true inside the methods of that class, so the walk over the whole class
+    body collects them too; the wider set can only make the gate fail closed.
     """
     return frozenset(
         name
@@ -11453,47 +11474,109 @@ def _class_body_global_names(node):
     )
 
 
-def _is_live_gunicorn_hook_binding(child, class_globals):
+def _is_live_gunicorn_hook_binding(child, scope):
     """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
     nested in any block and a binding of any kind count just like a top-level
-    ``def``; anything else would let the hook bypass the fail-closed signal. A
-    ``def`` or a plain store in a class body is the exception: both bind a class
-    attribute, which Gunicorn never installs because it only reads the module
-    namespace. A class-body store declared ``global`` still reaches it, so that
-    form keeps counting. ``class_globals`` is ``None`` outside a class body and
-    otherwise the ``global`` names the enclosing class body declared.
+    ``def``; anything else would let the hook bypass the fail-closed signal.
+    What does not reach it is the exception, and there are exactly two scopes
+    that do not: a ``def`` or a plain store in a class body binds a class
+    attribute, and a store in a function body binds a local. ``scope`` is
+    ``(in_class, declared_globals, may_run)``; inside a class body a binding
+    counts only when a ``global`` in that class promoted it, which is why the
+    ``def`` form of a promoted hook is live too, and outside one a binding
+    counts only when the enclosing function can run.
     """
     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return child.name in _GUNICORN_RUNTIME_HOOK_NAMES and class_globals is None
-    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-        return child.id in _GUNICORN_RUNTIME_HOOK_NAMES and (
-            class_globals is None or child.id in class_globals
-        )
-    return False
+        name = child.name
+    elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+        name = child.id
+    else:
+        return False
+    if name not in _GUNICORN_RUNTIME_HOOK_NAMES:
+        return False
+    in_class, declared_globals, may_run = scope
+    return name in declared_globals if in_class else may_run
+
+
+def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
+    """Return the binding scope that applies to the nodes inside ``child``.
+
+    A class body runs when the file is loaded, so it opens a scope of its own
+    that its methods inherit untouched: a method body is judged by the class
+    rule, never by the function rule. Every other node keeps the scope it is
+    already in, which is what makes a ``def`` in a plain block bind at module
+    scope. Entering a function outside a class is what consults
+    ``uncalled_names``: a body no reference can reach cannot run, and a hook
+    bound in it never reaches the module namespace.
+    """
+    in_class, declared_globals, may_run = scope
+    if isinstance(child, ast.ClassDef):
+        return (True, _class_body_global_names(child), True)
+    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if in_class:
+            return scope
+        return (False, declared_globals, may_run and child.name not in uncalled_names)
+    return scope
+
+
+def _uses_dynamic_name_lookup(tree):
+    """Return True when the file can reach a callable without naming it.
+
+    ``eval``, ``exec``, ``getattr`` and the namespace accessors can call a
+    function this walk can prove nothing else calls, so the inert-function
+    proof below is only sound when none of them appear.
+    """
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _DYNAMIC_NAME_LOOKUP_CALLS
+        for node in ast.walk(tree)
+    )
+
+
+def _provably_uncalled_function_names(tree):
+    """Return the names of functions the config file never references.
+
+    Any load of the name counts as a reference, including the forms this walk
+    cannot follow -- ``callbacks.append(helper)``, ``class X(helper)``,
+    ``register(helper)`` -- so a function that no load mentions is the only
+    shape whose body provably cannot run, and a hook bound there is not a module
+    binding. A file that looks names up dynamically references everything, so it
+    proves nothing and the walk stays fail-closed.
+    """
+    if _uses_dynamic_name_lookup(tree):
+        return frozenset()
+    referenced = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    } | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    return frozenset(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name not in referenced
+    )
 
 
 def _gunicorn_config_has_runtime_hooks(tree):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
-    count, and ``class_globals`` carries the enclosing class body's ``global``
-    names into the nodes below it.
+    count, and ``_gunicorn_hook_binding_scope`` carries the enclosing binding
+    scope into the nodes below it.
     """
-    stack = [(tree, None)]
+    uncalled_names = _provably_uncalled_function_names(tree)
+    stack = [(tree, (False, frozenset(), True))]
     while stack:
-        node, class_globals = stack.pop()
+        node, scope = stack.pop()
         for child in ast.iter_child_nodes(node):
-            if _is_live_gunicorn_hook_binding(child, class_globals):
+            if _is_live_gunicorn_hook_binding(child, scope):
                 return True
             stack.append(
-                (
-                    child,
-                    _class_body_global_names(child)
-                    if isinstance(child, ast.ClassDef)
-                    else class_globals,
-                )
+                (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
             )
     return False
 
