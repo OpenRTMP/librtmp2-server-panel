@@ -8549,8 +8549,42 @@ def _import_from_binds_workers(node):
     )
 
 
+def _globals_workers_pop(node):
+    """Return True for ``globals().pop('workers')``-style binding removals."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "pop"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "workers"
+        and _is_globals_call(node.func.value)
+    )
+
+
+def _workers_binding_removal(node):
+    """Return True when a statement removes the module ``workers`` name.
+
+    Gunicorn installs only the names present in the module namespace
+    (``if k not in self.cfg.settings: continue`` in
+    ``Application.load_config_from_module_name_or_filename``), so once
+    ``workers`` is gone the setting keeps its ``WEB_CONCURRENCY`` default
+    instead of the value a previous assignment left behind.
+    """
+    if isinstance(node, ast.Delete):
+        return any(
+            _target_assigns_workers(target) or _globals_workers_subscript(target)
+            for target in node.targets
+        )
+    if isinstance(node, ast.Expr):
+        return _globals_workers_pop(node.value)
+    return False
+
+
 def _worker_assignment_value(node):
     """Return whether node assigns workers and its static value when available."""
+    if _workers_binding_removal(node):
+        return True, None
     if isinstance(node, ast.Assign):
         targets_workers = any(
             _target_assigns_workers(target) or _globals_workers_subscript(target)
@@ -9039,6 +9073,11 @@ class _GunicornWorkersScanState:
     count = 1
     dynamic = False
     found = False
+
+    def clear_workers_assignment(self) -> None:
+        """Forget a static count that a later removal of ``workers`` invalidated."""
+        self.found = False
+        self.count = 1
 
     def record_workers_assignment(self, value, *, in_compound: bool) -> None:
         self.found = True
@@ -11047,6 +11086,12 @@ def _record_walrus_workers_assignment(node, state, *, in_compound):
 
 def _record_direct_workers_assignment(node, state, *, in_compound):
     """Record direct assignments to workers."""
+    if _workers_binding_removal(node) and not in_compound:
+        # An unconditional top-level removal is the only shape that provably
+        # empties the module namespace, so the stale static count is dropped and
+        # the WEB_CONCURRENCY default Gunicorn would actually apply is used.
+        state.clear_workers_assignment()
+        return
     assigns_workers, value = _worker_assignment_value(node)
     if assigns_workers:
         state.record_workers_assignment(value, in_compound=in_compound)
