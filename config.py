@@ -11357,26 +11357,51 @@ _GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
 )
 
 
+def _class_body_global_names(node):
+    """Return the names a class body binds to the module scope via ``global``.
+
+    ``global`` is legal in a class body, and a name it declares keeps binding
+    into the module namespace rather than becoming a class attribute.
+    """
+    return frozenset(
+        name
+        for child in ast.walk(node)
+        if isinstance(child, ast.Global)
+        for name in child.names
+    )
+
+
 def _gunicorn_config_has_runtime_hooks(tree):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
     nested in any block and a binding of any kind count just like a top-level
     ``def``; anything else would let the hook bypass the fail-closed signal. A
-    ``def`` in a class body is the exception: it binds a class attribute, which
-    Gunicorn never installs because it only reads the module namespace.
+    ``def`` or a plain store in a class body is the exception: both bind a class
+    attribute, which Gunicorn never installs because it only reads the module
+    namespace. A class-body store declared ``global`` still reaches it, so that
+    form keeps counting.
     """
-    stack = [(tree, False)]
+    stack = [(tree, None)]
     while stack:
-        node, in_class_body = stack.pop()
+        node, class_globals = stack.pop()
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if child.name in _GUNICORN_RUNTIME_HOOK_NAMES and not in_class_body:
+                if child.name in _GUNICORN_RUNTIME_HOOK_NAMES and class_globals is None:
                     return True
             elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                if child.id in _GUNICORN_RUNTIME_HOOK_NAMES:
+                if child.id in _GUNICORN_RUNTIME_HOOK_NAMES and (
+                    class_globals is None or child.id in class_globals
+                ):
                     return True
-            stack.append((child, in_class_body or isinstance(child, ast.ClassDef)))
+            stack.append(
+                (
+                    child,
+                    _class_body_global_names(child)
+                    if isinstance(child, ast.ClassDef)
+                    else class_globals,
+                )
+            )
     return False
 
 
