@@ -444,6 +444,68 @@ def test_cluster_overview_renders_nodes_and_states(monkeypatch):
         assert b"Remove" in r.data
 
 
+def test_cluster_overview_skips_non_object_node_entries(monkeypatch):
+    # cluster.html calls node.get(...) unguarded, so a non-dict element used to
+    # raise jinja2.UndefinedError and 500 the whole page.
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "status": "ok",
+            "cluster": {"enabled": True, "quorum": True, "leader_id": 1},
+        }
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "cluster_id": "cid-1",
+            "node_id": 1,
+            "node_name": "node-1",
+            "role": "leader",
+            "leader_id": 1,
+            "term": 28,
+            "quorum": True,
+            "state": "ready",
+            "voter_count": 3,
+            "learner_count": 0,
+            "healthy_nodes": 1,
+            "unavailable_nodes": 0,
+            "total_publishers": 0,
+            "total_players": 0,
+            "total_rx_mbps": 0,
+            "total_tx_mbps": 0,
+        }
+        mock_client.cluster_nodes.return_value = [
+            {
+                "id": 1,
+                "name": "node-1",
+                "role": "leader",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+                "rx_mbps": 10.0,
+                "tx_mbps": 20.0,
+                "capacity_mbps": 1000,
+                "publishers": 0,
+                "players": 0,
+                "last_heartbeat": "now",
+            },
+            "node-2",
+            None,
+            42,
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"node-1" in r.data
+        assert b"READY" in r.data
+
+
 def test_cluster_overview_quorum_lost(monkeypatch):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
