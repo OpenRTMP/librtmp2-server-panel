@@ -11325,15 +11325,21 @@ def _gunicorn_config_has_runtime_hooks(tree):
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
     nested in any block and a binding of any kind count just like a top-level
-    ``def``; anything else would let the hook bypass the fail-closed signal.
+    ``def``; anything else would let the hook bypass the fail-closed signal. A
+    ``def`` in a class body is the exception: it binds a class attribute, which
+    Gunicorn never installs because it only reads the module namespace.
     """
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in _GUNICORN_RUNTIME_HOOK_NAMES:
-                return True
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            if node.id in _GUNICORN_RUNTIME_HOOK_NAMES:
-                return True
+    stack = [(tree, False)]
+    while stack:
+        node, in_class_body = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name in _GUNICORN_RUNTIME_HOOK_NAMES and not in_class_body:
+                    return True
+            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                if child.id in _GUNICORN_RUNTIME_HOOK_NAMES:
+                    return True
+            stack.append((child, in_class_body or isinstance(child, ast.ClassDef)))
     return False
 
 
