@@ -9029,25 +9029,34 @@ def _collect_import_time_workers_mutators(
     class_targets=None,
     dict_subclass_names=None,
 ):
-    """Return function names that may mutate ``workers`` when called at import time."""
-    functions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    """Return function names that may mutate ``workers`` when called at import time.
+
+    Definitions nested inside another function are collected too, because a
+    top-level helper that calls a nested one is only known to mutate once the
+    nested name is in the fixpoint. A name counts as a mutator when *any* of
+    its definitions mutates, since a nested definition can shadow a
+    module-level one of the same name.
+    """
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.setdefault(node.name, []).append(node)
     mutators = set()
     changed = True
     while changed:
         changed = False
-        for name, node in functions.items():
+        for name, nodes in functions.items():
             if name in mutators:
                 continue
-            if _function_mutates_workers(
-                node,
-                operator_bindings,
-                mutators,
-                class_targets,
-                dict_subclass_names,
+            if any(
+                _function_mutates_workers(
+                    node,
+                    operator_bindings,
+                    mutators,
+                    class_targets,
+                    dict_subclass_names,
+                )
+                for node in nodes
             ):
                 mutators.add(name)
                 changed = True
