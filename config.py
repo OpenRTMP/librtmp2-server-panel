@@ -8768,6 +8768,16 @@ def _is_dynamic_workers_mutation(
         for child in ast.iter_child_nodes(node)
     ):
         return True
+    if isinstance(node, ast.expr) and _expression_mutates_workers(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
+        # A definition-time expression such as ``exec("workers = 2")`` arrives
+        # here as the bare call, so the child scan above never reaches the
+        # detector that recognises it.
+        return True
     if isinstance(node, ast.Assign):
         return any(
             _indirect_workers_assignment_target(target)
