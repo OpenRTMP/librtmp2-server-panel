@@ -655,7 +655,12 @@ class _PanelRuntime:
         for stream in streams:
             stream.update(self.build_urls(stream, rtmps_on, rtmps_port))
             if cluster_on:
-                stream["cluster"] = cluster_by_stream.get(stream.get("id"), {})
+                stream_id = stream.get("id")
+                stream["cluster"] = (
+                    cluster_by_stream.get(stream_id, {})
+                    if isinstance(stream_id, CLUSTER_KEY_TYPES)
+                    else {}
+                )
 
     def cluster_overview(self):
         flash_error = session.pop("flash_error", None)
