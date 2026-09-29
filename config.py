@@ -11439,21 +11439,68 @@ _GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
 )
 
 
-# Calls that can obtain a callable the config file never names. They are what
+# Calls that can obtain a callable the config file never names, matched both as
+# a bare name (``getattr(ns, "helper")``) and as an attribute
+# (``operator.attrgetter("helper")``, ``pickle.loads(stream)``). They are what
 # stops the walk from treating an unreferenced function as one that can never
 # run, so every one of them keeps the hook detection fail-closed.
 _DYNAMIC_NAME_LOOKUP_CALLS = frozenset(
     {
         "__import__",
+        "attrgetter",
         "compile",
         "eval",
         "exec",
         "getattr",
         "globals",
+        "import_module",
         "importlib",
+        "itemgetter",
+        "load",
+        "loads",
         "locals",
+        "methodcaller",
         "setattr",
         "vars",
+    }
+)
+
+# Modules whose calls launder a name the config file never writes down: the
+# accessor and deserialisation factories, and the namespace registries.
+_DYNAMIC_NAME_LOOKUP_MODULES = frozenset(
+    {
+        "builtins",
+        "ctypes",
+        "dill",
+        "importlib",
+        "marshal",
+        "operator",
+        "pickle",
+        "shelve",
+        "sys",
+    }
+)
+
+# Attributes that hand back a namespace the file can then reach into by key.
+_NAMESPACE_ESCAPE_ATTRS = frozenset(
+    {
+        "__bases__",
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "__func__",
+        "__getattribute__",
+        "__globals__",
+        "__import__",
+        "__loader__",
+        "__mro__",
+        "__name__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__self__",
+        "__spec__",
+        "__subclasses__",
+        "modules",
     }
 )
 
@@ -11521,17 +11568,58 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
     return scope
 
 
+def _is_dynamic_lookup_call(node):
+    """Return True when a call can build a callable out of a string."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _DYNAMIC_NAME_LOOKUP_CALLS
+    if not isinstance(func, ast.Attribute):
+        return False
+    return func.attr in _DYNAMIC_NAME_LOOKUP_CALLS or (
+        isinstance(func.value, ast.Name)
+        and func.value.id in _DYNAMIC_NAME_LOOKUP_MODULES
+    )
+
+
+def _is_namespace_escape_attr(node):
+    """Return True when an attribute read exposes a namespace mapping."""
+    return isinstance(node, ast.Attribute) and node.attr in _NAMESPACE_ESCAPE_ATTRS
+
+
+def _is_string_keyed_subscript(node):
+    """Return True when a subscript reads a key the file spells as a string.
+
+    A string key is the only way to pull one member out of a mapping without a
+    name load naming it, so ``d["helper"]`` -- whether it calls the value or
+    stores it for later dispatch -- counts for the guard as much as
+    ``sys.modules[__name__].__dict__["helper"]`` does. The container need not
+    look like a namespace at all: ``ctypes.cast(id(mod), ctypes.py_object)
+    .value["helper"]`` spells no dunder anywhere.
+    """
+    if not isinstance(node, ast.Subscript):
+        return False
+    index = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+    return any(
+        isinstance(key, ast.Constant) and isinstance(key.value, str) for key in index
+    )
+
+
 def _uses_dynamic_name_lookup(tree):
     """Return True when the file can reach a callable without naming it.
 
     ``eval``, ``exec``, ``getattr`` and the namespace accessors can call a
-    function this walk can prove nothing else calls, so the inert-function
-    proof below is only sound when none of them appear.
+    function this walk can prove nothing else calls, and so can the two forms
+    that never spell a name at all: reading a namespace attribute, and reading
+    a mapping key out of a string literal. Any of the three voids the
+    inert-function proof below, because a hook bound in a function the file
+    only ever names as ``d["helper"]`` still runs.
     """
     return any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in _DYNAMIC_NAME_LOOKUP_CALLS
+        _is_dynamic_lookup_call(node)
+        or _is_namespace_escape_attr(node)
+        or _is_string_keyed_subscript(node)
         for node in ast.walk(tree)
     )
 
