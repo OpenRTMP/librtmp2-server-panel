@@ -8798,8 +8798,15 @@ def _statements_declare_global_workers(statements):
 
 def _expression_invokes_function(expr, func_names):
     """Return True when an evaluated expression invokes a named helper."""
-    if not func_names or isinstance(expr, ast.Lambda):
+    if not func_names:
         return False
+    if isinstance(expr, ast.Lambda):
+        # A lambda body only runs when the lambda is called, but its default
+        # arguments are evaluated while the lambda object is created.
+        return any(
+            _expression_invokes_function(default, func_names)
+            for default in _definition_time_expressions(expr)
+        )
     if isinstance(expr, ast.Call):
         if _call_invokes_function(expr, func_names):
             return True
@@ -11107,11 +11114,60 @@ def _record_direct_workers_assignment(node, state, *, in_compound):
 
 
 def _node_has_worker_mutating_decorator(node, global_workers_mutators):
-    """Return True when a function or class decorator mutates workers."""
+    """Return True when a function or class decorator mutates workers.
+
+    A decorator is an expression the interpreter evaluates while the ``def``
+    or ``class`` statement runs, so ``@f()`` mutates ``workers`` at config
+    import exactly like the bare ``@f`` form and must be treated the same.
+    """
     return any(
-        isinstance(decorator, ast.Name)
-        and decorator.id in global_workers_mutators
+        (
+            isinstance(decorator, ast.Name)
+            and decorator.id in global_workers_mutators
+        )
+        or (
+            isinstance(decorator, ast.Call)
+            and _call_invokes_function(decorator, global_workers_mutators)
+        )
         for decorator in node.decorator_list
+    )
+
+
+def _definition_time_expressions(node):
+    """Return expressions evaluated while a function-like object is created.
+
+    ``def`` evaluates decorators, default arguments and the return annotation
+    before the body exists, so a helper called from one of them runs at config
+    import. A lambda body is excluded because it only runs when it is called.
+    """
+    expressions = [*node.args.defaults]
+    expressions.extend(
+        default for default in node.args.kw_defaults if default is not None
+    )
+    returns = getattr(node, "returns", None)  # ast.Lambda has no annotation
+    if returns is not None:
+        expressions.append(returns)
+    return expressions
+
+
+def _definition_time_workers_effect(
+    node,
+    global_workers_mutators,
+    operator_bindings,
+    class_targets,
+    dict_subclass_names,
+):
+    """Return True when a definition-time expression mutates the worker count."""
+    return any(
+        _expression_invokes_function(expression, global_workers_mutators)
+        or _node_has_dynamic_workers_effect(
+            expression,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
+        )
+        for expression in _definition_time_expressions(node)
     )
 
 
@@ -11136,12 +11192,20 @@ def _handle_worker_scan_definition(
     state,
     global_workers_mutators,
     class_targets,
+    operator_bindings,
+    dict_subclass_names,
 ):
     """Handle definitions without descending into function or class bodies."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         if _node_has_worker_mutating_decorator(
             node,
             global_workers_mutators,
+        ) or _definition_time_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
         ):
             state.dynamic = True
         return True
@@ -11183,6 +11247,8 @@ def _walk_gunicorn_workers_statements(
             state,
             global_workers_mutators,
             class_targets,
+            operator_bindings,
+            dict_subclass_names,
         ):
             continue
         if _track_sync_callback_dispatch(node, state, operator_bindings):
