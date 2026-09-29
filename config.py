@@ -2452,6 +2452,34 @@ def _attribute_is_sys_modules_builtins_exec(func, sys_aliases=None):
     )
 
 
+def _subscript_is_sys_modules_builtins(node, sys_aliases=None):
+    """Return True for ``sys.modules['builtins']`` subscripts."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    modules_attr = node.value
+    if not (
+        isinstance(modules_attr, ast.Attribute)
+        and modules_attr.attr == "modules"
+        and isinstance(modules_attr.value, ast.Name)
+        and modules_attr.value.id in (sys_aliases or {"sys"})
+    ):
+        return False
+    return (
+        isinstance(node.slice, ast.Constant)
+        and node.slice.value == "builtins"
+    )
+
+
+def _attribute_is_sys_modules_builtins_eager_consumer(func, sys_aliases=None):
+    """Return True for ``sys.modules['builtins'].sum/any/...`` callables."""
+    if (
+        not isinstance(func, ast.Attribute)
+        or func.attr not in _EAGER_GENERATOR_CONSUMER_BUILTINS
+    ):
+        return False
+    return _subscript_is_sys_modules_builtins(func.value, sys_aliases)
+
+
 def _attribute_is_imported_builtins_exec_eval(node):
     """Return True for ``__import__('builtins').exec/eval`` attribute references."""
     return (
@@ -3442,6 +3470,9 @@ def _call_is_dict_subclass_update_on_module_namespace(
 
 _OPERATOR_CALL_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
+_EXIT_STACK_ALIAS_EVENTS_KEY = object()
+_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY = object()
+_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
 
@@ -3488,8 +3519,16 @@ def _iterable_literal_contains_mutating_lambda(node, operator_bindings):
             and _lambda_mutates_workers(element, operator_bindings)
         )
         or _mutating_callback_alias_is_active(element, operator_bindings)
+        or _iterable_literal_contains_mutating_lambda(element, operator_bindings)
         for element in node.elts
     )
+
+
+def _iterable_holds_mutating_callbacks(node, operator_bindings):
+    """Return True when an iterable expression may hold mutating callbacks."""
+    if _iterable_literal_contains_mutating_lambda(node, operator_bindings):
+        return True
+    return _mutating_callback_container_is_active(node, operator_bindings)
 
 
 def _iterable_literal_contains_active_mutating_callback(
@@ -3587,6 +3626,8 @@ def _callback_assignment_kind(
         active_callbacks,
         operator_bindings,
     ):
+        return "container"
+    if _iterable_literal_contains_mutating_lambda(value, operator_bindings):
         return "container"
     if _subscript_selects_mutating_callback(
         value,
@@ -3757,6 +3798,105 @@ def _collect_mutating_callback_alias_events(tree, operator_bindings):
     )
     return callback_events, container_events
 
+
+def _contextlib_exit_stack_constructor(value, operator_bindings):
+    """Return True when ``value`` constructs a contextlib.ExitStack."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    reference_line = getattr(value, "lineno", 0)
+    binding_store = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    exit_stack_class_events = binding_store.get(
+        _EXIT_STACK_CLASS_ALIAS_EVENTS_KEY,
+        {},
+    )
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            exit_stack_class_events,
+            func.id,
+            reference_line,
+        )
+    if not (isinstance(func, ast.Attribute) and func.attr == "ExitStack"):
+        return False
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _record_exit_stack_with_alias(item, events, line, operator_bindings, *, conditional):
+    """Record one context-managed ExitStack instance alias."""
+    if item.optional_vars is None:
+        return
+    if not _contextlib_exit_stack_constructor(
+        item.context_expr,
+        operator_bindings,
+    ):
+        return
+    for name in _loop_target_names(item.optional_vars):
+        events.setdefault(name, []).append((line, True))
+        if conditional:
+            return
+
+
+def _scan_exit_stack_alias_events(statements, events, operator_bindings, *, conditional=False):
+    """Track aliases bound from ``with contextlib.ExitStack()`` blocks."""
+    for node in statements:
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            line = getattr(node, "lineno", 0)
+            for item in node.items:
+                _record_exit_stack_with_alias(
+                    item,
+                    events,
+                    line,
+                    operator_bindings,
+                    conditional=conditional,
+                )
+        for block in _compound_statement_blocks(node):
+            _scan_exit_stack_alias_events(
+                block,
+                events,
+                operator_bindings,
+                conditional=True,
+            )
+
+
+def _collect_exit_stack_alias_events(tree, operator_bindings):
+    """Collect source-ordered ExitStack instance aliases."""
+    events = {}
+    _scan_exit_stack_alias_events(tree.body, events, operator_bindings)
+    return events
+
+
+def _call_is_exit_stack_callback_mutation(call, operator_bindings):
+    """Return True for ``stack.callback(mutating)`` on a tracked ExitStack."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "callback" or len(call.args) != 1:
+        return False
+    if not _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    exit_stack_events = {}
+    if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict):
+        exit_stack_events = operator_bindings[32].get(
+            _EXIT_STACK_ALIAS_EVENTS_KEY,
+            {},
+        )
+    return _imported_alias_is_active(
+        exit_stack_events,
+        receiver.id,
+        getattr(call, "lineno", 0),
+    )
+
+
 def _lambda_invokes_first_positional_param(lambda_node):
     """Return True when a lambda body calls its first positional parameter."""
     if not isinstance(lambda_node, ast.Lambda):
@@ -3775,25 +3915,50 @@ def _lambda_invokes_first_positional_param(lambda_node):
     )
 
 
+def _resolved_map_filter_name(call, operator_bindings):
+    """Return ``map`` or ``filter`` when ``call`` resolves to the builtin."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return None
+    func = call.func
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(func, ast.Name):
+        name = func.id
+        if name not in {"map", "filter"}:
+            return None
+        shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+        if not _name_is_unshadowed_builtin(name, reference_line, shadow_lines):
+            return None
+        return name
+    if isinstance(func, ast.Attribute) and func.attr in {"map", "filter"}:
+        builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+        builtins_alias_events = (
+            operator_bindings[30] if len(operator_bindings) > 30 else {}
+        )
+        if _builtins_module_is_active_at_line(
+            func.value,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        ):
+            return func.attr
+    return None
+
+
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
     """Return True when consuming a map/filter must execute a risky lambda."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
-        return False
-    name = call.func.id
-    if name not in {'map', 'filter'} or not call.args:
-        return False
-    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    if not _name_is_unshadowed_builtin(
-        name,
-        getattr(call, 'lineno', 0),
-        shadow_lines,
-    ):
+    name = _resolved_map_filter_name(call, operator_bindings)
+    if name is None:
         return False
     lambda_node = call.args[0]
     if not isinstance(lambda_node, ast.Lambda):
         return False
     if _lambda_mutates_workers(lambda_node, operator_bindings):
         return True
+    if name == "filter" and len(call.args) > 1:
+        return _expression_is_mutating_lazy_iterator(
+            call.args[1],
+            operator_bindings,
+        )
     if name != 'map':
         return False
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
@@ -3804,9 +3969,17 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
         for param, iterable in zip(positional_params, call.args[1:])
     ):
         return True
+    positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
+    if positional_params:
+        param_name = positional_params[0].arg
+        if _expression_invokes_loop_callback(lambda_node.body, param_name):
+            return any(
+                _iterable_holds_mutating_callbacks(arg, operator_bindings)
+                for arg in call.args[1:]
+            )
     if _lambda_invokes_first_positional_param(lambda_node):
         return any(
-            _iterable_literal_contains_mutating_lambda(arg, operator_bindings)
+            _iterable_holds_mutating_callbacks(arg, operator_bindings)
             for arg in call.args[1:]
         )
     return False
@@ -4149,6 +4322,27 @@ def _key_lambda_mutates_workers(call, operator_bindings):
         and _lambda_mutates_workers(keyword.value, operator_bindings)
         for keyword in call.keywords
     )
+
+
+def _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
+    """Return True when a key= lambda invokes callbacks from the sorted iterable."""
+    key_lambda = None
+    for keyword in call.keywords:
+        if keyword.arg == "key" and isinstance(keyword.value, ast.Lambda):
+            key_lambda = keyword.value
+            break
+    if key_lambda is None or not call.args:
+        return False
+    positional_params = (
+        *key_lambda.args.posonlyargs,
+        *key_lambda.args.args,
+    )
+    if not positional_params:
+        return False
+    param_name = positional_params[0].arg
+    if not _expression_invokes_loop_callback(key_lambda.body, param_name):
+        return False
+    return _iterable_holds_mutating_callbacks(call.args[0], operator_bindings)
 
 
 def _builtin_consumer_is_active(name, call, operator_bindings):
@@ -7219,6 +7413,69 @@ _EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
 
 _EAGER_GENERATOR_CONSUMER_BUILTINS = _EAGER_LAZY_ITERATOR_CONSUMERS | {"sum"}
 
+_HEAPQ_ORDERED_CALLBACK_METHODS = frozenset({"nsmallest", "nlargest"})
+
+
+def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
+    """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
+    if receiver.id not in module_aliases and receiver.id != "heapq":
+        return False
+    if len(call.args) < 2:
+        return False
+    if _key_lambda_mutates_workers(call, operator_bindings):
+        return True
+    if _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
+        return True
+    iterable = call.args[1]
+    return (
+        _iterable_holds_mutating_callbacks(iterable, operator_bindings)
+        or _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
+    )
+
+
+def _call_is_itertools_starmap_mutation(call, operator_bindings):
+    """Return True when itertools.starmap executes workers-mutating callbacks."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "starmap" or len(call.args) < 2:
+        return False
+    module_events = operator_bindings[35] if len(operator_bindings) > 35 else {}
+    if not _module_alias_active_at_line(
+        call.func.value,
+        set(),
+        module_events,
+        getattr(call, "lineno", 0),
+    ):
+        return False
+    callback = call.args[0]
+    if _thread_pool_callback_mutates_workers(callback, operator_bindings):
+        return True
+    if isinstance(callback, ast.Lambda):
+        positional_params = (
+            *callback.args.posonlyargs,
+            *callback.args.args,
+        )
+        if positional_params:
+            param_name = positional_params[0].arg
+            if _expression_invokes_loop_callback(callback.body, param_name):
+                return any(
+                    _iterable_holds_mutating_callbacks(iterable, operator_bindings)
+                    for iterable in call.args[1:]
+                )
+    return any(
+        _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
+        or _iterable_holds_mutating_callbacks(iterable, operator_bindings)
+        for iterable in call.args[1:]
+    )
+
 
 def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
     """Return True for non-builtin eager consumers handled specially."""
@@ -7228,6 +7485,8 @@ def _call_is_special_lazy_iterator_consumer(call, operator_bindings):
             operator_bindings,
         )
         or _call_is_thread_pool_map_mutation(call, operator_bindings)
+        or _call_is_itertools_starmap_mutation(call, operator_bindings)
+        or _call_is_heapq_ordered_callback_mutation(call, operator_bindings)
         or _call_is_thread_pool_submit_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_async_mutation(call, operator_bindings)
         or _call_is_thread_pool_apply_mutation(call, operator_bindings)
@@ -7480,14 +7739,17 @@ def _resolved_builtin_eager_consumer_name(call, operator_bindings):
         return func.slice.value
     if _call_is_importlib_builtins_eager_consumer(call, operator_bindings):
         return call.func.attr
+    sys_aliases = operator_bindings[13] if len(operator_bindings) > 13 else {"sys"}
+    if _attribute_is_sys_modules_builtins_eager_consumer(func, sys_aliases):
+        return func.attr
     return None
 
 
 def _eager_consumer_drains_mutating_lazy_iterator(name, call, operator_bindings):
     """Shared argument checks for direct and builtins-module eager consumers."""
-    if (
-        name in {"sorted", "max", "min"}
-        and _key_lambda_mutates_workers(call, operator_bindings)
+    if name in {"sorted", "max", "min"} and (
+        _key_lambda_mutates_workers(call, operator_bindings)
+        or _key_lambda_invokes_mutating_callback_container(call, operator_bindings)
     ):
         return True
     if not call.args:
@@ -8254,6 +8516,7 @@ def _call_has_secondary_worker_mutation(
         or _call_is_literal_callback_invocation(expr, operator_bindings)
         or _call_is_operator_call_mutating_callback(expr, operator_bindings, bound_names)
         or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
+        or _call_is_exit_stack_callback_mutation(expr, operator_bindings)
     )
 
 
@@ -10458,6 +10721,22 @@ def _sync_callback_heap_heappop_subscript_mutates(expr, tracking):
     )
 
 
+def _sync_callback_deque_subscript_invocation_mutates(expr, tracking):
+    """Return True for ``deque[index]()`` callback execution on a mutating deque."""
+    if not (
+        isinstance(expr, ast.Call)
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func, ast.Subscript)
+        and isinstance(expr.func.value, ast.Name)
+    ):
+        return False
+    receiver = expr.func.value.id
+    if receiver not in tracking["mutating"]:
+        return False
+    return tracking["containers"].get(receiver) == "deque"
+
+
 def _sync_callback_queue_get_subscript_mutates(expr, tracking):
     """Return True for ``queue.get()[1]()`` PriorityQueue callback execution."""
     get_call, selected_index = _sync_callback_zero_arg_subscript_invocation(expr)
@@ -10531,6 +10810,8 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         expr,
         tracking,
     ):
+        return True
+    if _sync_callback_deque_subscript_invocation_mutates(expr, tracking):
         return True
     if _sync_callback_queue_get_subscript_mutates(
         expr,
@@ -11217,6 +11498,15 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
     )
+    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
+        _collect_imported_module_alias_events(tree, "contextlib")
+    )
+    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
+        _collect_exit_stack_alias_events(tree, operator_bindings)
+    )
     lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
         tree,
         operator_bindings,
@@ -11285,6 +11575,15 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
+    )
+    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
+        _collect_imported_module_alias_events(tree, "contextlib")
+    )
+    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
+        _collect_exit_stack_alias_events(tree, operator_bindings)
     )
     asyncio_module_alias_events = _collect_imported_module_alias_events(
         tree,
