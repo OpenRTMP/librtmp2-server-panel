@@ -11143,17 +11143,38 @@ def _node_has_worker_mutating_decorator(node, global_workers_mutators):
     )
 
 
-def _definition_time_expressions(node):
+def _config_defers_annotations(tree):
+    """Return True when a return annotation is not evaluated by ``def``.
+
+    PEP 649 defers annotation evaluation on Python 3.14, and
+    ``from __future__ import annotations`` does the same on every earlier
+    release, so in both cases the annotation never runs while the function
+    object is created.
+    """
+    if sys.version_info >= (3, 14):
+        return True
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
+
+
+def _definition_time_expressions(node, defer_annotations=False):
     """Return expressions evaluated while a function-like object is created.
 
     ``def`` evaluates decorators, default arguments and the return annotation
     before the body exists, so a helper called from one of them runs at config
-    import. A lambda body is excluded because it only runs when it is called.
+    import. A lambda body is excluded because it only runs when it is called,
+    and a deferred return annotation is excluded for the same reason.
     """
     expressions = [*node.args.defaults]
     expressions.extend(
         default for default in node.args.kw_defaults if default is not None
     )
+    if defer_annotations:
+        return expressions
     returns = getattr(node, "returns", None)  # ast.Lambda has no annotation
     if returns is not None:
         expressions.append(returns)
@@ -11166,6 +11187,7 @@ def _definition_time_workers_effect(
     operator_bindings,
     class_targets,
     dict_subclass_names,
+    defer_annotations=False,
 ):
     """Return True when a definition-time expression mutates the worker count."""
     return any(
@@ -11177,7 +11199,7 @@ def _definition_time_workers_effect(
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
         )
-        for expression in _definition_time_expressions(node)
+        for expression in _definition_time_expressions(node, defer_annotations)
     )
 
 
@@ -11204,6 +11226,7 @@ def _handle_worker_scan_definition(
     class_targets,
     operator_bindings,
     dict_subclass_names,
+    defer_annotations=False,
 ):
     """Handle definitions without descending into function or class bodies."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -11216,6 +11239,7 @@ def _handle_worker_scan_definition(
             operator_bindings,
             class_targets,
             dict_subclass_names,
+            defer_annotations,
         ):
             state.dynamic = True
         return True
@@ -11238,6 +11262,7 @@ def _walk_gunicorn_workers_statements(
     operator_bindings=None,
     class_targets=None,
     dict_subclass_names=None,
+    defer_annotations: bool = False,
 ) -> None:
     (
         global_workers_mutators,
@@ -11259,6 +11284,7 @@ def _walk_gunicorn_workers_statements(
             class_targets,
             operator_bindings,
             dict_subclass_names,
+            defer_annotations,
         ):
             continue
         if _track_sync_callback_dispatch(node, state, operator_bindings):
@@ -11297,6 +11323,7 @@ def _walk_gunicorn_workers_statements(
                 operator_bindings=operator_bindings,
                 class_targets=class_targets,
                 dict_subclass_names=dict_subclass_names,
+                defer_annotations=defer_annotations,
             )
 
 
@@ -11616,6 +11643,7 @@ def _scan_gunicorn_config_worker_details(tree):
         operator_bindings=operator_bindings,
         class_targets=class_targets,
         dict_subclass_names=dict_subclass_names,
+        defer_annotations=_config_defers_annotations(tree),
     )
     configured_count = state.count if state.found else None
     return configured_count, state.dynamic, runtime_dynamic
