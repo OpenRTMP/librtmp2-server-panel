@@ -402,9 +402,19 @@ def _is_globals_call(node):
     )
 
 
-def _globals_workers_subscript(node):
+def _globals_workers_subscript(node, operator_bindings=None):
     """Return True for ``globals()['workers']``-style subscript targets."""
-    return _subscript_slice_is_workers(node) and _is_globals_call(node.value)
+    if not _subscript_slice_is_workers(node):
+        return False
+    base = _subscript_base_node(node)
+    if not _globals_name_is_unshadowed_at(base, operator_bindings):
+        return False
+    namespace_aliases = (
+        operator_bindings[2]
+        if operator_bindings is not None and len(operator_bindings) > 2
+        else set()
+    )
+    return _is_module_namespace_mapping(base, namespace_aliases)
 
 
 def _dict_literal_sets_workers(node):
@@ -989,6 +999,35 @@ def _is_builtins_dict_attribute(
         )
     )
 
+
+
+def _globals_name_is_unshadowed_at(node, operator_bindings=None):
+    """Return True when a rebound ``globals`` has not hidden the builtin yet.
+
+    ``_is_globals_call`` only checks the call syntax, so a config that binds its
+    own ``globals`` would otherwise be read as mutating the module namespace
+    when it only touches a temporary mapping. An alias bound from that rebound
+    name is no more trustworthy, so the same shadow state is consulted for
+    every receiver.
+    """
+    builtin_shadow_lines = (
+        operator_bindings[32]
+        if operator_bindings is not None and len(operator_bindings) > 32
+        else {}
+    )
+    return _name_is_unshadowed_builtin(
+        "globals",
+        getattr(node, "lineno", 0),
+        builtin_shadow_lines,
+    )
+
+
+def _globals_call_is_unshadowed(node, operator_bindings=None):
+    """Return True for a ``globals()`` call that still names the builtin."""
+    return _is_globals_call(node) and _globals_name_is_unshadowed_at(
+        node,
+        operator_bindings,
+    )
 
 
 def _is_globals_class_dict_reference(node, shadow_lines=None):
@@ -8549,11 +8588,81 @@ def _import_from_binds_workers(node):
     )
 
 
-def _worker_assignment_value(node):
+def _namespace_workers_removal(node, operator_bindings=None):
+    """Return True for a call that empties the module ``workers`` name.
+
+    ``pop('workers')`` names the key directly, while ``popitem()``, ``clear()``
+    and ``__delitem__('workers')`` drop the binding it refers to, so all of
+    them leave Gunicorn without a ``workers`` setting to install.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    namespace_aliases = (
+        operator_bindings[2]
+        if operator_bindings is not None and len(operator_bindings) > 2
+        else set()
+    )
+    receiver = node.func.value
+    if not (
+        _globals_name_is_unshadowed_at(receiver, operator_bindings)
+        and _is_module_namespace_mapping(receiver, namespace_aliases)
+    ):
+        return False
+    method = node.func.attr
+    if method in ("popitem", "clear"):
+        return True
+    return (
+        method in ("pop", "__delitem__")
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "workers"
+    )
+
+
+def _statement_removes_namespace_workers(node, operator_bindings=None):
+    """Return True when a statement removes ``workers`` via the namespace mapping.
+
+    Unlike a bare ``del workers``, a removal through ``globals()`` names the
+    module namespace directly, so it applies from any function scope.
+    """
+    if isinstance(node, ast.Delete):
+        return any(
+            _globals_workers_subscript(target, operator_bindings)
+            for target in node.targets
+        )
+    if isinstance(node, ast.Expr):
+        return _namespace_workers_removal(node.value, operator_bindings)
+    return False
+
+
+def _workers_binding_removal(node, operator_bindings=None):
+    """Return True when a statement removes the module ``workers`` name.
+
+    Gunicorn installs only the names present in the module namespace
+    (``if k not in self.cfg.settings: continue`` in
+    ``Application.load_config_from_module_name_or_filename``), so once
+    ``workers`` is gone the setting keeps its ``WEB_CONCURRENCY`` default
+    instead of the value a previous assignment left behind.
+    """
+    if isinstance(node, ast.Delete):
+        return any(
+            _target_assigns_workers(target)
+            or _globals_workers_subscript(target, operator_bindings)
+            for target in node.targets
+        )
+    if isinstance(node, ast.Expr):
+        return _namespace_workers_removal(node.value, operator_bindings)
+    return False
+
+
+def _worker_assignment_value(node, operator_bindings=None):
     """Return whether node assigns workers and its static value when available."""
+    if _workers_binding_removal(node, operator_bindings):
+        return True, None
     if isinstance(node, ast.Assign):
         targets_workers = any(
-            _target_assigns_workers(target) or _globals_workers_subscript(target)
+            _target_assigns_workers(target)
+            or _globals_workers_subscript(target, operator_bindings)
             for target in node.targets
         )
         if not targets_workers:
@@ -8561,12 +8670,14 @@ def _worker_assignment_value(node):
         return True, _static_int_from_ast(node.value)
 
     if isinstance(node, ast.AnnAssign) and node.target and (
-        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
+        _target_assigns_workers(node.target)
+        or _globals_workers_subscript(node.target, operator_bindings)
     ):
         return True, _static_int_from_ast(node.value)
 
     if isinstance(node, ast.AugAssign) and (
-        _target_assigns_workers(node.target) or _globals_workers_subscript(node.target)
+        _target_assigns_workers(node.target)
+        or _globals_workers_subscript(node.target, operator_bindings)
     ):
         return True, None
 
@@ -8734,6 +8845,16 @@ def _is_dynamic_workers_mutation(
         for child in ast.iter_child_nodes(node)
     ):
         return True
+    if isinstance(node, ast.expr) and _expression_mutates_workers(
+        node,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
+        # A definition-time expression such as ``exec("workers = 2")`` arrives
+        # here as the bare call, so the child scan above never reaches the
+        # detector that recognises it.
+        return True
     if isinstance(node, ast.Assign):
         return any(
             _indirect_workers_assignment_target(target)
@@ -8764,8 +8885,15 @@ def _statements_declare_global_workers(statements):
 
 def _expression_invokes_function(expr, func_names):
     """Return True when an evaluated expression invokes a named helper."""
-    if not func_names or isinstance(expr, ast.Lambda):
+    if not func_names:
         return False
+    if isinstance(expr, ast.Lambda):
+        # A lambda body only runs when the lambda is called, but its default
+        # arguments are evaluated while the lambda object is created.
+        return any(
+            _expression_invokes_function(default, func_names)
+            for default in _definition_time_expressions(expr)
+        )
     if isinstance(expr, ast.Call):
         if _call_invokes_function(expr, func_names):
             return True
@@ -8849,8 +8977,12 @@ def _statement_mutates_workers(
         bound_names,
     ):
         return True
-    assigns_workers, _ = _worker_assignment_value(node)
+    assigns_workers, _ = _worker_assignment_value(node, operator_bindings)
     if global_workers and assigns_workers:
+        return True
+    if _statement_removes_namespace_workers(node, operator_bindings):
+        # ``globals()`` names the module namespace from any function scope, so a
+        # removal through it needs no ``global workers`` declaration to apply.
         return True
     return any(
         _statements_mutate_workers(
@@ -8995,25 +9127,34 @@ def _collect_import_time_workers_mutators(
     class_targets=None,
     dict_subclass_names=None,
 ):
-    """Return function names that may mutate ``workers`` when called at import time."""
-    functions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    """Return function names that may mutate ``workers`` when called at import time.
+
+    Definitions nested inside another function are collected too, because a
+    top-level helper that calls a nested one is only known to mutate once the
+    nested name is in the fixpoint. A name counts as a mutator when *any* of
+    its definitions mutates, since a nested definition can shadow a
+    module-level one of the same name.
+    """
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.setdefault(node.name, []).append(node)
     mutators = set()
     changed = True
     while changed:
         changed = False
-        for name, node in functions.items():
+        for name, nodes in functions.items():
             if name in mutators:
                 continue
-            if _function_mutates_workers(
-                node,
-                operator_bindings,
-                mutators,
-                class_targets,
-                dict_subclass_names,
+            if any(
+                _function_mutates_workers(
+                    node,
+                    operator_bindings,
+                    mutators,
+                    class_targets,
+                    dict_subclass_names,
+                )
+                for node in nodes
             ):
                 mutators.add(name)
                 changed = True
@@ -9039,6 +9180,11 @@ class _GunicornWorkersScanState:
     count = 1
     dynamic = False
     found = False
+
+    def clear_workers_assignment(self) -> None:
+        """Forget a static count that a later removal of ``workers`` invalidated."""
+        self.found = False
+        self.count = 1
 
     def record_workers_assignment(self, value, *, in_compound: bool) -> None:
         self.found = True
@@ -11045,19 +11191,96 @@ def _record_walrus_workers_assignment(node, state, *, in_compound):
     )
 
 
-def _record_direct_workers_assignment(node, state, *, in_compound):
+def _record_direct_workers_assignment(node, state, *, in_compound, operator_bindings=None):
     """Record direct assignments to workers."""
-    assigns_workers, value = _worker_assignment_value(node)
+    if _workers_binding_removal(node, operator_bindings) and not in_compound:
+        # An unconditional top-level removal is the only shape that provably
+        # empties the module namespace, so the stale static count is dropped and
+        # the WEB_CONCURRENCY default Gunicorn would actually apply is used.
+        state.clear_workers_assignment()
+        return
+    assigns_workers, value = _worker_assignment_value(node, operator_bindings)
     if assigns_workers:
         state.record_workers_assignment(value, in_compound=in_compound)
 
 
 def _node_has_worker_mutating_decorator(node, global_workers_mutators):
-    """Return True when a function or class decorator mutates workers."""
+    """Return True when a function or class decorator mutates workers.
+
+    A decorator is an expression the interpreter evaluates while the ``def``
+    or ``class`` statement runs, so ``@f()`` mutates ``workers`` at config
+    import exactly like the bare ``@f`` form and must be treated the same.
+    """
     return any(
-        isinstance(decorator, ast.Name)
-        and decorator.id in global_workers_mutators
+        (
+            isinstance(decorator, ast.Name)
+            and decorator.id in global_workers_mutators
+        )
+        or (
+            isinstance(decorator, ast.Call)
+            and _call_invokes_function(decorator, global_workers_mutators)
+        )
         for decorator in node.decorator_list
+    )
+
+
+def _config_defers_annotations(tree):
+    """Return True when a return annotation is not evaluated by ``def``.
+
+    PEP 649 defers annotation evaluation on Python 3.14, and
+    ``from __future__ import annotations`` does the same on every earlier
+    release, so in both cases the annotation never runs while the function
+    object is created.
+    """
+    if sys.version_info >= (3, 14):
+        return True
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
+
+
+def _definition_time_expressions(node, defer_annotations=False):
+    """Return expressions evaluated while a function-like object is created.
+
+    ``def`` evaluates decorators, default arguments and the return annotation
+    before the body exists, so a helper called from one of them runs at config
+    import. A lambda body is excluded because it only runs when it is called,
+    and a deferred return annotation is excluded for the same reason.
+    """
+    expressions = [*node.args.defaults]
+    expressions.extend(
+        default for default in node.args.kw_defaults if default is not None
+    )
+    if defer_annotations:
+        return expressions
+    returns = getattr(node, "returns", None)  # ast.Lambda has no annotation
+    if returns is not None:
+        expressions.append(returns)
+    return expressions
+
+
+def _definition_time_workers_effect(
+    node,
+    global_workers_mutators,
+    operator_bindings,
+    class_targets,
+    dict_subclass_names,
+    defer_annotations=False,
+):
+    """Return True when a definition-time expression mutates the worker count."""
+    return any(
+        _expression_invokes_function(expression, global_workers_mutators)
+        or _node_has_dynamic_workers_effect(
+            expression,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
+        )
+        for expression in _definition_time_expressions(node, defer_annotations)
     )
 
 
@@ -11082,12 +11305,22 @@ def _handle_worker_scan_definition(
     state,
     global_workers_mutators,
     class_targets,
+    operator_bindings,
+    dict_subclass_names,
+    defer_annotations=False,
 ):
     """Handle definitions without descending into function or class bodies."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         if _node_has_worker_mutating_decorator(
             node,
             global_workers_mutators,
+        ) or _definition_time_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
         ):
             state.dynamic = True
         return True
@@ -11110,6 +11343,7 @@ def _walk_gunicorn_workers_statements(
     operator_bindings=None,
     class_targets=None,
     dict_subclass_names=None,
+    defer_annotations: bool = False,
 ) -> None:
     (
         global_workers_mutators,
@@ -11129,6 +11363,9 @@ def _walk_gunicorn_workers_statements(
             state,
             global_workers_mutators,
             class_targets,
+            operator_bindings,
+            dict_subclass_names,
+            defer_annotations,
         ):
             continue
         if _track_sync_callback_dispatch(node, state, operator_bindings):
@@ -11157,6 +11394,7 @@ def _walk_gunicorn_workers_statements(
             node,
             state,
             in_compound=in_compound,
+            operator_bindings=operator_bindings,
         )
         for block in _compound_statement_blocks(node):
             _walk_gunicorn_workers_statements(
@@ -11167,27 +11405,267 @@ def _walk_gunicorn_workers_statements(
                 operator_bindings=operator_bindings,
                 class_targets=class_targets,
                 dict_subclass_names=dict_subclass_names,
+                defer_annotations=defer_annotations,
             )
 
 
+# Gunicorn runs the config file and installs every name in the module namespace
+# that matches a setting, so any of these hooks can raise the worker count after
+# the gate read a static ``workers = 1``. Derived from the "Server Hooks" section
+# of the pinned Gunicorn release (gunicorn==26.2.0, gunicorn/config.py) rather
+# than hand-curated, so a hook cannot be missed by omission. ``configure`` is not
+# a Gunicorn setting in any supported release; it is kept because the gate has
+# always failed closed on it and dropping it would only widen acceptance.
 _GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
     {
         "configure",
-        "on_starting",
-        "when_ready",
-        "post_fork",
-        "pre_exec",
+        "child_exit",
+        "nworkers_changed",
+        "on_exit",
         "on_reload",
+        "on_starting",
+        "post_fork",
+        "post_request",
+        "post_worker_init",
+        "pre_exec",
+        "pre_fork",
+        "pre_request",
+        "ssl_context",
+        "when_ready",
+        "worker_abort",
+        "worker_exit",
+        "worker_int",
     }
 )
 
 
+# Calls that can obtain a callable the config file never names, matched both as
+# a bare name (``getattr(ns, "helper")``) and as an attribute
+# (``operator.attrgetter("helper")``, ``pickle.loads(stream)``). They are what
+# stops the walk from treating an unreferenced function as one that can never
+# run, so every one of them keeps the hook detection fail-closed.
+_DYNAMIC_NAME_LOOKUP_CALLS = frozenset(
+    {
+        "__import__",
+        "attrgetter",
+        "compile",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "import_module",
+        "importlib",
+        "itemgetter",
+        "load",
+        "loads",
+        "locals",
+        "methodcaller",
+        "setattr",
+        "vars",
+    }
+)
+
+# Modules whose calls launder a name the config file never writes down: the
+# accessor and deserialisation factories, and the namespace registries.
+_DYNAMIC_NAME_LOOKUP_MODULES = frozenset(
+    {
+        "builtins",
+        "ctypes",
+        "dill",
+        "importlib",
+        "marshal",
+        "operator",
+        "pickle",
+        "shelve",
+        "sys",
+    }
+)
+
+# Attributes that hand back a namespace the file can then reach into by key.
+_NAMESPACE_ESCAPE_ATTRS = frozenset(
+    {
+        "__bases__",
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "__func__",
+        "__getattribute__",
+        "__globals__",
+        "__import__",
+        "__loader__",
+        "__mro__",
+        "__name__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__self__",
+        "__spec__",
+        "__subclasses__",
+        "modules",
+    }
+)
+
+
+def _class_body_global_names(node):
+    """Return the names a class body binds to the module scope via ``global``.
+
+    ``global`` is legal in a class body, and a name it declares keeps binding
+    into the module namespace rather than becoming a class attribute. The same
+    is true inside the methods of that class, so the walk over the whole class
+    body collects them too; the wider set can only make the gate fail closed.
+    """
+    return frozenset(
+        name
+        for child in ast.walk(node)
+        if isinstance(child, ast.Global)
+        for name in child.names
+    )
+
+
+def _is_live_gunicorn_hook_binding(child, scope):
+    """Return True when a node binds a hook name into the module namespace.
+
+    A hook is live whenever the name reaches the module namespace, so a ``def``
+    nested in any block and a binding of any kind count just like a top-level
+    ``def``; anything else would let the hook bypass the fail-closed signal.
+    What does not reach it is the exception, and there are exactly two scopes
+    that do not: a ``def`` or a plain store in a class body binds a class
+    attribute, and a store in a function body binds a local. ``scope`` is
+    ``(in_class, declared_globals, may_run)``; inside a class body a binding
+    counts only when a ``global`` in that class promoted it, which is why the
+    ``def`` form of a promoted hook is live too, and outside one a binding
+    counts only when the enclosing function can run.
+    """
+    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        name = child.name
+    elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+        name = child.id
+    else:
+        return False
+    if name not in _GUNICORN_RUNTIME_HOOK_NAMES:
+        return False
+    in_class, declared_globals, may_run = scope
+    return name in declared_globals if in_class else may_run
+
+
+def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
+    """Return the binding scope that applies to the nodes inside ``child``.
+
+    A class body runs when the file is loaded, so it opens a scope of its own
+    that its methods inherit untouched: a method body is judged by the class
+    rule, never by the function rule. Every other node keeps the scope it is
+    already in, which is what makes a ``def`` in a plain block bind at module
+    scope. Entering a function outside a class is what consults
+    ``uncalled_names``: a body no reference can reach cannot run, and a hook
+    bound in it never reaches the module namespace.
+    """
+    in_class, declared_globals, may_run = scope
+    if isinstance(child, ast.ClassDef):
+        return (True, _class_body_global_names(child), True)
+    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if in_class:
+            return scope
+        return (False, declared_globals, may_run and child.name not in uncalled_names)
+    return scope
+
+
+def _is_dynamic_lookup_call(node):
+    """Return True when a call can build a callable out of a string."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _DYNAMIC_NAME_LOOKUP_CALLS
+    if not isinstance(func, ast.Attribute):
+        return False
+    return func.attr in _DYNAMIC_NAME_LOOKUP_CALLS or (
+        isinstance(func.value, ast.Name)
+        and func.value.id in _DYNAMIC_NAME_LOOKUP_MODULES
+    )
+
+
+def _is_namespace_escape_attr(node):
+    """Return True when an attribute read exposes a namespace mapping."""
+    return isinstance(node, ast.Attribute) and node.attr in _NAMESPACE_ESCAPE_ATTRS
+
+
+def _is_string_keyed_subscript(node):
+    """Return True when a subscript reads a key the file spells as a string.
+
+    A string key is the only way to pull one member out of a mapping without a
+    name load naming it, so ``d["helper"]`` -- whether it calls the value or
+    stores it for later dispatch -- counts for the guard as much as
+    ``sys.modules[__name__].__dict__["helper"]`` does. The container need not
+    look like a namespace at all: ``ctypes.cast(id(mod), ctypes.py_object)
+    .value["helper"]`` spells no dunder anywhere.
+    """
+    if not isinstance(node, ast.Subscript):
+        return False
+    index = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+    return any(
+        isinstance(key, ast.Constant) and isinstance(key.value, str) for key in index
+    )
+
+
+def _uses_dynamic_name_lookup(tree):
+    """Return True when the file can reach a callable without naming it.
+
+    ``eval``, ``exec``, ``getattr`` and the namespace accessors can call a
+    function this walk can prove nothing else calls, and so can the two forms
+    that never spell a name at all: reading a namespace attribute, and reading
+    a mapping key out of a string literal. Any of the three voids the
+    inert-function proof below, because a hook bound in a function the file
+    only ever names as ``d["helper"]`` still runs.
+    """
+    return any(
+        _is_dynamic_lookup_call(node)
+        or _is_namespace_escape_attr(node)
+        or _is_string_keyed_subscript(node)
+        for node in ast.walk(tree)
+    )
+
+
+def _provably_uncalled_function_names(tree):
+    """Return the names of functions the config file never references.
+
+    Any load of the name counts as a reference, including the forms this walk
+    cannot follow -- ``callbacks.append(helper)``, ``class X(helper)``,
+    ``register(helper)`` -- so a function that no load mentions is the only
+    shape whose body provably cannot run, and a hook bound there is not a module
+    binding. A file that looks names up dynamically references everything, so it
+    proves nothing and the walk stays fail-closed.
+    """
+    if _uses_dynamic_name_lookup(tree):
+        return frozenset()
+    referenced = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    } | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    return frozenset(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name not in referenced
+    )
+
+
 def _gunicorn_config_has_runtime_hooks(tree):
-    """Return True when the config defines hooks that can mutate workers at runtime."""
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in _GUNICORN_RUNTIME_HOOK_NAMES:
+    """Return True when the config defines hooks that can mutate workers at runtime.
+
+    Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
+    count, and ``_gunicorn_hook_binding_scope`` carries the enclosing binding
+    scope into the nodes below it.
+    """
+    uncalled_names = _provably_uncalled_function_names(tree)
+    stack = [(tree, (False, frozenset(), True))]
+    while stack:
+        node, scope = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            if _is_live_gunicorn_hook_binding(child, scope):
                 return True
+            stack.append(
+                (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
+            )
     return False
 
 
@@ -11454,6 +11932,7 @@ def _scan_gunicorn_config_worker_details(tree):
         operator_bindings=operator_bindings,
         class_targets=class_targets,
         dict_subclass_names=dict_subclass_names,
+        defer_annotations=_config_defers_annotations(tree),
     )
     configured_count = state.count if state.found else None
     return configured_count, state.dynamic, runtime_dynamic
@@ -11513,6 +11992,11 @@ def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
             continue
         if token.startswith("--config="):
             config_path = token.split("=", 1)[1]
+        if token.startswith("-c") and len(token) > 2:
+            # argparse gives ``-c==prod.py`` the value ``=prod.py``, so only the
+            # single option separator may be dropped here.
+            value = token[2:]
+            config_path = value[1:] if value.startswith("=") else value
         i += 1
     return config_path
 
