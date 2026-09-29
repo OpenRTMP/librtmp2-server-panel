@@ -11170,23 +11170,49 @@ def _walk_gunicorn_workers_statements(
             )
 
 
+# Gunicorn runs the config file and installs every name in the module namespace
+# that matches a setting, so any of these hooks can raise the worker count after
+# the gate read a static ``workers = 1``. Derived from the "Server Hooks" section
+# of the pinned Gunicorn release (gunicorn==26.2.0, gunicorn/config.py) rather
+# than hand-curated, so a hook cannot be missed by omission. ``configure`` is not
+# a Gunicorn setting in any supported release; it is kept because the gate has
+# always failed closed on it and dropping it would only widen acceptance.
 _GUNICORN_RUNTIME_HOOK_NAMES = frozenset(
     {
         "configure",
-        "on_starting",
-        "when_ready",
-        "post_fork",
-        "pre_exec",
+        "child_exit",
+        "nworkers_changed",
+        "on_exit",
         "on_reload",
+        "on_starting",
+        "post_fork",
+        "post_request",
+        "post_worker_init",
+        "pre_exec",
+        "pre_fork",
+        "pre_request",
+        "ssl_context",
+        "when_ready",
+        "worker_abort",
+        "worker_exit",
+        "worker_int",
     }
 )
 
 
 def _gunicorn_config_has_runtime_hooks(tree):
-    """Return True when the config defines hooks that can mutate workers at runtime."""
-    for node in tree.body:
+    """Return True when the config defines hooks that can mutate workers at runtime.
+
+    A hook is live whenever the name reaches the module namespace, so a ``def``
+    nested in any block and a binding of any kind count just like a top-level
+    ``def``; anything else would let the hook bypass the fail-closed signal.
+    """
+    for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name in _GUNICORN_RUNTIME_HOOK_NAMES:
+                return True
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if node.id in _GUNICORN_RUNTIME_HOOK_NAMES:
                 return True
     return False
 
