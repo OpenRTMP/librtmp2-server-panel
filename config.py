@@ -9870,34 +9870,64 @@ def _call_is_frame_globals_update(call):
     return _update_payload_may_set_workers(call)
 
 
-def _inspect_currentframe_call_is_active(frame_call, inspect_analysis):
-    """Return True when a call resolves to the real inspect.currentframe."""
-    if not (
-        isinstance(frame_call, ast.Call)
-        and not frame_call.args
-        and not frame_call.keywords
-    ):
+def _frame_source_analysis_from_bindings(operator_bindings, marker_key):
+    """Return the most recent frame-source analysis dict carrying ``marker_key``."""
+    for entry in reversed(operator_bindings or ()):
+        if isinstance(entry, dict) and marker_key in entry:
+            return entry
+    return {}
+
+
+def _frame_call_is_active(frame_call, analysis, attribute_name, direct_alias_key):
+    """Return True when a call resolves to a known frame accessor (inspect/sys)."""
+    if not isinstance(frame_call, ast.Call):
         return False
     reference_line = getattr(frame_call, "lineno", 0)
     func = frame_call.func
-    if isinstance(func, ast.Attribute) and func.attr == "currentframe":
+    if isinstance(func, ast.Attribute) and func.attr == attribute_name:
         return _module_alias_active_at_line(
             func.value,
             set(),
-            inspect_analysis.get("module_alias_events", {}),
+            analysis.get("module_alias_events", {}),
             reference_line,
         )
     if isinstance(func, ast.Name):
         return _imported_alias_is_active(
-            inspect_analysis.get("currentframe_alias_events", {}),
+            analysis.get(direct_alias_key, {}),
             func.id,
             reference_line,
         )
     return False
 
 
-def _collect_inspect_frame_alias_events(tree, inspect_analysis):
-    """Track names proven to hold frames returned by inspect.currentframe."""
+def _inspect_currentframe_call_is_active(frame_call, inspect_analysis):
+    """Return True when a call resolves to the real inspect.currentframe."""
+    if (
+        isinstance(frame_call, ast.Call)
+        and not frame_call.args
+        and not frame_call.keywords
+    ):
+        return _frame_call_is_active(
+            frame_call,
+            inspect_analysis,
+            "currentframe",
+            "currentframe_alias_events",
+        )
+    return False
+
+
+def _sys_getframe_call_is_active(frame_call, sys_analysis):
+    """Return True when a call resolves to the real sys._getframe."""
+    return _frame_call_is_active(
+        frame_call,
+        sys_analysis,
+        "_getframe",
+        "getframe_alias_events",
+    )
+
+
+def _collect_frame_alias_events(tree, analysis, frame_call_is_active):
+    """Track names proven to hold frames returned by a frame accessor."""
     events = {}
     active = set()
     for node in tree.body:
@@ -9906,10 +9936,7 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
             _deactivate_imported_module_alias(node.name, active, events, line)
             continue
         for name, value in _namespace_assignment_values(node):
-            is_frame = _inspect_currentframe_call_is_active(
-                value,
-                inspect_analysis,
-            )
+            is_frame = frame_call_is_active(value, analysis)
             if isinstance(value, ast.Name) and value.id in active:
                 is_frame = True
             if is_frame:
@@ -9920,30 +9947,61 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
     return events
 
 
-def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
-    """Return True only for f_globals updates on a proven inspect frame."""
+def _collect_inspect_frame_alias_events(tree, inspect_analysis):
+    """Track names proven to hold frames returned by inspect.currentframe."""
+    return _collect_frame_alias_events(
+        tree,
+        inspect_analysis,
+        _inspect_currentframe_call_is_active,
+    )
+
+
+def _collect_sys_frame_alias_events(tree, sys_analysis):
+    """Track names proven to hold frames returned by sys._getframe."""
+    return _collect_frame_alias_events(
+        tree,
+        sys_analysis,
+        _sys_getframe_call_is_active,
+    )
+
+
+def _call_is_proven_frame_globals_update(call, analysis, frame_call_is_active):
+    """Return True for f_globals updates on a proven inspect/sys frame."""
     if not _call_is_frame_globals_update(call):
         return False
-    inspect_analysis = (
-        operator_bindings[-1]
-        if operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-        else {}
-    )
     frame_value = call.func.value.value
     if isinstance(frame_value, ast.Call):
-        return _inspect_currentframe_call_is_active(
-            frame_value,
-            inspect_analysis,
-        )
+        return frame_call_is_active(frame_value, analysis)
     if isinstance(frame_value, ast.Name):
         return _imported_alias_is_active(
-            inspect_analysis.get("frame_alias_events", {}),
+            analysis.get("frame_alias_events", {}),
             frame_value.id,
             getattr(call, "lineno", 0),
         )
     return False
+
+
+def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
+    """Return True only for f_globals updates on a proven inspect/sys frame."""
+    inspect_analysis = _frame_source_analysis_from_bindings(
+        operator_bindings,
+        "currentframe_alias_events",
+    )
+    if _call_is_proven_frame_globals_update(
+        call,
+        inspect_analysis,
+        _inspect_currentframe_call_is_active,
+    ):
+        return True
+    sys_analysis = _frame_source_analysis_from_bindings(
+        operator_bindings,
+        "getframe_alias_events",
+    )
+    return _call_is_proven_frame_globals_update(
+        call,
+        sys_analysis,
+        _sys_getframe_call_is_active,
+    )
 
 
 def _loop_target_names(target):
@@ -11914,9 +11972,27 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         inspect_analysis,
     )
+    sys_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        "sys",
+    )
+    sys_getframe_alias_events = _collect_imported_name_alias_events(
+        tree,
+        "sys",
+        {"_getframe"},
+    )
+    sys_analysis = {
+        "module_alias_events": sys_module_alias_events,
+        "getframe_alias_events": sys_getframe_alias_events,
+    }
+    sys_analysis["frame_alias_events"] = _collect_sys_frame_alias_events(
+        tree,
+        sys_analysis,
+    )
     operator_bindings = (
         *operator_bindings,
         inspect_analysis,
+        sys_analysis,
     )
     if _statements_start_mutating_thread(
         tree.body,

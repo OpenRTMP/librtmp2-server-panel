@@ -1457,3 +1457,27 @@ def test_codex_pr294_shadowed_builtin_helpers_stay_static(tmp_path, config_conte
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-09-30: sys._getframe f_globals workers mutation
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport sys\nsys._getframe(0).f_globals.update({'workers': 4})\n",
+        "workers = 1\nimport sys as s\ns._getframe(0).f_globals.update({'workers': 4})\n",
+        "workers = 1\nfrom sys import _getframe\n_getframe(0).f_globals.update({'workers': 4})\n",
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "frame = sys._getframe(0)\n"
+            "frame.f_globals.update({'workers': 4})\n"
+        ),
+    ],
+)
+def test_security_review_sep30_sys_getframe_globals_update_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
