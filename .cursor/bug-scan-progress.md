@@ -1,14 +1,29 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-09-26
+Last scanned: templates/ — 2026-09-30
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-09-30 templates/ pass)
+
+- No critical bugs found. Reviewed all six templates (`base.html`, `index.html`,
+  `login.html`, `create_stream.html`, `stream_created.html`, `cluster.html`):
+  every mutating `<form>` includes `csrf_token`; no `|safe` or autoescape
+  disables; API/user-derived strings use Jinja auto-escaping in body and
+  attribute contexts (`data-url`, form `value=`, cluster `data-node-id`).
+  Traced caller chains for `api_error`, `flash_error`, and `error` (fixed login
+  strings or `str(exc)` — still escaped). Verified `set_security_headers()`
+  `Referrer-Policy: same-origin` matches `base.html` meta for
+  `WTF_CSRF_SSL_STRICT` on HTTPS. `build_urls()` stats query uses `urlencode`;
+  stream/player IDs in `url_for()` actions are validated in `app.py` before
+  render. Copy buttons delegate secrets to `data-url` + `scripts.js`
+  `copyToClipboard` (not inline untrusted JS).
 
 ## Findings (2026-09-26 config.py pass)
 
