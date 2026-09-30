@@ -762,6 +762,10 @@ class _PanelRuntime:
                     "cluster_nodes failed: received an invalid response "
                     "from librtmp2-server"
                 )
+            # cluster.html calls node.get(...) unguarded, so a non-object entry
+            # would raise jinja2.UndefinedError and 500 the whole page. Same
+            # element filter the streams/players/cluster-streams loaders apply.
+            nodes = [n for n in nodes if isinstance(n, dict)]
         except Lrtmp2ApiError as exc:
             api_errors.append(str(exc))
             nodes = []
