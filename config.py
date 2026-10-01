@@ -9929,6 +9929,39 @@ def _inspect_currentframe_call_is_active(frame_call, inspect_analysis):
     return False
 
 
+def _inspect_getouterframes_call_is_active(frame_call, inspect_analysis):
+    """Return True when a call resolves to ``inspect.getouterframes``."""
+    if not isinstance(frame_call, ast.Call):
+        return False
+    reference_line = getattr(frame_call, "lineno", 0)
+    func = frame_call.func
+    if isinstance(func, ast.Attribute) and func.attr == "getouterframes":
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            inspect_analysis.get("module_alias_events", {}),
+            reference_line,
+        )
+    return False
+
+
+def _getouterframes_call_has_active_frame_arg(
+    frame_call,
+    inspect_analysis,
+    sys_aliases,
+    active_frame_names,
+):
+    """Return True when getouterframes is called with a live frame argument."""
+    if not frame_call.args:
+        return False
+    first = frame_call.args[0]
+    if _inspect_currentframe_call_is_active(first, inspect_analysis):
+        return True
+    if _sys_getframe_call_is_active(first, sys_aliases):
+        return True
+    return isinstance(first, ast.Name) and first.id in active_frame_names
+
+
 def _collect_inspect_frame_alias_events(tree, inspect_analysis, sys_aliases):
     """Track names proven to hold frames from inspect.currentframe or sys._getframe."""
     events = {}
@@ -9937,6 +9970,20 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis, sys_aliases):
         line = getattr(node, "lineno", 0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _deactivate_imported_module_alias(node.name, active, events, line)
+            continue
+        if isinstance(node, ast.For):
+            if (
+                _inspect_getouterframes_call_is_active(node.iter, inspect_analysis)
+                and _getouterframes_call_has_active_frame_arg(
+                    node.iter,
+                    inspect_analysis,
+                    sys_aliases,
+                    active,
+                )
+            ):
+                for name in _loop_target_names(node.target):
+                    active.add(name)
+                    events.setdefault(name, []).append((line, True))
             continue
         for name, value in _namespace_assignment_values(node):
             is_frame = _inspect_currentframe_call_is_active(
