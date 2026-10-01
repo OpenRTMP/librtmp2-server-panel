@@ -1459,6 +1459,86 @@ def test_codex_pr294_shadowed_builtin_helpers_stay_static(tmp_path, config_conte
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
 
+# Security review 2026-09-29: import-time worker scanner follow-up gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "".join(
+            (
+                "workers = 1\n",
+                "import builtins\n",
+                "callbacks = [lambda: globals().update({'workers': 4})]\n",
+                "builtins.list(map(lambda cb: cb() or 0, callbacks))\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "import sys\n",
+                "callbacks = [lambda: globals().update({'workers': 4})]\n",
+                "sys.modules['builtins'].sum(cb() or 0 for cb in callbacks)\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "from contextlib import ExitStack\n",
+                "with ExitStack() as stack:\n",
+                "    stack.callback(lambda: globals().update({'workers': 4}))\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "import builtins\n",
+                "callbacks = [lambda: globals().update({'workers': 4})]\n",
+                "builtins.sorted(callbacks, key=lambda cb: cb() or 0)\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "import builtins\n",
+                "callbacks = [lambda: globals().update({'workers': 4})]\n",
+                "builtins.list(builtins.filter(lambda x: x, "
+                "map(lambda cb: cb() or 0, callbacks)))\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "import heapq\n",
+                "callbacks = [lambda: globals().update({'workers': 4})]\n",
+                "heapq.nsmallest(1, callbacks, key=lambda cb: cb() or 0)\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "import itertools\n",
+                "callbacks = [(lambda: globals().update({'workers': 4}),)]\n",
+                "list(itertools.starmap(lambda f: f(), callbacks))\n",
+            )
+        ),
+        "".join(
+            (
+                "workers = 1\n",
+                "from collections import deque\n",
+                "d = deque()\n",
+                "d.append(lambda: globals().update({'workers': 4}))\n",
+                "d[0]()\n",
+            )
+        ),
+    ],
+)
+def test_security_review_sep29_worker_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
 # Security review 2026-10-01: frame enumeration and sys._getframe f_globals gaps
 @pytest.mark.parametrize(
     "config_content",
@@ -1507,3 +1587,4 @@ def test_security_review_oct01_frame_globals_mutations_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
