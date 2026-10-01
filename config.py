@@ -10246,6 +10246,63 @@ def _getouterframes_call_has_active_frame_arg(
     return isinstance(first, ast.Name) and first.id in active_frame_names
 
 
+def _getouterframes_loop_target_names(
+    node,
+    inspect_analysis,
+    sys_aliases,
+    active_frame_names,
+):
+    """Return frame aliases bound by one proven getouterframes loop."""
+    if not isinstance(node, ast.For):
+        return None
+    if not _inspect_getouterframes_call_is_active(node.iter, inspect_analysis):
+        return set()
+    if not _getouterframes_call_has_active_frame_arg(
+        node.iter,
+        inspect_analysis,
+        sys_aliases,
+        active_frame_names,
+    ):
+        return set()
+    return _loop_target_names(node.target)
+
+
+def _value_is_active_frame_alias(
+    value,
+    inspect_analysis,
+    sys_aliases,
+    active_frame_names,
+):
+    """Return True when an assignment value is a proven live frame."""
+    if _inspect_currentframe_call_is_active(value, inspect_analysis):
+        return True
+    if _sys_getframe_call_is_active(value, sys_aliases):
+        return True
+    return isinstance(value, ast.Name) and value.id in active_frame_names
+
+
+def _record_frame_alias_assignment(
+    name,
+    value,
+    line,
+    active,
+    events,
+    inspect_analysis,
+    sys_aliases,
+):
+    """Update tracked frame aliases for one namespace assignment."""
+    if _value_is_active_frame_alias(
+        value,
+        inspect_analysis,
+        sys_aliases,
+        active,
+    ):
+        active.add(name)
+        events.setdefault(name, []).append((line, True))
+        return
+    _deactivate_imported_module_alias(name, active, events, line)
+
+
 def _collect_inspect_frame_alias_events(tree, inspect_analysis, sys_aliases):
     """Track names proven to hold frames from inspect.currentframe or sys._getframe."""
     events = {}
@@ -10255,33 +10312,27 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis, sys_aliases):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _deactivate_imported_module_alias(node.name, active, events, line)
             continue
-        if isinstance(node, ast.For):
-            if (
-                _inspect_getouterframes_call_is_active(node.iter, inspect_analysis)
-                and _getouterframes_call_has_active_frame_arg(
-                    node.iter,
-                    inspect_analysis,
-                    sys_aliases,
-                    active,
-                )
-            ):
-                for name in _loop_target_names(node.target):
-                    active.add(name)
-                    events.setdefault(name, []).append((line, True))
-            continue
-        for name, value in _namespace_assignment_values(node):
-            is_frame = _inspect_currentframe_call_is_active(
-                value,
-                inspect_analysis,
-            )
-            is_frame = is_frame or _sys_getframe_call_is_active(value, sys_aliases)
-            if isinstance(value, ast.Name) and value.id in active:
-                is_frame = True
-            if is_frame:
+        loop_target_names = _getouterframes_loop_target_names(
+            node,
+            inspect_analysis,
+            sys_aliases,
+            active,
+        )
+        if loop_target_names is not None:
+            for name in loop_target_names:
                 active.add(name)
                 events.setdefault(name, []).append((line, True))
-            else:
-                _deactivate_imported_module_alias(name, active, events, line)
+            continue
+        for name, value in _namespace_assignment_values(node):
+            _record_frame_alias_assignment(
+                name,
+                value,
+                line,
+                active,
+                events,
+                inspect_analysis,
+                sys_aliases,
+            )
     return events
 
 
