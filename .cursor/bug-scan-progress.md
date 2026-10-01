@@ -1,14 +1,25 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-09-26
+Last scanned: templates/ — 2026-10-01
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-10-01 templates/ pass)
+
+- No critical bugs found. Reviewed all six templates end-to-end with caller chains
+  in `app.py`: every mutating form includes `csrf_token`; no `|safe` / `Markup`;
+  API and form-repopulation strings use Jinja autoescape in body and attribute
+  contexts (`data-url`, `data-stream-id`, `data-node-id`, accordion markup);
+  `base.html` `referrer` meta remains `same-origin`, aligned with
+  `set_security_headers()` (`Referrer-Policy: same-origin`) so HTTPS
+  `WTF_CSRF_SSL_STRICT` POSTs are not broken; cluster node actions POST via
+  `url_for` with server-side `int()` validation on `node_id`.
 
 ## Findings (2026-09-26 config.py pass)
 
