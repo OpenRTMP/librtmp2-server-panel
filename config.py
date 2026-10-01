@@ -3915,33 +3915,54 @@ def _lambda_invokes_first_positional_param(lambda_node):
     )
 
 
+def _resolved_map_filter_name_reference(func, reference_line, operator_bindings):
+    """Return map/filter for an unshadowed direct builtin name."""
+    if not isinstance(func, ast.Name) or func.id not in {"map", "filter"}:
+        return None
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    if not _name_is_unshadowed_builtin(func.id, reference_line, shadow_lines):
+        return None
+    return func.id
+
+
+def _resolved_map_filter_attribute(func, reference_line, operator_bindings):
+    """Return map/filter for a proven builtins-module attribute."""
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr in {"map", "filter"}
+    ):
+        return None
+    builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
+    builtins_alias_events = (
+        operator_bindings[30] if len(operator_bindings) > 30 else {}
+    )
+    if not _builtins_module_is_active_at_line(
+        func.value,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line,
+    ):
+        return None
+    return func.attr
+
+
 def _resolved_map_filter_name(call, operator_bindings):
     """Return ``map`` or ``filter`` when ``call`` resolves to the builtin."""
     if not isinstance(call, ast.Call) or not call.args:
         return None
-    func = call.func
     reference_line = getattr(call, "lineno", 0)
-    if isinstance(func, ast.Name):
-        name = func.id
-        if name not in {"map", "filter"}:
-            return None
-        shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-        if not _name_is_unshadowed_builtin(name, reference_line, shadow_lines):
-            return None
+    name = _resolved_map_filter_name_reference(
+        call.func,
+        reference_line,
+        operator_bindings,
+    )
+    if name is not None:
         return name
-    if isinstance(func, ast.Attribute) and func.attr in {"map", "filter"}:
-        builtins_aliases = operator_bindings[8] if len(operator_bindings) > 8 else set()
-        builtins_alias_events = (
-            operator_bindings[30] if len(operator_bindings) > 30 else {}
-        )
-        if _builtins_module_is_active_at_line(
-            func.value,
-            builtins_aliases,
-            builtins_alias_events,
-            reference_line,
-        ):
-            return func.attr
-    return None
+    return _resolved_map_filter_attribute(
+        call.func,
+        reference_line,
+        operator_bindings,
+    )
 
 
 def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
@@ -10797,6 +10818,16 @@ def _record_sync_callback_cancel(node, tracking):
         tracking["mutating"].discard(scheduler_name)
 
 
+def _sync_callback_direct_dispatch_mutates(expr, tracking):
+    """Return True for zero-argument direct container callback dispatch."""
+    checks = (
+        _sync_callback_heap_heappop_subscript_mutates(expr, tracking),
+        _sync_callback_deque_subscript_invocation_mutates(expr, tracking),
+        _sync_callback_queue_get_subscript_mutates(expr, tracking),
+    )
+    return any(checks)
+
+
 def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     """Return True only for proven synchronous execution of a mutating callback."""
     expr = _statement_value_expression(node)
@@ -10806,17 +10837,7 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         return True
     if expr.args or expr.keywords:
         return False
-    if _sync_callback_heap_heappop_subscript_mutates(
-        expr,
-        tracking,
-    ):
-        return True
-    if _sync_callback_deque_subscript_invocation_mutates(expr, tracking):
-        return True
-    if _sync_callback_queue_get_subscript_mutates(
-        expr,
-        tracking,
-    ):
+    if _sync_callback_direct_dispatch_mutates(expr, tracking):
         return True
     inner = expr.func
     if not isinstance(inner, ast.Call):
