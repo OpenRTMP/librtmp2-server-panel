@@ -1561,6 +1561,11 @@ def test_security_review_sep29_worker_scan_gaps_are_dynamic(
         ),
         (
             "workers = 1\n"
+            "from sys import _getframe as frame_getter\n"
+            "frame_getter(0).f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
             "import inspect\n"
             "for fi in inspect.stack():\n"
             "    fi.frame.f_globals.update({'workers': 4})\n"
@@ -1587,4 +1592,41 @@ def test_security_review_oct01_frame_globals_mutations_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Holder:\n"
+            "    pass\n"
+            "obj = Holder()\n"
+            "obj.frame = Holder()\n"
+            "obj.frame.f_globals = {}\n"
+            "obj.frame.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "class FakeFrame:\n"
+            "    f_globals = {}\n"
+            "_getframe = FakeFrame\n"
+            "_getframe().f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "from sys import _getframe\n"
+            "class FakeFrame:\n"
+            "    f_globals = {}\n"
+            "_getframe = FakeFrame\n"
+            "_getframe().f_globals.update({'workers': 4})\n"
+        ),
+    ],
+)
+def test_codex_pr302_unrelated_frame_shapes_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
