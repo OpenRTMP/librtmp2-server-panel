@@ -1457,3 +1457,53 @@ def test_codex_pr294_shadowed_builtin_helpers_stay_static(tmp_path, config_conte
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-01: frame enumeration and sys._getframe f_globals gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "sys._getframe(0).f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "frame = sys._getframe(0)\n"
+            "frame.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "getattr(sys, '_getframe')(0).f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "for fi in inspect.stack():\n"
+            "    fi.frame.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "[fi.frame.f_globals.update({'workers': 4}) for fi in inspect.stack()[:1]]\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "for frame, *_ in inspect.getouterframes(inspect.currentframe()):\n"
+            "    frame.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+    ],
+)
+def test_security_review_oct01_frame_globals_mutations_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
