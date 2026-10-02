@@ -1730,3 +1730,103 @@ def test_codex_pr302_unrelated_frame_shapes_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter scan 2026-10-02: setdefault, getattr/f_globals __ior__, hooks
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nglobals().setdefault('workers', 8)\n",
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "sys.modules[__name__].__dict__.setdefault('workers', 8)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "inspect.currentframe().f_globals.__ior__({'workers': 8})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "frame = inspect.currentframe()\n"
+            "getattr(frame, 'f_globals').update({'workers': 8})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "getattr(inspect.currentframe(), 'f_globals').__ior__({'workers': 8})\n"
+        ),
+    ],
+)
+def test_bughunter_oct02_indirect_workers_mutations_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nfrom hooks import when_ready\n",
+        "workers = 1\nfrom hooks import ready as when_ready\n",
+        "workers = 1\nfrom hooks import *\n",
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "setattr(sys.modules[__name__], 'when_ready', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "sys.modules[__name__].when_ready = hook\n"
+        ),
+        (
+            "workers = 1\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "globals()['when_ready'] = hook\n"
+        ),
+        (
+            "workers = 1\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "globals().update({'when_ready': hook})\n"
+        ),
+        (
+            "workers = 1\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "globals().setdefault('when_ready', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "sys.modules[__name__].__dict__.setdefault('on_starting', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "sys.modules[__name__].__dict__['post_fork'] = hook\n"
+        ),
+    ],
+)
+def test_bughunter_oct02_bound_runtime_hooks_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
