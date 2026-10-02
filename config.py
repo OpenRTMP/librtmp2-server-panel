@@ -9145,7 +9145,9 @@ def _is_dynamic_workers_mutation(
             for target in node.targets
         )
     if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        return _indirect_workers_assignment_target(node.target)
+        if _indirect_workers_assignment_target(node.target):
+            return True
+        return _augassign_mutates_proven_frame_globals(node, operator_bindings)
     return _match_guard_mutates_workers(
         node,
         operator_bindings,
@@ -10176,8 +10178,40 @@ def _inspect_named_call_is_active(call, inspect_analysis, name, alias_events_key
     return False
 
 
+def _traceback_named_call_is_active(call, inspect_analysis, name, alias_events_key):
+    """Return True when a call resolves to one tracked traceback callable."""
+    if not isinstance(call, ast.Call):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == name:
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            inspect_analysis.get("traceback_module_alias_events", {}),
+            reference_line,
+        )
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            inspect_analysis.get(alias_events_key, {}),
+            func.id,
+            reference_line,
+        )
+    return False
+
+
+def _traceback_walk_stack_call_is_active(call, inspect_analysis):
+    """Return True for proven traceback.walk_stack calls."""
+    return _traceback_named_call_is_active(
+        call,
+        inspect_analysis,
+        "walk_stack",
+        "walk_stack_alias_events",
+    )
+
+
 def _inspect_frameinfo_source_call_is_active(call, inspect_analysis):
-    """Return True for proven inspect.stack/getouterframes calls."""
+    """Return True for proven inspect FrameInfo-producing calls."""
     return (
         _inspect_named_call_is_active(
             call,
@@ -10190,6 +10224,12 @@ def _inspect_frameinfo_source_call_is_active(call, inspect_analysis):
             inspect_analysis,
             "getouterframes",
             "getouterframes_alias_events",
+        )
+        or _inspect_named_call_is_active(
+            call,
+            inspect_analysis,
+            "innerframes",
+            "innerframes_alias_events",
         )
     )
 
@@ -10208,44 +10248,138 @@ def _inspect_frameinfo_iterable_is_active(expr, inspect_analysis):
     )
 
 
-def _collect_inspect_frameinfo_alias_spans(tree, inspect_analysis):
-    """Track scoped names bound to FrameInfo values from inspect iterables."""
-    spans = {}
-
-    def record_target(target, start_line, end_line):
-        if isinstance(target, ast.Name):
-            spans.setdefault(target.id, []).append((start_line, end_line))
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.For, ast.AsyncFor)):
-            if _inspect_frameinfo_iterable_is_active(node.iter, inspect_analysis):
-                record_target(
-                    node.target,
-                    getattr(node, "lineno", 0),
-                    getattr(node, "end_lineno", getattr(node, "lineno", 0)),
-                )
-            continue
-        if not isinstance(
+def _module_scope_ast_nodes(tree):
+    """Yield module-scope AST nodes without entering function or class bodies."""
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(
             node,
-            (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
         ):
             continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _record_alias_span(spans, target, start_line, end_line):
+    """Record one line-bounded alias span for a simple name target."""
+    if isinstance(target, ast.Name):
+        spans.setdefault(target.id, []).append((start_line, end_line))
+
+
+def _collect_inspect_frameinfo_alias_spans(tree, inspect_analysis):
+    """Track loop/comprehension names bound to inspect FrameInfo values."""
+    spans = {}
+    comprehension_types = (
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+    )
+    for node in _module_scope_ast_nodes(tree):
         start_line = getattr(node, "lineno", 0)
         end_line = getattr(node, "end_lineno", start_line)
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            if _inspect_frameinfo_iterable_is_active(node.iter, inspect_analysis):
+                _record_alias_span(
+                    spans,
+                    node.target,
+                    start_line,
+                    end_line,
+                )
+            continue
+        if not isinstance(node, comprehension_types):
+            continue
         for generator in node.generators:
             if _inspect_frameinfo_iterable_is_active(
                 generator.iter,
                 inspect_analysis,
             ):
-                record_target(generator.target, start_line, end_line)
+                _record_alias_span(
+                    spans,
+                    generator.target,
+                    start_line,
+                    end_line,
+                )
     return spans
 
 
+def _frameinfo_assignment_value_is_active(
+    value,
+    inspect_analysis,
+    active_aliases,
+):
+    """Return True for a top-level value proven to hold inspect.FrameInfo."""
+    if isinstance(value, ast.NamedExpr):
+        value = value.value
+    if isinstance(value, ast.Name):
+        return value.id in active_aliases
+    return (
+        isinstance(value, ast.Subscript)
+        and not isinstance(value.slice, ast.Slice)
+        and _inspect_frameinfo_source_call_is_active(
+            value.value,
+            inspect_analysis,
+        )
+    )
+
+
+def _record_frameinfo_alias_assignment(
+    name,
+    value,
+    line,
+    active,
+    events,
+    inspect_analysis,
+):
+    """Update one source-ordered top-level FrameInfo alias binding."""
+    if _frameinfo_assignment_value_is_active(
+        value,
+        inspect_analysis,
+        active,
+    ):
+        active.add(name)
+        events.setdefault(name, []).append((line, True))
+        return
+    _deactivate_imported_module_alias(name, active, events, line)
+
+
+def _collect_inspect_frameinfo_alias_events(tree, inspect_analysis):
+    """Track top-level FrameInfo aliases and invalidate them on rebinding."""
+    events = {}
+    active = set()
+    for node in tree.body:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _deactivate_imported_module_alias(node.name, active, events, line)
+            continue
+        assignments = [
+            *_namespace_assignment_values(node),
+            *_compound_test_namespace_assignment_values(node),
+        ]
+        for name, value in assignments:
+            _record_frameinfo_alias_assignment(
+                name,
+                value,
+                line,
+                active,
+                events,
+                inspect_analysis,
+            )
+    return events
+
+
 def _inspect_frameinfo_alias_is_active(node, inspect_analysis):
-    """Return True when a name is a scoped alias for inspect.FrameInfo."""
+    """Return True when a name currently resolves to inspect.FrameInfo."""
     if not isinstance(node, ast.Name):
         return False
     reference_line = getattr(node, "lineno", 0)
+    events = inspect_analysis.get("frameinfo_alias_events", {})
+    if node.id in events:
+        state = _binding_state_at_line(events, node.id, reference_line)
+        if state is not None:
+            return bool(state)
     return any(
         start_line <= reference_line <= end_line
         for start_line, end_line in inspect_analysis.get(
@@ -10257,6 +10391,11 @@ def _inspect_frameinfo_alias_is_active(node, inspect_analysis):
 
 def _inspect_frameinfo_value_is_active(node, inspect_analysis):
     """Return True for a proven FrameInfo alias or indexed inspect result."""
+    if isinstance(node, ast.NamedExpr):
+        return _inspect_frameinfo_value_is_active(
+            node.value,
+            inspect_analysis,
+        )
     if _inspect_frameinfo_alias_is_active(node, inspect_analysis):
         return True
     return (
@@ -10268,21 +10407,37 @@ def _inspect_frameinfo_value_is_active(node, inspect_analysis):
         )
     )
 
-
-def _call_is_frameinfo_frame_globals_update(call, inspect_analysis):
-    """Return True only for proven inspect FrameInfo frame mutations."""
+def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
+    """Return True for f_globals updates on proven interpreter frame objects."""
+    inspect_analysis = (
+        operator_bindings[-1]
+        if operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "frame_alias_events" in operator_bindings[-1]
+        else {}
+    )
     if not _call_is_frame_globals_update(call):
         return False
-    base = call.func.value
-    holder = base.value
-    return (
-        isinstance(holder, ast.Attribute)
-        and holder.attr == "frame"
-        and _inspect_frameinfo_value_is_active(
-            holder.value,
-            inspect_analysis,
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = {
+        name
+        for name in inspect_analysis.get("frame_alias_events", {})
+        if _imported_alias_is_active(
+            inspect_analysis.get("frame_alias_events", {}),
+            name,
+            reference_line,
         )
-    )
+    }
+    frame_node = call.func.value.value
+    if _node_is_proven_live_frame(frame_node, inspect_analysis, active_frame_names):
+        return True
+    if isinstance(frame_node, ast.Name):
+        return _imported_alias_is_active(
+            inspect_analysis.get("frame_alias_events", {}),
+            frame_node.id,
+            reference_line,
+        )
+    return False
 
 
 def _sys_getframe_call_is_active(frame_call, inspect_analysis):
@@ -10373,6 +10528,58 @@ def _getouterframes_call_has_active_frame_arg(
     return isinstance(first, ast.Name) and first.id in active_frame_names
 
 
+def _walk_stack_loop_frame_target_names(node, inspect_analysis):
+    """Return direct frame aliases unpacked from traceback.walk_stack."""
+    if not isinstance(node, ast.For):
+        return None
+    if not _traceback_walk_stack_call_is_active(node.iter, inspect_analysis):
+        return None
+    if isinstance(node.target, (ast.Tuple, ast.List)) and node.target.elts:
+        first = node.target.elts[0]
+        if isinstance(first, ast.Name):
+            return {first.id}
+    return set()
+
+
+def _collect_walk_stack_pair_alias_spans(tree, inspect_analysis):
+    """Track single-name loop targets that hold walk_stack frame/line pairs."""
+    spans = {}
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.For):
+            continue
+        if not _traceback_walk_stack_call_is_active(node.iter, inspect_analysis):
+            continue
+        if not isinstance(node.target, ast.Name):
+            continue
+        start_line = getattr(node, "lineno", 0)
+        end_line = getattr(node, "end_lineno", start_line)
+        _record_alias_span(
+            spans,
+            node.target,
+            start_line,
+            end_line,
+        )
+    return spans
+
+
+def _walk_stack_pair_first_item_is_active(node, inspect_analysis):
+    """Return True for pair_alias[0] from a proven walk_stack loop."""
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == 0
+    ):
+        return False
+    reference_line = getattr(node, "lineno", 0)
+    return any(
+        start_line <= reference_line <= end_line
+        for start_line, end_line in inspect_analysis.get(
+            "walk_stack_pair_alias_spans",
+            {},
+        ).get(node.value.id, ())
+    )
+
 def _getouterframes_loop_target_names(
     node,
     inspect_analysis,
@@ -10382,7 +10589,7 @@ def _getouterframes_loop_target_names(
     if not isinstance(node, ast.For):
         return None
     if not _inspect_getouterframes_call_is_active(node.iter, inspect_analysis):
-        return set()
+        return None
     if not _getouterframes_call_has_active_frame_arg(
         node.iter,
         inspect_analysis,
@@ -10403,6 +10610,52 @@ def _value_is_active_frame_alias(
     if _sys_getframe_call_is_active(value, inspect_analysis):
         return True
     return isinstance(value, ast.Name) and value.id in active_frame_names
+
+
+def _node_is_proven_live_frame(node, inspect_analysis, active_frame_names):
+    """Return True when a node refers to the config's live frame object."""
+    if _value_is_active_frame_alias(node, inspect_analysis, active_frame_names):
+        return True
+    if _walk_stack_pair_first_item_is_active(node, inspect_analysis):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "frame":
+        return _inspect_frameinfo_value_is_active(
+            node.value,
+            inspect_analysis,
+        )
+    return False
+
+def _augassign_mutates_proven_frame_globals(node, operator_bindings):
+    """Return True for ``frame.f_globals |= {...}`` style worker mutations."""
+    inspect_analysis = (
+        operator_bindings[-1]
+        if operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "frame_alias_events" in operator_bindings[-1]
+        else {}
+    )
+    if not isinstance(node, ast.AugAssign) or not isinstance(node.op, ast.BitOr):
+        return False
+    target = node.target
+    if not isinstance(target, ast.Attribute) or target.attr != "f_globals":
+        return False
+    if not _dict_merge_payload_may_set_workers(node.value):
+        return False
+    reference_line = getattr(node, "lineno", 0)
+    active_frame_names = {
+        name
+        for name in inspect_analysis.get("frame_alias_events", {})
+        if _imported_alias_is_active(
+            inspect_analysis.get("frame_alias_events", {}),
+            name,
+            reference_line,
+        )
+    }
+    return _node_is_proven_live_frame(
+        target.value,
+        inspect_analysis,
+        active_frame_names,
+    )
 
 
 def _record_frame_alias_assignment(
@@ -10444,6 +10697,15 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 active.add(name)
                 events.setdefault(name, []).append((line, True))
             continue
+        walk_stack_targets = _walk_stack_loop_frame_target_names(
+            node,
+            inspect_analysis,
+        )
+        if walk_stack_targets is not None:
+            for name in walk_stack_targets:
+                active.add(name)
+                events.setdefault(name, []).append((line, True))
+            continue
         for name, value in _namespace_assignment_values(node):
             _record_frame_alias_assignment(
                 name,
@@ -10454,40 +10716,6 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 inspect_analysis,
             )
     return events
-
-
-def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
-    """Return True for f_globals updates on proven interpreter frame objects."""
-    inspect_analysis = (
-        operator_bindings[-1]
-        if operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-        else {}
-    )
-    if _call_is_frameinfo_frame_globals_update(call, inspect_analysis):
-        return True
-    if not _call_is_frame_globals_update(call):
-        return False
-    frame_value = call.func.value.value
-    if isinstance(frame_value, ast.Call):
-        return (
-            _inspect_currentframe_call_is_active(
-                frame_value,
-                inspect_analysis,
-            )
-            or _sys_getframe_call_is_active(
-                frame_value,
-                inspect_analysis,
-            )
-        )
-    if isinstance(frame_value, ast.Name):
-        return _imported_alias_is_active(
-            inspect_analysis.get("frame_alias_events", {}),
-            frame_value.id,
-            getattr(call, "lineno", 0),
-        )
-    return False
 
 
 def _loop_target_names(target):
@@ -12499,6 +12727,20 @@ def _scan_gunicorn_config_worker_details(tree):
             "inspect",
             {"getouterframes"},
         ),
+        "innerframes_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"innerframes"},
+        ),
+        "traceback_module_alias_events": _collect_imported_module_alias_events(
+            tree,
+            "traceback",
+        ),
+        "walk_stack_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "traceback",
+            {"walk_stack"},
+        ),
         "sys_module_alias_events": _collect_imported_module_alias_events(
             tree,
             "sys",
@@ -12511,6 +12753,18 @@ def _scan_gunicorn_config_worker_details(tree):
     }
     inspect_analysis["frameinfo_alias_spans"] = (
         _collect_inspect_frameinfo_alias_spans(
+            tree,
+            inspect_analysis,
+        )
+    )
+    inspect_analysis["frameinfo_alias_events"] = (
+        _collect_inspect_frameinfo_alias_events(
+            tree,
+            inspect_analysis,
+        )
+    )
+    inspect_analysis["walk_stack_pair_alias_spans"] = (
+        _collect_walk_stack_pair_alias_spans(
             tree,
             inspect_analysis,
         )

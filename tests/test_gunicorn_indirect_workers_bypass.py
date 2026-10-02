@@ -1593,6 +1593,107 @@ def test_security_review_oct01_frame_globals_mutations_are_dynamic(
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
+
+# Security review 2026-10-02: live-frame mutation paths
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import traceback\n"
+            "for f, _ in traceback.walk_stack(None):\n"
+            "    f.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+        (
+            "workers = 1\n"
+            "import traceback\n"
+            "for item in traceback.walk_stack(None):\n"
+            "    item[0].f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "sys._getframe(0).f_globals |= {'workers': 4}\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "inspect.stack()[0].frame.f_globals |= {'workers': 4}\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "fi = inspect.stack()[0]\n"
+            "fi.frame.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "for fi in inspect.innerframes(inspect.currentframe()):\n"
+            "    fi.frame.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "while (fi := inspect.stack()[0]).frame.f_globals.update({'workers': 4}) or False: break\n"
+        ),
+    ],
+)
+def test_security_review_oct02_frame_globals_mutations_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #310: reject non-config frames and stale/synthetic aliases
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import traceback\n"
+            "try:\n"
+            "    traceback.extract_stack()[0].frame.f_globals.update({'workers': 4})\n"
+            "except AttributeError:\n"
+            "    pass\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "sys._getframe(0).f_back.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "from types import SimpleNamespace\n"
+            "fi = inspect.stack()[0]\n"
+            "fi = SimpleNamespace(frame=SimpleNamespace(f_globals={}))\n"
+            "fi.frame.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "def unused():\n"
+            "    fi = inspect.stack()[0]\n"
+            "    fi.frame.f_globals.update({'workers': 4})\n"
+        ),
+    ],
+)
+def test_codex_pr310_frame_provenance_false_positives_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
 @pytest.mark.parametrize(
     "config_content",
     [
@@ -1629,4 +1730,3 @@ def test_codex_pr302_unrelated_frame_shapes_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
-
