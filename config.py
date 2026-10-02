@@ -12365,9 +12365,11 @@ def _class_body_global_names(node):
     )
 
 
-def _is_current_module_namespace_object(node):
+def _is_current_module_namespace_object(node, namespace_aliases=None):
     """Return True for a mapping/object that is this config module's namespace."""
-    return _is_module_namespace_mapping(node) or _is_current_module_reference(node)
+    return _is_module_namespace_mapping(
+        node, namespace_aliases
+    ) or _is_current_module_reference(node)
 
 
 def _hook_mapping_payload_may_bind(node):
@@ -12384,23 +12386,31 @@ def _hook_mapping_payload_may_bind(node):
     return True
 
 
-def _hook_store_target_name(target):
+def _hook_store_target_name(target, namespace_aliases=None):
     """Return the hook name an attribute/subscript store binds, if any."""
     if isinstance(target, ast.Attribute):
-        if not _is_current_module_namespace_object(target.value):
+        if not _is_current_module_namespace_object(target.value, namespace_aliases):
             return None
         return target.attr
     if isinstance(target, ast.Subscript):
-        if not _is_current_module_namespace_object(target.value):
+        if not _is_current_module_namespace_object(target.value, namespace_aliases):
             return None
         key = target.slice
         if isinstance(key, ast.Constant) and isinstance(key.value, str):
             return key.value
+        # A computed key cannot be proven different from a hook name.
         return "*"
     return None
 
 
-def _call_binds_hook_name(call):
+def _hook_store_key_name(key):
+    """Return a constant key, or ``"*"`` for a computed key that may be one."""
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value
+    return "*"
+
+
+def _call_binds_hook_name(call, namespace_aliases=None):
     """Return a hook name a call binds into the config namespace, if any."""
     if not isinstance(call, ast.Call):
         return None
@@ -12408,32 +12418,43 @@ def _call_binds_hook_name(call):
     if isinstance(func, ast.Name) and func.id == "setattr":
         if len(call.args) < 2:
             return None
-        if not _is_current_module_namespace_object(call.args[0]):
+        if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
             return None
-        key = call.args[1]
-        return key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None
+        return _hook_store_key_name(call.args[1])
     if not isinstance(func, ast.Attribute):
         return None
     receiver = func.value
     if func.attr in ("__setattr__", "__setitem__", "setdefault"):
-        if not call.args or not _is_current_module_namespace_object(receiver):
+        if not call.args or not _is_current_module_namespace_object(
+            receiver, namespace_aliases
+        ):
             return None
-        key = call.args[0]
-        return key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None
-    if func.attr == "update" and _is_current_module_namespace_object(receiver):
+        return _hook_store_key_name(call.args[0])
+    if func.attr == "update" and _is_current_module_namespace_object(
+        receiver, namespace_aliases
+    ):
         if any(_hook_mapping_payload_may_bind(arg) for arg in call.args):
             return "*"
-        if any(keyword.arg is None for keyword in call.keywords):
-            return "*"
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                return "*"
+            if keyword.arg in _GUNICORN_RUNTIME_HOOK_NAMES:
+                return keyword.arg
     return None
 
 
-def _gunicorn_hook_binding_names(child):
-    """Return the runtime hook names a node may bind into the module namespace."""
+def _gunicorn_hook_binding_names(child, namespace_aliases=None):
+    """Return ``(hook names, explicit)`` a node may bind into the module namespace.
+
+    ``explicit`` marks bindings that target the module namespace directly
+    (attribute/subscript stores and ``setattr``/``update`` calls); those count
+    even in a class body, where an ordinary name binding would only reach the
+    class namespace.
+    """
     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return (child.name,)
+        return (child.name,), False
     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-        return (child.id,)
+        return (child.id,), False
     if isinstance(child, ast.ImportFrom):
         names = []
         for alias in child.names:
@@ -12441,20 +12462,19 @@ def _gunicorn_hook_binding_names(child):
                 names.append("*")
             else:
                 names.append(alias.asname or alias.name)
-        return tuple(names)
-    if isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Store):
-        name = _hook_store_target_name(child)
-        return (name,) if name is not None else ()
-    if isinstance(child, ast.Subscript) and isinstance(child.ctx, ast.Store):
-        name = _hook_store_target_name(child)
-        return (name,) if name is not None else ()
+        return tuple(names), False
+    if isinstance(child, (ast.Attribute, ast.Subscript)) and isinstance(
+        child.ctx, ast.Store
+    ):
+        name = _hook_store_target_name(child, namespace_aliases)
+        return ((name,) if name is not None else ()), True
     if isinstance(child, ast.Call):
-        name = _call_binds_hook_name(child)
-        return (name,) if name is not None else ()
-    return ()
+        name = _call_binds_hook_name(child, namespace_aliases)
+        return ((name,) if name is not None else ()), True
+    return (), False
 
 
-def _is_live_gunicorn_hook_binding(child, scope):
+def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
     """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
@@ -12471,14 +12491,17 @@ def _is_live_gunicorn_hook_binding(child, scope):
     ``def`` form of a promoted hook is live too, and outside one a binding
     counts only when the enclosing function can run.
     """
-    names = _gunicorn_hook_binding_names(child)
+    names, explicit = _gunicorn_hook_binding_names(child, namespace_aliases)
     if not names:
         return False
     in_class, declared_globals, may_run = scope
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
             continue
-        if name in declared_globals if in_class else may_run:
+        # An explicit module-namespace mutation reaches the module regardless
+        # of the class scope; only whether the enclosing body can run matters.
+        live = may_run if explicit else (name in declared_globals if in_class else may_run)
+        if live:
             return True
     return False
 
@@ -12585,19 +12608,20 @@ def _provably_uncalled_function_names(tree):
     )
 
 
-def _gunicorn_config_has_runtime_hooks(tree):
+def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
     count, and ``_gunicorn_hook_binding_scope`` carries the enclosing binding
-    scope into the nodes below it.
+    scope into the nodes below it. ``namespace_aliases`` resolves aliases such
+    as ``namespace = globals()`` so hook stores through them are recognized.
     """
     uncalled_names = _provably_uncalled_function_names(tree)
     stack = [(tree, (False, frozenset(), True))]
     while stack:
         node, scope = stack.pop()
         for child in ast.iter_child_nodes(node):
-            if _is_live_gunicorn_hook_binding(child, scope):
+            if _is_live_gunicorn_hook_binding(child, scope, namespace_aliases):
                 return True
             stack.append(
                 (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
@@ -12608,8 +12632,9 @@ def _gunicorn_config_has_runtime_hooks(tree):
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
-    runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree)
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree, namespace_aliases)
     operator_call_alias_events = _collect_imported_name_alias_events(
         tree,
         "operator",

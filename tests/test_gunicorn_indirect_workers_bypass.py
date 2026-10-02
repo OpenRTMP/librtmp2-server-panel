@@ -1819,7 +1819,35 @@ def test_bughunter_oct02_indirect_workers_mutations_are_dynamic(
             "import sys\n"
             "def hook(server):\n"
             "    server.cfg.workers = 8\n"
-            "sys.modules[__name__].__dict__['post_fork'] = hook\n"
+            "sys.modules[__name__].__dict__.setdefault('on_starting', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "namespace = globals()\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "namespace.setdefault('on_starting', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "key = 'on_starting'\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "setattr(sys.modules[__name__], key, hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "globals().update(on_starting=hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "class Holder:\n"
+            "    globals()['on_starting'] = hook\n"
         ),
     ],
 )
