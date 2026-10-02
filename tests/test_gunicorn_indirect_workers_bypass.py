@@ -1693,12 +1693,6 @@ def test_codex_pr310_frame_provenance_false_positives_stay_static(
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
 
-@pytest.mark.parametrize(
-    "config_content",
-    [
-        (
-            "workers = 1\n"
-            "class Holder:
 
 @pytest.mark.parametrize(
     "config_content",
@@ -1736,4 +1730,3 @@ def test_codex_pr302_unrelated_frame_shapes_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
-
