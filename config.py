@@ -1715,6 +1715,8 @@ def _call_is_operator_methodcaller_on_module_namespace(
         )
     if method == "__setitem__":
         return len(factory.args) >= 3 and _key_may_be_workers(factory.args[1])
+    if method == "setdefault":
+        return len(factory.args) >= 2 and _key_may_be_workers(factory.args[1])
     return method is None
 
 
@@ -1886,6 +1888,23 @@ def _call_is_namespace_setdefault_workers(call, namespace_aliases=None):
     if not call.args or not _constant_is_workers(call.args[0]):
         return False
     return _is_module_namespace_mapping(call.func.value, namespace_aliases)
+
+
+def _call_is_getattr_setdefault_workers(call):
+    """Return True for ``getattr(globals(), 'setdefault')('workers', ...)``."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return False
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    if not _is_module_namespace_mapping(func.args[0]):
+        return False
+    method = func.args[1]
+    if not (isinstance(method, ast.Constant) and method.value == "setdefault"):
+        return False
+    return _constant_is_workers(call.args[0])
 
 
 def _call_is_operator_setitem_workers(call, operator_bindings):
@@ -8762,6 +8781,7 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
     return (
         _call_sets_workers_via_setitem(call)
         or _call_is_namespace_setdefault_workers(call, namespace_aliases)
+        or _call_is_getattr_setdefault_workers(call)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
         or _call_is_dict_type_setitem_on_module_namespace(call, namespace_aliases, dict_shadow_line)
@@ -10168,7 +10188,9 @@ def _frame_globals_receiver(call):
         isinstance(base, ast.Call)
         and isinstance(base.func, ast.Name)
         and base.func.id == "getattr"
-        and len(base.args) == 2
+        # A three-argument getattr's default is ignored whenever the live
+        # frame has `f_globals`, so it mutates the same namespace.
+        and len(base.args) in (2, 3)
         and not base.keywords
         and isinstance(base.args[1], ast.Constant)
         and base.args[1].value == "f_globals"
@@ -12369,7 +12391,7 @@ def _is_current_module_namespace_object(node, namespace_aliases=None):
     """Return True for a mapping/object that is this config module's namespace."""
     return _is_module_namespace_mapping(
         node, namespace_aliases
-    ) or _is_current_module_reference(node)
+    ) or _namespace_aliases_reference_current_module(node, namespace_aliases)
 
 
 def _hook_mapping_payload_may_bind(node):
@@ -12483,24 +12505,37 @@ def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
     Bindings include imports (``from hooks import when_ready``), ``setattr``
     calls, and attribute/subscript stores on the config module namespace; a
     ``from x import *`` may bind any hook and counts fail-closed. What does not
-    reach the module namespace is the exception, and there are exactly two
-    scopes that do not: a binding in a class body binds a class attribute, and
-    a store in a function body binds a local. ``scope`` is
-    ``(in_class, declared_globals, may_run)``; inside a class body a binding
-    counts only when a ``global`` in that class promoted it, which is why the
-    ``def`` form of a promoted hook is live too, and outside one a binding
-    counts only when the enclosing function can run.
+    reach the module namespace is the exception: a binding in a class body
+    binds a class attribute, and a store or import in a function body binds a
+    local. ``scope`` is ``(in_class, declared_globals, may_run, in_function)``;
+    inside a class body an ordinary binding counts only when a ``global`` in
+    that class promoted it, an import inside a function counts only when the
+    name was declared ``global``, and an explicit module-namespace mutation
+    counts whenever the enclosing body can run.
     """
     names, explicit = _gunicorn_hook_binding_names(child, namespace_aliases)
     if not names:
         return False
-    in_class, declared_globals, may_run = scope
+    in_class, declared_globals, may_run, in_function = scope
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
             continue
-        # An explicit module-namespace mutation reaches the module regardless
-        # of the class scope; only whether the enclosing body can run matters.
-        live = may_run if explicit else (name in declared_globals if in_class else may_run)
+        if explicit:
+            # An explicit module-namespace mutation reaches the module
+            # regardless of the class scope; only whether the enclosing body
+            # can run matters.
+            live = may_run
+        elif isinstance(child, ast.ImportFrom):
+            # An import inside a class body or function binds a class
+            # attribute or local, not a module name, unless the name was
+            # declared `global`; only a module-level import reaches Gunicorn.
+            live = (
+                name in declared_globals
+                if (in_class or in_function)
+                else may_run
+            )
+        else:
+            live = name in declared_globals if in_class else may_run
         if live:
             return True
     return False
@@ -12517,13 +12552,18 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
     ``uncalled_names``: a body no reference can reach cannot run, and a hook
     bound in it never reaches the module namespace.
     """
-    in_class, declared_globals, may_run = scope
+    in_class, declared_globals, may_run, in_function = scope
     if isinstance(child, ast.ClassDef):
-        return (True, _class_body_global_names(child), True)
+        return (True, _class_body_global_names(child), True, False)
     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
         if in_class:
             return scope
-        return (False, declared_globals, may_run and child.name not in uncalled_names)
+        return (
+            False,
+            declared_globals,
+            may_run and child.name not in uncalled_names,
+            True,
+        )
     return scope
 
 
@@ -12617,7 +12657,7 @@ def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
     as ``namespace = globals()`` so hook stores through them are recognized.
     """
     uncalled_names = _provably_uncalled_function_names(tree)
-    stack = [(tree, (False, frozenset(), True))]
+    stack = [(tree, (False, frozenset(), True, False))]
     while stack:
         node, scope = stack.pop()
         for child in ast.iter_child_nodes(node):

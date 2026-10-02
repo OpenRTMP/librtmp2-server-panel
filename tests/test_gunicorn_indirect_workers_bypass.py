@@ -1758,6 +1758,17 @@ def test_codex_pr302_unrelated_frame_shapes_stay_static(
             "import inspect\n"
             "getattr(inspect.currentframe(), 'f_globals').__ior__({'workers': 8})\n"
         ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "getattr(inspect.currentframe(), 'f_globals', {}).__ior__({'workers': 8})\n"
+        ),
+        "workers = 1\ngetattr(globals(), 'setdefault')('workers', 8)\n",
+        (
+            "workers = 1\n"
+            "import operator\n"
+            "operator.methodcaller('setdefault', 'workers', 8)(globals())\n"
+        ),
     ],
 )
 def test_bughunter_oct02_indirect_workers_mutations_are_dynamic(
@@ -1849,6 +1860,28 @@ def test_bughunter_oct02_indirect_workers_mutations_are_dynamic(
             "class Holder:\n"
             "    globals()['on_starting'] = hook\n"
         ),
+        (
+            "workers = 1\n"
+            "import sys as s\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "setattr(s.modules[__name__], 'on_starting', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "class Install:\n"
+            "    setattr(sys.modules[__name__], 'on_starting', hook)\n"
+        ),
+        (
+            "workers = 1\n"
+            "ns = globals()\n"
+            "def hook(server):\n"
+            "    server.cfg.workers = 8\n"
+            "ns['on_starting'] = hook\n"
+        ),
     ],
 )
 def test_bughunter_oct02_bound_runtime_hooks_are_dynamic(
@@ -1858,3 +1891,29 @@ def test_bughunter_oct02_bound_runtime_hooks_are_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "def setup():\n"
+            "    from hooks import when_ready\n"
+            "setup()\n"
+        ),
+        (
+            "workers = 1\n"
+            "def setup():\n"
+            "    import hooks\n"
+            "setup()\n"
+        ),
+    ],
+)
+def test_bughunter_oct02_function_local_hook_import_stays_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
