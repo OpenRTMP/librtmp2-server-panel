@@ -1911,3 +1911,68 @@ def test_bughunter_oct02_function_local_hook_import_stays_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-03: proven f_globals indirection and sys._current_frames
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "(fr := sys._getframe(0)).f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "fr = sys._getframe(0)\n"
+            "getattr(fr.f_globals, 'update')({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "from functools import partial\n"
+            "fr = sys._getframe(0)\n"
+            "partial(fr.f_globals.update, {'workers': 4})()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "fr = sys._getframe(0)\n"
+            "dict.__setitem__(fr.f_globals, 'workers', 4)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "fr = sys._getframe(0)\n"
+            "g = fr.f_globals\n"
+            "g.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys, operator\n"
+            "fr = sys._getframe(0)\n"
+            "operator.methodcaller('update', {'workers': 4})(fr.f_globals)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "fr = sys._getframe(0)\n"
+            "fr.f_globals['workers'] = 4\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "for _fid, fr in sys._current_frames().items():\n"
+            "    fr.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+    ],
+)
+def test_security_review_oct03_frame_globals_indirection_is_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
