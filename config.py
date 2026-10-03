@@ -713,6 +713,17 @@ def _binding_state_at_line(events, name, line):
     return state
 
 
+def _binding_event_at_line(events, name, line):
+    """Return the latest ``(event_line, value)`` binding at ``line``."""
+    state = None
+    for event in events.get(name, ()):
+        event_line = event[0]
+        if line and event_line > line:
+            break
+        state = (event_line, event[1] if len(event) == 2 else event[2])
+    return state
+
+
 def _collect_delegated_update_alias_events(tree, namespace_aliases):
     """Track top-level delegated SimpleNamespace aliases by source position."""
     events = {}
@@ -8344,21 +8355,20 @@ def _instance_hook_is_active(
     method_name,
     reference_line,
 ):
-    """Return True when a module-bound instance reaches a mutating method."""
-    instance_class = _binding_state_at_line(
-        instance_events,
-        instance_name,
-        reference_line,
-    )
+    """Return True when a module-bound instance reaches a mutating method.
+
+    The instance captured its class at assignment time, so the class name only
+    has to be live *then*: rebinding it before the call (``h = Helper();
+    Helper = None; h.bump()``) does not make the recorded method safe.
+    """
+    resolved = _binding_event_at_line(instance_events, instance_name, reference_line)
+    if not resolved:
+        return False
+    instance_line, instance_class = resolved
     return bool(
         instance_class
-        and _class_hook_is_active(
-            class_targets,
-            instance_class,
-            method_name,
-            methods,
-            reference_line,
-        )
+        and (instance_class, method_name) in methods
+        and _class_binding_is_active(class_targets, instance_class, instance_line)
     )
 
 
@@ -12753,6 +12763,19 @@ def _worker_scan_defaults(
 
 
 
+def _class_body_statement_assigns_workers(node):
+    """Return True when the statement binds the bare name ``workers``."""
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    elif isinstance(node, ast.For):
+        targets = [node.target]
+    else:
+        return False
+    return any(_target_assigns_workers(target) for target in targets)
+
+
 def _class_body_statement_has_dynamic_workers_effect(
     node,
     global_workers_mutators,
@@ -12760,8 +12783,16 @@ def _class_body_statement_has_dynamic_workers_effect(
     class_targets,
     dict_subclass_names,
     defer_annotations,
+    global_workers_declared=False,
 ):
-    """Return True when one class-body statement mutates the module ``workers``."""
+    """Return True when one class-body statement mutates the module ``workers``.
+
+    A class body has its own namespace: plain assignments, ``for`` targets and
+    imports bind class-local names and only reach the module value after an
+    applicable ``global workers`` declaration. Calls and proven
+    module-namespace mutations (``globals()``, namespace mappings, risky class
+    hooks) always count.
+    """
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return _node_has_worker_mutating_decorator(
             node,
@@ -12793,12 +12824,16 @@ def _class_body_statement_has_dynamic_workers_effect(
                 defer_annotations,
             )
         )
-    if _node_has_dynamic_workers_effect(
+    if global_workers_declared and _class_body_statement_assigns_workers(node):
+        return True
+    if _statement_invokes_function(node, global_workers_mutators):
+        return True
+    if _statement_has_class_workers_side_effect(node, class_targets):
+        return True
+    if _is_dynamic_workers_mutation(
         node,
-        global_workers_mutators,
         operator_bindings,
-        class_targets=class_targets,
-        dict_subclass_names=dict_subclass_names,
+        dict_subclass_names,
     ):
         return True
     return any(
@@ -12809,6 +12844,7 @@ def _class_body_statement_has_dynamic_workers_effect(
             class_targets,
             dict_subclass_names,
             defer_annotations,
+            global_workers_declared,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -12821,6 +12857,7 @@ def _class_body_has_dynamic_workers_effect(
     class_targets,
     dict_subclass_names,
     defer_annotations=False,
+    global_workers_declared=False,
 ):
     """Return True when class-body statements mutate the module ``workers`` name.
 
@@ -12828,17 +12865,22 @@ def _class_body_has_dynamic_workers_effect(
     so ``globals()['workers'] = 4`` inside one must make the config dynamic,
     while a plain ``workers = 4`` class attribute only binds a class name.
     """
-    return any(
-        _class_body_statement_has_dynamic_workers_effect(
+    declared = global_workers_declared
+    for node in statements:
+        if isinstance(node, ast.Global) and "workers" in node.names:
+            declared = True
+            continue
+        if _class_body_statement_has_dynamic_workers_effect(
             node,
             global_workers_mutators,
             operator_bindings,
             class_targets,
             dict_subclass_names,
             defer_annotations,
-        )
-        for node in statements
-    )
+            declared,
+        ):
+            return True
+    return False
 
 
 def _handle_worker_scan_definition(
