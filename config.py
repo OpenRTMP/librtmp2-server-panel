@@ -3132,6 +3132,11 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
         invocation_start,
     ):
         return True
+    if _partial_call_binds_proven_frame_globals_workers_setter(
+        partial_call,
+        operator_bindings,
+    ):
+        return True
     return _partial_call_binds_namespace_workers_setter(partial_call, namespace_aliases)
 
 
@@ -8531,6 +8536,7 @@ def _call_has_primary_worker_mutation(expr, operator_bindings):
             namespace_aliases,
             mutator_aliases,
         )
+        or _call_is_getattr_proven_frame_globals_mutation(expr, operator_bindings)
         or _call_is_operator_namespace_ior(expr, operator_bindings)
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
@@ -8752,6 +8758,7 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
         or _call_is_dict_type_setitem_on_module_namespace(call, namespace_aliases, dict_shadow_line)
+        or _call_is_dict_type_setitem_on_proven_frame_globals(call, operator_bindings)
         or _call_sets_workers_attribute(call, sys_aliases, importlib_aliases, importlib_module_aliases)
         or _call_is_dict_type_update_on_module_namespace(
             call,
@@ -8764,6 +8771,10 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
         or _call_is_importlib_sys_namespace_mutation(call, operator_bindings)
         or _call_is_subscript_namespace_workers_update(call, namespace_aliases, mutator_aliases)
         or _call_is_operator_methodcaller_on_module_namespace(call, operator_bindings, namespace_aliases)
+        or _call_is_operator_methodcaller_on_proven_frame_globals(
+            call,
+            operator_bindings,
+        )
     )
 
 
@@ -9140,6 +9151,8 @@ def _is_dynamic_workers_mutation(
         # detector that recognises it.
         return True
     if isinstance(node, ast.Assign):
+        if _assign_mutates_proven_frame_globals_workers(node, operator_bindings):
+            return True
         return any(
             _indirect_workers_assignment_target(target)
             for target in node.targets
@@ -10428,7 +10441,7 @@ def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
             reference_line,
         )
     }
-    frame_node = call.func.value.value
+    frame_node = _unwrap_ast_node(call.func.value.value)
     if _node_is_proven_live_frame(frame_node, inspect_analysis, active_frame_names):
         return True
     if isinstance(frame_node, ast.Name):
@@ -10437,6 +10450,272 @@ def _call_is_inspect_currentframe_globals_update(call, operator_bindings):
             frame_node.id,
             reference_line,
         )
+    return False
+
+
+def _inspect_analysis_from_bindings(operator_bindings):
+    """Return the inspect/frame provenance bundle from operator bindings."""
+    if (
+        operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "frame_alias_events" in operator_bindings[-1]
+    ):
+        return operator_bindings[-1]
+    return {}
+
+
+def _active_frame_names_at_line(inspect_analysis, reference_line):
+    """Return frame aliases that are active at ``reference_line``."""
+    events = inspect_analysis.get("frame_alias_events", {})
+    return {
+        name
+        for name in events
+        if _imported_alias_is_active(events, name, reference_line)
+    }
+
+
+def _active_frame_globals_dict_names_at_line(inspect_analysis, reference_line):
+    """Return ``f_globals`` dict aliases active at ``reference_line``."""
+    events = inspect_analysis.get("frame_globals_dict_alias_events", {})
+    return {
+        name
+        for name in events
+        if _imported_alias_is_active(events, name, reference_line)
+    }
+
+
+def _is_proven_frame_globals_mapping(
+    node,
+    inspect_analysis,
+    active_frame_names,
+    active_fg_dict_names,
+):
+    """Return True when a node refers to a live frame's ``f_globals`` mapping."""
+    node = _unwrap_ast_node(node)
+    if isinstance(node, ast.Name) and node.id in active_fg_dict_names:
+        return True
+    if not (isinstance(node, ast.Attribute) and node.attr == "f_globals"):
+        return False
+    return _node_is_proven_live_frame(
+        node.value,
+        inspect_analysis,
+        active_frame_names,
+    )
+
+
+def _getattr_proven_frame_globals_mutator_method(
+    func,
+    inspect_analysis,
+    active_frame_names,
+    active_fg_dict_names,
+):
+    """Return a mutator name from a proven ``f_globals`` mapping callable."""
+    if isinstance(func, ast.Attribute):
+        if func.attr in _NAMESPACE_GETATTR_METHODS and _is_proven_frame_globals_mapping(
+            func.value,
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        ):
+            return func.attr
+        return None
+    if not isinstance(func, ast.Call):
+        return None
+    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return None
+    if len(func.args) < 2 or not _is_proven_frame_globals_mapping(
+        func.args[0],
+        inspect_analysis,
+        active_frame_names,
+        active_fg_dict_names,
+    ):
+        return None
+    key = func.args[1]
+    if not isinstance(key, ast.Constant) or key.value not in _NAMESPACE_GETATTR_METHODS:
+        return None
+    return key.value
+
+
+def _call_is_getattr_proven_frame_globals_mutation(call, operator_bindings):
+    """Return True for ``getattr(frame.f_globals, 'update')(...)`` style mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    method = None
+    if isinstance(call.func, ast.Name):
+        mutator_aliases = inspect_analysis.get("frame_globals_mutator_aliases", {})
+        method = mutator_aliases.get(call.func.id)
+    if method is None:
+        method = _getattr_proven_frame_globals_mutator_method(
+            call.func,
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        )
+    return method is not None and _namespace_mutator_call_may_set_workers(
+        method,
+        call,
+    )
+
+
+def _call_is_operator_methodcaller_on_proven_frame_globals(
+    call,
+    operator_bindings,
+):
+    """Return True for ``methodcaller('update', ...)(frame.f_globals)`` mutations."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    factory = _resolve_operator_methodcaller_factory(call, operator_bindings)
+    if factory is None:
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    if not _is_proven_frame_globals_mapping(
+        call.args[0],
+        inspect_analysis,
+        active_frame_names,
+        active_fg_dict_names,
+    ):
+        return False
+    method = _methodcaller_method_name(factory)
+    if method == "update":
+        return _update_payload_may_set_workers(factory, start_index=1)
+    if method == "__ior__":
+        return len(factory.args) >= 2 and _dict_merge_payload_may_set_workers(
+            factory.args[1]
+        )
+    if method == "__setitem__":
+        return len(factory.args) >= 3 and _key_may_be_workers(factory.args[1])
+    return method is None
+
+
+def _call_is_dict_type_setitem_on_proven_frame_globals(
+    call,
+    operator_bindings,
+):
+    """Return True for ``dict.__setitem__(frame.f_globals, 'workers', ...)``."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    dict_shadow_line = (
+        operator_bindings[21] if len(operator_bindings) > 21 else None
+    )
+    if not _is_dict_type_setitem_callable(
+        call.func,
+        reference_line=getattr(call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    if not _is_proven_frame_globals_mapping(
+        call.args[0],
+        inspect_analysis,
+        active_frame_names,
+        active_fg_dict_names,
+    ):
+        return False
+    return _key_may_be_workers(call.args[1])
+
+
+def _attribute_is_proven_frame_globals_update(
+    node,
+    inspect_analysis,
+    active_frame_names,
+    active_fg_dict_names,
+):
+    """Return True for a proven ``f_globals.update`` attribute reference."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "update"
+        and _is_proven_frame_globals_mapping(
+            node.value,
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        )
+    )
+
+
+def _partial_call_binds_proven_frame_globals_workers_setter(
+    partial_call,
+    operator_bindings,
+):
+    """Return True for partials that bind workers on a proven ``f_globals`` dict."""
+    if not partial_call.args:
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(partial_call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    if (
+        len(partial_call.args) >= 2
+        and _attribute_is_proven_frame_globals_update(
+            partial_call.args[0],
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        )
+        and _update_payload_may_set_workers(partial_call, start_index=1)
+    ):
+        return True
+    if (
+        len(partial_call.args) >= 2
+        and isinstance(partial_call.args[0], ast.Attribute)
+        and partial_call.args[0].attr == "__setitem__"
+        and _is_proven_frame_globals_mapping(
+            partial_call.args[0].value,
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        )
+        and _constant_is_workers(partial_call.args[1])
+    ):
+        return True
+    return False
+
+
+def _assign_mutates_proven_frame_globals_workers(node, operator_bindings):
+    """Return True for ``frame.f_globals['workers'] = ...`` assignments."""
+    if not isinstance(node, ast.Assign):
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(node, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    for target in node.targets:
+        if not isinstance(target, ast.Subscript):
+            continue
+        if not _subscript_slice_is_workers(target.slice):
+            continue
+        if _is_proven_frame_globals_mapping(
+            target.value,
+            inspect_analysis,
+            active_frame_names,
+            active_fg_dict_names,
+        ):
+            return True
     return False
 
 
@@ -10612,8 +10891,16 @@ def _value_is_active_frame_alias(
     return isinstance(value, ast.Name) and value.id in active_frame_names
 
 
+def _unwrap_ast_node(node):
+    """Return the inner value when ``node`` is a walrus expression."""
+    while isinstance(node, ast.NamedExpr):
+        node = node.value
+    return node
+
+
 def _node_is_proven_live_frame(node, inspect_analysis, active_frame_names):
     """Return True when a node refers to the config's live frame object."""
+    node = _unwrap_ast_node(node)
     if _value_is_active_frame_alias(node, inspect_analysis, active_frame_names):
         return True
     if _walk_stack_pair_first_item_is_active(node, inspect_analysis):
@@ -10678,14 +10965,116 @@ def _record_frame_alias_assignment(
     _deactivate_imported_module_alias(name, active, events, line)
 
 
+def _record_frame_globals_dict_alias_assignment(
+    name,
+    value,
+    line,
+    active_frames,
+    active_fg_dict,
+    events,
+    inspect_analysis,
+):
+    """Track names bound to a proven live frame's ``f_globals`` mapping."""
+    value = _unwrap_ast_node(value)
+    if not (
+        isinstance(value, ast.Attribute)
+        and value.attr == "f_globals"
+        and _node_is_proven_live_frame(
+            value.value,
+            inspect_analysis,
+            active_frames,
+        )
+    ):
+        _deactivate_imported_module_alias(name, active_fg_dict, events, line)
+        return
+    active_fg_dict.add(name)
+    events.setdefault(name, []).append((line, True))
+
+
+def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
+    """Return True when ``iter_expr`` is ``sys._current_frames().items()``."""
+    if not isinstance(iter_expr, ast.Call):
+        return False
+    if not isinstance(iter_expr.func, ast.Attribute) or iter_expr.func.attr != "items":
+        return False
+    inner = iter_expr.func.value
+    if not isinstance(inner, ast.Call):
+        return False
+    func = inner.func
+    if isinstance(func, ast.Attribute) and func.attr == "_current_frames":
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            inspect_analysis.get("sys_module_alias_events", {}),
+            getattr(iter_expr, "lineno", 0),
+        )
+    return False
+
+
+def _current_frames_loop_frame_target_names(node, inspect_analysis):
+    """Return frame aliases unpacked from ``sys._current_frames().items()`` loops."""
+    if not isinstance(node, ast.For):
+        return None
+    if not _sys_current_frames_items_call_is_active(node.iter, inspect_analysis):
+        return None
+    if isinstance(node.target, ast.Tuple) and len(node.target.elts) >= 2:
+        frame_target = node.target.elts[1]
+        if isinstance(frame_target, ast.Name):
+            return {frame_target.id}
+    return set()
+
+
+def _collect_frame_globals_mutator_aliases(tree, inspect_analysis):
+    """Collect names bound to one proven ``f_globals`` mutator callable."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = {}
+    for name, values in assignments.items():
+        methods = []
+        for value in values:
+            if value is None:
+                methods.append(None)
+                continue
+            reference_line = getattr(value, "lineno", 0)
+            active_frame_names = _active_frame_names_at_line(
+                inspect_analysis,
+                reference_line,
+            )
+            active_fg_dict_names = _active_frame_globals_dict_names_at_line(
+                inspect_analysis,
+                reference_line,
+            )
+            methods.append(
+                _getattr_proven_frame_globals_mutator_method(
+                    value,
+                    inspect_analysis,
+                    active_frame_names,
+                    active_fg_dict_names,
+                )
+            )
+        if methods and methods[0] is not None and all(
+            method == methods[0] for method in methods
+        ):
+            aliases[name] = methods[0]
+    return aliases
+
+
 def _collect_inspect_frame_alias_events(tree, inspect_analysis):
     """Track names proven to hold frames from inspect.currentframe or sys._getframe."""
     events = {}
+    fg_dict_events = {}
     active = set()
+    active_fg_dict = set()
     for node in tree.body:
         line = getattr(node, "lineno", 0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _deactivate_imported_module_alias(node.name, active, events, line)
+            _deactivate_imported_module_alias(
+                node.name,
+                active_fg_dict,
+                fg_dict_events,
+                line,
+            )
             continue
         loop_target_names = _getouterframes_loop_target_names(
             node,
@@ -10706,6 +11095,15 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 active.add(name)
                 events.setdefault(name, []).append((line, True))
             continue
+        current_frames_targets = _current_frames_loop_frame_target_names(
+            node,
+            inspect_analysis,
+        )
+        if current_frames_targets is not None:
+            for name in current_frames_targets:
+                active.add(name)
+                events.setdefault(name, []).append((line, True))
+            continue
         for name, value in _namespace_assignment_values(node):
             _record_frame_alias_assignment(
                 name,
@@ -10715,6 +11113,20 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 events,
                 inspect_analysis,
             )
+            _record_frame_globals_dict_alias_assignment(
+                name,
+                value,
+                line,
+                active,
+                active_fg_dict,
+                fg_dict_events,
+                inspect_analysis,
+            )
+    inspect_analysis["frame_globals_dict_alias_events"] = fg_dict_events
+    inspect_analysis["frame_alias_events"] = events
+    inspect_analysis["frame_globals_mutator_aliases"] = (
+        _collect_frame_globals_mutator_aliases(tree, inspect_analysis)
+    )
     return events
 
 
