@@ -12643,6 +12643,77 @@ def _worker_scan_defaults(
 
 
 
+def _class_body_has_dynamic_workers_effect(
+    statements,
+    global_workers_mutators,
+    operator_bindings,
+    class_targets,
+    dict_subclass_names,
+    defer_annotations=False,
+):
+    """Return True when class-body statements mutate the module ``workers`` name.
+
+    A class body runs while the ``class`` statement executes at config import,
+    so ``globals()['workers'] = 4`` inside one must make the config dynamic,
+    while a plain ``workers = 4`` class attribute only binds a class name.
+    """
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _node_has_worker_mutating_decorator(
+                node,
+                global_workers_mutators,
+            ) or _definition_time_workers_effect(
+                node,
+                global_workers_mutators,
+                operator_bindings,
+                class_targets,
+                dict_subclass_names,
+                defer_annotations,
+            ):
+                return True
+            continue
+        if isinstance(node, ast.ClassDef):
+            if (
+                _node_has_worker_mutating_decorator(
+                    node,
+                    global_workers_mutators,
+                )
+                or _classdef_has_import_time_workers_side_effect(
+                    node,
+                    class_targets,
+                )
+                or _class_body_has_dynamic_workers_effect(
+                    node.body,
+                    global_workers_mutators,
+                    operator_bindings,
+                    class_targets,
+                    dict_subclass_names,
+                    defer_annotations,
+                )
+            ):
+                return True
+            continue
+        if _node_has_dynamic_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
+        ):
+            return True
+        for block in _compound_statement_blocks(node):
+            if _class_body_has_dynamic_workers_effect(
+                block,
+                global_workers_mutators,
+                operator_bindings,
+                class_targets,
+                dict_subclass_names,
+                defer_annotations,
+            ):
+                return True
+    return False
+
+
 def _handle_worker_scan_definition(
     node,
     state,
@@ -12673,6 +12744,15 @@ def _handle_worker_scan_definition(
         node,
         global_workers_mutators,
     ) or _classdef_has_import_time_workers_side_effect(node, class_targets):
+        state.dynamic = True
+    elif _class_body_has_dynamic_workers_effect(
+        node.body,
+        global_workers_mutators,
+        operator_bindings,
+        class_targets,
+        dict_subclass_names,
+        defer_annotations,
+    ):
         state.dynamic = True
     return True
 
