@@ -1,3 +1,4 @@
+import contextlib
 import os
 from unittest.mock import patch
 
@@ -9,6 +10,42 @@ def _login(client):
         "/login",
         data={"username": "admin", "password": os.environ["PASSWORD"]},
     )
+
+
+def _stream_row():
+    return {
+        "id": "stream42",
+        "name": "Camera",
+        "app": "live",
+        "publish_key": "pub_k",
+        "play_key": "pl_k",
+        "stats_key": "st_k",
+        "players": [],
+        "enabled": True,
+        "created_at": 1,
+    }
+
+
+@contextlib.contextmanager
+def _cluster_index_client(monkeypatch, cluster_status, cluster_streams):
+    """Yield a logged-in test client whose cluster endpoints return the payloads."""
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_status.return_value = cluster_status
+        mock_client.list_streams.return_value = [_stream_row()]
+        mock_client.cluster_streams.return_value = cluster_streams
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+        yield client, mock_client
 
 
 def test_index_lists_streams_before_health(monkeypatch):
@@ -98,48 +135,21 @@ def test_index_surfaces_cluster_detection_failure(monkeypatch):
 
 
 def test_index_loads_placement_when_health_unknown(monkeypatch):
-    from lrtmp2_client import Lrtmp2ApiError
-
-    with patch("app.Lrtmp2Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value
-        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
-        mock_client.cluster_status.return_value = {
-            "enabled": True,
-            "cluster_id": "cid-1",
-            "quorum": True,
+    cluster_streams = [
+        {
+            "stream_id": "stream42",
+            "owner_node_id": 1,
+            "epoch": 18,
+            "subscribed_nodes": [2],
+            "standby_nodes": [],
+            "cluster_players": 3,
         }
-        mock_client.list_streams.return_value = [
-            {
-                "id": "stream42",
-                "name": "Camera",
-                "app": "live",
-                "publish_key": "pub_k",
-                "play_key": "pl_k",
-                "stats_key": "st_k",
-                "players": [],
-                "enabled": True,
-                "created_at": 1,
-            }
-        ]
-        mock_client.cluster_streams.return_value = [
-            {
-                "stream_id": "stream42",
-                "owner_node_id": 1,
-                "epoch": 18,
-                "subscribed_nodes": [2],
-                "standby_nodes": [],
-                "cluster_players": 3,
-            }
-        ]
-
-        import app as app_module
-
-        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
-        application = app_module.create_app()
-        configure_testing_app(application)
-        client = application.test_client()
-        _login(client)
-
+    ]
+    with _cluster_index_client(
+        monkeypatch,
+        {"enabled": True, "cluster_id": "cid-1", "quorum": True},
+        cluster_streams,
+    ) as (client, mock_client):
         r = client.get("/")
         assert r.status_code == 200
         assert b"health timeout" in r.data
@@ -155,48 +165,21 @@ def test_index_loads_placement_when_health_unknown(monkeypatch):
 def test_index_normalizes_mistyped_cluster_node_lists(monkeypatch):
     # index.html joins subscribed/standby nodes, so a mistyped scalar used to
     # raise TypeError in Jinja and 500 the index page.
-    from lrtmp2_client import Lrtmp2ApiError
-
-    with patch("app.Lrtmp2Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value
-        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
-        mock_client.cluster_status.return_value = {
-            "enabled": True,
-            "cluster_id": "cid-1",
-            "quorum": True,
+    cluster_streams = [
+        {
+            "stream_id": "stream42",
+            "owner_node_id": 1,
+            "epoch": 18,
+            "subscribed_nodes": 5,
+            "standby_nodes": "node-2",
+            "cluster_players": 3,
         }
-        mock_client.list_streams.return_value = [
-            {
-                "id": "stream42",
-                "name": "Camera",
-                "app": "live",
-                "publish_key": "pub_k",
-                "play_key": "pl_k",
-                "stats_key": "st_k",
-                "players": [],
-                "enabled": True,
-                "created_at": 1,
-            }
-        ]
-        mock_client.cluster_streams.return_value = [
-            {
-                "stream_id": "stream42",
-                "owner_node_id": 1,
-                "epoch": 18,
-                "subscribed_nodes": 5,
-                "standby_nodes": "node-2",
-                "cluster_players": 3,
-            }
-        ]
-
-        import app as app_module
-
-        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
-        application = app_module.create_app()
-        configure_testing_app(application)
-        client = application.test_client()
-        _login(client)
-
+    ]
+    with _cluster_index_client(
+        monkeypatch,
+        {"enabled": True, "cluster_id": "cid-1", "quorum": True},
+        cluster_streams,
+    ) as (client, _mock_client):
         r = client.get("/")
         assert r.status_code == 200
         assert b"Subscribed nodes" in r.data
@@ -210,19 +193,7 @@ def test_index_health_unknown_standalone_cluster_streams_not_cluster_mode(monkey
         mock_client = mock_client_cls.return_value
         mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
         mock_client.cluster_status.return_value = {"enabled": False}
-        mock_client.list_streams.return_value = [
-            {
-                "id": "stream42",
-                "name": "Camera",
-                "app": "live",
-                "publish_key": "pub_k",
-                "play_key": "pl_k",
-                "stats_key": "st_k",
-                "players": [],
-                "enabled": True,
-                "created_at": 1,
-            }
-        ]
+        mock_client.list_streams.return_value = [_stream_row()]
         # Standalone servers still return local rows from /cluster/streams.
         mock_client.cluster_streams.return_value = [
             {
@@ -291,19 +262,7 @@ def test_index_shows_cluster_nav_and_stream_owner(monkeypatch):
                 "state": "ready",
             },
         }
-        mock_client.list_streams.return_value = [
-            {
-                "id": "stream42",
-                "name": "Camera",
-                "app": "live",
-                "publish_key": "pub_k",
-                "play_key": "pl_k",
-                "stats_key": "st_k",
-                "players": [],
-                "enabled": True,
-                "created_at": 1,
-            }
-        ]
+        mock_client.list_streams.return_value = [_stream_row()]
         mock_client.cluster_streams.return_value = [
             {
                 "stream_id": "stream42",
@@ -343,19 +302,7 @@ def test_index_surfaces_cluster_streams_error(monkeypatch):
             "rtmps_enabled": False,
             "cluster": {"enabled": True, "quorum": True},
         }
-        mock_client.list_streams.return_value = [
-            {
-                "id": "stream42",
-                "name": "Camera",
-                "app": "live",
-                "publish_key": "pub_k",
-                "play_key": "pl_k",
-                "stats_key": "st_k",
-                "players": [],
-                "enabled": True,
-                "created_at": 1,
-            }
-        ]
+        mock_client.list_streams.return_value = [_stream_row()]
         mock_client.cluster_streams.side_effect = Lrtmp2ApiError("cluster_streams failed")
 
         import app as app_module
