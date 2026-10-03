@@ -8,9 +8,19 @@ class Lrtmp2ApiError(Exception):
     pass
 
 
-# librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs).
-# The panel must outlast that window when polling list_streams after HTTP 202.
-DELETE_STREAM_DRAIN_WAIT_SECONDS = 305
+# librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs), but
+# the drain loop checks the deadline only after a serial per-peer cluster RPC
+# capped at 8s each (src/cluster/network.rs), so a successful delete can
+# finalize after 300s + 8s * peer count. The panel cannot know the peer count,
+# so it waits conservatively past that worst case before reporting failure.
+DELETE_STREAM_DRAIN_WAIT_SECONDS = 400
+
+# librtmp2-server admin handlers await synchronous per-peer cluster RPCs before
+# responding (each capped at 8s, src/cluster/network.rs), so a blackholed peer
+# can push the response past the 5s used for ordinary reads while the server
+# keeps processing the mutation. Admin calls get a longer budget; it still
+# grows with the peer count, so a large cluster may need a larger value.
+ADMIN_REQUEST_TIMEOUT_SECONDS = 30
 
 
 def _api_error(resp, operation):
@@ -43,20 +53,32 @@ def _parse_json(resp, operation):
 class Lrtmp2Client:
     """Thin client for the librtmp2-server REST API."""
 
-    def __init__(self, base_url, token, timeout=5):
+    def __init__(self, base_url, token, timeout=5, admin_timeout=None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        # Admin calls must never get a shorter budget than the caller's own
+        # request timeout: default to the larger of the two, while an explicit
+        # admin_timeout still wins.
+        self.admin_timeout = (
+            max(timeout, ADMIN_REQUEST_TIMEOUT_SECONDS)
+            if admin_timeout is None
+            else admin_timeout
+        )
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _request(self, request_func, url, operation, **kwargs):
+    def _request(self, request_func, url, operation, timeout=None, **kwargs):
         """Perform an HTTP request, translating network-level failures (connection
         refused, DNS failure, timeout, ...) into Lrtmp2ApiError so callers only ever
         need to catch one exception type instead of the request crashing the panel."""
         try:
-            return request_func(url, timeout=self.timeout, **kwargs)
+            return request_func(
+                url,
+                timeout=self.timeout if timeout is None else timeout,
+                **kwargs,
+            )
         except requests.exceptions.Timeout as exc:
             raise Lrtmp2ApiError(
                 f"{operation} failed: librtmp2-server did not respond in time"
@@ -142,7 +164,9 @@ class Lrtmp2Client:
         callers can rely on the stream being gone once this returns, rather
         than racing the background delete. librtmp2-server waits up to 300s for
         active RTMP sessions to drain before abandoning local roles and
-        finalizing, so the default wait_timeout is 305s. If the stream is
+        finalizing, and checks that deadline only after a per-peer cluster RPC
+        that can add 8s per unreachable peer, so the default wait_timeout is
+        400s. If the stream is
         still listed after that window, raises Lrtmp2ApiError so the panel can
         surface the incomplete delete instead of silently redirecting while the
         stream remains.
@@ -152,6 +176,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}",
             "delete_stream",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_stream")
@@ -246,6 +271,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}/drain",
             "cluster_drain_node",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
 
     def cluster_resume_node(self, node_id):
@@ -254,6 +280,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}/resume",
             "cluster_resume_node",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
 
     def cluster_remove_node(self, node_id):
@@ -262,6 +289,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/cluster/nodes/{int(node_id)}",
             "cluster_remove_node",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
         # Do not treat a bare 404 as success — pre-cluster servers and missing
         # routes also 404, which would make Remove look successful while

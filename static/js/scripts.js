@@ -139,59 +139,94 @@ function buildPlayerRows(players) {
         .filter(Boolean);
 }
 
-function renderStats(statsContainer, data) {
-    if (data.error) {
-        const error = document.createElement('p');
-        error.className = 'text-danger';
-        error.textContent = String(data.error);
-        statsContainer.replaceChildren(error);
-        return;
+function resolveStreamVideo(row) {
+    if (row.video && typeof row.video === 'object') {
+        return row.video;
     }
+    return {
+        codec: row.video_codec || 'n/a',
+        width: row.video_width,
+        height: row.video_height,
+        fps: row.fps,
+    };
+}
 
-    const streams = Array.isArray(data.streams) ? data.streams : [];
-    if (streams.length === 0) {
-        const offline = document.createElement('p');
-        offline.className = 'text-muted';
-        const emphasis = document.createElement('em');
-        emphasis.textContent = 'Stream offline';
-        offline.append(emphasis);
-        statsContainer.replaceChildren(offline);
-        return;
+function resolveStreamUptime(row) {
+    if (row.uptime !== undefined) {
+        return row.uptime;
     }
+    if (row.connected_at === null) {
+        return null;
+    }
+    const connectedAt = Number(row.connected_at);
+    if (!Number.isFinite(connectedAt)) {
+        return 0;
+    }
+    return Math.max(0, Math.floor(Date.now() / 1000) - connectedAt);
+}
 
-    const stream = streams[0];
-    const video = stream.video || {};
+function proxiedStreamRow(row) {
+    if (!row || typeof row !== 'object') {
+        return {};
+    }
+    return {
+        id: row.id || row.stream_id,
+        name: row.name || row.stream_name || row.stream_id || '',
+        app: row.app,
+        uptime: resolveStreamUptime(row),
+        bitrate_kbps: row.bitrate_kbps,
+        rtt_ms: row.rtt_ms,
+        video: resolveStreamVideo(row),
+        audio: row.audio || { codec: row.audio_codec || 'n/a' },
+    };
+}
+
+function renderStatsPlaceholder(statsContainer, text, className) {
+    const placeholder = document.createElement('p');
+    placeholder.className = className;
+    const emphasis = document.createElement('em');
+    emphasis.textContent = text;
+    placeholder.append(emphasis);
+    statsContainer.replaceChildren(placeholder);
+}
+
+function resolveRelayMbps(data, clusterProxy) {
+    const relayRaw = data.relay_mbps ?? clusterProxy.relay_mbps;
+    return relayRaw === null || relayRaw === undefined
+        ? Number.NaN
+        : Number(relayRaw);
+}
+
+function resolvePlayerRows(data, clusterProxy) {
+    const local = Array.isArray(data.players) ? data.players : [];
+    if (local.length > 0) {
+        return local;
+    }
+    return Array.isArray(clusterProxy.player_rows) ? clusterProxy.player_rows : [];
+}
+
+function resolvePlayers(data, clusterProxy, proxyOnly) {
+    // On a non-owner node the local summary reports 0 players; prefer the
+    // proxied owner metric for a proxy-only stream.
+    if (proxyOnly) {
+        return Number(clusterProxy.players ?? data.summary?.players);
+    }
+    return Number(data.summary?.players ?? clusterProxy.players);
+}
+
+function resolvePlayersByNode(data, clusterProxy, proxyOnly) {
+    if (proxyOnly) {
+        return clusterProxy.players_by_node || data.players_by_node || {};
+    }
+    return data.players_by_node || clusterProxy.players_by_node || {};
+}
+
+function buildStatsRows(stream, video, players, clusterRows, playerRows) {
     const bitrate = Number(stream.bitrate_kbps);
     const rtt = Number(stream.rtt_ms);
     const width = Number(video.width);
     const height = Number(video.height);
     const fps = Number(video.fps);
-    const players = Number((data.summary || {}).players);
-    const clusterEnabled = statsContainer.dataset.cluster === '1';
-    const clusterProxy = getClusterProxy(data);
-    const relayRaw = data.relay_mbps ?? clusterProxy.relay_mbps;
-    const relayMbps = relayRaw === null || relayRaw === undefined
-        ? Number.NaN
-        : Number(relayRaw);
-    const playersByNode = data.players_by_node
-        || clusterProxy.players_by_node
-        || {};
-    const clusterRows = buildClusterRows(
-        clusterEnabled,
-        data,
-        clusterProxy,
-        relayMbps,
-        playersByNode,
-    );
-    const playerRows = buildPlayerRows(Array.isArray(data.players) ? data.players : []);
-
-    const wrapper = document.createElement('div');
-    wrapper.className = 'mt-2 p-2 bg-dark bg-opacity-50 rounded';
-
-    const title = document.createElement('h6');
-    title.className = 'mb-2';
-    title.textContent = 'Stream Statistics';
-
     const rows = document.createElement('div');
     rows.className = 'row g-2';
     rows.append(
@@ -203,7 +238,10 @@ function renderStats(statsContainer, data) {
             'Publisher RTT:',
             Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a',
         ),
-        createStatColumn('Uptime:', formatUptime(stream.uptime || 0)),
+        createStatColumn(
+            'Uptime:',
+            stream.uptime === null ? 'n/a' : formatUptime(stream.uptime || 0),
+        ),
         createStatColumn('Codec:', video.codec || 'n/a'),
         createStatColumn(
             'Resolution:',
@@ -214,8 +252,54 @@ function renderStats(statsContainer, data) {
         ...clusterRows,
         ...playerRows,
     );
+    return rows;
+}
 
-    wrapper.append(title, rows);
+function renderStats(statsContainer, data) {
+    if (data.error) {
+        const error = document.createElement('p');
+        error.className = 'text-danger';
+        error.textContent = String(data.error);
+        statsContainer.replaceChildren(error);
+        return;
+    }
+
+    const streams = Array.isArray(data.streams) ? data.streams : [];
+    const clusterProxy = getClusterProxy(data);
+    const proxiedPublisherRows = Array.isArray(clusterProxy.publisher_rows)
+        ? clusterProxy.publisher_rows
+        : [];
+    if (streams.length === 0 && proxiedPublisherRows.length === 0) {
+        renderStatsPlaceholder(statsContainer, 'Stream offline', 'text-muted');
+        return;
+    }
+
+    // The owner node's publisher rows are proxied in cluster_proxy when this
+    // node does not host the stream, so a live remote stream is not offline.
+    const stream = streams[0] || proxiedStreamRow(proxiedPublisherRows[0]);
+    const proxyOnly = streams.length === 0;
+    const players = resolvePlayers(data, clusterProxy, proxyOnly);
+    const playersByNode = resolvePlayersByNode(data, clusterProxy, proxyOnly);
+    const clusterRows = buildClusterRows(
+        statsContainer.dataset.cluster === '1',
+        data,
+        clusterProxy,
+        resolveRelayMbps(data, clusterProxy),
+        playersByNode,
+    );
+    const playerRows = buildPlayerRows(resolvePlayerRows(data, clusterProxy));
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'mt-2 p-2 bg-dark bg-opacity-50 rounded';
+
+    const title = document.createElement('h6');
+    title.className = 'mb-2';
+    title.textContent = 'Stream Statistics';
+
+    wrapper.append(
+        title,
+        buildStatsRows(stream, stream.video || {}, players, clusterRows, playerRows),
+    );
     statsContainer.replaceChildren(wrapper);
 }
 

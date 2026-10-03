@@ -1976,3 +1976,174 @@ def test_security_review_oct03_frame_globals_indirection_is_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Bug-hunter 2026-10-03: plain instance methods that mutate workers
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper().bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "h = Helper()\n"
+            "h.bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper.bump(Helper())\n"
+        ),
+    ],
+)
+def test_instance_method_workers_mutation_is_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "h = Helper()\n"
+            "h = None\n"
+            "h.bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper = lambda: None\n"
+            "Helper().bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        pass\n"
+            "Helper().bump()\n"
+        ),
+    ],
+)
+def test_non_mutating_or_rebound_instance_calls_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex review 2026-10-03: instance provenance must survive a later rebinding
+# of the class name, and class-local bindings must not be mistaken for module
+# mutations.
+def test_instance_provenance_survives_class_name_rebinding(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def bump(self):\n"
+        "        globals()['workers'] = 4\n"
+        "h = Helper()\n"
+        "Helper = None\n"
+        "h.bump()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Holder:\n"
+            "    for workers in range(2):\n"
+            "        pass\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Holder:\n"
+            "    from os import workers\n"
+        ),
+    ],
+)
+def test_class_local_workers_bindings_stay_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_class_body_global_workers_assignment_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    global workers\n"
+        "    workers = 4\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# CodeRabbit review 2026-10-03: a conditional rebinding must keep the earlier
+# instance class as a candidate, because the branch may not have run.
+def test_conditional_instance_rebinding_keeps_both_candidates(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def bump(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Other:\n"
+        "    def bump(self):\n"
+        "        pass\n"
+        "h = Helper()\n"
+        "if True:\n"
+        "    h = Other()\n"
+        "h.bump()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# CodeRabbit review 2026-10-04: a walrus after `global workers` in a class
+# body binds the module name and must be treated as dynamic.
+def test_class_body_global_workers_walrus_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    global workers\n"
+        "    (workers := 4)\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_class_body_lambda_walrus_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    global workers\n"
+        "    fn = lambda: (workers := 4)\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)

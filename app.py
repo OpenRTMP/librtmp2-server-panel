@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import ipaddress
+import math
 import re
 import secrets
 import threading
@@ -167,6 +168,31 @@ def _normalize_streams_list(streams):
     if isinstance(streams, list):
         return [item for item in streams if isinstance(item, dict)]
     return []
+
+
+def _as_number(value):
+    """Return a finite float for numeric payload values, or None when the
+    value is not numeric, overflows, or is NaN/Infinity."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        return number if math.isfinite(number) else None
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except (OverflowError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _as_list(value):
+    """Return a list for list payload values, or [] for anything else."""
+    return value if isinstance(value, list) else []
 
 
 def _append_api_error(current, error):
@@ -652,6 +678,10 @@ class _PanelRuntime:
                 continue
             sid = entry.get("stream_id") or entry.get("id")
             if isinstance(sid, CLUSTER_KEY_TYPES):
+                # index.html joins these lists, so a mistyped scalar would raise
+                # TypeError in Jinja and 500 the whole page.
+                entry["subscribed_nodes"] = _as_list(entry.get("subscribed_nodes"))
+                entry["standby_nodes"] = _as_list(entry.get("standby_nodes"))
                 cluster_by_stream[_cluster_key(sid)] = entry
         return cluster_by_stream, api_error
 
@@ -766,6 +796,11 @@ class _PanelRuntime:
             # would raise jinja2.UndefinedError and 500 the whole page. Same
             # element filter the streams/players/cluster-streams loaders apply.
             nodes = [n for n in nodes if isinstance(n, dict)]
+            # cluster.html formats and divides these metrics, so a mistyped
+            # scalar would raise TypeError in Jinja and 500 the whole page.
+            for node in nodes:
+                for field in ("rx_mbps", "tx_mbps", "capacity_mbps"):
+                    node[field] = _as_number(node.get(field))
         except Lrtmp2ApiError as exc:
             api_errors.append(str(exc))
             nodes = []

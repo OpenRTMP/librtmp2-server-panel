@@ -278,3 +278,31 @@ def test_python_config_uri_rejects_memory_ratelimit(monkeypatch, config_module):
     error = config_module._ratelimit_storage_error()
     assert error is not None
     assert "memory://" in error
+
+
+def test_class_body_workers_mutation_is_dynamic_and_rejects_memory_ratelimit(
+    monkeypatch, tmp_path, config_module
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "class Holder:\n    globals()['workers'] = 4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    tree = ast.parse(config_file.read_text(encoding="utf-8"))
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+    error = config_module._ratelimit_storage_error()
+    assert error is not None
+    assert "memory://" in error
+
+
+def test_class_attribute_workers_assignment_stays_static(config_module):
+    tree = ast.parse("workers = 1\nclass Holder:\n    workers = 4\n")
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
