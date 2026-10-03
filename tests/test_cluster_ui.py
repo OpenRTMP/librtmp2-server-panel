@@ -152,6 +152,57 @@ def test_index_loads_placement_when_health_unknown(monkeypatch):
         assert mock_client.cluster_streams.call_count == 1
 
 
+def test_index_normalizes_mistyped_cluster_node_lists(monkeypatch):
+    # index.html joins subscribed/standby nodes, so a mistyped scalar used to
+    # raise TypeError in Jinja and 500 the index page.
+    from lrtmp2_client import Lrtmp2ApiError
+
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "cluster_id": "cid-1",
+            "quorum": True,
+        }
+        mock_client.list_streams.return_value = [
+            {
+                "id": "stream42",
+                "name": "Camera",
+                "app": "live",
+                "publish_key": "pub_k",
+                "play_key": "pl_k",
+                "stats_key": "st_k",
+                "players": [],
+                "enabled": True,
+                "created_at": 1,
+            }
+        ]
+        mock_client.cluster_streams.return_value = [
+            {
+                "stream_id": "stream42",
+                "owner_node_id": 1,
+                "epoch": 18,
+                "subscribed_nodes": 5,
+                "standby_nodes": "node-2",
+                "cluster_players": 3,
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"Subscribed nodes" in r.data
+        assert b"none" in r.data
+
+
 def test_index_health_unknown_standalone_cluster_streams_not_cluster_mode(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 
@@ -504,6 +555,63 @@ def test_cluster_overview_skips_non_object_node_entries(monkeypatch):
         assert r.status_code == 200
         assert b"node-1" in r.data
         assert b"READY" in r.data
+
+
+def test_cluster_overview_normalizes_mistyped_node_metrics(monkeypatch):
+    # cluster.html formats and divides node metrics, so a mistyped scalar used
+    # to raise TypeError in Jinja and 500 the cluster page.
+    with patch("app.Lrtmp2Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.health.return_value = {
+            "status": "ok",
+            "cluster": {"enabled": True, "quorum": True, "leader_id": 1},
+        }
+        mock_client.cluster_status.return_value = {
+            "enabled": True,
+            "cluster_id": "cid-1",
+            "node_id": 1,
+            "node_name": "node-1",
+            "role": "leader",
+            "leader_id": 1,
+            "term": 28,
+            "quorum": True,
+            "state": "ready",
+            "voter_count": 1,
+            "learner_count": 0,
+            "healthy_nodes": 1,
+            "unavailable_nodes": 0,
+        }
+        mock_client.cluster_nodes.return_value = [
+            {
+                "id": 1,
+                "name": "node-1",
+                "role": "leader",
+                "voter": True,
+                "state": "ready",
+                "healthy": True,
+                "rx_mbps": "10.5",
+                "tx_mbps": "500",
+                "capacity_mbps": "1000",
+                "publishers": 2,
+                "players": 5,
+                "last_heartbeat": "now",
+            }
+        ]
+
+        import app as app_module
+
+        monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
+        application = app_module.create_app()
+        configure_testing_app(application)
+        client = application.test_client()
+        _login(client)
+
+        r = client.get("/cluster")
+        assert r.status_code == 200
+        assert b"node-1" in r.data
+        assert b"10.5 Mbps" in r.data
+        assert b"500.0 Mbps" in r.data
+        assert b"50%" in r.data
 
 
 def test_cluster_overview_quorum_lost(monkeypatch):

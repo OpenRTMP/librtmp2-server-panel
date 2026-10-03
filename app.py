@@ -169,6 +169,25 @@ def _normalize_streams_list(streams):
     return []
 
 
+def _as_number(value):
+    """Return a float for numeric payload values, or None when not numeric."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _as_list(value):
+    """Return a list for list payload values, or [] for anything else."""
+    return value if isinstance(value, list) else []
+
+
 def _append_api_error(current, error):
     text = str(error)
     return text if current is None else f"{current}; {text}"
@@ -652,6 +671,10 @@ class _PanelRuntime:
                 continue
             sid = entry.get("stream_id") or entry.get("id")
             if isinstance(sid, CLUSTER_KEY_TYPES):
+                # index.html joins these lists, so a mistyped scalar would raise
+                # TypeError in Jinja and 500 the whole page.
+                entry["subscribed_nodes"] = _as_list(entry.get("subscribed_nodes"))
+                entry["standby_nodes"] = _as_list(entry.get("standby_nodes"))
                 cluster_by_stream[_cluster_key(sid)] = entry
         return cluster_by_stream, api_error
 
@@ -766,6 +789,11 @@ class _PanelRuntime:
             # would raise jinja2.UndefinedError and 500 the whole page. Same
             # element filter the streams/players/cluster-streams loaders apply.
             nodes = [n for n in nodes if isinstance(n, dict)]
+            # cluster.html formats and divides these metrics, so a mistyped
+            # scalar would raise TypeError in Jinja and 500 the whole page.
+            for node in nodes:
+                for field in ("rx_mbps", "tx_mbps", "capacity_mbps"):
+                    node[field] = _as_number(node.get(field))
         except Lrtmp2ApiError as exc:
             api_errors.append(str(exc))
             nodes = []
