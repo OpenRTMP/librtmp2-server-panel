@@ -155,6 +155,9 @@ function resolveStreamUptime(row) {
     if (row.uptime !== undefined) {
         return row.uptime;
     }
+    if (row.connected_at === null) {
+        return null;
+    }
     const connectedAt = Number(row.connected_at);
     if (!Number.isFinite(connectedAt)) {
         return 0;
@@ -202,6 +205,22 @@ function resolvePlayerRows(data, clusterProxy) {
     return Array.isArray(clusterProxy.player_rows) ? clusterProxy.player_rows : [];
 }
 
+function resolvePlayers(data, clusterProxy, proxyOnly) {
+    // On a non-owner node the local summary reports 0 players; prefer the
+    // proxied owner metric for a proxy-only stream.
+    if (proxyOnly) {
+        return Number(clusterProxy.players ?? data.summary?.players);
+    }
+    return Number(data.summary?.players ?? clusterProxy.players);
+}
+
+function resolvePlayersByNode(data, clusterProxy, proxyOnly) {
+    if (proxyOnly) {
+        return clusterProxy.players_by_node || data.players_by_node || {};
+    }
+    return data.players_by_node || clusterProxy.players_by_node || {};
+}
+
 function buildStatsRows(stream, video, players, clusterRows, playerRows) {
     const bitrate = Number(stream.bitrate_kbps);
     const rtt = Number(stream.rtt_ms);
@@ -219,7 +238,10 @@ function buildStatsRows(stream, video, players, clusterRows, playerRows) {
             'Publisher RTT:',
             Number.isFinite(rtt) && rtt > 0 ? `${rtt.toFixed(1)} ms` : 'n/a',
         ),
-        createStatColumn('Uptime:', formatUptime(stream.uptime || 0)),
+        createStatColumn(
+            'Uptime:',
+            stream.uptime === null ? 'n/a' : formatUptime(stream.uptime || 0),
+        ),
         createStatColumn('Codec:', video.codec || 'n/a'),
         createStatColumn(
             'Resolution:',
@@ -255,10 +277,9 @@ function renderStats(statsContainer, data) {
     // The owner node's publisher rows are proxied in cluster_proxy when this
     // node does not host the stream, so a live remote stream is not offline.
     const stream = streams[0] || proxiedStreamRow(proxiedPublisherRows[0]);
-    const players = Number(data.summary?.players ?? clusterProxy.players);
-    const playersByNode = data.players_by_node
-        || clusterProxy.players_by_node
-        || {};
+    const proxyOnly = streams.length === 0;
+    const players = resolvePlayers(data, clusterProxy, proxyOnly);
+    const playersByNode = resolvePlayersByNode(data, clusterProxy, proxyOnly);
     const clusterRows = buildClusterRows(
         statsContainer.dataset.cluster === '1',
         data,

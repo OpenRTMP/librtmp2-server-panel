@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import ipaddress
+import math
 import re
 import secrets
 import threading
@@ -170,16 +171,22 @@ def _normalize_streams_list(streams):
 
 
 def _as_number(value):
-    """Return a float for numeric payload values, or None when not numeric."""
+    """Return a finite float for numeric payload values, or None when the
+    value is not numeric, overflows, or is NaN/Infinity."""
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        return number if math.isfinite(number) else None
     if isinstance(value, str):
         try:
-            return float(value.strip())
-        except ValueError:
+            number = float(value.strip())
+        except (OverflowError, ValueError):
             return None
+        return number if math.isfinite(number) else None
     return None
 
 

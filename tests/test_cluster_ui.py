@@ -186,6 +186,20 @@ def test_index_normalizes_mistyped_cluster_node_lists(monkeypatch):
         assert b"none" in r.data
 
 
+def test_as_number_rejects_overflow_and_non_finite_values():
+    import app as app_module
+
+    assert app_module._as_number(10**309) is None
+    assert app_module._as_number(float("nan")) is None
+    assert app_module._as_number(float("inf")) is None
+    assert app_module._as_number("NaN") is None
+    assert app_module._as_number("Infinity") is None
+    assert app_module._as_number("12.5") == 12.5
+    assert app_module._as_number(7) == 7.0
+    assert app_module._as_number(True) is None
+    assert app_module._as_number(None) is None
+
+
 def test_index_health_unknown_standalone_cluster_streams_not_cluster_mode(monkeypatch):
     from lrtmp2_client import Lrtmp2ApiError
 

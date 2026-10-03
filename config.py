@@ -713,15 +713,27 @@ def _binding_state_at_line(events, name, line):
     return state
 
 
-def _binding_event_at_line(events, name, line):
-    """Return the latest ``(event_line, value)`` binding at ``line``."""
-    state = None
+def _instance_binding_candidates_at_line(events, name, line):
+    """Return ``(event_line, class_name)`` instance candidates visible at ``line``.
+
+    The latest unconditional binding is the base; conditional bindings after it
+    are kept as additional candidates because the branch may or may not have
+    run, so the worker scan must fail closed for any of them.
+    """
+    base = None
+    conditionals = []
     for event in events.get(name, ()):
         event_line = event[0]
         if line and event_line > line:
             break
-        state = (event_line, event[1] if len(event) == 2 else event[2])
-    return state
+        if len(event) == 3:
+            conditionals.append((event_line, event[1]))
+        else:
+            value = event[1]
+            base = (event_line, value) if value else None
+            conditionals = []
+    candidates = ([base] if base else []) + conditionals
+    return [(event_line, class_name) for event_line, class_name in candidates if class_name]
 
 
 def _collect_delegated_update_alias_events(tree, namespace_aliases):
@@ -8279,7 +8291,9 @@ def _scan_class_instance_bindings(statements, events, *, conditional=False):
         bindings = _class_instance_assignment_bindings(node)
         if bindings:
             for name, class_name in bindings:
-                events.setdefault(name, []).append((line, class_name))
+                events.setdefault(name, []).append(
+                    (line, class_name, True) if conditional else (line, class_name)
+                )
         elif not conditional:
             _invalidate_tracked_bindings_from_statement(node, events, line)
         for block in _compound_statement_blocks(node):
@@ -8359,17 +8373,22 @@ def _instance_hook_is_active(
 
     The instance captured its class at assignment time, so the class name only
     has to be live *then*: rebinding it before the call (``h = Helper();
-    Helper = None; h.bump()``) does not make the recorded method safe.
+    Helper = None; h.bump()``) does not make the recorded method safe. A
+    conditional rebinding leaves both classes as candidates, so any risky one
+    makes the config dynamic.
     """
-    resolved = _binding_event_at_line(instance_events, instance_name, reference_line)
-    if not resolved:
-        return False
-    instance_line, instance_class = resolved
-    return bool(
-        instance_class
-        and (instance_class, method_name) in methods
-        and _class_binding_is_active(class_targets, instance_class, instance_line)
-    )
+    for instance_line, instance_class in _instance_binding_candidates_at_line(
+        instance_events,
+        instance_name,
+        reference_line,
+    ):
+        if (instance_class, method_name) in methods and _class_binding_is_active(
+            class_targets,
+            instance_class,
+            instance_line,
+        ):
+            return True
+    return False
 
 
 def _expression_triggers_class_workers_side_effect(expr, class_targets):

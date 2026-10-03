@@ -2100,3 +2100,24 @@ def test_class_body_global_workers_assignment_is_dynamic(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# CodeRabbit review 2026-10-03: a conditional rebinding must keep the earlier
+# instance class as a candidate, because the branch may not have run.
+def test_conditional_instance_rebinding_keeps_both_candidates(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def bump(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Other:\n"
+        "    def bump(self):\n"
+        "        pass\n"
+        "h = Helper()\n"
+        "if True:\n"
+        "    h = Other()\n"
+        "h.bump()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
