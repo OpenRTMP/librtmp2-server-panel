@@ -178,3 +178,35 @@ def test_request_exception_wrapped():
     ):
         with pytest.raises(Lrtmp2ApiError, match="could not reach"):
             client.health()
+
+
+def test_admin_mutations_use_longer_timeout_than_reads():
+    client = Lrtmp2Client("http://example.test", "tok")
+    assert client.admin_timeout > client.timeout
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.post"
+    ) as mock_post, patch("lrtmp2_client.requests.get") as mock_get:
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 200
+        mock_delete.return_value.content = b"{}"
+        mock_delete.return_value.json.return_value = {}
+        mock_post.return_value.ok = True
+        mock_post.return_value.json.return_value = {}
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.return_value = []
+
+        client.cluster_drain_node(2)
+        client.cluster_resume_node(2)
+        client.cluster_remove_node(3)
+        client.delete_stream("s1")
+        client.list_streams()
+
+    assert all(
+        call.kwargs["timeout"] == client.admin_timeout
+        for call in mock_post.call_args_list
+    )
+    assert all(
+        call.kwargs["timeout"] == client.admin_timeout
+        for call in mock_delete.call_args_list
+    )
+    assert mock_get.call_args.kwargs["timeout"] == client.timeout
