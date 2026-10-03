@@ -1976,3 +1976,75 @@ def test_security_review_oct03_frame_globals_indirection_is_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Bug-hunter 2026-10-03: plain instance methods that mutate workers
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper().bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "h = Helper()\n"
+            "h.bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper.bump(Helper())\n"
+        ),
+    ],
+)
+def test_instance_method_workers_mutation_is_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "h = Helper()\n"
+            "h = None\n"
+            "h.bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "Helper = lambda: None\n"
+            "Helper().bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Helper:\n"
+            "    def bump(self):\n"
+            "        pass\n"
+            "Helper().bump()\n"
+        ),
+    ],
+)
+def test_non_mutating_or_rebound_instance_calls_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)

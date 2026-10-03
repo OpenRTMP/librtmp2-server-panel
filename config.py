@@ -8123,7 +8123,14 @@ def _record_class_side_effect_target(
     if stmt.name == "__get__":
         methods.add(target)
         return True
-    return False
+    # A plain instance method runs the mutation through an instance
+    # (``Helper().bump()``, ``h.bump()``) or through the class
+    # (``Helper.bump(Helper())``). A decorator can replace the function with a
+    # wrapper that never runs its body, so only undecorated methods are proven.
+    if stmt.decorator_list:
+        return False
+    methods.add(target)
+    return True
 
 
 
@@ -8231,6 +8238,43 @@ def _scan_class_side_effect_bindings(
             )
 
 
+def _class_instance_assignment_bindings(node):
+    """Return ``(name, class name)`` pairs for ``name = Class()`` bindings."""
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+        value = node.value
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+        value = node.value
+    else:
+        return ()
+    if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+        return ()
+    return tuple(
+        (target.id, value.func.id)
+        for target in targets
+        if isinstance(target, ast.Name)
+    )
+
+
+def _scan_class_instance_bindings(statements, events, *, conditional=False):
+    """Populate source-ordered class-instance bindings through compound blocks."""
+    for node in statements:
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not conditional:
+                _deactivate_tracked_binding(events, node.name, line)
+            continue
+        bindings = _class_instance_assignment_bindings(node)
+        if bindings:
+            for name, class_name in bindings:
+                events.setdefault(name, []).append((line, class_name))
+        elif not conditional:
+            _invalidate_tracked_bindings_from_statement(node, events, line)
+        for block in _compound_statement_blocks(node):
+            _scan_class_instance_bindings(block, events, conditional=True)
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
@@ -8250,6 +8294,8 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         properties,
         binding_events,
     )
+    instance_events = {}
+    _scan_class_instance_bindings(tree.body, instance_events)
     descriptor_classes = _descriptor_class_names(methods)
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -8265,6 +8311,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         metaclass_definitions,
         binding_events,
         descriptor_fields,
+        instance_events,
     )
 
 
@@ -8284,6 +8331,7 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
     descriptor_fields = class_targets[5] if len(class_targets) > 5 else set()
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(expr, 'lineno', 0)
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
         return expr.func.id in constructors and _class_binding_is_active(
@@ -8297,6 +8345,34 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
         and isinstance(expr.func.value, ast.Name)
     ):
         class_name = expr.func.value.id
+        if (
+            (class_name, expr.func.attr) in methods
+            and _class_binding_is_active(class_targets, class_name, reference_line)
+        ):
+            return True
+        # A module-bound instance (``h = Helper()``) reaches the same mutating
+        # method through the class recorded for the instance name.
+        instance_class = _binding_state_at_line(
+            instance_events,
+            class_name,
+            reference_line,
+        )
+        return bool(
+            instance_class
+            and (instance_class, expr.func.attr) in methods
+            and _class_binding_is_active(
+                class_targets,
+                instance_class,
+                reference_line,
+            )
+        )
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and isinstance(expr.func.value, ast.Call)
+        and isinstance(expr.func.value.func, ast.Name)
+    ):
+        class_name = expr.func.value.func.id
         return (
             (class_name, expr.func.attr) in methods
             and _class_binding_is_active(class_targets, class_name, reference_line)
@@ -12637,7 +12713,7 @@ def _worker_scan_defaults(
     return (
         set() if global_workers_mutators is None else global_workers_mutators,
         (set(), set()) if operator_bindings is None else operator_bindings,
-        (set(), set(), set(), set(), {}, set()) if class_targets is None else class_targets,
+        (set(), set(), set(), set(), {}, set(), {}) if class_targets is None else class_targets,
         {} if dict_subclass_names is None else dict_subclass_names,
     )
 
