@@ -210,3 +210,17 @@ def test_admin_mutations_use_longer_timeout_than_reads():
         for call in mock_delete.call_args_list
     )
     assert mock_get.call_args.kwargs["timeout"] == client.timeout
+
+
+def test_admin_timeout_never_shortens_a_caller_supplied_timeout():
+    # Codex review: Lrtmp2Client(timeout=60) must keep a >=60s budget for
+    # admin mutations instead of being cut to the 30s default.
+    client = Lrtmp2Client("http://example.test", "tok", timeout=60)
+    assert client.admin_timeout == 60
+
+    # An explicit admin_timeout still wins over the derived default.
+    explicit = Lrtmp2Client("http://example.test", "tok", timeout=60, admin_timeout=45)
+    assert explicit.admin_timeout == 45
+
+    default = Lrtmp2Client("http://example.test", "tok")
+    assert default.admin_timeout == 30

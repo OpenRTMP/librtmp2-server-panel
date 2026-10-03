@@ -53,11 +53,18 @@ def _parse_json(resp, operation):
 class Lrtmp2Client:
     """Thin client for the librtmp2-server REST API."""
 
-    def __init__(self, base_url, token, timeout=5, admin_timeout=ADMIN_REQUEST_TIMEOUT_SECONDS):
+    def __init__(self, base_url, token, timeout=5, admin_timeout=None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
-        self.admin_timeout = admin_timeout
+        # Admin calls must never get a shorter budget than the caller's own
+        # request timeout: default to the larger of the two, while an explicit
+        # admin_timeout still wins.
+        self.admin_timeout = (
+            max(timeout, ADMIN_REQUEST_TIMEOUT_SECONDS)
+            if admin_timeout is None
+            else admin_timeout
+        )
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
