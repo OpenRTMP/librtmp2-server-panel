@@ -52,7 +52,7 @@ def test_delete_stream_default_wait_matches_server_drain_window():
 
     sig = inspect.signature(Lrtmp2Client.delete_stream)
     assert sig.parameters["wait_timeout"].default == DELETE_STREAM_DRAIN_WAIT_SECONDS
-    assert DELETE_STREAM_DRAIN_WAIT_SECONDS == 305
+    assert DELETE_STREAM_DRAIN_WAIT_SECONDS == 400
 
 
 def test_delete_stream_treats_404_as_success():

@@ -8,9 +8,12 @@ class Lrtmp2ApiError(Exception):
     pass
 
 
-# librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs).
-# The panel must outlast that window when polling list_streams after HTTP 202.
-DELETE_STREAM_DRAIN_WAIT_SECONDS = 305
+# librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs), but
+# the drain loop checks the deadline only after a serial per-peer cluster RPC
+# capped at 8s each (src/cluster/network.rs), so a successful delete can
+# finalize after 300s + 8s * peer count. The panel cannot know the peer count,
+# so it waits conservatively past that worst case before reporting failure.
+DELETE_STREAM_DRAIN_WAIT_SECONDS = 400
 
 # librtmp2-server admin handlers await synchronous per-peer cluster RPCs before
 # responding (each capped at 8s, src/cluster/network.rs), so a blackholed peer
@@ -154,7 +157,9 @@ class Lrtmp2Client:
         callers can rely on the stream being gone once this returns, rather
         than racing the background delete. librtmp2-server waits up to 300s for
         active RTMP sessions to drain before abandoning local roles and
-        finalizing, so the default wait_timeout is 305s. If the stream is
+        finalizing, and checks that deadline only after a per-peer cluster RPC
+        that can add 8s per unreachable peer, so the default wait_timeout is
+        400s. If the stream is
         still listed after that window, raises Lrtmp2ApiError so the panel can
         surface the incomplete delete instead of silently redirecting while the
         stream remains.
