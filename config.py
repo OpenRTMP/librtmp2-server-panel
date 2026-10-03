@@ -8327,6 +8327,41 @@ def _class_binding_is_active(class_targets, class_name, reference_line):
     return bool(_binding_state_at_line(events, class_name, reference_line))
 
 
+def _class_hook_is_active(class_targets, class_name, method_name, hooks, reference_line):
+    """Return True when ``class_name.method_name`` is a live mutating hook."""
+    return (class_name, method_name) in hooks and _class_binding_is_active(
+        class_targets,
+        class_name,
+        reference_line,
+    )
+
+
+def _instance_hook_is_active(
+    class_targets,
+    instance_events,
+    methods,
+    instance_name,
+    method_name,
+    reference_line,
+):
+    """Return True when a module-bound instance reaches a mutating method."""
+    instance_class = _binding_state_at_line(
+        instance_events,
+        instance_name,
+        reference_line,
+    )
+    return bool(
+        instance_class
+        and _class_hook_is_active(
+            class_targets,
+            instance_class,
+            method_name,
+            methods,
+            reference_line,
+        )
+    )
+
+
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
@@ -8339,58 +8374,57 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
             expr.func.id,
             reference_line,
         )
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Attribute)
-        and isinstance(expr.func.value, ast.Name)
-    ):
-        class_name = expr.func.value.id
-        if (
-            (class_name, expr.func.attr) in methods
-            and _class_binding_is_active(class_targets, class_name, reference_line)
-        ):
-            return True
-        # A module-bound instance (``h = Helper()``) reaches the same mutating
-        # method through the class recorded for the instance name.
-        instance_class = _binding_state_at_line(
-            instance_events,
-            class_name,
-            reference_line,
-        )
-        return bool(
-            instance_class
-            and (instance_class, expr.func.attr) in methods
-            and _class_binding_is_active(
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+        method_name = expr.func.attr
+        receiver = expr.func.value
+        if isinstance(receiver, ast.Name):
+            if _class_hook_is_active(
                 class_targets,
-                instance_class,
+                receiver.id,
+                method_name,
+                methods,
+                reference_line,
+            ):
+                return True
+            # A module-bound instance (``h = Helper()``) reaches the same
+            # mutating method through the class recorded for the instance name.
+            return _instance_hook_is_active(
+                class_targets,
+                instance_events,
+                methods,
+                receiver.id,
+                method_name,
                 reference_line,
             )
-        )
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Attribute)
-        and isinstance(expr.func.value, ast.Call)
-        and isinstance(expr.func.value.func, ast.Name)
-    ):
-        class_name = expr.func.value.func.id
-        return (
-            (class_name, expr.func.attr) in methods
-            and _class_binding_is_active(class_targets, class_name, reference_line)
-        )
+        if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+            return _class_hook_is_active(
+                class_targets,
+                receiver.func.id,
+                method_name,
+                methods,
+                reference_line,
+            )
+        return False
     if (
         isinstance(expr, ast.Attribute)
         and isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Name)
     ):
         class_name = expr.value.func.id
-        if (
-            (class_name, expr.attr) in properties
-            and _class_binding_is_active(class_targets, class_name, reference_line)
+        if _class_hook_is_active(
+            class_targets,
+            class_name,
+            expr.attr,
+            properties,
+            reference_line,
         ):
             return True
-        return (
-            (class_name, expr.attr) in descriptor_fields
-            and _class_binding_is_active(class_targets, class_name, reference_line)
+        return _class_hook_is_active(
+            class_targets,
+            class_name,
+            expr.attr,
+            descriptor_fields,
+            reference_line,
         )
     return False
 
@@ -12719,6 +12753,67 @@ def _worker_scan_defaults(
 
 
 
+def _class_body_statement_has_dynamic_workers_effect(
+    node,
+    global_workers_mutators,
+    operator_bindings,
+    class_targets,
+    dict_subclass_names,
+    defer_annotations,
+):
+    """Return True when one class-body statement mutates the module ``workers``."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return _node_has_worker_mutating_decorator(
+            node,
+            global_workers_mutators,
+        ) or _definition_time_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
+    if isinstance(node, ast.ClassDef):
+        return (
+            _node_has_worker_mutating_decorator(
+                node,
+                global_workers_mutators,
+            )
+            or _classdef_has_import_time_workers_side_effect(
+                node,
+                class_targets,
+            )
+            or _class_body_has_dynamic_workers_effect(
+                node.body,
+                global_workers_mutators,
+                operator_bindings,
+                class_targets,
+                dict_subclass_names,
+                defer_annotations,
+            )
+        )
+    if _node_has_dynamic_workers_effect(
+        node,
+        global_workers_mutators,
+        operator_bindings,
+        class_targets=class_targets,
+        dict_subclass_names=dict_subclass_names,
+    ):
+        return True
+    return any(
+        _class_body_has_dynamic_workers_effect(
+            block,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
+        for block in _compound_statement_blocks(node)
+    )
+
+
 def _class_body_has_dynamic_workers_effect(
     statements,
     global_workers_mutators,
@@ -12733,61 +12828,17 @@ def _class_body_has_dynamic_workers_effect(
     so ``globals()['workers'] = 4`` inside one must make the config dynamic,
     while a plain ``workers = 4`` class attribute only binds a class name.
     """
-    for node in statements:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _node_has_worker_mutating_decorator(
-                node,
-                global_workers_mutators,
-            ) or _definition_time_workers_effect(
-                node,
-                global_workers_mutators,
-                operator_bindings,
-                class_targets,
-                dict_subclass_names,
-                defer_annotations,
-            ):
-                return True
-            continue
-        if isinstance(node, ast.ClassDef):
-            if (
-                _node_has_worker_mutating_decorator(
-                    node,
-                    global_workers_mutators,
-                )
-                or _classdef_has_import_time_workers_side_effect(
-                    node,
-                    class_targets,
-                )
-                or _class_body_has_dynamic_workers_effect(
-                    node.body,
-                    global_workers_mutators,
-                    operator_bindings,
-                    class_targets,
-                    dict_subclass_names,
-                    defer_annotations,
-                )
-            ):
-                return True
-            continue
-        if _node_has_dynamic_workers_effect(
+    return any(
+        _class_body_statement_has_dynamic_workers_effect(
             node,
             global_workers_mutators,
             operator_bindings,
-            class_targets=class_targets,
-            dict_subclass_names=dict_subclass_names,
-        ):
-            return True
-        for block in _compound_statement_blocks(node):
-            if _class_body_has_dynamic_workers_effect(
-                block,
-                global_workers_mutators,
-                operator_bindings,
-                class_targets,
-                dict_subclass_names,
-                defer_annotations,
-            ):
-                return True
-    return False
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
+        for node in statements
+    )
 
 
 def _handle_worker_scan_definition(
@@ -12816,18 +12867,17 @@ def _handle_worker_scan_definition(
         return True
     if not isinstance(node, ast.ClassDef):
         return False
-    if _node_has_worker_mutating_decorator(
-        node,
-        global_workers_mutators,
-    ) or _classdef_has_import_time_workers_side_effect(node, class_targets):
-        state.dynamic = True
-    elif _class_body_has_dynamic_workers_effect(
-        node.body,
-        global_workers_mutators,
-        operator_bindings,
-        class_targets,
-        dict_subclass_names,
-        defer_annotations,
+    if (
+        _node_has_worker_mutating_decorator(node, global_workers_mutators)
+        or _classdef_has_import_time_workers_side_effect(node, class_targets)
+        or _class_body_has_dynamic_workers_effect(
+            node.body,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
     ):
         state.dynamic = True
     return True
