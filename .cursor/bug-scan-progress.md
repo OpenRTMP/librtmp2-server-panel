@@ -1,14 +1,28 @@
 # Bug scan progress
 
-Last scanned: config.py — 2026-09-26
+Last scanned: templates/ — 2026-10-03
 
 ## Module checklist
 
 - [x] `app.py` — Flask routes, auth, session handling, stream CRUD
 - [x] `lrtmp2_client.py` — librtmp2-server REST API client
 - [x] `config.py` — startup validation and environment configuration
-- [ ] `templates/` — Jinja2 templates (XSS, CSRF forms)
+- [x] `templates/` — Jinja2 templates (XSS, CSRF forms)
 - [ ] `static/js/` — frontend JavaScript (DOM injection, fetch logic)
+
+## Findings (2026-10-03 templates/ pass)
+
+- No critical bugs found. Reviewed all six templates (`base.html`, `index.html`,
+  `login.html`, `create_stream.html`, `stream_created.html`, `cluster.html`)
+  and every `render_template()` caller in `app.py`. All mutating forms include
+  `csrf_token`; no `|safe` or unescaped filters; API/user-derived strings use
+  Jinja auto-escaping in body and attribute contexts (`data-url`, `data-stream-id`,
+  `data-node-id`, form repopulation). `base.html` `referrer` meta remains
+  `same-origin`, aligned with `set_security_headers()` in `app.py`. Cluster/stream
+  POST actions use `url_for()` with server-validated IDs on submit; list view IDs
+  from the API are escaped at render time. Reviewed but not a bug: inline
+  `onclick="copyToClipboard(this)"` (secrets via `data-url`, not inline strings);
+  stats/publish keys visible in HTML by design for authenticated operators.
 
 ## Findings (2026-09-26 config.py pass)
 
