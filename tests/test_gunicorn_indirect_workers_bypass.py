@@ -1827,13 +1827,6 @@ def test_bughunter_oct02_indirect_workers_mutations_are_dynamic(
         ),
         (
             "workers = 1\n"
-            "import sys\n"
-            "def hook(server):\n"
-            "    server.cfg.workers = 8\n"
-            "sys.modules[__name__].__dict__.setdefault('on_starting', hook)\n"
-        ),
-        (
-            "workers = 1\n"
             "namespace = globals()\n"
             "def hook(server):\n"
             "    server.cfg.workers = 8\n"

@@ -12432,37 +12432,64 @@ def _hook_store_key_name(key):
     return "*"
 
 
+def _setattr_binds_hook_name(call, namespace_aliases):
+    """Return a hook name a bare ``setattr`` call may bind, if any."""
+    if len(call.args) < 2:
+        return None
+    if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
+        return None
+    return _hook_store_key_name(call.args[1])
+
+
+def _method_binds_hook_name(call, receiver, namespace_aliases):
+    """Return a hook name a namespace method call may bind, if any."""
+    if not _is_current_module_namespace_object(receiver, namespace_aliases):
+        return None
+    method = call.func.attr
+    if method in ("__setattr__", "__setitem__", "setdefault"):
+        if not call.args:
+            return None
+        return _hook_store_key_name(call.args[0])
+    if method != "update":
+        return None
+    if any(_hook_mapping_payload_may_bind(arg) for arg in call.args):
+        return "*"
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            return "*"
+        if keyword.arg in _GUNICORN_RUNTIME_HOOK_NAMES:
+            return keyword.arg
+    return None
+
+
 def _call_binds_hook_name(call, namespace_aliases=None):
     """Return a hook name a call binds into the config namespace, if any."""
     if not isinstance(call, ast.Call):
         return None
     func = call.func
     if isinstance(func, ast.Name) and func.id == "setattr":
-        if len(call.args) < 2:
-            return None
-        if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
-            return None
-        return _hook_store_key_name(call.args[1])
+        return _setattr_binds_hook_name(call, namespace_aliases)
     if not isinstance(func, ast.Attribute):
         return None
-    receiver = func.value
-    if func.attr in ("__setattr__", "__setitem__", "setdefault"):
-        if not call.args or not _is_current_module_namespace_object(
-            receiver, namespace_aliases
-        ):
-            return None
-        return _hook_store_key_name(call.args[0])
-    if func.attr == "update" and _is_current_module_namespace_object(
-        receiver, namespace_aliases
-    ):
-        if any(_hook_mapping_payload_may_bind(arg) for arg in call.args):
-            return "*"
-        for keyword in call.keywords:
-            if keyword.arg is None:
-                return "*"
-            if keyword.arg in _GUNICORN_RUNTIME_HOOK_NAMES:
-                return keyword.arg
-    return None
+    return _method_binds_hook_name(call, func.value, namespace_aliases)
+
+
+def _import_from_bound_names(child):
+    """Return the names a ``from x import ...`` statement binds."""
+    names = []
+    for alias in child.names:
+        if alias.name == "*":
+            names.append("*")
+        else:
+            names.append(alias.asname or alias.name)
+    return tuple(names)
+
+
+def _single_hook_binding(name, explicit):
+    """Return a one-name binding result, or an empty one when there is none."""
+    if name is None:
+        return (), False
+    return (name,), explicit
 
 
 def _gunicorn_hook_binding_names(child, namespace_aliases=None):
@@ -12478,22 +12505,37 @@ def _gunicorn_hook_binding_names(child, namespace_aliases=None):
     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
         return (child.id,), False
     if isinstance(child, ast.ImportFrom):
-        names = []
-        for alias in child.names:
-            if alias.name == "*":
-                names.append("*")
-            else:
-                names.append(alias.asname or alias.name)
-        return tuple(names), False
+        return _import_from_bound_names(child), False
     if isinstance(child, (ast.Attribute, ast.Subscript)) and isinstance(
         child.ctx, ast.Store
     ):
-        name = _hook_store_target_name(child, namespace_aliases)
-        return ((name,) if name is not None else ()), True
+        return _single_hook_binding(
+            _hook_store_target_name(child, namespace_aliases), True
+        )
     if isinstance(child, ast.Call):
-        name = _call_binds_hook_name(child, namespace_aliases)
-        return ((name,) if name is not None else ()), True
+        return _single_hook_binding(
+            _call_binds_hook_name(child, namespace_aliases), True
+        )
     return (), False
+
+
+def _hook_binding_name_is_live(child, name, explicit, scope):
+    """Return True when one bound hook name reaches the module namespace."""
+    in_class, declared_globals, may_run, in_function = scope
+    if explicit:
+        # An explicit module-namespace mutation reaches the module regardless
+        # of the class scope; only whether the enclosing body can run matters.
+        return may_run
+    if isinstance(child, ast.ImportFrom):
+        # An import inside a class body or function binds a class attribute or
+        # local, not a module name, unless the name was declared `global`;
+        # only a module-level import reaches Gunicorn.
+        if in_class or in_function:
+            return name in declared_globals
+        return may_run
+    if in_class:
+        return name in declared_globals
+    return may_run
 
 
 def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
@@ -12514,29 +12556,10 @@ def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
     counts whenever the enclosing body can run.
     """
     names, explicit = _gunicorn_hook_binding_names(child, namespace_aliases)
-    if not names:
-        return False
-    in_class, declared_globals, may_run, in_function = scope
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
             continue
-        if explicit:
-            # An explicit module-namespace mutation reaches the module
-            # regardless of the class scope; only whether the enclosing body
-            # can run matters.
-            live = may_run
-        elif isinstance(child, ast.ImportFrom):
-            # An import inside a class body or function binds a class
-            # attribute or local, not a module name, unless the name was
-            # declared `global`; only a module-level import reaches Gunicorn.
-            live = (
-                name in declared_globals
-                if (in_class or in_function)
-                else may_run
-            )
-        else:
-            live = name in declared_globals if in_class else may_run
-        if live:
+        if _hook_binding_name_is_live(child, name, explicit, scope):
             return True
     return False
 
@@ -12552,7 +12575,7 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
     ``uncalled_names``: a body no reference can reach cannot run, and a hook
     bound in it never reaches the module namespace.
     """
-    in_class, declared_globals, may_run, in_function = scope
+    in_class, declared_globals, may_run, _ = scope
     if isinstance(child, ast.ClassDef):
         return (True, _class_body_global_names(child), True, False)
     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
