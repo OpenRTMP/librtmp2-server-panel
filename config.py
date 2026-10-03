@@ -8280,6 +8280,19 @@ def _class_instance_assignment_bindings(node):
     )
 
 
+def _record_class_instance_statement(node, line, events, conditional):
+    """Record or invalidate one statement's class-instance bindings."""
+    bindings = _class_instance_assignment_bindings(node)
+    if bindings:
+        for name, class_name in bindings:
+            events.setdefault(name, []).append(
+                (line, class_name, True) if conditional else (line, class_name)
+            )
+        return
+    if not conditional:
+        _invalidate_tracked_bindings_from_statement(node, events, line)
+
+
 def _scan_class_instance_bindings(statements, events, *, conditional=False):
     """Populate source-ordered class-instance bindings through compound blocks."""
     for node in statements:
@@ -8288,14 +8301,7 @@ def _scan_class_instance_bindings(statements, events, *, conditional=False):
             if not conditional:
                 _deactivate_tracked_binding(events, node.name, line)
             continue
-        bindings = _class_instance_assignment_bindings(node)
-        if bindings:
-            for name, class_name in bindings:
-                events.setdefault(name, []).append(
-                    (line, class_name, True) if conditional else (line, class_name)
-                )
-        elif not conditional:
-            _invalidate_tracked_bindings_from_statement(node, events, line)
+        _record_class_instance_statement(node, line, events, conditional)
         for block in _compound_statement_blocks(node):
             _scan_class_instance_bindings(block, events, conditional=True)
 
@@ -8391,71 +8397,114 @@ def _instance_hook_is_active(
     return False
 
 
+def _class_call_triggers_workers(expr, constructors, class_targets, reference_line):
+    """Return True when a ``ClassName(...)`` call constructs a risky class."""
+    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
+        return False
+    return expr.func.id in constructors and _class_binding_is_active(
+        class_targets,
+        expr.func.id,
+        reference_line,
+    )
+
+
+def _attribute_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True for ``Class.method(...)``, ``Class().method(...)`` and ``h.method()``."""
+    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)):
+        return False
+    method_name = expr.func.attr
+    receiver = expr.func.value
+    if isinstance(receiver, ast.Name):
+        if _class_hook_is_active(
+            class_targets,
+            receiver.id,
+            method_name,
+            methods,
+            reference_line,
+        ):
+            return True
+        # A module-bound instance (``h = Helper()``) reaches the same
+        # mutating method through the class recorded for the instance name.
+        return _instance_hook_is_active(
+            class_targets,
+            instance_events,
+            methods,
+            receiver.id,
+            method_name,
+            reference_line,
+        )
+    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+        return _class_hook_is_active(
+            class_targets,
+            receiver.func.id,
+            method_name,
+            methods,
+            reference_line,
+        )
+    return False
+
+
+def _attribute_access_triggers_workers(
+    expr,
+    properties,
+    descriptor_fields,
+    class_targets,
+    reference_line,
+):
+    """Return True for a bare ``Class().attr`` property/descriptor read."""
+    if not (
+        isinstance(expr, ast.Attribute)
+        and isinstance(expr.value, ast.Call)
+        and isinstance(expr.value.func, ast.Name)
+    ):
+        return False
+    class_name = expr.value.func.id
+    if _class_hook_is_active(
+        class_targets,
+        class_name,
+        expr.attr,
+        properties,
+        reference_line,
+    ):
+        return True
+    return _class_hook_is_active(
+        class_targets,
+        class_name,
+        expr.attr,
+        descriptor_fields,
+        reference_line,
+    )
+
+
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
     descriptor_fields = class_targets[5] if len(class_targets) > 5 else set()
     instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(expr, 'lineno', 0)
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-        return expr.func.id in constructors and _class_binding_is_active(
+    return (
+        _class_call_triggers_workers(expr, constructors, class_targets, reference_line)
+        or _attribute_call_triggers_workers(
+            expr,
+            methods,
             class_targets,
-            expr.func.id,
+            instance_events,
             reference_line,
         )
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
-        method_name = expr.func.attr
-        receiver = expr.func.value
-        if isinstance(receiver, ast.Name):
-            if _class_hook_is_active(
-                class_targets,
-                receiver.id,
-                method_name,
-                methods,
-                reference_line,
-            ):
-                return True
-            # A module-bound instance (``h = Helper()``) reaches the same
-            # mutating method through the class recorded for the instance name.
-            return _instance_hook_is_active(
-                class_targets,
-                instance_events,
-                methods,
-                receiver.id,
-                method_name,
-                reference_line,
-            )
-        if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
-            return _class_hook_is_active(
-                class_targets,
-                receiver.func.id,
-                method_name,
-                methods,
-                reference_line,
-            )
-        return False
-    if (
-        isinstance(expr, ast.Attribute)
-        and isinstance(expr.value, ast.Call)
-        and isinstance(expr.value.func, ast.Name)
-    ):
-        class_name = expr.value.func.id
-        if _class_hook_is_active(
-            class_targets,
-            class_name,
-            expr.attr,
+        or _attribute_access_triggers_workers(
+            expr,
             properties,
-            reference_line,
-        ):
-            return True
-        return _class_hook_is_active(
-            class_targets,
-            class_name,
-            expr.attr,
             descriptor_fields,
+            class_targets,
             reference_line,
         )
-    return False
+    )
 
 
 
