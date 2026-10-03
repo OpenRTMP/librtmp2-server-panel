@@ -3094,6 +3094,26 @@ def _partial_call_binds_namespace_workers_setter(partial_call, namespace_aliases
         and _update_payload_may_set_workers(partial_call, start_index=1)
     )
 
+def _named_partial_workers_mutation(
+    call,
+    saved_aliases,
+    partial_mutator_alias_events,
+):
+    """Return a saved partial mutator result, or None when the name is unrelated."""
+    if not isinstance(call.func, ast.Name):
+        return None
+    if call.func.id in saved_aliases:
+        return True
+    saved_method = _binding_state_at_line(
+        partial_mutator_alias_events,
+        call.func.id,
+        getattr(call, 'lineno', 0),
+    )
+    if saved_method is None:
+        return None
+    return _call_payload_may_set_workers(saved_method, call)
+
+
 def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     """Return True for direct or saved partial workers setters."""
     if not isinstance(call, ast.Call):
@@ -3105,16 +3125,13 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
     partial_mutator_alias_events = operator_bindings[27] if len(operator_bindings) > 27 else {}
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    if isinstance(call.func, ast.Name):
-        if call.func.id in saved_aliases:
-            return True
-        saved_method = _binding_state_at_line(
-            partial_mutator_alias_events,
-            call.func.id,
-            getattr(call, 'lineno', 0),
-        )
-        if saved_method is not None:
-            return _call_payload_may_set_workers(saved_method, call)
+    saved_mutation = _named_partial_workers_mutation(
+        call,
+        saved_aliases,
+        partial_mutator_alias_events,
+    )
+    if saved_mutation is not None:
+        return saved_mutation
     partial_call, invocation_start = _resolve_partial_invocation(
         call,
         partial_aliases,
@@ -3138,7 +3155,6 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
     ):
         return True
     return _partial_call_binds_namespace_workers_setter(partial_call, namespace_aliases)
-
 
 
 
@@ -9106,6 +9122,33 @@ def _compound_statement_body_mutates_workers(
     )
 
 
+def _node_or_child_expression_mutates_workers(
+    node,
+    operator_bindings,
+    dict_subclass_names,
+    bound_names,
+):
+    """Return True when an expression node or one of its expression children mutates workers."""
+    return any(
+        isinstance(child, ast.expr)
+        and _expression_mutates_workers(
+            child,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
+        for child in ast.iter_child_nodes(node)
+    ) or (
+        isinstance(node, ast.expr)
+        and _expression_mutates_workers(
+            node,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
+    )
+
+
 def _is_dynamic_workers_mutation(
     node,
     operator_bindings,
@@ -9129,26 +9172,15 @@ def _is_dynamic_workers_mutation(
         bound_names,
     ):
         return True
-    if any(
-        isinstance(child, ast.expr)
-        and _expression_mutates_workers(
-            child,
-            operator_bindings,
-            dict_subclass_names,
-            bound_names,
-        )
-        for child in ast.iter_child_nodes(node)
-    ):
-        return True
-    if isinstance(node, ast.expr) and _expression_mutates_workers(
+    if _node_or_child_expression_mutates_workers(
         node,
         operator_bindings,
         dict_subclass_names,
         bound_names,
     ):
-        # A definition-time expression such as ``exec("workers = 2")`` arrives
-        # here as the bare call, so the child scan above never reaches the
-        # detector that recognises it.
+        # A definition-time expression such as exec("workers = 2") can
+        # arrive here as the bare call, while statement nodes expose the call
+        # through their expression children.
         return True
     if isinstance(node, ast.Assign):
         if _assign_mutates_proven_frame_globals_workers(node, operator_bindings):
@@ -11059,6 +11091,52 @@ def _collect_frame_globals_mutator_aliases(tree, inspect_analysis):
     return aliases
 
 
+def _deactivate_frame_alias_bindings(
+    name,
+    active,
+    events,
+    active_fg_dict,
+    fg_dict_events,
+    line,
+):
+    """Deactivate frame and f_globals aliases shadowed by a definition."""
+    _deactivate_imported_module_alias(name, active, events, line)
+    _deactivate_imported_module_alias(
+        name,
+        active_fg_dict,
+        fg_dict_events,
+        line,
+    )
+
+
+def _module_scope_frame_loop_target_names(node, inspect_analysis, active):
+    """Return frame aliases introduced by a supported module-scope frame loop."""
+    loop_target_names = _getouterframes_loop_target_names(
+        node,
+        inspect_analysis,
+        active,
+    )
+    if loop_target_names is not None:
+        return loop_target_names
+    walk_stack_targets = _walk_stack_loop_frame_target_names(
+        node,
+        inspect_analysis,
+    )
+    if walk_stack_targets is not None:
+        return walk_stack_targets
+    return _current_frames_loop_frame_target_names(
+        node,
+        inspect_analysis,
+    )
+
+
+def _activate_frame_alias_targets(names, active, events, line):
+    """Record frame aliases proven active from a module-scope loop."""
+    for name in names:
+        active.add(name)
+        events.setdefault(name, []).append((line, True))
+
+
 def _collect_inspect_frame_alias_events(tree, inspect_analysis):
     """Track names proven to hold frames from inspect.currentframe or sys._getframe."""
     events = {}
@@ -11068,41 +11146,27 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
     for node in tree.body:
         line = getattr(node, "lineno", 0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            _deactivate_imported_module_alias(node.name, active, events, line)
-            _deactivate_imported_module_alias(
+            _deactivate_frame_alias_bindings(
                 node.name,
+                active,
+                events,
                 active_fg_dict,
                 fg_dict_events,
                 line,
             )
             continue
-        loop_target_names = _getouterframes_loop_target_names(
+        loop_target_names = _module_scope_frame_loop_target_names(
             node,
             inspect_analysis,
             active,
         )
         if loop_target_names is not None:
-            for name in loop_target_names:
-                active.add(name)
-                events.setdefault(name, []).append((line, True))
-            continue
-        walk_stack_targets = _walk_stack_loop_frame_target_names(
-            node,
-            inspect_analysis,
-        )
-        if walk_stack_targets is not None:
-            for name in walk_stack_targets:
-                active.add(name)
-                events.setdefault(name, []).append((line, True))
-            continue
-        current_frames_targets = _current_frames_loop_frame_target_names(
-            node,
-            inspect_analysis,
-        )
-        if current_frames_targets is not None:
-            for name in current_frames_targets:
-                active.add(name)
-                events.setdefault(name, []).append((line, True))
+            _activate_frame_alias_targets(
+                loop_target_names,
+                active,
+                events,
+                line,
+            )
             continue
         for name, value in _namespace_assignment_values(node):
             _record_frame_alias_assignment(
