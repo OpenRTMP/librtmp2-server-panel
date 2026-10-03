@@ -1764,6 +1764,7 @@ def test_codex_pr302_unrelated_frame_shapes_stay_static(
             "getattr(inspect.currentframe(), 'f_globals', {}).__ior__({'workers': 8})\n"
         ),
         "workers = 1\ngetattr(globals(), 'setdefault')('workers', 8)\n",
+        "ns = globals()\ngetattr(ns, 'setdefault')('workers', 8)\n",
         (
             "workers = 1\n"
             "import operator\n"

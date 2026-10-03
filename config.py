@@ -1890,7 +1890,7 @@ def _call_is_namespace_setdefault_workers(call, namespace_aliases=None):
     return _is_module_namespace_mapping(call.func.value, namespace_aliases)
 
 
-def _call_is_getattr_setdefault_workers(call):
+def _call_is_getattr_setdefault_workers(call, namespace_aliases=None):
     """Return True for ``getattr(globals(), 'setdefault')('workers', ...)``."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
@@ -1899,7 +1899,7 @@ def _call_is_getattr_setdefault_workers(call):
         return False
     if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
         return False
-    if not _is_module_namespace_mapping(func.args[0]):
+    if not _is_module_namespace_mapping(func.args[0], namespace_aliases):
         return False
     method = func.args[1]
     if not (isinstance(method, ast.Constant) and method.value == "setdefault"):
@@ -8781,7 +8781,7 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
     return (
         _call_sets_workers_via_setitem(call)
         or _call_is_namespace_setdefault_workers(call, namespace_aliases)
-        or _call_is_getattr_setdefault_workers(call)
+        or _call_is_getattr_setdefault_workers(call, namespace_aliases)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
         or _call_is_dict_type_setitem_on_module_namespace(call, namespace_aliases, dict_shadow_line)
