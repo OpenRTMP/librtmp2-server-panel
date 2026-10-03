@@ -12831,6 +12831,19 @@ def _worker_scan_defaults(
 
 
 
+def _node_has_workers_walrus(node):
+    """Return True when an evaluated walrus expression in ``node`` binds ``workers``.
+
+    A walrus inside a lambda body is deferred until the lambda runs, so it
+    cannot mutate ``workers`` at class-definition time.
+    """
+    if isinstance(node, ast.Lambda):
+        return False
+    if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
+        return True
+    return any(_node_has_workers_walrus(child) for child in ast.iter_child_nodes(node))
+
+
 def _class_body_statement_assigns_workers(node):
     """Return True when the statement binds the bare name ``workers``."""
     if isinstance(node, ast.Assign):
@@ -12840,8 +12853,10 @@ def _class_body_statement_assigns_workers(node):
     elif isinstance(node, ast.For):
         targets = [node.target]
     else:
-        return False
-    return any(_target_assigns_workers(target) for target in targets)
+        targets = []
+    if any(_target_assigns_workers(target) for target in targets):
+        return True
+    return _node_has_workers_walrus(node)
 
 
 def _class_body_statement_has_dynamic_workers_effect(

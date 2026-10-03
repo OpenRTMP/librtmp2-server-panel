@@ -2121,3 +2121,29 @@ def test_conditional_instance_rebinding_keeps_both_candidates(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# CodeRabbit review 2026-10-04: a walrus after `global workers` in a class
+# body binds the module name and must be treated as dynamic.
+def test_class_body_global_workers_walrus_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    global workers\n"
+        "    (workers := 4)\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_class_body_lambda_walrus_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Holder:\n"
+        "    global workers\n"
+        "    fn = lambda: (workers := 4)\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
