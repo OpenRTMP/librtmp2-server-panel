@@ -195,6 +195,18 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
+def _normalize_cluster_metrics(cluster):
+    """Sanitize cluster-level metrics that cluster.html formats as floats."""
+    if not isinstance(cluster, dict):
+        return None
+    for container in (cluster, cluster.get("load")):
+        if not isinstance(container, dict):
+            continue
+        for field in ("rx_mbps", "tx_mbps", "total_rx_mbps", "total_tx_mbps"):
+            container[field] = _as_number(container.get(field))
+    return cluster
+
+
 def _append_api_error(current, error):
     text = str(error)
     return text if current is None else f"{current}; {text}"
@@ -299,6 +311,7 @@ class _PanelRuntime:
             "5 per minute",
             methods=["POST"],
             exempt_when=lambda: request.endpoint != "login",
+            override_defaults=False,
         )(self._login_post_rate_limit)
         self.app.before_request(hook)
 
@@ -762,7 +775,7 @@ class _PanelRuntime:
             api_errors.append(
                 "Health probe reports standalone but cluster API is enabled."
             )
-            return status, None, True
+            return _normalize_cluster_metrics(status), None, True
         response = render_template(
             CLUSTER_TEMPLATE,
             cluster_enabled=False,
@@ -819,8 +832,8 @@ class _PanelRuntime:
             fallback = (
                 (health or {}).get("cluster") if isinstance(health, dict) else None
             )
-            return fallback if isinstance(fallback, dict) else None
-        return status
+            return _normalize_cluster_metrics(fallback)
+        return _normalize_cluster_metrics(status)
 
     @staticmethod
     def _resolve_cluster_enabled(cluster, nodes, cluster_on, detect_error):
