@@ -8213,28 +8213,26 @@ def _class_has_worker_side_effect_target(
     return risky
 
 
-def _descriptor_class_names(methods):
-    """Return classes whose descriptor hooks may mutate ``workers``."""
-    return {
-        class_name
-        for class_name, method_name in methods
-        if method_name in ("__get__", "__set__", "__delete__")
-    }
-
-
-def _record_descriptor_field_assignments(class_node, descriptor_classes, descriptor_fields):
-    """Record class attributes instantiated from mutating descriptor classes."""
+def _record_descriptor_field_assignments(class_node, methods, descriptor_fields):
+    """Record descriptor fields keyed by the hook an access kind invokes."""
     found = False
     for stmt in class_node.body:
         if not isinstance(stmt, ast.Assign):
             continue
         if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
             continue
-        if stmt.value.func.id not in descriptor_classes:
+        descriptor_class = stmt.value.func.id
+        matching_hooks = [
+            hook
+            for hook in descriptor_fields
+            if (descriptor_class, hook) in methods
+        ]
+        if not matching_hooks:
             continue
         for target in stmt.targets:
             if isinstance(target, ast.Name):
-                descriptor_fields.add((class_node.name, target.id))
+                for hook in matching_hooks:
+                    descriptor_fields[hook].add((class_node.name, target.id))
                 found = True
     return found
 
@@ -8263,7 +8261,6 @@ def _scan_class_side_effect_bindings(
     properties,
     binding_events,
     *,
-    descriptor_classes=None,
     descriptor_fields=None,
     conditional=False,
 ):
@@ -8278,11 +8275,11 @@ def _scan_class_side_effect_bindings(
                 methods,
                 properties,
             )
-            if descriptor_classes is not None and descriptor_fields is not None:
+            if descriptor_fields is not None:
                 risky = (
                     _record_descriptor_field_assignments(
                         node,
-                        descriptor_classes,
+                        methods,
                         descriptor_fields,
                     )
                     or risky
@@ -8308,7 +8305,6 @@ def _scan_class_side_effect_bindings(
                 methods,
                 properties,
                 binding_events,
-                descriptor_classes=descriptor_classes,
                 descriptor_fields=descriptor_fields,
                 conditional=True,
             )
@@ -8383,7 +8379,7 @@ _ENUM_BASE_NAMES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
 
 
 def _enum_import_aliases(tree):
-    """Return module and direct-base aliases that identify enum classes."""
+    """Return module, direct-base and nonmember aliases that identify enums."""
     module_aliases = {
         imported.asname or imported.name
         for node in tree.body
@@ -8398,7 +8394,14 @@ def _enum_import_aliases(tree):
         for imported in node.names
         if imported.name in _ENUM_BASE_NAMES
     }
-    return module_aliases, base_aliases
+    nonmember_aliases = {
+        imported.asname or imported.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "enum"
+        for imported in node.names
+        if imported.name == "nonmember"
+    }
+    return module_aliases, base_aliases, nonmember_aliases
 
 
 def _base_is_direct_enum(base, module_aliases, base_aliases):
@@ -8430,9 +8433,31 @@ def _statement_simple_targets(stmt):
     return []
 
 
-def _enum_member_names(class_node):
-    """Yield public simple names assigned in an enum class body."""
+def _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
+    """Return True when an enum-body value is ``nonmember(...)``."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id in nonmember_aliases
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "nonmember"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in module_aliases
+    )
+
+
+def _enum_member_names(class_node, module_aliases, nonmember_aliases):
+    """Yield public simple names that create true members in an enum body."""
     for stmt in class_node.body:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if isinstance(value, ast.Lambda) or _enum_value_is_nonmember(
+            value,
+            module_aliases,
+            nonmember_aliases,
+        ):
+            continue
         for target in _statement_simple_targets(stmt):
             if isinstance(target, ast.Name) and not target.id.startswith("_"):
                 yield target.id
@@ -8440,7 +8465,7 @@ def _enum_member_names(class_node):
 
 def _collect_enum_member_targets(tree):
     """Return enum class/member pairs for direct enum definitions."""
-    module_aliases, base_aliases = _enum_import_aliases(tree)
+    module_aliases, base_aliases, nonmember_aliases = _enum_import_aliases(tree)
     members = set()
     for node in tree.body:
         if not isinstance(node, ast.ClassDef):
@@ -8449,9 +8474,34 @@ def _collect_enum_member_targets(tree):
             continue
         members.update(
             (node.name, member_name)
-            for member_name in _enum_member_names(node)
+            for member_name in _enum_member_names(
+                node,
+                module_aliases,
+                nonmember_aliases,
+            )
         )
     return members
+
+
+def _class_body_plain_attribute_names(class_node):
+    """Return names bound to provably plain values in one class body.
+
+    Only values that cannot implement the descriptor protocol (constants and
+    literal containers) qualify, so the barrier can never hide a descriptor
+    assigned through a name or a factory call.
+    """
+    names = set()
+    for stmt in class_node.body:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if not isinstance(
+            value,
+            (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.JoinedStr),
+        ):
+            continue
+        for target in _statement_simple_targets(stmt):
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
 
 
 def _collect_class_side_effect_targets(tree, operator_bindings):
@@ -8459,9 +8509,10 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     constructors = set()
     methods = set()
     properties = set()
-    descriptor_fields = set()
+    descriptor_fields = {"__get__": set(), "__set__": set(), "__delete__": set()}
     class_bases = {}
     class_methods = set()
+    class_attributes = set()
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
@@ -8475,7 +8526,6 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         properties,
         {},
     )
-    descriptor_classes = _descriptor_class_names(methods)
 
     binding_events = {}
     _scan_class_side_effect_bindings(
@@ -8485,7 +8535,6 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         methods,
         properties,
         binding_events,
-        descriptor_classes=descriptor_classes,
         descriptor_fields=descriptor_fields,
     )
 
@@ -8506,6 +8555,10 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
                 for stmt in node.body
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
+            class_attributes.update(
+                (node.name, attribute_name)
+                for attribute_name in _class_body_plain_attribute_names(node)
+            )
     return (
         constructors,
         methods,
@@ -8517,6 +8570,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_bases,
         class_methods,
         enum_members,
+        class_attributes,
     )
 
 
@@ -8547,6 +8601,7 @@ def _class_hierarchy_defines_method(
     method_name,
     class_methods=None,
     seen=None,
+    class_attributes=None,
 ):
     """Return True when MRO lookup reaches a mutating method definition."""
     seen = frozenset() if seen is None else seen
@@ -8555,6 +8610,10 @@ def _class_hierarchy_defines_method(
     if (class_name, method_name) in methods:
         return True
     if class_methods is not None and (class_name, method_name) in class_methods:
+        return False
+    if class_attributes is not None and (class_name, method_name) in class_attributes:
+        # A plain class attribute shadows every inherited property/descriptor,
+        # so the instance access never reaches the mutating base hook.
         return False
     next_seen = seen | {class_name}
     return any(
@@ -8565,6 +8624,7 @@ def _class_hierarchy_defines_method(
             method_name,
             class_methods,
             next_seen,
+            class_attributes,
         )
         for base in class_bases.get(class_name, ())
     )
@@ -8577,6 +8637,7 @@ def _instance_hook_is_active(
     instance_name,
     method_name,
     reference_line,
+    class_attributes=None,
 ):
     """Return True when a module-bound instance reaches a mutating method.
 
@@ -8599,6 +8660,7 @@ def _instance_hook_is_active(
             instance_class,
             method_name,
             class_methods,
+            class_attributes=class_attributes,
         ):
             continue
         if _class_binding_is_active(
@@ -8760,6 +8822,7 @@ def _attribute_access_triggers_workers(
         class_name = expr.value.id
     if class_name is None:
         return False
+    get_fields = descriptor_fields.get("__get__", set())
     if instance_read and _class_hook_is_active(
         class_targets,
         class_name,
@@ -8772,26 +8835,28 @@ def _attribute_access_triggers_workers(
         class_targets,
         class_name,
         expr.attr,
-        descriptor_fields,
+        get_fields,
         reference_line,
     ):
         return True
     if instance_read:
         return False
+    class_attributes = class_targets[10] if len(class_targets) > 10 else None
     return _instance_hook_is_active(
         class_targets,
         instance_events,
-        properties | descriptor_fields,
+        properties | get_fields,
         class_name,
         expr.attr,
         reference_line,
+        class_attributes=class_attributes,
     )
 
 
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
-    descriptor_fields = class_targets[5] if len(class_targets) > 5 else set()
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
     instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(expr, 'lineno', 0)
     return (
@@ -9790,6 +9855,8 @@ def _expression_has_class_workers_side_effect(expr, class_targets):
     """Recursively inspect evaluated expressions without entering lambda scopes."""
     if isinstance(expr, ast.Lambda):
         return False
+    if _comprehension_hook_write_triggers_workers(expr, class_targets):
+        return True
     if _expression_triggers_class_workers_side_effect(expr, class_targets):
         return True
     return any(
@@ -9799,10 +9866,147 @@ def _expression_has_class_workers_side_effect(expr, class_targets):
     )
 
 
+def _attribute_hook_write_triggers_workers(
+    expr,
+    hook_fields,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when an assignment/deletion target reaches a mutating hook."""
+    if not isinstance(expr, ast.Attribute):
+        return False
+    class_name = None
+    instance_write = False
+    if (
+        isinstance(expr.value, ast.Call)
+        and isinstance(expr.value.func, ast.Name)
+    ):
+        class_name = expr.value.func.id
+        instance_write = True
+    elif isinstance(expr.value, ast.Name):
+        class_name = expr.value.id
+    if class_name is None:
+        return False
+    if _class_hook_is_active(
+        class_targets,
+        class_name,
+        expr.attr,
+        hook_fields,
+        reference_line,
+    ):
+        return True
+    if instance_write:
+        return False
+    return _instance_hook_is_active(
+        class_targets,
+        instance_events,
+        hook_fields,
+        class_name,
+        expr.attr,
+        reference_line,
+    )
+
+
+def _target_hook_write_triggers_workers(
+    target,
+    hook_fields,
+    class_targets,
+    instance_events,
+):
+    """Return True when one assignment/deletion target tree reaches a hook."""
+    if isinstance(target, ast.Attribute):
+        return _attribute_hook_write_triggers_workers(
+            target,
+            hook_fields,
+            class_targets,
+            instance_events,
+            getattr(target, "lineno", 0),
+        )
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(
+            _target_hook_write_triggers_workers(
+                element,
+                hook_fields,
+                class_targets,
+                instance_events,
+            )
+            for element in target.elts
+        )
+    if isinstance(target, ast.Starred):
+        return _target_hook_write_triggers_workers(
+            target.value,
+            hook_fields,
+            class_targets,
+            instance_events,
+        )
+    return False
+
+
+def _comprehension_hook_write_triggers_workers(expr, class_targets):
+    """Return True when a comprehension target invokes a mutating hook."""
+    if not isinstance(expr, ast.comprehension):
+        return False
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
+    hook_fields = descriptor_fields.get("__set__", set())
+    if not hook_fields:
+        return False
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    return _target_hook_write_triggers_workers(
+        expr.target,
+        hook_fields,
+        class_targets,
+        instance_events,
+    )
+
+
+def _statement_hook_write_triggers_workers(node, class_targets):
+    """Return True when a statement's assignment/deletion targets run a hook."""
+    if isinstance(node, ast.Delete):
+        targets = node.targets
+        hook = "__delete__"
+    elif isinstance(node, ast.Assign):
+        targets = node.targets
+        hook = "__set__"
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            return False
+        targets = [node.target]
+        hook = "__set__"
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        targets = [node.target]
+        hook = "__set__"
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        targets = [
+            item.optional_vars
+            for item in node.items
+            if item.optional_vars is not None
+        ]
+        hook = "__set__"
+    else:
+        return False
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
+    hook_fields = descriptor_fields.get(hook, set())
+    if not hook_fields:
+        return False
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    return any(
+        _target_hook_write_triggers_workers(
+            target,
+            hook_fields,
+            class_targets,
+            instance_events,
+        )
+        for target in targets
+    )
+
+
 def _statement_has_class_workers_side_effect(node, class_targets):
     """Return True when an evaluated statement expression invokes a risky class hook."""
     if not class_targets or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return False
+    if _statement_hook_write_triggers_workers(node, class_targets):
+        return True
     if isinstance(node, (ast.With, ast.AsyncWith)):
         return any(
             _expression_has_class_workers_side_effect(item.context_expr, class_targets)
