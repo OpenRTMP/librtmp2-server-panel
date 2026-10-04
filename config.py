@@ -2086,6 +2086,63 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     return method is None
 
 
+def _call_is_operator_attrgetter_on_proven_frame_globals(call, operator_bindings):
+    """Return True for ``operator.attrgetter('f_globals')(frame)(...)`` mutations."""
+    if not isinstance(call, ast.Call):
+        return False
+    if (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "update"
+        and isinstance(call.func.value, ast.Call)
+        and call.func.value.args
+    ):
+        bound = call.func.value
+        factory = bound.func
+        if (
+            isinstance(factory, ast.Call)
+            and _is_operator_attrgetter_factory(factory, operator_bindings)
+            and _operator_attrgetter_method_name(factory) == "f_globals"
+        ):
+            inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+            reference_line = getattr(call, "lineno", 0)
+            active_frame_names = _active_frame_names_at_line(
+                inspect_analysis,
+                reference_line,
+            )
+            if _node_is_proven_live_frame(
+                bound.args[0],
+                inspect_analysis,
+                active_frame_names,
+            ):
+                return _update_payload_may_set_workers(call)
+    bound = call.func
+    if isinstance(bound, ast.NamedExpr) and isinstance(bound.value, ast.Call):
+        bound = bound.value
+    if not isinstance(bound, ast.Call) or not bound.args:
+        return False
+    factory = bound.func
+    if not isinstance(factory, ast.Call):
+        return False
+    if not _is_operator_attrgetter_factory(factory, operator_bindings):
+        return False
+    if _operator_attrgetter_method_name(factory) != "f_globals":
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(inspect_analysis, reference_line)
+    if not _node_is_proven_live_frame(
+        bound.args[0],
+        inspect_analysis,
+        active_frame_names,
+    ):
+        return False
+    if not call.args:
+        return False
+    if len(call.args) == 1 and isinstance(call.args[0], ast.Dict):
+        return _dict_literal_sets_workers(call.args[0])
+    return _update_payload_may_set_workers(call)
+
+
 _NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
 _DYNAMIC_EXEC_EVAL_NAMES = frozenset({"exec", "eval"})
 _BUILTINS_SHADOW_MARKER = "__builtins_shadowed__"
@@ -8312,6 +8369,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     methods = set()
     properties = set()
     descriptor_fields = set()
+    class_bases = {}
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
@@ -8330,6 +8388,9 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     descriptor_classes = _descriptor_class_names(methods)
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
+            class_bases[node.name] = tuple(
+                base.id for base in node.bases if isinstance(base, ast.Name)
+            )
             _record_descriptor_field_assignments(
                 node,
                 descriptor_classes,
@@ -8343,6 +8404,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         binding_events,
         descriptor_fields,
         instance_events,
+        class_bases,
     )
 
 
@@ -8367,6 +8429,16 @@ def _class_hook_is_active(class_targets, class_name, method_name, hooks, referen
     )
 
 
+def _class_hierarchy_defines_method(methods, class_bases, class_name, method_name):
+    """Return True when ``class_name`` or a base defines ``method_name``."""
+    if (class_name, method_name) in methods:
+        return True
+    for base in class_bases.get(class_name, ()):
+        if _class_hierarchy_defines_method(methods, class_bases, base, method_name):
+            return True
+    return False
+
+
 def _instance_hook_is_active(
     class_targets,
     instance_events,
@@ -8383,12 +8455,20 @@ def _instance_hook_is_active(
     conditional rebinding leaves both classes as candidates, so any risky one
     makes the config dynamic.
     """
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
     for instance_line, instance_class in _instance_binding_candidates_at_line(
         instance_events,
         instance_name,
         reference_line,
     ):
-        if (instance_class, method_name) in methods and _class_binding_is_active(
+        if not _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            instance_class,
+            method_name,
+        ):
+            continue
+        if _class_binding_is_active(
             class_targets,
             instance_class,
             instance_line,
@@ -8440,9 +8520,24 @@ def _attribute_call_triggers_workers(
             reference_line,
         )
     if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+        class_name = receiver.func.id
+        class_bases = class_targets[7] if len(class_targets) > 7 else {}
+        if _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            class_name,
+            method_name,
+        ) and _class_binding_is_active(
+            class_targets,
+            class_name,
+            reference_line,
+        ):
+            return True
+        return False
+    if isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name):
         return _class_hook_is_active(
             class_targets,
-            receiver.func.id,
+            receiver.value.id,
             method_name,
             methods,
             reference_line,
@@ -8457,14 +8552,19 @@ def _attribute_access_triggers_workers(
     class_targets,
     reference_line,
 ):
-    """Return True for a bare ``Class().attr`` property/descriptor read."""
-    if not (
-        isinstance(expr, ast.Attribute)
-        and isinstance(expr.value, ast.Call)
+    """Return True for property/descriptor reads on instances or class attributes."""
+    if not isinstance(expr, ast.Attribute):
+        return False
+    class_name = None
+    if (
+        isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Name)
     ):
+        class_name = expr.value.func.id
+    elif isinstance(expr.value, ast.Name):
+        class_name = expr.value.id
+    if class_name is None:
         return False
-    class_name = expr.value.func.id
     if _class_hook_is_active(
         class_targets,
         class_name,
@@ -8774,6 +8874,10 @@ def _call_has_primary_worker_mutation(expr, operator_bindings):
         or _call_is_operator_namespace_ior(expr, operator_bindings)
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
+        or _call_is_operator_attrgetter_on_proven_frame_globals(
+            expr,
+            operator_bindings,
+        )
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
     )
@@ -10415,6 +10519,9 @@ def _frame_globals_receiver(call):
     ``getattr(frame, 'f_globals')`` spelling.
     """
     base = call.func.value
+    frame_from_getattribute = _object_getattribute_f_globals_frame(base)
+    if frame_from_getattribute is not None:
+        return frame_from_getattribute
     if isinstance(base, ast.Attribute) and base.attr == "f_globals":
         return base.value
     if (
@@ -10781,6 +10888,34 @@ def _active_frame_globals_dict_names_at_line(inspect_analysis, reference_line):
     }
 
 
+def _object_getattribute_f_globals_frame(node):
+    """Return the frame argument of ``object.__getattribute__(frame, 'f_globals')``."""
+    if not isinstance(node, ast.Call) or len(node.args) < 2:
+        return None
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "__getattribute__":
+        if not (isinstance(func.value, ast.Name) and func.value.id == "object"):
+            return None
+    elif isinstance(func, ast.Call) and isinstance(func.func, ast.Name):
+        if func.func.id != "getattr" or len(func.args) < 2:
+            return None
+        module = func.args[0]
+        attr = func.args[1]
+        if not (
+            isinstance(module, ast.Name)
+            and module.id == "object"
+            and isinstance(attr, ast.Constant)
+            and attr.value == "__getattribute__"
+        ):
+            return None
+    else:
+        return None
+    key = node.args[1]
+    if not (isinstance(key, ast.Constant) and key.value == "f_globals"):
+        return None
+    return node.args[0]
+
+
 def _is_proven_frame_globals_mapping(
     node,
     inspect_analysis,
@@ -10791,6 +10926,13 @@ def _is_proven_frame_globals_mapping(
     node = _unwrap_ast_node(node)
     if isinstance(node, ast.Name) and node.id in active_fg_dict_names:
         return True
+    frame_from_getattribute = _object_getattribute_f_globals_frame(node)
+    if frame_from_getattribute is not None:
+        return _node_is_proven_live_frame(
+            frame_from_getattribute,
+            inspect_analysis,
+            active_frame_names,
+        )
     if not (isinstance(node, ast.Attribute) and node.attr == "f_globals"):
         return False
     return _node_is_proven_live_frame(
@@ -11288,11 +11430,11 @@ def _record_frame_globals_dict_alias_assignment(
     events.setdefault(name, []).append((line, True))
 
 
-def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
-    """Return True when ``iter_expr`` is ``sys._current_frames().items()``."""
+def _sys_current_frames_mapping_call_is_active(iter_expr, inspect_analysis, method):
+    """Return True when ``iter_expr`` is ``sys._current_frames().<method>()``."""
     if not isinstance(iter_expr, ast.Call):
         return False
-    if not isinstance(iter_expr.func, ast.Attribute) or iter_expr.func.attr != "items":
+    if not isinstance(iter_expr.func, ast.Attribute) or iter_expr.func.attr != method:
         return False
     inner = iter_expr.func.value
     if not isinstance(inner, ast.Call):
@@ -11308,16 +11450,32 @@ def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
     return False
 
 
+def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
+    """Return True when ``iter_expr`` is ``sys._current_frames().items()``."""
+    return _sys_current_frames_mapping_call_is_active(
+        iter_expr,
+        inspect_analysis,
+        "items",
+    )
+
+
 def _current_frames_loop_frame_target_names(node, inspect_analysis):
-    """Return frame aliases unpacked from ``sys._current_frames().items()`` loops."""
+    """Return frame aliases unpacked from ``sys._current_frames()`` mapping loops."""
     if not isinstance(node, ast.For):
         return None
-    if not _sys_current_frames_items_call_is_active(node.iter, inspect_analysis):
-        return None
-    if isinstance(node.target, ast.Tuple) and len(node.target.elts) >= 2:
-        frame_target = node.target.elts[1]
-        if isinstance(frame_target, ast.Name):
-            return {frame_target.id}
+    if _sys_current_frames_items_call_is_active(node.iter, inspect_analysis):
+        if isinstance(node.target, ast.Tuple) and len(node.target.elts) >= 2:
+            frame_target = node.target.elts[1]
+            if isinstance(frame_target, ast.Name):
+                return {frame_target.id}
+        return set()
+    if _sys_current_frames_mapping_call_is_active(
+        node.iter,
+        inspect_analysis,
+        "values",
+    ):
+        if isinstance(node.target, ast.Name):
+            return {node.target.id}
     return set()
 
 
