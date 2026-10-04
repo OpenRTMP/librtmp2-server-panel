@@ -8214,8 +8214,12 @@ def _class_has_worker_side_effect_target(
 
 
 def _descriptor_class_names(methods):
-    """Return classes whose ``__get__`` hook may mutate ``workers``."""
-    return {class_name for class_name, method_name in methods if method_name == "__get__"}
+    """Return classes whose descriptor hooks may mutate ``workers``."""
+    return {
+        class_name
+        for class_name, method_name in methods
+        if method_name in ("__get__", "__set__", "__delete__")
+    }
 
 
 def _record_descriptor_field_assignments(class_node, descriptor_classes, descriptor_fields):
@@ -8310,7 +8314,7 @@ def _scan_class_side_effect_bindings(
             )
 
 
-def _class_instance_assignment_bindings(node):
+def _class_instance_assignment_bindings(node, enum_members=None):
     """Return ``(name, class name)`` pairs for ``name = Class()`` bindings."""
     if isinstance(node, ast.Assign):
         targets = node.targets
@@ -8320,18 +8324,27 @@ def _class_instance_assignment_bindings(node):
         value = node.value
     else:
         return ()
-    if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+        class_name = value.func.id
+    elif (
+        enum_members
+        and isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and (value.value.id, value.attr) in enum_members
+    ):
+        class_name = value.value.id
+    else:
         return ()
     return tuple(
-        (target.id, value.func.id)
+        (target.id, class_name)
         for target in targets
         if isinstance(target, ast.Name)
     )
 
 
-def _record_class_instance_statement(node, line, events, conditional):
+def _record_class_instance_statement(node, line, events, conditional, enum_members=None):
     """Record or invalidate one statement's class-instance bindings."""
-    bindings = _class_instance_assignment_bindings(node)
+    bindings = _class_instance_assignment_bindings(node, enum_members)
     if bindings:
         for name, class_name in bindings:
             events.setdefault(name, []).append(
@@ -8342,7 +8355,13 @@ def _record_class_instance_statement(node, line, events, conditional):
         _invalidate_tracked_bindings_from_statement(node, events, line)
 
 
-def _scan_class_instance_bindings(statements, events, *, conditional=False):
+def _scan_class_instance_bindings(
+    statements,
+    events,
+    *,
+    conditional=False,
+    enum_members=None,
+):
     """Populate source-ordered class-instance bindings through compound blocks."""
     for node in statements:
         line = getattr(node, "lineno", 0)
@@ -8350,9 +8369,14 @@ def _scan_class_instance_bindings(statements, events, *, conditional=False):
             if not conditional:
                 _deactivate_tracked_binding(events, node.name, line)
             continue
-        _record_class_instance_statement(node, line, events, conditional)
+        _record_class_instance_statement(node, line, events, conditional, enum_members)
         for block in _compound_statement_blocks(node):
-            _scan_class_instance_bindings(block, events, conditional=True)
+            _scan_class_instance_bindings(
+                block,
+                events,
+                conditional=True,
+                enum_members=enum_members,
+            )
 
 
 _ENUM_BASE_NAMES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
@@ -8465,9 +8489,13 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         descriptor_fields=descriptor_fields,
     )
 
-    instance_events = {}
-    _scan_class_instance_bindings(tree.body, instance_events)
     enum_members = _collect_enum_member_targets(tree)
+    instance_events = {}
+    _scan_class_instance_bindings(
+        tree.body,
+        instance_events,
+        enum_members=enum_members,
+    )
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             class_bases[node.name] = tuple(
@@ -8714,6 +8742,7 @@ def _attribute_access_triggers_workers(
     properties,
     descriptor_fields,
     class_targets,
+    instance_events,
     reference_line,
 ):
     """Return True for property/descriptor reads that execute a risky hook."""
@@ -8739,11 +8768,22 @@ def _attribute_access_triggers_workers(
         reference_line,
     ):
         return True
-    return _class_hook_is_active(
+    if _class_hook_is_active(
         class_targets,
         class_name,
         expr.attr,
         descriptor_fields,
+        reference_line,
+    ):
+        return True
+    if instance_read:
+        return False
+    return _instance_hook_is_active(
+        class_targets,
+        instance_events,
+        properties | descriptor_fields,
+        class_name,
+        expr.attr,
         reference_line,
     )
 
@@ -8768,6 +8808,7 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
             properties,
             descriptor_fields,
             class_targets,
+            instance_events,
             reference_line,
         )
     )
