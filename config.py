@@ -2086,6 +2086,39 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     return method is None
 
 
+def _call_is_operator_attrgetter_on_proven_frame_globals(call, operator_bindings):
+    """Return True for attrgetter-based live-frame f_globals mutations."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in _NAMESPACE_GETATTR_METHODS
+        and isinstance(call.func.value, ast.Call)
+        and call.func.value.args
+    ):
+        return False
+    bound = call.func.value
+    factory = bound.func
+    if not (
+        isinstance(factory, ast.Call)
+        and _is_operator_attrgetter_factory(factory, operator_bindings)
+        and _operator_attrgetter_method_name(factory) == "f_globals"
+    ):
+        return False
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    reference_line = getattr(call, "lineno", 0)
+    active_frame_names = _active_frame_names_at_line(
+        inspect_analysis,
+        reference_line,
+    )
+    if not _node_is_proven_live_frame(
+        bound.args[0],
+        inspect_analysis,
+        active_frame_names,
+    ):
+        return False
+    return _namespace_mutator_call_may_set_workers(call.func.attr, call)
+
+
 _NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
 _DYNAMIC_EXEC_EVAL_NAMES = frozenset({"exec", "eval"})
 _BUILTINS_SHADOW_MARKER = "__builtins_shadowed__"
@@ -8186,7 +8219,8 @@ def _descriptor_class_names(methods):
 
 
 def _record_descriptor_field_assignments(class_node, descriptor_classes, descriptor_fields):
-    """Record class attributes instantiated from descriptor classes."""
+    """Record class attributes instantiated from mutating descriptor classes."""
+    found = False
     for stmt in class_node.body:
         if not isinstance(stmt, ast.Assign):
             continue
@@ -8197,6 +8231,8 @@ def _record_descriptor_field_assignments(class_node, descriptor_classes, descrip
         for target in stmt.targets:
             if isinstance(target, ast.Name):
                 descriptor_fields.add((class_node.name, target.id))
+                found = True
+    return found
 
 
 def _record_class_side_effect_binding(
@@ -8223,6 +8259,8 @@ def _scan_class_side_effect_bindings(
     properties,
     binding_events,
     *,
+    descriptor_classes=None,
+    descriptor_fields=None,
     conditional=False,
 ):
     """Populate source-ordered risky class bindings through compound blocks."""
@@ -8236,6 +8274,15 @@ def _scan_class_side_effect_bindings(
                 methods,
                 properties,
             )
+            if descriptor_classes is not None and descriptor_fields is not None:
+                risky = (
+                    _record_descriptor_field_assignments(
+                        node,
+                        descriptor_classes,
+                        descriptor_fields,
+                    )
+                    or risky
+                )
             _record_class_side_effect_binding(
                 node,
                 binding_events,
@@ -8257,6 +8304,8 @@ def _scan_class_side_effect_bindings(
                 methods,
                 properties,
                 binding_events,
+                descriptor_classes=descriptor_classes,
+                descriptor_fields=descriptor_fields,
                 conditional=True,
             )
 
@@ -8306,16 +8355,104 @@ def _scan_class_instance_bindings(statements, events, *, conditional=False):
             _scan_class_instance_bindings(block, events, conditional=True)
 
 
+_ENUM_BASE_NAMES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
+
+
+def _enum_import_aliases(tree):
+    """Return module and direct-base aliases that identify enum classes."""
+    module_aliases = {
+        imported.asname or imported.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for imported in node.names
+        if imported.name == "enum"
+    }
+    base_aliases = {
+        imported.asname or imported.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "enum"
+        for imported in node.names
+        if imported.name in _ENUM_BASE_NAMES
+    }
+    return module_aliases, base_aliases
+
+
+def _base_is_direct_enum(base, module_aliases, base_aliases):
+    """Return True when one base expression names a supported enum base."""
+    if isinstance(base, ast.Name):
+        return base.id in base_aliases
+    return (
+        isinstance(base, ast.Attribute)
+        and base.attr in _ENUM_BASE_NAMES
+        and isinstance(base.value, ast.Name)
+        and base.value.id in module_aliases
+    )
+
+
+def _class_is_direct_enum(class_node, module_aliases, base_aliases):
+    """Return True when a class directly derives from a supported enum base."""
+    return any(
+        _base_is_direct_enum(base, module_aliases, base_aliases)
+        for base in class_node.bases
+    )
+
+
+def _statement_simple_targets(stmt):
+    """Return simple assignment targets without nested conditional expressions."""
+    if isinstance(stmt, ast.Assign):
+        return stmt.targets
+    if isinstance(stmt, ast.AnnAssign):
+        return [stmt.target]
+    return []
+
+
+def _enum_member_names(class_node):
+    """Yield public simple names assigned in an enum class body."""
+    for stmt in class_node.body:
+        for target in _statement_simple_targets(stmt):
+            if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                yield target.id
+
+
+def _collect_enum_member_targets(tree):
+    """Return enum class/member pairs for direct enum definitions."""
+    module_aliases, base_aliases = _enum_import_aliases(tree)
+    members = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not _class_is_direct_enum(node, module_aliases, base_aliases):
+            continue
+        members.update(
+            (node.name, member_name)
+            for member_name in _enum_member_names(node)
+        )
+    return members
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
     properties = set()
     descriptor_fields = set()
+    class_bases = {}
+    class_methods = set()
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
     )
+
+    _scan_class_side_effect_bindings(
+        tree.body,
+        operator_bindings,
+        constructors,
+        methods,
+        properties,
+        {},
+    )
+    descriptor_classes = _descriptor_class_names(methods)
+
     binding_events = {}
     _scan_class_side_effect_bindings(
         tree.body,
@@ -8324,16 +8461,22 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         methods,
         properties,
         binding_events,
+        descriptor_classes=descriptor_classes,
+        descriptor_fields=descriptor_fields,
     )
+
     instance_events = {}
     _scan_class_instance_bindings(tree.body, instance_events)
-    descriptor_classes = _descriptor_class_names(methods)
+    enum_members = _collect_enum_member_targets(tree)
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
-            _record_descriptor_field_assignments(
-                node,
-                descriptor_classes,
-                descriptor_fields,
+            class_bases[node.name] = tuple(
+                base.id for base in node.bases if isinstance(base, ast.Name)
+            )
+            class_methods.update(
+                (node.name, stmt.name)
+                for stmt in node.body
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
     return (
         constructors,
@@ -8343,8 +8486,10 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         binding_events,
         descriptor_fields,
         instance_events,
+        class_bases,
+        class_methods,
+        enum_members,
     )
-
 
 
 
@@ -8367,6 +8512,36 @@ def _class_hook_is_active(class_targets, class_name, method_name, hooks, referen
     )
 
 
+def _class_hierarchy_defines_method(
+    methods,
+    class_bases,
+    class_name,
+    method_name,
+    class_methods=None,
+    seen=None,
+):
+    """Return True when MRO lookup reaches a mutating method definition."""
+    seen = frozenset() if seen is None else seen
+    if class_name in seen:
+        return False
+    if (class_name, method_name) in methods:
+        return True
+    if class_methods is not None and (class_name, method_name) in class_methods:
+        return False
+    next_seen = seen | {class_name}
+    return any(
+        _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            base,
+            method_name,
+            class_methods,
+            next_seen,
+        )
+        for base in class_bases.get(class_name, ())
+    )
+
+
 def _instance_hook_is_active(
     class_targets,
     instance_events,
@@ -8383,12 +8558,22 @@ def _instance_hook_is_active(
     conditional rebinding leaves both classes as candidates, so any risky one
     makes the config dynamic.
     """
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
     for instance_line, instance_class in _instance_binding_candidates_at_line(
         instance_events,
         instance_name,
         reference_line,
     ):
-        if (instance_class, method_name) in methods and _class_binding_is_active(
+        if not _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            instance_class,
+            method_name,
+            class_methods,
+        ):
+            continue
+        if _class_binding_is_active(
             class_targets,
             instance_class,
             instance_line,
@@ -8408,6 +8593,82 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
     )
 
 
+def _name_receiver_call_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when a named class or tracked instance reaches a risky hook."""
+    if _class_hook_is_active(
+        class_targets,
+        receiver.id,
+        method_name,
+        methods,
+        reference_line,
+    ):
+        return True
+    return _instance_hook_is_active(
+        class_targets,
+        instance_events,
+        methods,
+        receiver.id,
+        method_name,
+        reference_line,
+    )
+
+
+def _constructed_receiver_call_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    reference_line,
+):
+    """Return True when ClassName().method() resolves to a risky hook."""
+    class_name = receiver.func.id
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    return (
+        _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            class_name,
+            method_name,
+            class_methods,
+        )
+        and _class_binding_is_active(
+            class_targets,
+            class_name,
+            reference_line,
+        )
+    )
+
+
+def _enum_member_call_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    reference_line,
+):
+    """Return True when EnumClass.MEMBER.method() reaches a risky hook."""
+    class_name = receiver.value.id
+    enum_members = class_targets[9] if len(class_targets) > 9 else set()
+    return (
+        (class_name, receiver.attr) in enum_members
+        and _class_hook_is_active(
+            class_targets,
+            class_name,
+            method_name,
+            methods,
+            reference_line,
+        )
+    )
+
+
 def _attribute_call_triggers_workers(
     expr,
     methods,
@@ -8415,36 +8676,34 @@ def _attribute_call_triggers_workers(
     instance_events,
     reference_line,
 ):
-    """Return True for ``Class.method(...)``, ``Class().method(...)`` and ``h.method()``."""
+    """Return True for calls that reach proven mutating class hooks."""
     if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)):
         return False
     method_name = expr.func.attr
     receiver = expr.func.value
     if isinstance(receiver, ast.Name):
-        if _class_hook_is_active(
-            class_targets,
-            receiver.id,
+        return _name_receiver_call_triggers_workers(
+            receiver,
             method_name,
             methods,
-            reference_line,
-        ):
-            return True
-        # A module-bound instance (``h = Helper()``) reaches the same
-        # mutating method through the class recorded for the instance name.
-        return _instance_hook_is_active(
             class_targets,
             instance_events,
-            methods,
-            receiver.id,
-            method_name,
             reference_line,
         )
     if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
-        return _class_hook_is_active(
-            class_targets,
-            receiver.func.id,
+        return _constructed_receiver_call_triggers_workers(
+            receiver,
             method_name,
             methods,
+            class_targets,
+            reference_line,
+        )
+    if isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name):
+        return _enum_member_call_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
             reference_line,
         )
     return False
@@ -8457,15 +8716,22 @@ def _attribute_access_triggers_workers(
     class_targets,
     reference_line,
 ):
-    """Return True for a bare ``Class().attr`` property/descriptor read."""
-    if not (
-        isinstance(expr, ast.Attribute)
-        and isinstance(expr.value, ast.Call)
+    """Return True for property/descriptor reads that execute a risky hook."""
+    if not isinstance(expr, ast.Attribute):
+        return False
+    class_name = None
+    instance_read = False
+    if (
+        isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Name)
     ):
+        class_name = expr.value.func.id
+        instance_read = True
+    elif isinstance(expr.value, ast.Name):
+        class_name = expr.value.id
+    if class_name is None:
         return False
-    class_name = expr.value.func.id
-    if _class_hook_is_active(
+    if instance_read and _class_hook_is_active(
         class_targets,
         class_name,
         expr.attr,
@@ -8774,6 +9040,10 @@ def _call_has_primary_worker_mutation(expr, operator_bindings):
         or _call_is_operator_namespace_ior(expr, operator_bindings)
         or _call_is_getattr_operator_namespace_mutation(expr, operator_bindings)
         or _call_is_operator_attrgetter_namespace_mutation(expr, operator_bindings)
+        or _call_is_operator_attrgetter_on_proven_frame_globals(
+            expr,
+            operator_bindings,
+        )
         or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
     )
@@ -10408,21 +10678,27 @@ def _reduce_lambda_invokes_mutating_iterable_callback(call, operator_bindings):
     )
 
 
-def _frame_globals_receiver(call):
-    """Return the frame expression of a ``<frame>.f_globals`` receiver.
-
-    Accepts the attribute form (``frame.f_globals``) and the equivalent
-    ``getattr(frame, 'f_globals')`` spelling.
-    """
+def _frame_globals_receiver(call, inspect_analysis=None):
+    """Return the live-frame expression behind an f_globals receiver."""
     base = call.func.value
+    shadow_lines = (inspect_analysis or {}).get("builtin_shadow_lines", {})
+    frame_from_getattribute = _object_getattribute_f_globals_frame(
+        base,
+        inspect_analysis,
+    )
+    if frame_from_getattribute is not None:
+        return frame_from_getattribute
     if isinstance(base, ast.Attribute) and base.attr == "f_globals":
         return base.value
     if (
         isinstance(base, ast.Call)
         and isinstance(base.func, ast.Name)
         and base.func.id == "getattr"
-        # A three-argument getattr's default is ignored whenever the live
-        # frame has `f_globals`, so it mutates the same namespace.
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            getattr(base, "lineno", 0),
+            shadow_lines,
+        )
         and len(base.args) in (2, 3)
         and not base.keywords
         and isinstance(base.args[1], ast.Constant)
@@ -10715,7 +10991,7 @@ def _frame_globals_call_targets_live_frame(call, operator_bindings):
             reference_line,
         )
     }
-    frame_node = _frame_globals_receiver(call)
+    frame_node = _frame_globals_receiver(call, inspect_analysis)
     if frame_node is None:
         return False
     frame_node = _unwrap_ast_node(frame_node)
@@ -10781,6 +11057,54 @@ def _active_frame_globals_dict_names_at_line(inspect_analysis, reference_line):
     }
 
 
+def _uses_builtin_object_getattribute(func, reference_line, shadow_lines):
+    """Return True for a proven builtin object.__getattribute__ resolver."""
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == "__getattribute__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "object"
+        )
+    if not (isinstance(func, ast.Call) and isinstance(func.func, ast.Name)):
+        return False
+    if func.func.id != "getattr" or len(func.args) < 2:
+        return False
+    if not _name_is_unshadowed_builtin(
+        "getattr",
+        reference_line,
+        shadow_lines,
+    ):
+        return False
+    module = func.args[0]
+    attr = func.args[1]
+    return (
+        isinstance(module, ast.Name)
+        and module.id == "object"
+        and isinstance(attr, ast.Constant)
+        and attr.value == "__getattribute__"
+    )
+
+
+def _object_getattribute_f_globals_frame(node, inspect_analysis=None):
+    """Return the frame in a proven builtin object.__getattribute__ call."""
+    if not isinstance(node, ast.Call) or len(node.args) < 2:
+        return None
+    reference_line = getattr(node, "lineno", 0)
+    shadow_lines = (inspect_analysis or {}).get("builtin_shadow_lines", {})
+    if not _name_is_unshadowed_builtin("object", reference_line, shadow_lines):
+        return None
+    if not _uses_builtin_object_getattribute(
+        node.func,
+        reference_line,
+        shadow_lines,
+    ):
+        return None
+    key = node.args[1]
+    if isinstance(key, ast.Constant) and key.value == "f_globals":
+        return node.args[0]
+    return None
+
+
 def _is_proven_frame_globals_mapping(
     node,
     inspect_analysis,
@@ -10791,6 +11115,16 @@ def _is_proven_frame_globals_mapping(
     node = _unwrap_ast_node(node)
     if isinstance(node, ast.Name) and node.id in active_fg_dict_names:
         return True
+    frame_from_getattribute = _object_getattribute_f_globals_frame(
+        node,
+        inspect_analysis,
+    )
+    if frame_from_getattribute is not None:
+        return _node_is_proven_live_frame(
+            frame_from_getattribute,
+            inspect_analysis,
+            active_frame_names,
+        )
     if not (isinstance(node, ast.Attribute) and node.attr == "f_globals"):
         return False
     return _node_is_proven_live_frame(
@@ -11288,11 +11622,11 @@ def _record_frame_globals_dict_alias_assignment(
     events.setdefault(name, []).append((line, True))
 
 
-def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
-    """Return True when ``iter_expr`` is ``sys._current_frames().items()``."""
+def _sys_current_frames_mapping_call_is_active(iter_expr, inspect_analysis, method):
+    """Return True when ``iter_expr`` is ``sys._current_frames().<method>()``."""
     if not isinstance(iter_expr, ast.Call):
         return False
-    if not isinstance(iter_expr.func, ast.Attribute) or iter_expr.func.attr != "items":
+    if not isinstance(iter_expr.func, ast.Attribute) or iter_expr.func.attr != method:
         return False
     inner = iter_expr.func.value
     if not isinstance(inner, ast.Call):
@@ -11308,16 +11642,34 @@ def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
     return False
 
 
+def _sys_current_frames_items_call_is_active(iter_expr, inspect_analysis):
+    """Return True when ``iter_expr`` is ``sys._current_frames().items()``."""
+    return _sys_current_frames_mapping_call_is_active(
+        iter_expr,
+        inspect_analysis,
+        "items",
+    )
+
+
 def _current_frames_loop_frame_target_names(node, inspect_analysis):
-    """Return frame aliases unpacked from ``sys._current_frames().items()`` loops."""
+    """Return frame aliases unpacked from ``sys._current_frames()`` mapping loops."""
     if not isinstance(node, ast.For):
         return None
-    if not _sys_current_frames_items_call_is_active(node.iter, inspect_analysis):
-        return None
-    if isinstance(node.target, ast.Tuple) and len(node.target.elts) >= 2:
-        frame_target = node.target.elts[1]
-        if isinstance(frame_target, ast.Name):
-            return {frame_target.id}
+    if _sys_current_frames_items_call_is_active(node.iter, inspect_analysis):
+        if isinstance(node.target, ast.Tuple) and len(node.target.elts) >= 2:
+            frame_target = node.target.elts[1]
+            if isinstance(frame_target, ast.Name):
+                return {frame_target.id}
+        return set()
+    if (
+        _sys_current_frames_mapping_call_is_active(
+            node.iter,
+            inspect_analysis,
+            "values",
+        )
+        and isinstance(node.target, ast.Name)
+    ):
+        return {node.target.id}
     return set()
 
 
@@ -12584,7 +12936,7 @@ def _collect_operator_setitem_bindings(tree):
     builtin_shadow_lines = {
         name: _collect_definite_name_shadow_line(tree, name)
         for name in {
-            'globals', 'getattr', 'staticmethod', 'classmethod', 'property',
+            'globals', 'getattr', 'object', 'staticmethod', 'classmethod', 'property',
             'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
             'iter', 'reversed', 'vars', 'sum',
@@ -13759,6 +14111,9 @@ def _scan_gunicorn_config_worker_details(tree):
     inspect_analysis = {
         "module_alias_events": inspect_module_alias_events,
         "currentframe_alias_events": inspect_currentframe_alias_events,
+        "builtin_shadow_lines": (
+            operator_bindings[32] if len(operator_bindings) > 32 else {}
+        ),
         "stack_alias_events": _collect_imported_name_alias_events(
             tree,
             "inspect",

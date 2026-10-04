@@ -2147,3 +2147,158 @@ def test_class_body_lambda_walrus_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-04: frame and class-hook indirection gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "fr = sys._getframe(0)\n"
+            "object.__getattribute__(fr, 'f_globals').update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "getattr(object, '__getattribute__')(sys._getframe(0), 'f_globals').update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys, operator\n"
+            "operator.attrgetter('f_globals')(sys._getframe(0)).update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "for fr in sys._current_frames().values():\n"
+            "    fr.f_globals.update({'workers': 4})\n"
+            "    break\n"
+        ),
+        (
+            "workers = 1\n"
+            "class D:\n"
+            "    def __get__(self, obj, typ=None):\n"
+            "        globals()['workers'] = 4\n"
+            "class H:\n"
+            "    d = D()\n"
+            "H.d\n"
+        ),
+        (
+            "workers = 1\n"
+            "from enum import Enum\n"
+            "class E(Enum):\n"
+            "    A = 1\n"
+            "    def f(self):\n"
+            "        globals()['workers'] = 4\n"
+            "E.A.f()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class B:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "class H(B):\n"
+            "    pass\n"
+            "H().bump()\n"
+        ),
+    ],
+)
+def test_security_review_oct04_workers_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class A:\n"
+            "    def ping(self):\n"
+            "        return None\n"
+            "class A(A):\n"
+            "    pass\n"
+            "A().ping()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class B:\n"
+            "    def bump(self):\n"
+            "        globals()['workers'] = 4\n"
+            "class H(B):\n"
+            "    def bump(self):\n"
+            "        return None\n"
+            "H().bump()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class FakeObject:\n"
+            "    @staticmethod\n"
+            "    def __getattribute__(frame, name):\n"
+            "        return {}\n"
+            "object = FakeObject\n"
+            "object.__getattribute__(sys._getframe(0), 'f_globals').update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def getattr(target, name):\n"
+            "    return lambda *args: {}\n"
+            "getattr(object, '__getattribute__')(sys._getframe(0), 'f_globals').update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "class D:\n"
+            "    def __get__(self, obj, typ=None):\n"
+            "        globals()['workers'] = 4\n"
+            "class H:\n"
+            "    d = D()\n"
+            "class Safe:\n"
+            "    d = object()\n"
+            "H = Safe\n"
+            "H.d\n"
+        ),
+        (
+            "workers = 1\n"
+            "class H:\n"
+            "    @property\n"
+            "    def p(self):\n"
+            "        globals()['workers'] = 4\n"
+            "H.p\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Item:\n"
+            "    def f(self):\n"
+            "        return None\n"
+            "class E:\n"
+            "    A = Item()\n"
+            "    def f(self):\n"
+            "        globals()['workers'] = 4\n"
+            "E.A.f()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import operator, sys\n"
+            "try:\n"
+            "    operator.attrgetter('f_globals')(sys._getframe(0))({'workers': 4})\n"
+            "except TypeError:\n"
+            "    pass\n"
+        ),
+    ],
+)
+def test_codex_review_oct04_false_positives_stay_static(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
