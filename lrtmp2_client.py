@@ -220,6 +220,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/players/{quote(player_id, safe='')}",
             "delete_player",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_player")
