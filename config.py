@@ -8213,6 +8213,29 @@ def _class_has_worker_side_effect_target(
     return risky
 
 
+def _descriptor_hooks_for_class(descriptor_class, methods, descriptor_fields):
+    """Return hooks whose mutating method is defined on ``descriptor_class``."""
+    return [
+        hook
+        for hook in descriptor_fields
+        if (descriptor_class, hook) in methods
+    ]
+
+
+def _record_descriptor_targets(class_name, targets, hooks, descriptor_fields):
+    """Record ``(class, field)`` for each simple target and each hook."""
+    if not hooks:
+        return False
+    found = False
+    for target in targets:
+        if not isinstance(target, ast.Name):
+            continue
+        for hook in hooks:
+            descriptor_fields[hook].add((class_name, target.id))
+        found = True
+    return found
+
+
 def _record_descriptor_field_assignments(class_node, methods, descriptor_fields):
     """Record descriptor fields keyed by the hook an access kind invokes."""
     found = False
@@ -8221,19 +8244,17 @@ def _record_descriptor_field_assignments(class_node, methods, descriptor_fields)
             continue
         if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
             continue
-        descriptor_class = stmt.value.func.id
-        matching_hooks = [
-            hook
-            for hook in descriptor_fields
-            if (descriptor_class, hook) in methods
-        ]
-        if not matching_hooks:
-            continue
-        for target in stmt.targets:
-            if isinstance(target, ast.Name):
-                for hook in matching_hooks:
-                    descriptor_fields[hook].add((class_node.name, target.id))
-                found = True
+        found = (
+            _record_descriptor_targets(
+                class_node.name,
+                stmt.targets,
+                _descriptor_hooks_for_class(
+                    stmt.value.func.id, methods, descriptor_fields
+                ),
+                descriptor_fields,
+            )
+            or found
+        )
     return found
 
 
