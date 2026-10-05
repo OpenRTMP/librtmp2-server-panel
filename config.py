@@ -4072,6 +4072,19 @@ def _warnings_showwarning_target_is_active(target, operator_bindings, reference_
     )
 
 
+def _warnings_showwarning_value_mutates(
+    value,
+    operator_bindings,
+    mutator_names,
+):
+    """Return True when a showwarning replacement can mutate ``workers``."""
+    if isinstance(value, ast.Name):
+        return value.id in mutator_names
+    if isinstance(value, ast.Lambda):
+        return _lambda_mutates_workers(value, operator_bindings)
+    return _expression_mutates_workers(value, operator_bindings)
+
+
 def _module_assigns_mutating_warnings_showwarning(
     tree,
     operator_bindings,
@@ -4083,21 +4096,21 @@ def _module_assigns_mutating_warnings_showwarning(
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        for target in node.targets:
-            line = getattr(node, "lineno", 0)
-            if not _warnings_showwarning_target_is_active(
+        line = getattr(node, "lineno", 0)
+        assigns_showwarning = any(
+            _warnings_showwarning_target_is_active(
                 target,
                 operator_bindings,
                 line,
-            ):
-                continue
-            if isinstance(node.value, ast.Name) and node.value.id in mutator_names:
-                return True
-            if isinstance(node.value, ast.Lambda):
-                if _lambda_mutates_workers(node.value, operator_bindings):
-                    return True
-            elif _expression_mutates_workers(node.value, operator_bindings):
-                return True
+            )
+            for target in node.targets
+        )
+        if assigns_showwarning and _warnings_showwarning_value_mutates(
+            node.value,
+            operator_bindings,
+            mutator_names,
+        ):
+            return True
     return False
 
 
@@ -4166,6 +4179,18 @@ def _class_uses_dataclass_decorator(class_node):
     return False
 
 
+def _dataclass_default_factory_mutates(field_call, operator_bindings):
+    """Return True when a dataclass field default_factory mutates ``workers``."""
+    for keyword in field_call.keywords:
+        if keyword.arg != "default_factory":
+            continue
+        factory = keyword.value
+        if isinstance(factory, ast.Lambda):
+            return _lambda_mutates_workers(factory, operator_bindings)
+        return _expression_mutates_workers(factory, operator_bindings)
+    return False
+
+
 def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings):
     """Return True when a dataclass field default_factory mutates ``workers``."""
     if not _class_uses_dataclass_decorator(class_node):
@@ -4175,17 +4200,12 @@ def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings
         if not isinstance(value, ast.Call):
             continue
         line = getattr(stmt, "lineno", 0)
-        if not _call_is_dataclasses_field(value, operator_bindings, line):
-            continue
-        for keyword in value.keywords:
-            if keyword.arg != "default_factory":
-                continue
-            factory = keyword.value
-            if isinstance(factory, ast.Lambda):
-                if _lambda_mutates_workers(factory, operator_bindings):
-                    return True
-            elif _expression_mutates_workers(factory, operator_bindings):
-                return True
+        if _call_is_dataclasses_field(
+            value,
+            operator_bindings,
+            line,
+        ) and _dataclass_default_factory_mutates(value, operator_bindings):
+            return True
     return False
 
 
@@ -8782,15 +8802,82 @@ def _class_body_plain_attribute_names(class_node):
     return names
 
 
+def _collect_class_definition_metadata(tree):
+    """Collect class bases, defined methods, and plain class attributes."""
+    class_bases = {}
+    class_methods = set()
+    class_attributes = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_bases[node.name] = tuple(
+            base.id for base in node.bases if isinstance(base, ast.Name)
+        )
+        class_methods.update(
+            (node.name, stmt.name)
+            for stmt in node.body
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        class_attributes.update(
+            (node.name, attribute_name)
+            for attribute_name in _class_body_plain_attribute_names(node)
+        )
+    return class_bases, class_methods, class_attributes
+
+
+def _collect_metaclass_init_mutator_names(tree, operator_bindings):
+    """Return classes whose metaclass initializer mutates ``workers``."""
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and _metaclass_init_mutates_workers(node, operator_bindings)
+    }
+
+
+def _class_uses_mutating_metaclass(class_node, metaclass_mutator_names):
+    """Return True when a class uses a metaclass with a mutating initializer."""
+    return any(
+        keyword.arg == "metaclass"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id in metaclass_mutator_names
+        for keyword in class_node.keywords
+    )
+
+
+def _record_mutating_super_methods(
+    node,
+    class_bases,
+    methods,
+    class_methods,
+    constructors,
+):
+    """Record methods that delegate to a mutating superclass method."""
+    if not isinstance(node, ast.ClassDef):
+        return
+    for stmt in node.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        if not _function_invokes_mutating_super_method(
+            stmt,
+            node.name,
+            class_bases,
+            methods,
+            class_methods,
+        ):
+            continue
+        if stmt.name in ("__init__", "__post_init__"):
+            constructors.add(node.name)
+        else:
+            methods.add((node.name, stmt.name))
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
     properties = set()
     descriptor_fields = {"__get__": set(), "__set__": set(), "__delete__": set()}
-    class_bases = {}
-    class_methods = set()
-    class_attributes = set()
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
@@ -8823,50 +8910,25 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         instance_events,
         enum_members=enum_members,
     )
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            class_bases[node.name] = tuple(
-                base.id for base in node.bases if isinstance(base, ast.Name)
-            )
-            class_methods.update(
-                (node.name, stmt.name)
-                for stmt in node.body
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-            )
-            class_attributes.update(
-                (node.name, attribute_name)
-                for attribute_name in _class_body_plain_attribute_names(node)
-            )
-    metaclass_mutator_names = {
-        node.name
-        for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and _metaclass_init_mutates_workers(node, operator_bindings)
-    }
+    class_bases, class_methods, class_attributes = (
+        _collect_class_definition_metadata(tree)
+    )
+    metaclass_mutator_names = _collect_metaclass_init_mutator_names(
+        tree,
+        operator_bindings,
+    )
     for node in tree.body:
         if not isinstance(node, ast.ClassDef):
             continue
-        for keyword in node.keywords:
-            if (
-                keyword.arg == "metaclass"
-                and isinstance(keyword.value, ast.Name)
-                and keyword.value.id in metaclass_mutator_names
-            ):
-                constructors.add(node.name)
-        for stmt in node.body:
-            if not isinstance(stmt, ast.FunctionDef):
-                continue
-            if _function_invokes_mutating_super_method(
-                stmt,
-                node.name,
-                class_bases,
-                methods,
-                class_methods,
-            ):
-                if stmt.name in ("__init__", "__post_init__"):
-                    constructors.add(node.name)
-                else:
-                    methods.add((node.name, stmt.name))
+        if _class_uses_mutating_metaclass(node, metaclass_mutator_names):
+            constructors.add(node.name)
+        _record_mutating_super_methods(
+            node,
+            class_bases,
+            methods,
+            class_methods,
+            constructors,
+        )
     return (
         constructors,
         methods,
@@ -8880,7 +8942,6 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         enum_members,
         class_attributes,
     )
-
 
 
 def _class_binding_is_active(class_targets, class_name, reference_line):
