@@ -13484,11 +13484,25 @@ def _worker_scan_defaults(
 def _node_has_workers_walrus(node):
     """Return True when an evaluated walrus expression in ``node`` binds ``workers``.
 
-    A walrus inside a lambda body is deferred until the lambda runs, so it
-    cannot mutate ``workers`` at class-definition time.
+    Only expressions that actually run while the enclosing definition is created
+    count. A ``def`` evaluates its decorators and default arguments at definition
+    time but defers its body, and a lambda defers its body while still evaluating
+    its defaults, so ``cb = lambda x=(workers := 2): None`` binds module-level
+    ``workers`` even though ``lambda: (workers := 2)`` never does.
+
+    A generator expression defers everything except its outermost iterable:
+    ``(x for x in range((workers := 4)))`` binds ``workers`` when the generator
+    object is created, while ``((workers := 4) for _ in ())`` does not bind it
+    unless the generator is actually iterated.
     """
-    if isinstance(node, ast.Lambda):
-        return False
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        expressions = [
+            *getattr(node, "decorator_list", ()),
+            *_definition_time_expressions(node),
+        ]
+        return any(_node_has_workers_walrus(expression) for expression in expressions)
+    if isinstance(node, ast.GeneratorExp):
+        return _node_has_workers_walrus(node.generators[0].iter)
     if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
         return True
     return any(_node_has_workers_walrus(child) for child in ast.iter_child_nodes(node))
@@ -13627,16 +13641,20 @@ def _handle_worker_scan_definition(
 ):
     """Handle definitions without descending into function or class bodies."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if _node_has_worker_mutating_decorator(
-            node,
-            global_workers_mutators,
-        ) or _definition_time_workers_effect(
-            node,
-            global_workers_mutators,
-            operator_bindings,
-            class_targets,
-            dict_subclass_names,
-            defer_annotations,
+        if (
+            _node_has_worker_mutating_decorator(
+                node,
+                global_workers_mutators,
+            )
+            or _definition_time_workers_effect(
+                node,
+                global_workers_mutators,
+                operator_bindings,
+                class_targets,
+                dict_subclass_names,
+                defer_annotations,
+            )
+            or _node_has_workers_walrus(node)
         ):
             state.dynamic = True
         return True
