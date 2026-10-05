@@ -2384,3 +2384,153 @@ def test_codex_review_oct04_false_positives_stay_static(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex review follow-up for PR #332.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "from dataclasses import dataclass as dc, field\n"
+            "@dc\n"
+            "class C:\n"
+            "    value: object = field(default_factory=lambda: globals().update({'workers': 4}))\n"
+            "C()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys as s\n"
+            "def frames():\n"
+            "    yield s._getframe(0)\n"
+            "for frame in frames():\n"
+            "    frame.f_globals['workers'] = 4\n"
+        ),
+        (
+            "workers = 1\n"
+            "from sys import _getframe as gf\n"
+            "def frames():\n"
+            "    yield gf(0)\n"
+            "for frame in frames():\n"
+            "    frame.f_globals['workers'] = 4\n"
+        ),
+        (
+            "workers = 1\n"
+            "from weakref import finalize\n"
+            "class X: pass\n"
+            "finalize(X(), lambda: globals().update({'workers': 4}))\n"
+        ),
+        (
+            "workers = 1\n"
+            "import warnings\n"
+            "from warnings import warn\n"
+            "def mutator(*args, **kwargs):\n"
+            "    globals().update({'workers': 4})\n"
+            "warnings.showwarning = mutator\n"
+            "warn('x')\n"
+        ),
+        (
+            "workers = 1\n"
+            "class M(type):\n"
+            "    def __call__(cls, *args, **kwargs):\n"
+            "        globals().update({'workers': 4})\n"
+            "class N(M):\n"
+            "    pass\n"
+            "class C(metaclass=N):\n"
+            "    pass\n"
+            "C()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    def __class_getitem__(cls, item):\n"
+            "        globals().update({'workers': 4})\n"
+            "class Derived(Base):\n"
+            "    pass\n"
+            "Derived[int]\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Mutating:\n"
+            "    def __init__(self):\n"
+            "        globals().update({'workers': 4})\n"
+            "class Safe:\n"
+            "    pass\n"
+            "class D(Mutating, Safe):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "D()\n"
+        ),
+    ],
+)
+def test_codex_pr332_review_dynamic_patterns_are_detected(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class M(type):\n"
+            "    def __call__(cls, *args, **kwargs):\n"
+            "        globals().update({'workers': 4})\n"
+            "class C(metaclass=M):\n"
+            "    pass\n"
+        ),
+        (
+            "workers = 1\n"
+            "import warnings\n"
+            "def mutator(*args, **kwargs):\n"
+            "    globals().update({'workers': 4})\n"
+            "warnings.warn('safe')\n"
+            "warnings.showwarning = mutator\n"
+        ),
+        (
+            "workers = 1\n"
+            "import warnings\n"
+            "def mutator(*args, **kwargs):\n"
+            "    globals().update({'workers': 4})\n"
+            "warnings.showwarning = mutator\n"
+            "warnings.showwarning = lambda *args, **kwargs: None\n"
+            "warnings.warn('safe')\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "for fi in inspect.stack():\n"
+            "    fi.frame.f_globals.update({'diagnostic': True})\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Safe:\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "class Mutating:\n"
+            "    def __init__(self):\n"
+            "        globals().update({'workers': 4})\n"
+            "class D(Safe, Mutating):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "D()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    def __class_getitem__(cls, item):\n"
+            "        globals().update({'workers': 4})\n"
+            "class Derived(Base):\n"
+            "    def __class_getitem__(cls, item):\n"
+            "        return item\n"
+            "Derived[int]\n"
+        ),
+    ],
+)
+def test_codex_pr332_review_safe_patterns_remain_static(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
