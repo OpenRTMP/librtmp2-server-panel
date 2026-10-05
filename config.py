@@ -12939,6 +12939,22 @@ def _inspect_analysis_from_operator_bindings(operator_bindings):
     return {}
 
 
+def _call_updates_frame_globals_workers(call):
+    """Return True when an f_globals.update call may assign workers."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "update"
+    ):
+        return False
+    receiver = call.func.value
+    while isinstance(receiver, ast.Attribute):
+        if receiver.attr == "f_globals":
+            return _update_payload_may_set_workers(call)
+        receiver = receiver.value
+    return False
+
+
 def _for_loop_inspect_stack_body_mutates_workers(node, operator_bindings):
     """Return True when a ``for ... in inspect.stack()`` body mutates ``workers``."""
     if not isinstance(node, ast.For):
@@ -12952,21 +12968,10 @@ def _for_loop_inspect_stack_body_mutates_workers(node, operator_bindings):
         global_workers=True,
     ):
         return True
-    for child in ast.walk(node):
-        if not (
-            isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr == "update"
-        ):
-            continue
-        receiver = child.func.value
-        while isinstance(receiver, ast.Attribute):
-            if receiver.attr == "f_globals":
-                if _update_payload_may_set_workers(child):
-                    return True
-                break
-            receiver = receiver.value
-    return False
+    return any(
+        _call_updates_frame_globals_workers(child)
+        for child in ast.walk(node)
+    )
 
 
 def _for_loop_invokes_mutating_callback(node, operator_bindings):
