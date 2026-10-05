@@ -2214,6 +2214,88 @@ def test_security_review_oct04_workers_scan_gaps_are_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class M(type):\n"
+            "    def __call__(cls, *a, **k):\n"
+            "        globals()['workers'] = 4\n"
+            "        return super().__call__(*a, **k)\n"
+            "class C(metaclass=M):\n"
+            "    pass\n"
+            "C()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class B:\n"
+            "    def __init__(self):\n"
+            "        globals()['workers'] = 4\n"
+            "class D(B):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "D()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class C:\n"
+            "    def __class_getitem__(cls, item):\n"
+            "        globals()['workers'] = 4\n"
+            "        return cls\n"
+            "C[int]\n"
+        ),
+        (
+            "workers = 1\n"
+            "import inspect\n"
+            "for fi in inspect.stack():\n"
+            "    if (g := fi.frame.f_globals) is globals():\n"
+            "        g.update({'workers': 4})\n"
+            "        break\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "def g():\n"
+            "    yield sys._getframe(0)\n"
+            "for fr in g():\n"
+            "    fr.f_globals.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "from dataclasses import dataclass, field\n"
+            "@dataclass\n"
+            "class D:\n"
+            "    x: int = field(\n"
+            "        default_factory=lambda: (globals().update({'workers': 4}) or 1)\n"
+            "    )\n"
+            "D()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import weakref\n"
+            "class X:\n"
+            "    pass\n"
+            "weakref.finalize(X(), lambda: globals().update({'workers': 4}))\n"
+        ),
+        (
+            "workers = 1\n"
+            "import warnings\n"
+            "def w(*a):\n"
+            "    globals().update({'workers': 4})\n"
+            "warnings.showwarning = w\n"
+            "warnings.warn('x')\n"
+        ),
+    ],
+)
+def test_security_review_oct05_workers_scan_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
 
 @pytest.mark.parametrize(
     "config_content",
