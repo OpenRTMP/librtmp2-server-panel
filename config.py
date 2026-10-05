@@ -4019,6 +4019,176 @@ def _collect_exit_stack_alias_events(tree, operator_bindings):
     return events
 
 
+def _weakref_module_alias_events(operator_bindings):
+    """Return source-ordered weakref module alias events when present."""
+    if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict):
+        return operator_bindings[32].get("weakref_module_alias_events", {})
+    return {}
+
+
+def _warnings_module_alias_events(operator_bindings):
+    """Return source-ordered warnings module alias events when present."""
+    if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict):
+        return operator_bindings[32].get("warnings_module_alias_events", {})
+    return {}
+
+
+def _call_is_weakref_finalize_mutation(call, operator_bindings, bound_names=None):
+    """Return True for ``weakref.finalize(..., mutating_callback)`` at import time."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not isinstance(call.func, ast.Attribute) or call.func.attr != "finalize":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    if not _imported_alias_is_active(
+        _weakref_module_alias_events(operator_bindings),
+        receiver.id,
+        getattr(call, "lineno", 0),
+    ):
+        return False
+    callback = call.args[1]
+    if isinstance(callback, ast.Lambda):
+        return _lambda_mutates_workers(callback, operator_bindings)
+    return _expression_mutates_workers(
+        callback,
+        operator_bindings,
+        bound_names=bound_names,
+    )
+
+
+def _warnings_showwarning_target_is_active(target, operator_bindings, reference_line):
+    """Return True when ``target`` is an active ``warnings.showwarning`` assignment."""
+    if not isinstance(target, ast.Attribute) or target.attr != "showwarning":
+        return False
+    receiver = target.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    return _imported_alias_is_active(
+        _warnings_module_alias_events(operator_bindings),
+        receiver.id,
+        reference_line,
+    )
+
+
+def _module_assigns_mutating_warnings_showwarning(
+    tree,
+    operator_bindings,
+    mutator_names=None,
+):
+    """Return True when the config assigns a mutating ``warnings.showwarning`` hook."""
+    if mutator_names is None:
+        mutator_names = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            line = getattr(node, "lineno", 0)
+            if not _warnings_showwarning_target_is_active(
+                target,
+                operator_bindings,
+                line,
+            ):
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id in mutator_names:
+                return True
+            if isinstance(node.value, ast.Lambda):
+                if _lambda_mutates_workers(node.value, operator_bindings):
+                    return True
+            elif _expression_mutates_workers(node.value, operator_bindings):
+                return True
+    return False
+
+
+def _call_is_warnings_warn_after_mutating_hook(call, operator_bindings):
+    """Return True for ``warnings.warn(...)`` after a mutating showwarning assignment."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "warn":
+        return False
+    receiver = call.func.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    inspect_analysis = (
+        operator_bindings[-1]
+        if operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "warnings_showwarning_mutates" in operator_bindings[-1]
+        else {}
+    )
+    if not inspect_analysis.get("warnings_showwarning_mutates"):
+        return False
+    return _imported_alias_is_active(
+        _warnings_module_alias_events(operator_bindings),
+        receiver.id,
+        getattr(call, "lineno", 0),
+    )
+
+
+def _call_is_dataclasses_field(call, operator_bindings, reference_line):
+    """Return True for a proven ``dataclasses.field(...)`` / ``field(...)`` call."""
+    func = call.func
+    extra = operator_bindings[32] if len(operator_bindings) > 32 and isinstance(
+        operator_bindings[32],
+        dict,
+    ) else {}
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            extra.get("dataclasses_field_alias_events", {}),
+            func.id,
+            reference_line,
+        )
+    if isinstance(func, ast.Attribute) and func.attr == "field":
+        module = func.value
+        if not isinstance(module, ast.Name):
+            return False
+        return _imported_alias_is_active(
+            extra.get("dataclasses_module_alias_events", {}),
+            module.id,
+            reference_line,
+        )
+    return False
+
+
+def _class_uses_dataclass_decorator(class_node):
+    """Return True when a class is decorated with ``@dataclass``."""
+    for decorator in class_node.decorator_list:
+        if isinstance(decorator, ast.Name) and decorator.id == "dataclass":
+            return True
+        if isinstance(decorator, ast.Call) and isinstance(
+            decorator.func,
+            ast.Name,
+        ) and decorator.func.id == "dataclass":
+            return True
+        if isinstance(decorator, ast.Attribute) and decorator.attr == "dataclass":
+            return True
+    return False
+
+
+def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings):
+    """Return True when a dataclass field default_factory mutates ``workers``."""
+    if not _class_uses_dataclass_decorator(class_node):
+        return False
+    for stmt in class_node.body:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if not isinstance(value, ast.Call):
+            continue
+        line = getattr(stmt, "lineno", 0)
+        if not _call_is_dataclasses_field(value, operator_bindings, line):
+            continue
+        for keyword in value.keywords:
+            if keyword.arg != "default_factory":
+                continue
+            factory = keyword.value
+            if isinstance(factory, ast.Lambda):
+                if _lambda_mutates_workers(factory, operator_bindings):
+                    return True
+            elif _expression_mutates_workers(factory, operator_bindings):
+                return True
+    return False
+
+
 def _call_is_exit_stack_callback_mutation(call, operator_bindings):
     """Return True for ``stack.callback(mutating)`` on a tracked ExitStack."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
@@ -4273,11 +4443,49 @@ def _function_has_mutating_yield_from(func_def, operator_bindings):
     )
 
 
+def _function_yields_sys_getframe(func_def):
+    """Return True when a generator yields ``sys._getframe(...)``."""
+    for node in _function_runtime_nodes(func_def):
+        if not isinstance(node, ast.Yield) or node.value is None:
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call) or not isinstance(
+            value.func,
+            ast.Attribute,
+        ):
+            continue
+        if value.func.attr != "_getframe":
+            continue
+        if isinstance(value.func.value, ast.Name) and value.func.value.id == "sys":
+            return True
+    return False
+
+
+def _function_yields_proven_live_frame(func_def, inspect_analysis):
+    """Return True when a generator yields a proven live frame object."""
+    active_frame_names = set()
+    for node in _function_runtime_nodes(func_def):
+        if not isinstance(node, ast.Yield) or node.value is None:
+            continue
+        if _sys_getframe_call_is_active(node.value, inspect_analysis):
+            return True
+        if _node_is_proven_live_frame(
+            node.value,
+            inspect_analysis,
+            active_frame_names,
+        ):
+            return True
+    return False
+
+
 def _scan_mutating_yield_from_functions(statements, operator_bindings, names):
     """Collect risky generator definitions from import-time compound blocks."""
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _function_has_mutating_yield_from(node, operator_bindings):
+            if (
+                _function_has_mutating_yield_from(node, operator_bindings)
+                or _function_yields_sys_getframe(node)
+            ):
                 names.add(node.name)
             continue
         if isinstance(node, ast.ClassDef):
@@ -4316,9 +4524,17 @@ def _record_mutating_generator_definition(
     ):
         return False
     line = getattr(node, "lineno", 0)
-    if (
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and _function_has_mutating_yield_from(node, operator_bindings)
+    inspect_analysis = (
+        operator_bindings[-1]
+        if operator_bindings
+        and isinstance(operator_bindings[-1], dict)
+        and "frame_alias_events" in operator_bindings[-1]
+        else {}
+    )
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+        _function_has_mutating_yield_from(node, operator_bindings)
+        or _function_yields_sys_getframe(node)
+        or _function_yields_proven_live_frame(node, inspect_analysis)
     ):
         active_names.add(node.name)
         events.setdefault(node.name, []).append((line, True))
@@ -8111,6 +8327,37 @@ def _function_is_property_method(func_node, operator_bindings=None):
 
 
 
+def _function_invokes_mutating_super_method(
+    func_node,
+    class_name,
+    class_bases,
+    methods,
+    class_methods=None,
+):
+    """Return True when ``super().method()`` reaches a mutating base implementation."""
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        super_call = node.func.value
+        if not (
+            isinstance(super_call, ast.Call)
+            and isinstance(super_call.func, ast.Name)
+            and super_call.func.id == "super"
+        ):
+            continue
+        method_name = node.func.attr
+        for base in class_bases.get(class_name, ()):
+            if _class_hierarchy_defines_method(
+                methods,
+                class_bases,
+                base,
+                method_name,
+                class_methods,
+            ):
+                return True
+    return False
+
+
 def _metaclass_init_mutates_workers(class_node, operator_bindings):
     """Return True when a ``type`` subclass hook mutates ``workers``."""
     if not any(
@@ -8121,7 +8368,7 @@ def _metaclass_init_mutates_workers(class_node, operator_bindings):
     for stmt in class_node.body:
         if (
             isinstance(stmt, ast.FunctionDef)
-            and stmt.name in ("__init__", "__new__")
+            and stmt.name in ("__init__", "__new__", "__call__")
             and _function_mutates_workers(stmt, operator_bindings)
         ):
             return True
@@ -8164,8 +8411,12 @@ def _record_class_side_effect_target(
         return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
+    if stmt.name == "__class_getitem__":
+        methods.add((class_name, stmt.name))
+        return True
     if stmt.name in ("__init__", "__post_init__"):
         constructors.add(class_name)
+        methods.add((class_name, stmt.name))
         return True
     target = (class_name, stmt.name)
     if stmt.name == "__init_subclass__" or _function_is_static_or_class_method(
@@ -8210,6 +8461,12 @@ def _class_has_worker_side_effect_target(
             properties,
         ):
             risky = True
+    if _class_dataclass_field_default_factory_mutates(
+        class_node,
+        operator_bindings,
+    ):
+        constructors.add(class_node.name)
+        risky = True
     return risky
 
 
@@ -8580,6 +8837,36 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
                 (node.name, attribute_name)
                 for attribute_name in _class_body_plain_attribute_names(node)
             )
+    metaclass_mutator_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and _metaclass_init_mutates_workers(node, operator_bindings)
+    }
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for keyword in node.keywords:
+            if (
+                keyword.arg == "metaclass"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id in metaclass_mutator_names
+            ):
+                constructors.add(node.name)
+        for stmt in node.body:
+            if not isinstance(stmt, ast.FunctionDef):
+                continue
+            if _function_invokes_mutating_super_method(
+                stmt,
+                node.name,
+                class_bases,
+                methods,
+                class_methods,
+            ):
+                if stmt.name in ("__init__", "__post_init__"):
+                    constructors.add(node.name)
+                else:
+                    methods.add((node.name, stmt.name))
     return (
         constructors,
         methods,
@@ -8874,6 +9161,23 @@ def _attribute_access_triggers_workers(
     )
 
 
+def _class_subscript_triggers_workers(expr, class_targets):
+    """Return True when ``Class[item]`` invokes a mutating ``__class_getitem__``."""
+    if not isinstance(expr, ast.Subscript):
+        return False
+    if not isinstance(expr.value, ast.Name):
+        return False
+    methods = class_targets[1]
+    reference_line = getattr(expr, "lineno", 0)
+    return _class_hook_is_active(
+        class_targets,
+        expr.value.id,
+        "__class_getitem__",
+        methods,
+        reference_line,
+    )
+
+
 def _expression_triggers_class_workers_side_effect(expr, class_targets):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
@@ -8881,7 +9185,8 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
     instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(expr, 'lineno', 0)
     return (
-        _class_call_triggers_workers(expr, constructors, class_targets, reference_line)
+        _class_subscript_triggers_workers(expr, class_targets)
+        or _class_call_triggers_workers(expr, constructors, class_targets, reference_line)
         or _attribute_call_triggers_workers(
             expr,
             methods,
@@ -9215,6 +9520,12 @@ def _call_has_secondary_worker_mutation(
         or _call_is_operator_call_mutating_callback(expr, operator_bindings, bound_names)
         or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
         or _call_is_exit_stack_callback_mutation(expr, operator_bindings)
+        or _call_is_weakref_finalize_mutation(
+            expr,
+            operator_bindings,
+            bound_names,
+        )
+        or _call_is_warnings_warn_after_mutating_hook(expr, operator_bindings)
     )
 
 
@@ -9780,6 +10091,8 @@ def _is_dynamic_workers_mutation(
     if _namespace_mapping_may_gain_workers_via_merge(node, namespace_aliases):
         return True
     if _for_loop_invokes_mutating_callback(node, operator_bindings):
+        return True
+    if _for_loop_inspect_stack_body_mutates_workers(node, operator_bindings):
         return True
     if _statement_consumes_mutating_lazy_iterator(node, operator_bindings):
         return True
@@ -11992,6 +12305,34 @@ def _deactivate_frame_alias_bindings(
     )
 
 
+def _scan_frameinfo_loop_body_f_globals_aliases(
+    for_node,
+    inspect_analysis,
+    active_fg_dict,
+    fg_dict_events,
+    active,
+):
+    """Track ``f_globals`` walrus/assign aliases inside ``for fi in inspect.stack()``."""
+    if not isinstance(for_node, ast.For):
+        return
+    if not _inspect_frameinfo_iterable_is_active(for_node.iter, inspect_analysis):
+        return
+    for child in for_node.body:
+        for name, value in (
+            *_namespace_assignment_values(child),
+            *_compound_test_namespace_assignment_values(child),
+        ):
+            _record_frame_globals_dict_alias_assignment(
+                name,
+                value,
+                getattr(child, "lineno", 0),
+                active,
+                active_fg_dict,
+                fg_dict_events,
+                inspect_analysis,
+            )
+
+
 def _module_scope_frame_loop_target_names(node, inspect_analysis, active):
     """Return frame aliases introduced by a supported module-scope frame loop."""
     loop_target_names = _getouterframes_loop_target_names(
@@ -12043,7 +12384,7 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
             inspect_analysis,
             active,
         )
-        if loop_target_names is not None:
+        if loop_target_names:
             _activate_frame_alias_targets(
                 loop_target_names,
                 active,
@@ -12051,6 +12392,14 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 line,
             )
             continue
+        if isinstance(node, ast.For):
+            _scan_frameinfo_loop_body_f_globals_aliases(
+                node,
+                inspect_analysis,
+                active_fg_dict,
+                fg_dict_events,
+                active,
+            )
         for name, value in _namespace_assignment_values(node):
             _record_frame_alias_assignment(
                 name,
@@ -12294,6 +12643,44 @@ def _call_consumes_mutating_generator(
         operator_bindings,
         eager_consumer=True,
     )
+
+
+def _inspect_analysis_from_operator_bindings(operator_bindings):
+    """Return the inspect frame analysis dict when present on ``operator_bindings``."""
+    if not operator_bindings:
+        return {}
+    for item in reversed(operator_bindings):
+        if isinstance(item, dict) and "frameinfo_alias_spans" in item:
+            return item
+    return {}
+
+
+def _for_loop_inspect_stack_body_mutates_workers(node, operator_bindings):
+    """Return True when a ``for ... in inspect.stack()`` body mutates ``workers``."""
+    if not isinstance(node, ast.For):
+        return False
+    inspect_analysis = _inspect_analysis_from_operator_bindings(operator_bindings)
+    if not _inspect_frameinfo_iterable_is_active(node.iter, inspect_analysis):
+        return False
+    if _statements_mutate_workers(
+        node.body,
+        operator_bindings,
+        global_workers=True,
+    ):
+        return True
+    for child in ast.walk(node):
+        if not (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "update"
+        ):
+            continue
+        receiver = child.func.value
+        while isinstance(receiver, ast.Attribute):
+            if receiver.attr == "f_globals":
+                return True
+            receiver = receiver.value
+    return False
 
 
 def _for_loop_invokes_mutating_callback(node, operator_bindings):
@@ -14154,6 +14541,18 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
         _collect_exit_stack_alias_events(tree, operator_bindings)
     )
+    operator_bindings[32]["weakref_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "weakref")
+    )
+    operator_bindings[32]["warnings_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "warnings")
+    )
+    operator_bindings[32]["dataclasses_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "dataclasses")
+    )
+    operator_bindings[32]["dataclasses_field_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "dataclasses", {"field"})
+    )
     lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
         tree,
         operator_bindings,
@@ -14439,6 +14838,13 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         inspect_analysis,
+    )
+    inspect_analysis["warnings_showwarning_mutates"] = (
+        _module_assigns_mutating_warnings_showwarning(
+            tree,
+            operator_bindings,
+            import_time_workers_mutators,
+        )
     )
     if _statements_start_mutating_thread(
         tree.body,
