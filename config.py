@@ -256,8 +256,19 @@ def _emit_config_error(message: str) -> None:
 
 
 def _parse_worker_count(value):
-    """Return a positive integer-looking worker count, or None."""
-    return int(value) if value.isdigit() else None
+    """Return an integer-looking worker count, or None.
+
+    Gunicorn parses these values with plain ``int()``, so the panel must too:
+    an ``isdigit()`` gate both rejects what Gunicorn accepts (``1_6``, ``+16``)
+    and accepts what ``int()`` rejects (U+00B2), which raised an unhandled
+    ``ValueError`` during startup validation.
+    """
+    try:
+        count = int(value)
+    except ValueError:
+        return None
+    # Gunicorn's validate_pos_int rejects negatives, so they are never live.
+    return count if count >= 0 else None
 
 
 def _worker_count_from_compact_token(token):
@@ -1242,7 +1253,18 @@ def _call_is_dict_type_update_on_module_namespace(
 
 
 def _dict_name_is_builtin_at_line(reference_line, dict_shadow_line=None):
-    """Return whether ``dict`` still resolves to the builtin at a source line."""
+    """Return whether ``dict`` still resolves to the builtin at a source line.
+
+    ``dict`` bound at module scope and later restored from a proven
+    ``builtins`` alias yields the whole shadow EVENT list, which
+    ``_name_is_unshadowed_builtin`` already reads line by line.
+    """
+    if isinstance(dict_shadow_line, list):
+        return _name_is_unshadowed_builtin(
+            'dict',
+            reference_line,
+            {'dict': dict_shadow_line},
+        )
     return dict_shadow_line is None or (
         reference_line and reference_line < dict_shadow_line
     )
@@ -9272,7 +9294,17 @@ def _expression_mutates_workers(
 ):
     """Return True when an evaluated expression mutates ``workers`` indirectly."""
     if isinstance(expr, ast.Lambda):
-        return False
+        # A lambda body only runs when the lambda is called, but its default
+        # arguments are evaluated while the lambda object is created.
+        return any(
+            _expression_mutates_workers(
+                expression,
+                operator_bindings,
+                dict_subclass_names,
+                bound_names,
+            )
+            for expression in _definition_time_expressions(expr)
+        )
     if _expression_consumes_mutating_lazy_iterator(expr, operator_bindings):
         return True
     if _comprehension_invokes_mutating_callback(expr, operator_bindings):
@@ -13677,6 +13709,8 @@ def _walk_gunicorn_workers_statements(
             dict_subclass_names=dict_subclass_names,
         ):
             state.dynamic = True
+        if _node_has_workers_walrus(node):
+            state.dynamic = True
         _record_walrus_workers_assignment(
             node,
             state,
@@ -14489,7 +14523,13 @@ def _gunicorn_config_worker_details_from_path(
     tree = _parse_gunicorn_config_tree(path)
     if tree is None:
         return None, True, True
-    return _scan_gunicorn_config_worker_details(tree)
+    try:
+        return _scan_gunicorn_config_worker_details(tree)
+    except RecursionError:
+        # The expression walks have no depth guard, so an unusually deep
+        # expression chain exhausts the stack after ast.parse() succeeded.
+        # Same fail-closed verdict as an uninspectable config.
+        return None, True, True
 
 
 def _workers_from_gunicorn_config_path(config_path: str) -> tuple[int, bool]:
@@ -14646,9 +14686,9 @@ def _worker_count_from_environment() -> int:
     """Return the largest safety-relevant environment worker count."""
     counts = [1]
     for env_key in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw.isdigit():
-            counts.append(int(raw))
+        count = _parse_worker_count(os.environ.get(env_key, "").strip())
+        if count is not None:
+            counts.append(count)
     return max(counts)
 
 
