@@ -2203,6 +2203,37 @@ def test_class_body_lambda_walrus_stays_static(tmp_path):
             "    pass\n"
             "H().bump()\n"
         ),
+        (
+            "workers = 1\n"
+            "import operator, sys\n"
+            "operator.attrgetter('__dict__')(sys.modules[__name__]).update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "import operator, sys\n"
+            "g = operator.attrgetter('__dict__')(sys.modules[__name__])\n"
+            "g.update({'workers': 4})\n"
+        ),
+        (
+            "workers = 1\n"
+            "class B:\n"
+            "    @staticmethod\n"
+            "    def mut():\n"
+            "        globals()['workers'] = 4\n"
+            "class H(B):\n"
+            "    pass\n"
+            "H.mut()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class B:\n"
+            "    @classmethod\n"
+            "    def mut(cls):\n"
+            "        globals()['workers'] = 4\n"
+            "class H(B):\n"
+            "    pass\n"
+            "H.mut()\n"
+        ),
     ],
 )
 def test_security_review_oct04_workers_scan_gaps_are_dynamic(

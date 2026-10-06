@@ -597,6 +597,16 @@ def _namespace_aliases_reference_current_module(node, namespace_aliases):
     )
 
 
+def _is_structural_operator_attrgetter_factory(factory_call):
+    """Return True for syntactic ``operator.attrgetter`` / imported ``attrgetter``."""
+    if not isinstance(factory_call, ast.Call):
+        return False
+    func = factory_call.func
+    if isinstance(func, ast.Attribute) and func.attr == "attrgetter":
+        return isinstance(func.value, ast.Name)
+    return isinstance(func, ast.Name) and func.id == "attrgetter"
+
+
 def _is_module_namespace_mapping(node, namespace_aliases=None):
     """Return True for mappings known to be the current module namespace."""
     if namespace_aliases is None:
@@ -611,6 +621,19 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
         return _namespace_aliases_reference_current_module(
             node.value, namespace_aliases
         )
+    if (
+        isinstance(node, ast.Call)
+        and node.args
+        and isinstance(node.func, ast.Call)
+        and node.func.args
+        and isinstance(node.func.args[0], ast.Constant)
+        and node.func.args[0].value == "__dict__"
+        and _is_structural_operator_attrgetter_factory(node.func)
+        and _namespace_aliases_reference_current_module(
+            node.args[0], namespace_aliases
+        )
+    ):
+        return True
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return False
     if node.func.id == "vars":
@@ -9309,6 +9332,19 @@ def _name_receiver_call_triggers_workers(
         method_name,
         methods,
         reference_line,
+    ):
+        return True
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    if (
+        _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            receiver.id,
+            method_name,
+            class_methods,
+        )
+        and _class_binding_is_active(class_targets, receiver.id, reference_line)
     ):
         return True
     return _instance_hook_is_active(
