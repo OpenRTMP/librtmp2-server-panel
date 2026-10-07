@@ -9427,6 +9427,25 @@ def _class_constructor_assignment_is_non_mutating(value, operator_bindings):
     return False
 
 
+def _class_constructor_assignment_names(stmt, operator_bindings):
+    """Yield constructor names a provably safe class-body assignment rebinds."""
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        return
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+        return
+    if not _class_constructor_assignment_is_non_mutating(
+        stmt.value,
+        operator_bindings,
+    ):
+        return
+    for target in _statement_simple_targets(stmt):
+        if isinstance(target, ast.Name) and target.id in (
+            "__init__",
+            "__post_init__",
+        ):
+            yield target.id
+
+
 def _record_class_constructor_assignment_barriers(
     tree,
     operator_bindings,
@@ -9443,21 +9462,11 @@ def _record_class_constructor_assignment_barriers(
         if not isinstance(node, ast.ClassDef):
             continue
         for stmt in node.body:
-            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
-                continue
-            if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
-                continue
-            if not _class_constructor_assignment_is_non_mutating(
-                stmt.value,
+            for name in _class_constructor_assignment_names(
+                stmt,
                 operator_bindings,
             ):
-                continue
-            for target in _statement_simple_targets(stmt):
-                if isinstance(target, ast.Name) and target.id in (
-                    "__init__",
-                    "__post_init__",
-                ):
-                    class_methods.add((node.name, target.id))
+                class_methods.add((node.name, name))
 
 
 def _collect_class_side_effect_targets(tree, operator_bindings):
