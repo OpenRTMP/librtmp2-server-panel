@@ -12811,7 +12811,7 @@ def _record_frame_globals_dict_alias_assignment(
 ):
     """Track names bound to a proven live frame's ``f_globals`` mapping."""
     value = _unwrap_ast_node(value)
-    if not (
+    if (
         isinstance(value, ast.Attribute)
         and value.attr == "f_globals"
         and _node_is_proven_live_frame(
@@ -12819,11 +12819,11 @@ def _record_frame_globals_dict_alias_assignment(
             inspect_analysis,
             active_frames,
         )
-    ):
-        _deactivate_imported_module_alias(name, active_fg_dict, events, line)
+    ) or (isinstance(value, ast.Name) and value.id in active_fg_dict):
+        active_fg_dict.add(name)
+        events.setdefault(name, []).append((line, True))
         return
-    active_fg_dict.add(name)
-    events.setdefault(name, []).append((line, True))
+    _deactivate_imported_module_alias(name, active_fg_dict, events, line)
 
 
 def _sys_current_frames_mapping_call_is_active(iter_expr, inspect_analysis, method):

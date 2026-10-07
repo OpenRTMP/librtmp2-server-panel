@@ -102,3 +102,30 @@ def test_shadowed_sum_consuming_mutating_map_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-P4-3: a second alias of a tracked f_globals mapping keeps its provenance.
+def test_second_f_globals_alias_in_stack_loop_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import inspect\n"
+        "for fi in inspect.stack():\n"
+        "    g = fi.frame.f_globals\n"
+        "    h = g\n"
+        "    h.update({'workers': 4})\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_alias_of_untracked_name_in_stack_loop_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import inspect\n"
+        "for fi in inspect.stack():\n"
+        "    g = {}\n"
+        "    h = g\n"
+        "    h.update({'workers': 4})\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
