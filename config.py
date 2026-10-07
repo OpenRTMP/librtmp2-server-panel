@@ -8210,6 +8210,7 @@ _EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
         "min",
         "next",
         "sorted",
+        "sum",
     }
 )
 

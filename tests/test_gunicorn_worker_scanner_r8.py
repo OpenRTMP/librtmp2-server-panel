@@ -81,3 +81,24 @@ def test_subclass_overriding_mutating_init_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-P3-5: bare sum is an eager consumer of a mutating lazy iterator.
+def test_bare_sum_consuming_mutating_map_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "sum(map(lambda _: globals().update({'workers': 4}), [1]))\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_shadowed_sum_consuming_mutating_map_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "def sum(values):\n"
+        "    return 0\n"
+        "sum(map(lambda _: globals().update({'workers': 4}), [1]))\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
