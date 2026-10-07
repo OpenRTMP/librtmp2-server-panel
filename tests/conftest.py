@@ -1,4 +1,6 @@
+import importlib
 import os
+import sys
 
 import pytest
 from flask_test_utils import configure_testing_app
@@ -15,6 +17,25 @@ def pytest_configure(config):
         "markers",
         "integration: tests requiring a live librtmp2-server (RUN_INTEGRATION=1)",
     )
+
+
+@pytest.fixture
+def config_module(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "valid-test-secret-key-for-worker-regressions")
+    monkeypatch.setenv("PASSWORD", "valid-test-password-for-worker-regressions")
+    monkeypatch.setenv("LRTMP2_API_TOKEN", "valid-test-api-token-for-worker-regressions")
+    monkeypatch.setenv("REQUIRE_LOGIN", "true")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "redis://localhost:6379/0")
+    monkeypatch.delenv("GUNICORN_CMD_ARGS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
+    sys.modules.pop("config", None)
+    module = importlib.import_module("config")
+    try:
+        yield module
+    finally:
+        sys.modules.pop("config", None)
 
 
 @pytest.fixture
