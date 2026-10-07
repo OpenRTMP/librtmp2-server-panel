@@ -9408,6 +9408,58 @@ def _record_mutating_super_methods(
             methods.add((node.name, stmt.name))
 
 
+def _class_constructor_assignment_is_non_mutating(value, operator_bindings):
+    """Return True when an assigned constructor provably cannot mutate workers."""
+    if isinstance(value, ast.Lambda):
+        return not _lambda_mutates_workers(value, operator_bindings)
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr in ("__init__", "__post_init__")
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "object"
+    ):
+        shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+        return _name_is_unshadowed_builtin(
+            "object",
+            getattr(value, "lineno", 0),
+            shadow_lines,
+        )
+    return False
+
+
+def _record_class_constructor_assignment_barriers(
+    tree,
+    operator_bindings,
+    class_methods,
+):
+    """Record non-mutating ``__init__`` assignments as hierarchy barriers.
+
+    A class-body assignment replaces the inherited initializer with a value the
+    scanner can prove safe, so the MRO lookup must stop at that class. Unknown
+    or mutating assigned constructors stay unrecorded, leaving the existing
+    inherited-constructor lookup unchanged.
+    """
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+                continue
+            if not _class_constructor_assignment_is_non_mutating(
+                stmt.value,
+                operator_bindings,
+            ):
+                continue
+            for target in _statement_simple_targets(stmt):
+                if isinstance(target, ast.Name) and target.id in (
+                    "__init__",
+                    "__post_init__",
+                ):
+                    class_methods.add((node.name, target.id))
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
@@ -9455,6 +9507,11 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
             class_definition_lines.setdefault(node.name, []).append(
                 getattr(node, "lineno", 0)
             )
+    _record_class_constructor_assignment_barriers(
+        tree,
+        operator_bindings,
+        class_methods,
+    )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,

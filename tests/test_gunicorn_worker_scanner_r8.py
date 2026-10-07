@@ -317,3 +317,18 @@ def test_subclass_of_rebound_safe_base_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-F6: an assigned safe __init__ stops the inherited constructor lookup.
+def test_assigned_object_init_barrier_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base):\n"
+        "    __init__ = object.__init__\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
