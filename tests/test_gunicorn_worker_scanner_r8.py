@@ -255,3 +255,32 @@ def test_class_body_bare_sum_consuming_mutating_map_is_dynamic(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+# BUG-R8-F4: an import rebinding drops stale f_globals alias provenance.
+def test_import_rebound_f_globals_alias_in_stack_loop_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import inspect\n"
+        "for fi in inspect.stack():\n"
+        "    g = fi.frame.f_globals\n"
+        "    from sys import modules as g\n"
+        "    h = g\n"
+        "    h.update({'workers': 4})\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_import_rebound_module_f_globals_alias_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import inspect\n"
+        "fi = inspect.currentframe()\n"
+        "g = fi.f_globals\n"
+        "from sys import modules as g\n"
+        "h = g\n"
+        "h.update({'workers': 4})\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)

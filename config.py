@@ -13023,6 +13023,14 @@ def _scan_frameinfo_loop_body_f_globals_aliases(
     if not _inspect_frameinfo_iterable_is_active(for_node.iter, inspect_analysis):
         return
     for child in for_node.body:
+        line = getattr(child, "lineno", 0)
+        for name in _import_bound_names(child):
+            _deactivate_imported_module_alias(
+                name,
+                active_fg_dict,
+                fg_dict_events,
+                line,
+            )
         for name, value in (
             *_namespace_assignment_values(child),
             *_compound_test_namespace_assignment_values(child),
@@ -13030,7 +13038,7 @@ def _scan_frameinfo_loop_body_f_globals_aliases(
             _record_frame_globals_dict_alias_assignment(
                 name,
                 value,
-                getattr(child, "lineno", 0),
+                line,
                 active,
                 active_fg_dict,
                 fg_dict_events,
@@ -13084,6 +13092,15 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 line,
             )
             continue
+        for name in _import_bound_names(node):
+            _deactivate_frame_alias_bindings(
+                name,
+                active,
+                events,
+                active_fg_dict,
+                fg_dict_events,
+                line,
+            )
         loop_target_names = _module_scope_frame_loop_target_names(
             node,
             inspect_analysis,
