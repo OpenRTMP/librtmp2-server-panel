@@ -4188,30 +4188,95 @@ def _collect_warnings_showwarning_mutation_events(
     if mutator_names is None:
         mutator_names = set()
     events = []
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        line = getattr(node, "lineno", 0)
-        if not any(
-            _warnings_showwarning_target_is_active(
-                target,
-                operator_bindings,
-                line,
-            )
-            for target in node.targets
-        ):
-            continue
-        events.append(
-            (
-                line,
-                _warnings_showwarning_value_mutates(
-                    node.value,
-                    operator_bindings,
-                    mutator_names,
-                ),
-            )
-        )
+    _scan_warnings_showwarning_mutation_events(
+        tree.body,
+        operator_bindings,
+        mutator_names,
+        events,
+        definite=True,
+    )
     return events
+
+
+def _class_body_bound_names(statements):
+    """Return names a class body binds in its own namespace."""
+    names = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        names.update(_statement_scope_bound_names(node))
+        names.update(_import_bound_names(node))
+        for block in _compound_statement_blocks(node):
+            names.update(_class_body_bound_names(block))
+    return names
+
+
+def _scan_warnings_showwarning_mutation_events(
+    statements,
+    operator_bindings,
+    mutator_names,
+    events,
+    *,
+    definite,
+    shadowed=frozenset(),
+):
+    """Record showwarning replacements, flagging straight-line module ones.
+
+    Only a definitely executed (straight-line, unconditional) safe assignment
+    clears an earlier mutating replacement; a safe assignment inside a compound
+    statement or class body may be skipped at runtime, so it must not hide the
+    mutating hook. A mutating replacement anywhere still fails closed. Inside a
+    class body that locally rebinds the receiver name, ``receiver.showwarning``
+    targets that local name instead of the imported module and is ignored.
+    """
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            _scan_warnings_showwarning_mutation_events(
+                node.body,
+                operator_bindings,
+                mutator_names,
+                events,
+                definite=False,
+                shadowed=_class_body_bound_names(node.body),
+            )
+            continue
+        if isinstance(node, ast.Assign):
+            line = getattr(node, "lineno", 0)
+            if any(
+                _warnings_showwarning_target_is_active(
+                    target,
+                    operator_bindings,
+                    line,
+                )
+                and not (
+                    isinstance(target.value, ast.Name)
+                    and target.value.id in shadowed
+                )
+                for target in node.targets
+            ):
+                events.append(
+                    (
+                        line,
+                        _warnings_showwarning_value_mutates(
+                            node.value,
+                            operator_bindings,
+                            mutator_names,
+                        ),
+                        definite,
+                    )
+                )
+        for block in _compound_statement_blocks(node):
+            _scan_warnings_showwarning_mutation_events(
+                block,
+                operator_bindings,
+                mutator_names,
+                events,
+                definite=False,
+                shadowed=shadowed,
+            )
 
 
 def _warnings_showwarning_mutates_at_line(operator_bindings, reference_line):
@@ -4222,13 +4287,16 @@ def _warnings_showwarning_mutates_at_line(operator_bindings, reference_line):
         else {}
     )
     state = False
-    for event_line, mutates in binding_store.get(
+    for event_line, mutates, definite in binding_store.get(
         "warnings_showwarning_mutation_events",
         (),
     ):
         if reference_line and event_line > reference_line:
             break
-        state = mutates
+        if mutates:
+            state = True
+        elif definite:
+            state = False
     return state
 
 
@@ -5147,8 +5215,10 @@ def _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
     return _iterable_holds_mutating_callbacks(call.args[0], operator_bindings)
 
 
-def _builtin_consumer_is_active(name, call, operator_bindings):
+def _builtin_consumer_is_active(name, call, operator_bindings, bound_names=None):
     """Return whether a known eager iterable consumer still resolves to a builtin."""
+    if bound_names and name in bound_names:
+        return False
     shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
     return _name_is_unshadowed_builtin(
         name,
@@ -8210,6 +8280,7 @@ _EAGER_LAZY_ITERATOR_CONSUMERS = frozenset(
         "min",
         "next",
         "sorted",
+        "sum",
     }
 )
 
@@ -8564,7 +8635,11 @@ def _eager_consumer_drains_mutating_lazy_iterator(name, call, operator_bindings)
     )
 
 
-def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
+def _named_builtin_consumes_mutating_lazy_iterator(
+    call,
+    operator_bindings,
+    bound_names=None,
+):
     """Detect eager builtin consumers of a risky lazy iterator."""
     if not isinstance(call.func, ast.Name):
         return False
@@ -8575,6 +8650,7 @@ def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
             name,
             call,
             operator_bindings,
+            bound_names,
         )
     ):
         return False
@@ -8597,7 +8673,7 @@ def _builtin_module_consumes_mutating_lazy_iterator(call, operator_bindings):
     )
 
 
-def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
+def _call_consumes_mutating_lazy_iterator(call, operator_bindings, bound_names=None):
     """Detect eager consumers of direct or saved risky map/filter iterators."""
     if not isinstance(call, ast.Call):
         return False
@@ -8610,6 +8686,7 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
         or _named_builtin_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
+            bound_names,
         )
         or _builtin_module_consumes_mutating_lazy_iterator(
             call,
@@ -8696,9 +8773,13 @@ def _collect_mutating_lazy_iterator_alias_events(tree, operator_bindings):
     return events
 
 
-def _call_has_mutating_lambda_argument(call, operator_bindings):
+def _call_has_mutating_lambda_argument(call, operator_bindings, bound_names=None):
     """Detect callbacks only when the current call actually executes them."""
-    return _call_consumes_mutating_lazy_iterator(call, operator_bindings)
+    return _call_consumes_mutating_lazy_iterator(
+        call,
+        operator_bindings,
+        bound_names,
+    )
 
 
 
@@ -9327,6 +9408,67 @@ def _record_mutating_super_methods(
             methods.add((node.name, stmt.name))
 
 
+def _class_constructor_assignment_is_non_mutating(value, operator_bindings):
+    """Return True when an assigned constructor provably cannot mutate workers."""
+    if isinstance(value, ast.Lambda):
+        return not _lambda_mutates_workers(value, operator_bindings)
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr in ("__init__", "__post_init__")
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "object"
+    ):
+        shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+        return _name_is_unshadowed_builtin(
+            "object",
+            getattr(value, "lineno", 0),
+            shadow_lines,
+        )
+    return False
+
+
+def _class_constructor_assignment_names(stmt, operator_bindings):
+    """Yield constructor names a provably safe class-body assignment rebinds."""
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        return
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+        return
+    if not _class_constructor_assignment_is_non_mutating(
+        stmt.value,
+        operator_bindings,
+    ):
+        return
+    for target in _statement_simple_targets(stmt):
+        if isinstance(target, ast.Name) and target.id in (
+            "__init__",
+            "__post_init__",
+        ):
+            yield target.id
+
+
+def _record_class_constructor_assignment_barriers(
+    tree,
+    operator_bindings,
+    class_methods,
+):
+    """Record non-mutating ``__init__`` assignments as hierarchy barriers.
+
+    A class-body assignment replaces the inherited initializer with a value the
+    scanner can prove safe, so the MRO lookup must stop at that class. Unknown
+    or mutating assigned constructors stay unrecorded, leaving the existing
+    inherited-constructor lookup unchanged.
+    """
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            for name in _class_constructor_assignment_names(
+                stmt,
+                operator_bindings,
+            ):
+                class_methods.add((node.name, name))
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
@@ -9368,6 +9510,31 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
+    class_definition_lines = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            class_definition_lines.setdefault(node.name, []).append(
+                getattr(node, "lineno", 0)
+            )
+    _record_class_constructor_assignment_barriers(
+        tree,
+        operator_bindings,
+        class_methods,
+    )
+    class_nodes = [
+        node for node in tree.body if isinstance(node, ast.ClassDef)
+    ]
+    class_nodes_by_name = {node.name: node for node in class_nodes}
+    metaclass_bypass_events = {}
+    for node, metaclass_name in _effective_metaclass_names(class_nodes):
+        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
+            metaclass_name,
+            class_nodes_by_name,
+            class_bases,
+        )
+        metaclass_bypass_events.setdefault(node.name, []).append(
+            (getattr(node, "lineno", 0), bypass)
+        )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
@@ -9396,6 +9563,8 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_methods,
         enum_members,
         class_attributes,
+        class_definition_lines,
+        metaclass_bypass_events,
     )
 
 
@@ -9407,6 +9576,88 @@ def _class_binding_is_active(class_targets, class_name, reference_line):
     if class_name not in events:
         return True
     return bool(_binding_state_at_line(events, class_name, reference_line))
+
+
+def _class_definition_line_at(definition_lines, class_name, reference_line):
+    """Return the last class definition line visible at ``reference_line``."""
+    line = 0
+    for definition_line in definition_lines.get(class_name, ()):
+        if reference_line and definition_line > reference_line:
+            break
+        line = definition_line
+    return line
+
+
+def _function_delegates_type_call(func_node):
+    """Return True when a metaclass ``__call__`` reaches ``type.__call__``."""
+    for child in ast.walk(func_node):
+        if (
+            not isinstance(child, ast.Call)
+            or not isinstance(child.func, ast.Attribute)
+            or child.func.attr != "__call__"
+        ):
+            continue
+        receiver = child.func.value
+        if (
+            isinstance(receiver, ast.Call)
+            and isinstance(receiver.func, ast.Name)
+            and receiver.func.id == "super"
+        ):
+            return True
+        if isinstance(receiver, ast.Name) and receiver.id == "type":
+            return True
+    return False
+
+
+def _effective_metaclass_names(class_nodes):
+    """Return each class definition's explicit or inherited metaclass name."""
+    effective = {}
+    resolved = []
+    for node in class_nodes:
+        explicit = _explicit_metaclass_name(node)
+        if explicit is not None:
+            metaclass_name = explicit
+        else:
+            metaclass_name = next(
+                (
+                    effective[base.id]
+                    for base in node.bases
+                    if isinstance(base, ast.Name) and base.id in effective
+                ),
+                None,
+            )
+        resolved.append((node, metaclass_name))
+        if metaclass_name is None:
+            effective.pop(node.name, None)
+        else:
+            effective[node.name] = metaclass_name
+    return resolved
+
+
+def _metaclass_call_bypasses_initializer(
+    metaclass_name,
+    class_nodes_by_name,
+    class_bases,
+):
+    """Return True when the metaclass ``__call__`` never runs ``type.__call__``."""
+    for owner in _class_mro_names(metaclass_name, class_bases):
+        node = class_nodes_by_name.get(owner)
+        if node is None:
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "__call__":
+                return not _function_delegates_type_call(stmt)
+    return False
+
+
+def _class_metaclass_bypasses_at_line(events, class_name, reference_line):
+    """Return True when the active class definition's metaclass bypasses __init__."""
+    state = False
+    for event_line, bypass in events.get(class_name, ()):
+        if reference_line and event_line > reference_line:
+            break
+        state = bypass
+    return state
 
 
 def _class_hook_is_active(class_targets, class_name, method_name, hooks, reference_line):
@@ -9472,6 +9723,24 @@ def _class_mro_names(class_name, class_bases, cache=None, active=None):
     return cache[class_name]
 
 
+def _mro_method_mutation_owner(
+    methods,
+    class_methods,
+    class_attributes,
+    mro_names,
+    method_name,
+):
+    """Return the first MRO owner with a mutating definition, if any."""
+    for owner in mro_names:
+        if (owner, method_name) in methods:
+            return owner
+        if class_methods is not None and (owner, method_name) in class_methods:
+            return None
+        if class_attributes is not None and (owner, method_name) in class_attributes:
+            return None
+    return None
+
+
 def _mro_method_mutation_state(
     methods,
     class_methods,
@@ -9480,14 +9749,13 @@ def _mro_method_mutation_state(
     method_name,
 ):
     """Return whether the first known MRO definition is mutating."""
-    for owner in mro_names:
-        if (owner, method_name) in methods:
-            return True
-        if class_methods is not None and (owner, method_name) in class_methods:
-            return False
-        if class_attributes is not None and (owner, method_name) in class_attributes:
-            return False
-    return False
+    return _mro_method_mutation_owner(
+        methods,
+        class_methods,
+        class_attributes,
+        mro_names,
+        method_name,
+    ) is not None
 
 
 def _class_hierarchy_defines_method(
@@ -9574,11 +9842,47 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
     """Return True when a ``ClassName(...)`` call constructs a risky class."""
     if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
         return False
-    return expr.func.id in constructors and _class_binding_is_active(
-        class_targets,
+    if not _class_binding_is_active(class_targets, expr.func.id, reference_line):
+        return False
+    if expr.func.id in constructors:
+        return True
+    metaclass_bypass_events = (
+        class_targets[12] if len(class_targets) > 12 else {}
+    )
+    if _class_metaclass_bypasses_at_line(
+        metaclass_bypass_events,
+        expr.func.id,
+        reference_line,
+    ):
+        return False
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    owner = _mro_method_mutation_owner(
+        class_targets[1],
+        class_methods,
+        None,
+        _class_mro_names(expr.func.id, class_bases),
+        "__init__",
+    )
+    if owner is None or owner == expr.func.id:
+        return owner is not None
+    class_definition_lines = (
+        class_targets[11] if len(class_targets) > 11 else {}
+    )
+    class_def_line = _class_definition_line_at(
+        class_definition_lines,
         expr.func.id,
         reference_line,
     )
+    if class_def_line and not _class_binding_is_active(
+        class_targets,
+        owner,
+        class_def_line,
+    ):
+        # The subclass captured an earlier (non-mutating) binding of the base
+        # name, so a later mutating redefinition cannot provide its __init__.
+        return False
+    return True
 
 
 def _name_receiver_call_triggers_workers(
@@ -10117,7 +10421,7 @@ def _call_has_secondary_worker_mutation(
         or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings, bound_names)
-        or _call_has_mutating_lambda_argument(expr, operator_bindings)
+        or _call_has_mutating_lambda_argument(expr, operator_bindings, bound_names)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
@@ -12802,7 +13106,7 @@ def _record_frame_globals_dict_alias_assignment(
 ):
     """Track names bound to a proven live frame's ``f_globals`` mapping."""
     value = _unwrap_ast_node(value)
-    if not (
+    if (
         isinstance(value, ast.Attribute)
         and value.attr == "f_globals"
         and _node_is_proven_live_frame(
@@ -12810,11 +13114,11 @@ def _record_frame_globals_dict_alias_assignment(
             inspect_analysis,
             active_frames,
         )
-    ):
-        _deactivate_imported_module_alias(name, active_fg_dict, events, line)
+    ) or (isinstance(value, ast.Name) and value.id in active_fg_dict):
+        active_fg_dict.add(name)
+        events.setdefault(name, []).append((line, True))
         return
-    active_fg_dict.add(name)
-    events.setdefault(name, []).append((line, True))
+    _deactivate_imported_module_alias(name, active_fg_dict, events, line)
 
 
 def _sys_current_frames_mapping_call_is_active(iter_expr, inspect_analysis, method):
@@ -12934,6 +13238,14 @@ def _scan_frameinfo_loop_body_f_globals_aliases(
     if not _inspect_frameinfo_iterable_is_active(for_node.iter, inspect_analysis):
         return
     for child in for_node.body:
+        line = getattr(child, "lineno", 0)
+        for name in _import_bound_names(child):
+            _deactivate_imported_module_alias(
+                name,
+                active_fg_dict,
+                fg_dict_events,
+                line,
+            )
         for name, value in (
             *_namespace_assignment_values(child),
             *_compound_test_namespace_assignment_values(child),
@@ -12941,7 +13253,7 @@ def _scan_frameinfo_loop_body_f_globals_aliases(
             _record_frame_globals_dict_alias_assignment(
                 name,
                 value,
-                getattr(child, "lineno", 0),
+                line,
                 active,
                 active_fg_dict,
                 fg_dict_events,
@@ -12995,6 +13307,15 @@ def _collect_inspect_frame_alias_events(tree, inspect_analysis):
                 line,
             )
             continue
+        for name in _import_bound_names(node):
+            _deactivate_frame_alias_bindings(
+                name,
+                active,
+                events,
+                active_fg_dict,
+                fg_dict_events,
+                line,
+            )
         loop_target_names = _module_scope_frame_loop_target_names(
             node,
             inspect_analysis,
@@ -14515,6 +14836,7 @@ def _class_body_statement_has_dynamic_workers_effect(
     dict_subclass_names,
     defer_annotations,
     global_workers_declared=False,
+    bound_names=None,
 ):
     """Return True when one class-body statement mutates the module ``workers``.
 
@@ -14565,6 +14887,7 @@ def _class_body_statement_has_dynamic_workers_effect(
         node,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     ):
         return True
     if _import_statement_after_builtins_import_hook(node, operator_bindings):
@@ -14582,9 +14905,19 @@ def _class_body_statement_has_dynamic_workers_effect(
             dict_subclass_names,
             defer_annotations,
             global_workers_declared,
+            bound_names,
         )
         for block in _compound_statement_blocks(node)
     )
+
+
+def _statement_bound_names(node):
+    """Return names bound by one statement in its enclosing scope."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    names = _statement_scope_bound_names(node)
+    names.update(_import_bound_names(node))
+    return names
 
 
 def _class_body_has_dynamic_workers_effect(
@@ -14595,14 +14928,18 @@ def _class_body_has_dynamic_workers_effect(
     dict_subclass_names,
     defer_annotations=False,
     global_workers_declared=False,
+    bound_names=None,
 ):
     """Return True when class-body statements mutate the module ``workers`` name.
 
     A class body runs while the ``class`` statement executes at config import,
     so ``globals()['workers'] = 4`` inside one must make the config dynamic,
     while a plain ``workers = 4`` class attribute only binds a class name.
+    Earlier class-body bindings shadow module globals for later statements,
+    which keeps a class-local ``sum = ...`` from reading as the builtin.
     """
     declared = global_workers_declared
+    local_names = set() if bound_names is None else set(bound_names)
     for node in statements:
         if isinstance(node, ast.Global) and "workers" in node.names:
             declared = True
@@ -14615,8 +14952,10 @@ def _class_body_has_dynamic_workers_effect(
             dict_subclass_names,
             defer_annotations,
             declared,
+            local_names,
         ):
             return True
+        local_names.update(_statement_bound_names(node))
     return False
 
 
