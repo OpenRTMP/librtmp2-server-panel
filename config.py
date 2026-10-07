@@ -4248,6 +4248,27 @@ def _call_is_warnings_warn_after_mutating_hook(call, operator_bindings):
     )
 
 
+def _node_source_position(node):
+    """Return a stable source-order key for an AST node."""
+    return (
+        getattr(node, "lineno", 0),
+        getattr(node, "col_offset", 0),
+    )
+
+
+def _iter_import_time_statements(statements):
+    """Yield statements that execute while the config module is imported."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        yield node
+        if isinstance(node, ast.ClassDef):
+            yield from _iter_import_time_statements(node.body)
+            continue
+        for block in _compound_statement_blocks(node):
+            yield from _iter_import_time_statements(block)
+
+
 def _builtins_module_alias_events(operator_bindings):
     """Return source-ordered builtins module alias events when present."""
     if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict):
@@ -4256,7 +4277,7 @@ def _builtins_module_alias_events(operator_bindings):
 
 
 def _builtins_dunder_import_target_is_active(target, operator_bindings, reference_line):
-    """Return True when target assigns the active builtins module's __import__."""
+    """Return True when target references the active builtins.__import__."""
     if not isinstance(target, ast.Attribute) or target.attr != "__import__":
         return False
     receiver = target.value
@@ -4269,46 +4290,157 @@ def _builtins_dunder_import_target_is_active(target, operator_bindings, referenc
     )
 
 
+def _builtins_dunder_import_assignment_is_noop(node, operator_bindings):
+    """Return True for a provable builtins.__import__ self-assignment."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return False
+    value = node.value
+    if value is None:
+        return False
+    line = getattr(node, "lineno", 0)
+    return _builtins_dunder_import_target_is_active(
+        value,
+        operator_bindings,
+        line,
+    )
+
+
+def _assignment_targets(node):
+    """Return assignment targets relevant to import-hook mutation tracking."""
+    if isinstance(node, ast.Assign):
+        return node.targets
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return (node.target,)
+    return ()
+
+
 def _collect_builtins_dunder_import_replacement_lines(tree, operator_bindings):
-    """Return source lines where builtins.__import__ is replaced at import time."""
-    lines = []
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
+    """Return source positions where builtins.__import__ is replaced."""
+    positions = []
+    for node in _iter_import_time_statements(tree.body):
+        targets = _assignment_targets(node)
+        if not targets:
             continue
         line = getattr(node, "lineno", 0)
-        if any(
+        if not any(
             _builtins_dunder_import_target_is_active(
                 target,
                 operator_bindings,
                 line,
             )
-            for target in node.targets
+            for target in targets
         ):
-            lines.append(line)
-    return lines
+            continue
+        if _builtins_dunder_import_assignment_is_noop(node, operator_bindings):
+            continue
+        positions.append(_node_source_position(node))
+    return sorted(set(positions))
 
 
-def _builtins_dunder_import_replaced_before_line(operator_bindings, reference_line):
-    """Return True when builtins.__import__ was replaced before reference_line."""
+def _builtins_dunder_import_replaced_before_node(operator_bindings, node):
+    """Return True when builtins.__import__ was replaced before one AST node."""
     binding_store = (
         operator_bindings[32]
         if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
         else {}
     )
-    for event_line in binding_store.get("builtins_dunder_import_replacement_lines", ()):
-        if reference_line and event_line < reference_line:
-            return True
-    return False
+    reference_position = _node_source_position(node)
+    return any(
+        event_position < reference_position
+        for event_position in binding_store.get(
+            "builtins_dunder_import_replacement_lines",
+            (),
+        )
+    )
 
 
 def _import_statement_after_builtins_import_hook(node, operator_bindings):
     """Return True when an import runs after a replaced builtins.__import__ hook."""
-    if not isinstance(node, (ast.Import, ast.ImportFrom)):
+    return isinstance(node, (ast.Import, ast.ImportFrom)) and (
+        _builtins_dunder_import_replaced_before_node(
+            operator_bindings,
+            node,
+        )
+    )
+
+
+def _call_is_active_dunder_import(call, operator_bindings):
+    """Return True when a call resolves to the active __import__ builtin."""
+    if not isinstance(call, ast.Call):
         return False
-    reference_line = getattr(node, "lineno", 0)
-    return _builtins_dunder_import_replaced_before_line(
+    reference_line = getattr(call, "lineno", 0)
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "__import__":
+        binding_store = (
+            operator_bindings[32]
+            if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+            else {}
+        )
+        return _name_is_unshadowed_builtin(
+            "__import__",
+            reference_line,
+            binding_store,
+        )
+    return _builtins_dunder_import_target_is_active(
+        func,
         operator_bindings,
         reference_line,
+    )
+
+
+def _statement_calls_dunder_import_after_hook(node, operator_bindings):
+    """Return True when an import-time expression directly invokes the hook."""
+    expr = _statement_value_expression(node)
+    if expr is None:
+        return False
+    stack = [expr]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Lambda):
+            continue
+        if (
+            isinstance(current, ast.Call)
+            and _call_is_active_dunder_import(current, operator_bindings)
+            and _builtins_dunder_import_replaced_before_node(
+                operator_bindings,
+                current,
+            )
+        ):
+            return True
+        stack.extend(ast.iter_child_nodes(current))
+    return False
+
+
+def _sys_meta_path_reference_is_active(node, operator_bindings, reference_line):
+    """Return True for an active sys.meta_path attribute reference."""
+    if not isinstance(node, ast.Attribute) or node.attr != "meta_path":
+        return False
+    receiver = node.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    sys_events = (
+        operator_bindings[32].get("sys_module_alias_events", {})
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    return _imported_alias_is_active(sys_events, receiver.id, reference_line)
+
+
+def _sys_meta_path_target_is_active(target, operator_bindings, reference_line):
+    """Return True when an assignment mutates the active sys.meta_path."""
+    if _sys_meta_path_reference_is_active(
+        target,
+        operator_bindings,
+        reference_line,
+    ):
+        return True
+    return (
+        isinstance(target, ast.Subscript)
+        and _sys_meta_path_reference_is_active(
+            target.value,
+            operator_bindings,
+            reference_line,
+        )
     )
 
 
@@ -4318,53 +4450,56 @@ def _call_mutates_sys_meta_path(call, operator_bindings):
         return False
     if call.func.attr not in {"insert", "append", "extend"}:
         return False
-    meta_path = call.func.value
-    if not isinstance(meta_path, ast.Attribute) or meta_path.attr != "meta_path":
-        return False
-    receiver = meta_path.value
-    if not isinstance(receiver, ast.Name):
-        return False
-    reference_line = getattr(call, "lineno", 0)
-    sys_events = (
-        operator_bindings[32].get("sys_module_alias_events", {})
-        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
-        else {}
+    return _sys_meta_path_reference_is_active(
+        call.func.value,
+        operator_bindings,
+        getattr(call, "lineno", 0),
     )
-    return _imported_alias_is_active(sys_events, receiver.id, reference_line)
 
 
 def _collect_sys_meta_path_mutation_lines(tree, operator_bindings):
-    """Return lines that register a custom import hook on sys.meta_path."""
-    lines = []
-    for node in tree.body:
+    """Return source positions that install or mutate sys.meta_path hooks."""
+    positions = []
+    for node in _iter_import_time_statements(tree.body):
         expr = _statement_value_expression(node)
         if isinstance(expr, ast.Call) and _call_mutates_sys_meta_path(
             expr,
             operator_bindings,
         ):
-            lines.append(getattr(node, "lineno", 0))
-    return lines
+            positions.append(_node_source_position(node))
+            continue
+        line = getattr(node, "lineno", 0)
+        if any(
+            _sys_meta_path_target_is_active(
+                target,
+                operator_bindings,
+                line,
+            )
+            for target in _assignment_targets(node)
+        ):
+            positions.append(_node_source_position(node))
+    return sorted(set(positions))
 
 
-def _sys_meta_path_mutated_before_line(operator_bindings, reference_line):
-    """Return True when sys.meta_path was mutated before reference_line."""
+def _sys_meta_path_mutated_before_node(operator_bindings, node):
+    """Return True when sys.meta_path was mutated before one AST node."""
     binding_store = (
         operator_bindings[32]
         if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
         else {}
     )
-    for event_line in binding_store.get("sys_meta_path_mutation_lines", ()):
-        if reference_line and event_line < reference_line:
-            return True
-    return False
+    reference_position = _node_source_position(node)
+    return any(
+        event_position < reference_position
+        for event_position in binding_store.get("sys_meta_path_mutation_lines", ())
+    )
 
 
 def _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
     """Return True when an import may invoke a custom sys.meta_path hook."""
-    if not isinstance(node, (ast.Import, ast.ImportFrom)):
-        return False
-    reference_line = getattr(node, "lineno", 0)
-    return _sys_meta_path_mutated_before_line(operator_bindings, reference_line)
+    return isinstance(node, (ast.Import, ast.ImportFrom)) and (
+        _sys_meta_path_mutated_before_node(operator_bindings, node)
+    )
 
 
 def _call_is_dataclasses_field(call, operator_bindings, reference_line):
@@ -14200,6 +14335,8 @@ def _node_has_dynamic_workers_effect(
         return True
     if _import_statement_after_builtins_import_hook(node, operator_bindings):
         return True
+    if _statement_calls_dunder_import_after_hook(node, operator_bindings):
+        return True
     if _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
         return True
     return _import_from_binds_workers(node)
@@ -14429,6 +14566,12 @@ def _class_body_statement_has_dynamic_workers_effect(
         operator_bindings,
         dict_subclass_names,
     ):
+        return True
+    if _import_statement_after_builtins_import_hook(node, operator_bindings):
+        return True
+    if _statement_calls_dunder_import_after_hook(node, operator_bindings):
+        return True
+    if _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
         return True
     return any(
         _class_body_has_dynamic_workers_effect(
