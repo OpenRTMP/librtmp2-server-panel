@@ -4188,7 +4188,7 @@ def _collect_warnings_showwarning_mutation_events(
     if mutator_names is None:
         mutator_names = set()
     events = []
-    for node in tree.body:
+    for node in _iter_import_time_statements(tree.body):
         if not isinstance(node, ast.Assign):
             continue
         line = getattr(node, "lineno", 0)
