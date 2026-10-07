@@ -5215,8 +5215,10 @@ def _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
     return _iterable_holds_mutating_callbacks(call.args[0], operator_bindings)
 
 
-def _builtin_consumer_is_active(name, call, operator_bindings):
+def _builtin_consumer_is_active(name, call, operator_bindings, bound_names=None):
     """Return whether a known eager iterable consumer still resolves to a builtin."""
+    if bound_names and name in bound_names:
+        return False
     shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
     return _name_is_unshadowed_builtin(
         name,
@@ -8633,7 +8635,11 @@ def _eager_consumer_drains_mutating_lazy_iterator(name, call, operator_bindings)
     )
 
 
-def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
+def _named_builtin_consumes_mutating_lazy_iterator(
+    call,
+    operator_bindings,
+    bound_names=None,
+):
     """Detect eager builtin consumers of a risky lazy iterator."""
     if not isinstance(call.func, ast.Name):
         return False
@@ -8644,6 +8650,7 @@ def _named_builtin_consumes_mutating_lazy_iterator(call, operator_bindings):
             name,
             call,
             operator_bindings,
+            bound_names,
         )
     ):
         return False
@@ -8666,7 +8673,7 @@ def _builtin_module_consumes_mutating_lazy_iterator(call, operator_bindings):
     )
 
 
-def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
+def _call_consumes_mutating_lazy_iterator(call, operator_bindings, bound_names=None):
     """Detect eager consumers of direct or saved risky map/filter iterators."""
     if not isinstance(call, ast.Call):
         return False
@@ -8679,6 +8686,7 @@ def _call_consumes_mutating_lazy_iterator(call, operator_bindings):
         or _named_builtin_consumes_mutating_lazy_iterator(
             call,
             operator_bindings,
+            bound_names,
         )
         or _builtin_module_consumes_mutating_lazy_iterator(
             call,
@@ -8765,9 +8773,13 @@ def _collect_mutating_lazy_iterator_alias_events(tree, operator_bindings):
     return events
 
 
-def _call_has_mutating_lambda_argument(call, operator_bindings):
+def _call_has_mutating_lambda_argument(call, operator_bindings, bound_names=None):
     """Detect callbacks only when the current call actually executes them."""
-    return _call_consumes_mutating_lazy_iterator(call, operator_bindings)
+    return _call_consumes_mutating_lazy_iterator(
+        call,
+        operator_bindings,
+        bound_names,
+    )
 
 
 
@@ -10194,7 +10206,7 @@ def _call_has_secondary_worker_mutation(
         or _call_is_chainmap_maps_update(expr, namespace_aliases, chainmap_aliases)
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings, bound_names)
-        or _call_has_mutating_lambda_argument(expr, operator_bindings)
+        or _call_has_mutating_lambda_argument(expr, operator_bindings, bound_names)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
         or _call_is_partial_operator_methodcaller_namespace_update(expr, operator_bindings)
@@ -14592,6 +14604,7 @@ def _class_body_statement_has_dynamic_workers_effect(
     dict_subclass_names,
     defer_annotations,
     global_workers_declared=False,
+    bound_names=None,
 ):
     """Return True when one class-body statement mutates the module ``workers``.
 
@@ -14642,6 +14655,7 @@ def _class_body_statement_has_dynamic_workers_effect(
         node,
         operator_bindings,
         dict_subclass_names,
+        bound_names,
     ):
         return True
     if _import_statement_after_builtins_import_hook(node, operator_bindings):
@@ -14659,9 +14673,19 @@ def _class_body_statement_has_dynamic_workers_effect(
             dict_subclass_names,
             defer_annotations,
             global_workers_declared,
+            bound_names,
         )
         for block in _compound_statement_blocks(node)
     )
+
+
+def _statement_bound_names(node):
+    """Return names bound by one statement in its enclosing scope."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    names = _statement_scope_bound_names(node)
+    names.update(_import_bound_names(node))
+    return names
 
 
 def _class_body_has_dynamic_workers_effect(
@@ -14672,14 +14696,18 @@ def _class_body_has_dynamic_workers_effect(
     dict_subclass_names,
     defer_annotations=False,
     global_workers_declared=False,
+    bound_names=None,
 ):
     """Return True when class-body statements mutate the module ``workers`` name.
 
     A class body runs while the ``class`` statement executes at config import,
     so ``globals()['workers'] = 4`` inside one must make the config dynamic,
     while a plain ``workers = 4`` class attribute only binds a class name.
+    Earlier class-body bindings shadow module globals for later statements,
+    which keeps a class-local ``sum = ...`` from reading as the builtin.
     """
     declared = global_workers_declared
+    local_names = set() if bound_names is None else set(bound_names)
     for node in statements:
         if isinstance(node, ast.Global) and "workers" in node.names:
             declared = True
@@ -14692,8 +14720,10 @@ def _class_body_has_dynamic_workers_effect(
             dict_subclass_names,
             defer_annotations,
             declared,
+            local_names,
         ):
             return True
+        local_names.update(_statement_bound_names(node))
     return False
 
 

@@ -233,3 +233,25 @@ def test_class_body_warnings_replacement_without_rebinding_is_dynamic(config_mod
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+# BUG-R8-F3: a class-local ``sum`` binding shadows the builtin consumer.
+def test_class_local_sum_shadow_consuming_mutating_map_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class C:\n"
+        "    sum = lambda values: 0\n"
+        "    sum(map(lambda _: globals().update({'workers': 4}), [1]))\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_class_body_bare_sum_consuming_mutating_map_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class C:\n"
+        "    sum(map(lambda _: globals().update({'workers': 4}), [1]))\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
