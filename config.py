@@ -4310,8 +4310,8 @@ def _assignment_targets(node):
     if isinstance(node, ast.Assign):
         return node.targets
     if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        return (node.target,)
-    return ()
+        return [node.target]
+    return []
 
 
 def _collect_builtins_dunder_import_replacement_lines(tree, operator_bindings):
