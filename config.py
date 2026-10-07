@@ -4198,6 +4198,20 @@ def _collect_warnings_showwarning_mutation_events(
     return events
 
 
+def _class_body_bound_names(statements):
+    """Return names a class body binds in its own namespace."""
+    names = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        names.update(_statement_scope_bound_names(node))
+        names.update(_import_bound_names(node))
+        for block in _compound_statement_blocks(node):
+            names.update(_class_body_bound_names(block))
+    return names
+
+
 def _scan_warnings_showwarning_mutation_events(
     statements,
     operator_bindings,
@@ -4205,13 +4219,16 @@ def _scan_warnings_showwarning_mutation_events(
     events,
     *,
     definite,
+    shadowed=frozenset(),
 ):
     """Record showwarning replacements, flagging straight-line module ones.
 
     Only a definitely executed (straight-line, unconditional) safe assignment
     clears an earlier mutating replacement; a safe assignment inside a compound
     statement or class body may be skipped at runtime, so it must not hide the
-    mutating hook. A mutating replacement anywhere still fails closed.
+    mutating hook. A mutating replacement anywhere still fails closed. Inside a
+    class body that locally rebinds the receiver name, ``receiver.showwarning``
+    targets that local name instead of the imported module and is ignored.
     """
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -4223,6 +4240,7 @@ def _scan_warnings_showwarning_mutation_events(
                 mutator_names,
                 events,
                 definite=False,
+                shadowed=_class_body_bound_names(node.body),
             )
             continue
         if isinstance(node, ast.Assign):
@@ -4232,6 +4250,10 @@ def _scan_warnings_showwarning_mutation_events(
                     target,
                     operator_bindings,
                     line,
+                )
+                and not (
+                    isinstance(target.value, ast.Name)
+                    and target.value.id in shadowed
                 )
                 for target in node.targets
             ):
@@ -4253,6 +4275,7 @@ def _scan_warnings_showwarning_mutation_events(
                 mutator_names,
                 events,
                 definite=False,
+                shadowed=shadowed,
             )
 
 

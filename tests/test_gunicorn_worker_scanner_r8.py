@@ -185,3 +185,51 @@ def test_conditional_safe_replacement_alone_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-F2: class-local ``warnings`` names never touch the imported module.
+def test_class_local_warnings_rebinding_keeps_mutating_hook(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "warnings.showwarning = w\n"
+        "class C:\n"
+        "    warnings = object()\n"
+        "    warnings.showwarning = lambda *args, **kwargs: None\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_class_local_mutating_warnings_replacement_alone_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "class Dummy:\n"
+        "    pass\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "class C:\n"
+        "    warnings = Dummy()\n"
+        "    warnings.showwarning = w\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_class_body_warnings_replacement_without_rebinding_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "class C:\n"
+        "    warnings.showwarning = w\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
