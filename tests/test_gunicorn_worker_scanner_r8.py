@@ -332,3 +332,57 @@ def test_assigned_object_init_barrier_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-F7: a metaclass __call__ bypassing type.__call__ never runs __init__.
+def test_metaclass_bypassing_initializer_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        return object()\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base, metaclass=Meta):\n"
+        "    pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_delegating_metaclass_runs_inherited_mutating_init(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        return super().__call__(*args, **kwargs)\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base, metaclass=Meta):\n"
+        "    pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_bypass_metaclass_rebound_to_plain_class_runs_mutating_init(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        return object()\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base, metaclass=Meta):\n"
+        "    pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)

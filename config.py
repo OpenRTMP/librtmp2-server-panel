@@ -9512,6 +9512,20 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         operator_bindings,
         class_methods,
     )
+    class_nodes = [
+        node for node in tree.body if isinstance(node, ast.ClassDef)
+    ]
+    class_nodes_by_name = {node.name: node for node in class_nodes}
+    metaclass_bypass_events = {}
+    for node, metaclass_name in _effective_metaclass_names(class_nodes):
+        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
+            metaclass_name,
+            class_nodes_by_name,
+            class_bases,
+        )
+        metaclass_bypass_events.setdefault(node.name, []).append(
+            (getattr(node, "lineno", 0), bypass)
+        )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
@@ -9541,6 +9555,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         enum_members,
         class_attributes,
         class_definition_lines,
+        metaclass_bypass_events,
     )
 
 
@@ -9562,6 +9577,78 @@ def _class_definition_line_at(definition_lines, class_name, reference_line):
             break
         line = definition_line
     return line
+
+
+def _function_delegates_type_call(func_node):
+    """Return True when a metaclass ``__call__`` reaches ``type.__call__``."""
+    for child in ast.walk(func_node):
+        if (
+            not isinstance(child, ast.Call)
+            or not isinstance(child.func, ast.Attribute)
+            or child.func.attr != "__call__"
+        ):
+            continue
+        receiver = child.func.value
+        if (
+            isinstance(receiver, ast.Call)
+            and isinstance(receiver.func, ast.Name)
+            and receiver.func.id == "super"
+        ):
+            return True
+        if isinstance(receiver, ast.Name) and receiver.id == "type":
+            return True
+    return False
+
+
+def _effective_metaclass_names(class_nodes):
+    """Return each class definition's explicit or inherited metaclass name."""
+    effective = {}
+    resolved = []
+    for node in class_nodes:
+        explicit = _explicit_metaclass_name(node)
+        if explicit is not None:
+            metaclass_name = explicit
+        else:
+            metaclass_name = next(
+                (
+                    effective[base.id]
+                    for base in node.bases
+                    if isinstance(base, ast.Name) and base.id in effective
+                ),
+                None,
+            )
+        resolved.append((node, metaclass_name))
+        if metaclass_name is None:
+            effective.pop(node.name, None)
+        else:
+            effective[node.name] = metaclass_name
+    return resolved
+
+
+def _metaclass_call_bypasses_initializer(
+    metaclass_name,
+    class_nodes_by_name,
+    class_bases,
+):
+    """Return True when the metaclass ``__call__`` never runs ``type.__call__``."""
+    for owner in _class_mro_names(metaclass_name, class_bases):
+        node = class_nodes_by_name.get(owner)
+        if node is None:
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == "__call__":
+                return not _function_delegates_type_call(stmt)
+    return False
+
+
+def _class_metaclass_bypasses_at_line(events, class_name, reference_line):
+    """Return True when the active class definition's metaclass bypasses __init__."""
+    state = False
+    for event_line, bypass in events.get(class_name, ()):
+        if reference_line and event_line > reference_line:
+            break
+        state = bypass
+    return state
 
 
 def _class_hook_is_active(class_targets, class_name, method_name, hooks, reference_line):
@@ -9750,6 +9837,15 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         return False
     if expr.func.id in constructors:
         return True
+    metaclass_bypass_events = (
+        class_targets[12] if len(class_targets) > 12 else {}
+    )
+    if _class_metaclass_bypasses_at_line(
+        metaclass_bypass_events,
+        expr.func.id,
+        reference_line,
+    ):
+        return False
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
     owner = _mro_method_mutation_owner(
