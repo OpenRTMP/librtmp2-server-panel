@@ -51,3 +51,33 @@ def test_non_mutating_showwarning_replacement_in_compound_block_stays_static(
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-P3-2: subclass construction runs an inherited mutating __init__.
+def test_subclass_inheriting_mutating_init_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_subclass_overriding_mutating_init_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)

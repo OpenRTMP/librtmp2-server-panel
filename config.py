@@ -9574,10 +9574,18 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
     """Return True when a ``ClassName(...)`` call constructs a risky class."""
     if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
         return False
-    return expr.func.id in constructors and _class_binding_is_active(
-        class_targets,
+    if not _class_binding_is_active(class_targets, expr.func.id, reference_line):
+        return False
+    if expr.func.id in constructors:
+        return True
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    return _class_hierarchy_defines_method(
+        class_targets[1],
+        class_bases,
         expr.func.id,
-        reference_line,
+        "__init__",
+        class_methods,
     )
 
 
