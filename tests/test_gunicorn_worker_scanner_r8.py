@@ -284,3 +284,36 @@ def test_import_rebound_module_f_globals_alias_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-F5: the base binding captured at subclass definition time wins.
+def test_subclass_of_earlier_base_binding_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Base:\n"
+        "    pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_subclass_of_rebound_safe_base_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Base:\n"
+        "    pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "Child()\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)

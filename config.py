@@ -9449,6 +9449,12 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
+    class_definition_lines = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            class_definition_lines.setdefault(node.name, []).append(
+                getattr(node, "lineno", 0)
+            )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
@@ -9477,6 +9483,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_methods,
         enum_members,
         class_attributes,
+        class_definition_lines,
     )
 
 
@@ -9488,6 +9495,16 @@ def _class_binding_is_active(class_targets, class_name, reference_line):
     if class_name not in events:
         return True
     return bool(_binding_state_at_line(events, class_name, reference_line))
+
+
+def _class_definition_line_at(definition_lines, class_name, reference_line):
+    """Return the last class definition line visible at ``reference_line``."""
+    line = 0
+    for definition_line in definition_lines.get(class_name, ()):
+        if reference_line and definition_line > reference_line:
+            break
+        line = definition_line
+    return line
 
 
 def _class_hook_is_active(class_targets, class_name, method_name, hooks, reference_line):
@@ -9553,6 +9570,24 @@ def _class_mro_names(class_name, class_bases, cache=None, active=None):
     return cache[class_name]
 
 
+def _mro_method_mutation_owner(
+    methods,
+    class_methods,
+    class_attributes,
+    mro_names,
+    method_name,
+):
+    """Return the first MRO owner with a mutating definition, if any."""
+    for owner in mro_names:
+        if (owner, method_name) in methods:
+            return owner
+        if class_methods is not None and (owner, method_name) in class_methods:
+            return None
+        if class_attributes is not None and (owner, method_name) in class_attributes:
+            return None
+    return None
+
+
 def _mro_method_mutation_state(
     methods,
     class_methods,
@@ -9561,14 +9596,13 @@ def _mro_method_mutation_state(
     method_name,
 ):
     """Return whether the first known MRO definition is mutating."""
-    for owner in mro_names:
-        if (owner, method_name) in methods:
-            return True
-        if class_methods is not None and (owner, method_name) in class_methods:
-            return False
-        if class_attributes is not None and (owner, method_name) in class_attributes:
-            return False
-    return False
+    return _mro_method_mutation_owner(
+        methods,
+        class_methods,
+        class_attributes,
+        mro_names,
+        method_name,
+    ) is not None
 
 
 def _class_hierarchy_defines_method(
@@ -9661,13 +9695,32 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         return True
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
-    return _class_hierarchy_defines_method(
+    owner = _mro_method_mutation_owner(
         class_targets[1],
-        class_bases,
-        expr.func.id,
-        "__init__",
         class_methods,
+        None,
+        _class_mro_names(expr.func.id, class_bases),
+        "__init__",
     )
+    if owner is None or owner == expr.func.id:
+        return owner is not None
+    class_definition_lines = (
+        class_targets[11] if len(class_targets) > 11 else {}
+    )
+    class_def_line = _class_definition_line_at(
+        class_definition_lines,
+        expr.func.id,
+        reference_line,
+    )
+    if class_def_line and not _class_binding_is_active(
+        class_targets,
+        owner,
+        class_def_line,
+    ):
+        # The subclass captured an earlier (non-mutating) binding of the base
+        # name, so a later mutating redefinition cannot provide its __init__.
+        return False
+    return True
 
 
 def _name_receiver_call_triggers_workers(
