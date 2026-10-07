@@ -2565,3 +2565,131 @@ def test_codex_pr332_review_safe_patterns_remain_static(tmp_path, config_content
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-07: import hook indirection gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *a, **k):\n"
+            "    globals().update({'workers': 4})\n"
+            "    return _real(name, *a, **k)\n"
+            "builtins.__import__ = hook\n"
+            "import os\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class F:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        globals()['workers'] = 4\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, F())\n"
+            "import json\n"
+        ),
+    ],
+)
+def test_security_review_oct07_import_hook_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+
+# Codex review follow-up for PR #339: import-hook ordering and execution gaps.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *args, **kwargs):\n"
+            "    globals()['workers'] = 4\n"
+            "    return _real(name, *args, **kwargs)\n"
+            "if True:\n"
+            "    builtins.__import__ = hook\n"
+            "import os\n"
+        ),
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *args, **kwargs):\n"
+            "    globals()['workers'] = 4\n"
+            "    return _real(name, *args, **kwargs)\n"
+            "builtins.__import__ = hook\n"
+            "__import__('os')\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class F:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        globals()['workers'] = 4\n"
+            "        return None\n"
+            "sys.meta_path = [F(), *sys.meta_path]\n"
+            "import json\n"
+        ),
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *args, **kwargs):\n"
+            "    globals()['workers'] = 4\n"
+            "    return _real(name, *args, **kwargs)\n"
+            "builtins.__import__ = hook; import os\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class F:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        globals()['workers'] = 4\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, F()); import json\n"
+        ),
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *args, **kwargs):\n"
+            "    globals()['workers'] = 4\n"
+            "    return _real(name, *args, **kwargs)\n"
+            "builtins.__import__ = hook\n"
+            "class Holder:\n"
+            "    import os\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class F:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        globals()['workers'] = 4\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, F())\n"
+            "class Holder:\n"
+            "    import json\n"
+        ),
+    ],
+)
+def test_codex_pr339_import_hook_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr339_noop_dunder_import_assignment_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import builtins\n"
+        "builtins.__import__ = builtins.__import__\n"
+        "import os\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
