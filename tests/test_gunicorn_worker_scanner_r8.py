@@ -129,3 +129,59 @@ def test_alias_of_untracked_name_in_stack_loop_stays_static(config_module):
     )
 
     assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+# BUG-R8-F1: only definite safe replacements may clear a mutating hook.
+def test_conditional_safe_replacement_after_mutating_hook_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "warnings.showwarning = w\n"
+        "if False:\n"
+        "    warnings.showwarning = lambda *args, **kwargs: None\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_conditional_mutating_replacement_is_dynamic(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "if True:\n"
+        "    warnings.showwarning = w\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, True)
+
+
+def test_definite_safe_replacement_after_mutating_hook_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "def w(*args, **kwargs):\n"
+        "    globals().update({'workers': 4})\n"
+        "warnings.showwarning = w\n"
+        "warnings.showwarning = lambda *args, **kwargs: None\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)
+
+
+def test_conditional_safe_replacement_alone_stays_static(config_module):
+    tree = ast.parse(
+        "workers = 1\n"
+        "import warnings\n"
+        "if True:\n"
+        "    warnings.showwarning = lambda *args, **kwargs: None\n"
+        "warnings.warn('x')\n"
+    )
+
+    assert config_module._scan_gunicorn_config_workers(tree) == (1, False)

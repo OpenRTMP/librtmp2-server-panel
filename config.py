@@ -4188,30 +4188,72 @@ def _collect_warnings_showwarning_mutation_events(
     if mutator_names is None:
         mutator_names = set()
     events = []
-    for node in _iter_import_time_statements(tree.body):
-        if not isinstance(node, ast.Assign):
-            continue
-        line = getattr(node, "lineno", 0)
-        if not any(
-            _warnings_showwarning_target_is_active(
-                target,
-                operator_bindings,
-                line,
-            )
-            for target in node.targets
-        ):
-            continue
-        events.append(
-            (
-                line,
-                _warnings_showwarning_value_mutates(
-                    node.value,
-                    operator_bindings,
-                    mutator_names,
-                ),
-            )
-        )
+    _scan_warnings_showwarning_mutation_events(
+        tree.body,
+        operator_bindings,
+        mutator_names,
+        events,
+        definite=True,
+    )
     return events
+
+
+def _scan_warnings_showwarning_mutation_events(
+    statements,
+    operator_bindings,
+    mutator_names,
+    events,
+    *,
+    definite,
+):
+    """Record showwarning replacements, flagging straight-line module ones.
+
+    Only a definitely executed (straight-line, unconditional) safe assignment
+    clears an earlier mutating replacement; a safe assignment inside a compound
+    statement or class body may be skipped at runtime, so it must not hide the
+    mutating hook. A mutating replacement anywhere still fails closed.
+    """
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            _scan_warnings_showwarning_mutation_events(
+                node.body,
+                operator_bindings,
+                mutator_names,
+                events,
+                definite=False,
+            )
+            continue
+        if isinstance(node, ast.Assign):
+            line = getattr(node, "lineno", 0)
+            if any(
+                _warnings_showwarning_target_is_active(
+                    target,
+                    operator_bindings,
+                    line,
+                )
+                for target in node.targets
+            ):
+                events.append(
+                    (
+                        line,
+                        _warnings_showwarning_value_mutates(
+                            node.value,
+                            operator_bindings,
+                            mutator_names,
+                        ),
+                        definite,
+                    )
+                )
+        for block in _compound_statement_blocks(node):
+            _scan_warnings_showwarning_mutation_events(
+                block,
+                operator_bindings,
+                mutator_names,
+                events,
+                definite=False,
+            )
 
 
 def _warnings_showwarning_mutates_at_line(operator_bindings, reference_line):
@@ -4222,13 +4264,16 @@ def _warnings_showwarning_mutates_at_line(operator_bindings, reference_line):
         else {}
     )
     state = False
-    for event_line, mutates in binding_store.get(
+    for event_line, mutates, definite in binding_store.get(
         "warnings_showwarning_mutation_events",
         (),
     ):
         if reference_line and event_line > reference_line:
             break
-        state = mutates
+        if mutates:
+            state = True
+        elif definite:
+            state = False
     return state
 
 
