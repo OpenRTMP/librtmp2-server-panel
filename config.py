@@ -4248,6 +4248,125 @@ def _call_is_warnings_warn_after_mutating_hook(call, operator_bindings):
     )
 
 
+def _builtins_module_alias_events(operator_bindings):
+    """Return source-ordered builtins module alias events when present."""
+    if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict):
+        return operator_bindings[32].get("builtins_module_alias_events", {})
+    return {}
+
+
+def _builtins_dunder_import_target_is_active(target, operator_bindings, reference_line):
+    """Return True when target assigns the active builtins module's __import__."""
+    if not isinstance(target, ast.Attribute) or target.attr != "__import__":
+        return False
+    receiver = target.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    return _imported_alias_is_active(
+        _builtins_module_alias_events(operator_bindings),
+        receiver.id,
+        reference_line,
+    )
+
+
+def _collect_builtins_dunder_import_replacement_lines(tree, operator_bindings):
+    """Return source lines where builtins.__import__ is replaced at import time."""
+    lines = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        line = getattr(node, "lineno", 0)
+        if any(
+            _builtins_dunder_import_target_is_active(
+                target,
+                operator_bindings,
+                line,
+            )
+            for target in node.targets
+        ):
+            lines.append(line)
+    return lines
+
+
+def _builtins_dunder_import_replaced_before_line(operator_bindings, reference_line):
+    """Return True when builtins.__import__ was replaced before reference_line."""
+    binding_store = (
+        operator_bindings[32]
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    for event_line in binding_store.get("builtins_dunder_import_replacement_lines", ()):
+        if reference_line and event_line < reference_line:
+            return True
+    return False
+
+
+def _import_statement_after_builtins_import_hook(node, operator_bindings):
+    """Return True when an import runs after a replaced builtins.__import__ hook."""
+    if not isinstance(node, (ast.Import, ast.ImportFrom)):
+        return False
+    reference_line = getattr(node, "lineno", 0)
+    return _builtins_dunder_import_replaced_before_line(
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _call_mutates_sys_meta_path(call, operator_bindings):
+    """Return True for sys.meta_path.insert/append/extend at config import time."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr not in {"insert", "append", "extend"}:
+        return False
+    meta_path = call.func.value
+    if not isinstance(meta_path, ast.Attribute) or meta_path.attr != "meta_path":
+        return False
+    receiver = meta_path.value
+    if not isinstance(receiver, ast.Name):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    sys_events = (
+        operator_bindings[32].get("sys_module_alias_events", {})
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    return _imported_alias_is_active(sys_events, receiver.id, reference_line)
+
+
+def _collect_sys_meta_path_mutation_lines(tree, operator_bindings):
+    """Return lines that register a custom import hook on sys.meta_path."""
+    lines = []
+    for node in tree.body:
+        expr = _statement_value_expression(node)
+        if isinstance(expr, ast.Call) and _call_mutates_sys_meta_path(
+            expr,
+            operator_bindings,
+        ):
+            lines.append(getattr(node, "lineno", 0))
+    return lines
+
+
+def _sys_meta_path_mutated_before_line(operator_bindings, reference_line):
+    """Return True when sys.meta_path was mutated before reference_line."""
+    binding_store = (
+        operator_bindings[32]
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    for event_line in binding_store.get("sys_meta_path_mutation_lines", ()):
+        if reference_line and event_line < reference_line:
+            return True
+    return False
+
+
+def _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
+    """Return True when an import may invoke a custom sys.meta_path hook."""
+    if not isinstance(node, (ast.Import, ast.ImportFrom)):
+        return False
+    reference_line = getattr(node, "lineno", 0)
+    return _sys_meta_path_mutated_before_line(operator_bindings, reference_line)
+
+
 def _call_is_dataclasses_field(call, operator_bindings, reference_line):
     """Return True for a proven ``dataclasses.field(...)`` / ``field(...)`` call."""
     func = call.func
@@ -14079,6 +14198,10 @@ def _node_has_dynamic_workers_effect(
         dict_subclass_names,
     ):
         return True
+    if _import_statement_after_builtins_import_hook(node, operator_bindings):
+        return True
+    if _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
+        return True
     return _import_from_binds_workers(node)
 
 
@@ -14942,6 +15065,12 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32]["warnings_warn_alias_events"] = (
         _collect_imported_name_alias_events(tree, "warnings", {"warn"})
     )
+    operator_bindings[32]["builtins_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "builtins")
+    )
+    operator_bindings[32]["builtins_dunder_import_replacement_lines"] = (
+        _collect_builtins_dunder_import_replacement_lines(tree, operator_bindings)
+    )
     operator_bindings[32]["dataclasses_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "dataclasses")
     )
@@ -14953,6 +15082,9 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32]["sys_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "sys")
+    )
+    operator_bindings[32]["sys_meta_path_mutation_lines"] = (
+        _collect_sys_meta_path_mutation_lines(tree, operator_bindings)
     )
     operator_bindings[32]["sys_getframe_alias_events"] = (
         _collect_imported_name_alias_events(tree, "sys", {"_getframe"})

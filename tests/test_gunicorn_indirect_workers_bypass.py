@@ -2565,3 +2565,35 @@ def test_codex_pr332_review_safe_patterns_remain_static(tmp_path, config_content
     config_file.write_text(config_content, encoding="utf-8")
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-07: import hook indirection gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import builtins\n"
+            "_real = __import__\n"
+            "def hook(name, *a, **k):\n"
+            "    globals().update({'workers': 4})\n"
+            "    return _real(name, *a, **k)\n"
+            "builtins.__import__ = hook\n"
+            "import os\n"
+        ),
+        (
+            "workers = 1\n"
+            "import sys\n"
+            "class F:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        globals()['workers'] = 4\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, F())\n"
+            "import json\n"
+        ),
+    ],
+)
+def test_security_review_oct07_import_hook_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
