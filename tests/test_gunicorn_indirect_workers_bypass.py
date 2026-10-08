@@ -2693,3 +2693,59 @@ def test_codex_pr339_noop_dunder_import_assignment_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-08: module-level super() dispatch gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "super(Child, Child).m()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @classmethod\n"
+            "    def m(cls):\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "super(Child, Child).m()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "getattr(super(Child, Child), 'm')()\n"
+        ),
+        (
+            "workers = 1\n"
+            "from functools import partial\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "partial(super(Child, Child).m)()\n"
+        ),
+    ],
+)
+def test_security_review_oct08_super_dispatch_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

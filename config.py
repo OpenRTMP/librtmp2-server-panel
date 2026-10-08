@@ -3506,6 +3506,15 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
             callback,
             operator_bindings,
         )
+    if isinstance(callback, ast.Attribute):
+        class_targets = _operator_bindings_class_targets(operator_bindings)
+        if class_targets and isinstance(callback.value, ast.Call):
+            return _super_method_call_triggers_workers(
+                callback.value,
+                callback.attr,
+                class_targets[1],
+                class_targets,
+            )
     return False
 
 
@@ -9974,6 +9983,71 @@ def _enum_member_call_triggers_workers(
     )
 
 
+def _explicit_super_call_class_name(super_call):
+    """Return the class name from ``super(Class)`` / ``super(Class, obj)``."""
+    if not (
+        isinstance(super_call, ast.Call)
+        and isinstance(super_call.func, ast.Name)
+        and super_call.func.id == "super"
+        and super_call.args
+        and isinstance(super_call.args[0], ast.Name)
+    ):
+        return None
+    return super_call.args[0].id
+
+
+def _super_method_call_triggers_workers(
+    super_call,
+    method_name,
+    methods,
+    class_targets,
+):
+    """Return True when ``super(Class, ...).method()`` reaches a mutating hook."""
+    class_name = _explicit_super_call_class_name(super_call)
+    if class_name is None:
+        return False
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    return _class_super_method_mutates(
+        methods,
+        class_bases,
+        class_name,
+        method_name,
+        class_methods,
+    )
+
+
+def _operator_bindings_class_targets(operator_bindings):
+    """Return class hook metadata stashed on the worker-scan binding tuple."""
+    if not operator_bindings:
+        return None
+    for item in reversed(operator_bindings):
+        if isinstance(item, dict) and "class_targets" in item:
+            return item["class_targets"]
+    return None
+
+
+def _getattr_super_method_call_triggers_workers(expr, methods, class_targets):
+    """Return True for ``getattr(super(Class, ...), 'method')()`` calls."""
+    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Call)):
+        return False
+    getattr_call = expr.func
+    if not (
+        isinstance(getattr_call.func, ast.Name)
+        and getattr_call.func.id == "getattr"
+        and len(getattr_call.args) >= 2
+        and isinstance(getattr_call.args[1], ast.Constant)
+        and isinstance(getattr_call.args[1].value, str)
+    ):
+        return False
+    return _super_method_call_triggers_workers(
+        getattr_call.args[0],
+        getattr_call.args[1].value,
+        methods,
+        class_targets,
+    )
+
+
 def _attribute_call_triggers_workers(
     expr,
     methods,
@@ -9986,6 +10060,17 @@ def _attribute_call_triggers_workers(
         return False
     method_name = expr.func.attr
     receiver = expr.func.value
+    if (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Name)
+        and receiver.func.id == "super"
+    ):
+        return _super_method_call_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
+        )
     if isinstance(receiver, ast.Name):
         return _name_receiver_call_triggers_workers(
             receiver,
@@ -10103,6 +10188,11 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
             class_targets,
             instance_events,
             reference_line,
+        )
+        or _getattr_super_method_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
         )
         or _attribute_access_triggers_workers(
             expr,
@@ -15860,6 +15950,7 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         inspect_analysis,
     )
+    inspect_analysis["class_targets"] = class_targets
     operator_bindings = (
         *operator_bindings,
         inspect_analysis,
