@@ -10049,6 +10049,8 @@ def _super_method_call_triggers_workers(
 
 def _super_descriptor_read_triggers_workers(super_call, name, class_targets):
     """A super attribute read invokes an inherited descriptor's __get__."""
+    if not isinstance(super_call, ast.Call):
+        return False
     tail = _super_mro_tail(super_call, class_targets)
     properties = class_targets[2]
     descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
