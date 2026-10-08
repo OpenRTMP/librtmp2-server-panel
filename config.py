@@ -15800,8 +15800,8 @@ def _scan_gunicorn_config_worker_details(tree):
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
     # Function bodies are scanned before the late inspect-analysis bundle exists.
-    # Keep class targets available for eager callback checks in those bodies.
-    operator_bindings = (*operator_bindings, {"class_targets": class_targets})
+    # Keep class targets in the existing metadata map, preserving tuple indices.
+    operator_bindings[32]["class_targets"] = class_targets
     import_time_workers_mutators = _collect_import_time_workers_mutators(
         tree,
         operator_bindings,
