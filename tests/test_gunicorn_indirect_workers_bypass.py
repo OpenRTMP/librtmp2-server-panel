@@ -2693,3 +2693,206 @@ def test_codex_pr339_noop_dunder_import_assignment_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-08: module-level super() dispatch gaps
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "super(Child, Child).m()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @classmethod\n"
+            "    def m(cls):\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "super(Child, Child).m()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "getattr(super(Child, Child), 'm')()\n"
+        ),
+        (
+            "workers = 1\n"
+            "from functools import partial\n"
+            "class Base:\n"
+            "    @staticmethod\n"
+            "    def m():\n"
+            "        globals()['workers'] = 4\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "partial(super(Child, Child).m)()\n"
+        ),
+    ],
+)
+def test_security_review_oct08_super_dispatch_gaps_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #342: super() dispatch, eager wrappers, and descriptor lookup
+_SUPER_MUTATING_HOOK_CONFIG = (
+    "workers = 1\n"
+    "class Base:\n"
+    "    @staticmethod\n"
+    "    def m():\n"
+    "        globals()['workers'] = 4\n"
+    "class Child(Base):\n"
+    "    pass\n"
+)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "super(Child, Child).m()",
+        "getattr(super(Child, Child), 'm')()",
+        "partial(super(Child, Child).m)()",
+        "partial(getattr(super(Child, Child), 'm'))()",
+        "operator.call(super(Child, Child).m)",
+        "operator.call(getattr(super(Child, Child), 'm'))",
+        "def run():\n    partial(super(Child, Child).m)()\nrun()",
+        "def run():\n    operator.call(super(Child, Child).m)\nrun()",
+    ],
+)
+def test_codex_pr342_eager_super_callbacks_are_dynamic(tmp_path, dispatch):
+    contents = (
+        "from functools import partial\n"
+        "import operator\n"
+        + _SUPER_MUTATING_HOOK_CONFIG
+        + dispatch
+        + "\n"
+    )
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(contents, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "super(B, C).m()",
+        "partial(super(B, C).m)()",
+        "operator.call(super(B, C).m)",
+    ],
+)
+def test_codex_pr342_super_resolves_second_argument_mro(tmp_path, dispatch):
+    contents = (
+        "from functools import partial\n"
+        "import operator\n"
+        "workers = 1\n"
+        "class A:\n"
+        "    @staticmethod\n"
+        "    def m():\n"
+        "        globals()['workers'] = 4\n"
+        "class B:\n"
+        "    pass\n"
+        "class C(B, A):\n"
+        "    pass\n"
+        + dispatch
+        + "\n"
+    )
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(contents, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "super(Child, Child).m",
+        "super(Child, Child).m()",
+        "getattr(super(Child, Child), 'm')",
+        "partial(getattr(super(Child, Child), 'm'))()",
+    ],
+)
+def test_codex_pr342_super_descriptor_get_is_dynamic(tmp_path, dispatch):
+    contents = (
+        "from functools import partial\n"
+        "workers = 1\n"
+        "class Descriptor:\n"
+        "    def __get__(self, instance, owner):\n"
+        "        globals()['workers'] = 4\n"
+        "        return lambda: None\n"
+        "class Base:\n"
+        "    m = Descriptor()\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        + dispatch
+        + "\n"
+    )
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(contents, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr342_super_instance_property_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    @property\n"
+        "    def m(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "super(Child, Child()).m\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr342_shadowed_super_is_not_builtin(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _SUPER_MUTATING_HOOK_CONFIG
+        + "class Safe:\n"
+        "    def m(self):\n"
+        "        pass\n"
+        "def super(*args):\n"
+        "    return Safe()\n"
+        "super(Child, Child).m()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_codex_pr342_super_mro_safe_override_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    @staticmethod\n"
+        "    def m():\n"
+        "        globals()['workers'] = 4\n"
+        "class Middle(Base):\n"
+        "    @staticmethod\n"
+        "    def m():\n"
+        "        pass\n"
+        "class Child(Middle):\n"
+        "    pass\n"
+        "super(Child, Child).m()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)

@@ -3482,7 +3482,11 @@ def _call_is_operator_call_mutating_callback(call, operator_bindings, bound_name
             callee,
             operator_bindings,
         )
-    return False
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    return bool(
+        class_targets
+        and _super_callback_method_triggers_workers(callee, class_targets)
+    )
 
 
 def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
@@ -3506,7 +3510,11 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
             callback,
             operator_bindings,
         )
-    return False
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    return bool(
+        class_targets
+        and _super_callback_method_triggers_workers(callback, class_targets)
+    )
 
 
 def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names=None):
@@ -9565,6 +9573,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_attributes,
         class_definition_lines,
         metaclass_bypass_events,
+        operator_bindings[32] if len(operator_bindings) > 32 else {},
     )
 
 
@@ -9974,6 +9983,157 @@ def _enum_member_call_triggers_workers(
     )
 
 
+def _explicit_super_call_class_name(super_call, class_targets):
+    """Return the class anchor only when ``super`` is the real builtin."""
+    if not (
+        isinstance(super_call, ast.Call)
+        and isinstance(super_call.func, ast.Name)
+        and super_call.func.id == "super"
+        and super_call.args
+        and isinstance(super_call.args[0], ast.Name)
+    ):
+        return None
+    shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+    if not _name_is_unshadowed_builtin(
+        "super", getattr(super_call, "lineno", 0), shadow_lines
+    ):
+        return None
+    return super_call.args[0].id
+
+
+def _super_mro_tail(super_call, class_targets):
+    """Resolve the MRO *after* super's first argument on its second argument."""
+    anchor = _explicit_super_call_class_name(super_call, class_targets)
+    if anchor is None:
+        return ()
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    # For super(B, C) the searched MRO belongs to C, not B. Also handle C().
+    owner = anchor
+    if len(super_call.args) >= 2:
+        second = super_call.args[1]
+        if isinstance(second, ast.Name):
+            owner = second.id
+        elif isinstance(second, ast.Call) and isinstance(second.func, ast.Name):
+            owner = second.func.id
+        else:
+            return ()
+    mro = _class_mro_names(owner, class_bases)
+    if anchor not in mro:
+        return ()
+    reference_line = getattr(super_call, "lineno", 0)
+    if not (
+        _class_binding_is_active(class_targets, anchor, reference_line)
+        and _class_binding_is_active(class_targets, owner, reference_line)
+    ):
+        return ()
+    return mro[mro.index(anchor) + 1:]
+
+
+def _super_method_call_triggers_workers(
+    super_call,
+    method_name,
+    methods,
+    class_targets,
+):
+    """Return whether super's actual resolved method mutates workers."""
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    class_attributes = class_targets[10] if len(class_targets) > 10 else None
+    return _mro_method_mutation_state(
+        methods,
+        class_methods,
+        class_attributes,
+        _super_mro_tail(super_call, class_targets),
+        method_name,
+    )
+
+
+def _super_descriptor_read_triggers_workers(super_call, name, class_targets):
+    """A super attribute read invokes an inherited descriptor's __get__."""
+    if not isinstance(super_call, ast.Call):
+        return False
+    tail = _super_mro_tail(super_call, class_targets)
+    properties = class_targets[2]
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
+    get_fields = descriptor_fields.get("__get__", set())
+    methods = class_targets[1]
+    class_methods = class_targets[8] if len(class_targets) > 8 else set()
+    class_attributes = class_targets[10] if len(class_targets) > 10 else set()
+    # Builtin property getters run on instance super(), not class super().
+    instance_read = (
+        len(super_call.args) >= 2
+        and isinstance(super_call.args[1], ast.Call)
+    )
+    for owner in tail:
+        key = (owner, name)
+        if key in get_fields or (instance_read and key in properties):
+            return True
+        if key in methods or key in class_methods or key in class_attributes:
+            return False
+        if key in properties:
+            return False
+    return False
+
+
+def _operator_bindings_class_targets(operator_bindings):
+    """Return class hook metadata stashed on the worker-scan binding tuple."""
+    if not operator_bindings:
+        return None
+    for item in reversed(operator_bindings):
+        if isinstance(item, dict) and "class_targets" in item:
+            return item["class_targets"]
+    return None
+
+
+def _super_getattr_target(expr, class_targets):
+    """Return (super call, attribute) for a source-valid builtin getattr."""
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "getattr"
+        and len(expr.args) >= 2
+        and isinstance(expr.args[1], ast.Constant)
+        and isinstance(expr.args[1].value, str)
+    ):
+        return None
+    shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+    if not _name_is_unshadowed_builtin(
+        "getattr", getattr(expr, "lineno", 0), shadow_lines
+    ):
+        return None
+    return expr.args[0], expr.args[1].value
+
+
+def _super_callback_method_triggers_workers(callback, class_targets):
+    """Resolve callable references used by partial, operator.call and getattr."""
+    if isinstance(callback, ast.Attribute) and isinstance(callback.value, ast.Call):
+        return _super_method_call_triggers_workers(
+            callback.value, callback.attr, class_targets[1], class_targets
+        )
+    target = _super_getattr_target(callback, class_targets)
+    return bool(
+        target
+        and _super_method_call_triggers_workers(
+            target[0], target[1], class_targets[1], class_targets
+        )
+    )
+
+
+def _getattr_super_method_call_triggers_workers(expr, methods, class_targets):
+    """Return True for ``getattr(super(...), 'method')()`` calls."""
+    del methods  # Obtained from class_targets in the shared callback resolver.
+    return isinstance(expr, ast.Call) and _super_callback_method_triggers_workers(
+        expr.func, class_targets
+    )
+
+
+def _getattr_super_descriptor_read_triggers_workers(expr, class_targets):
+    """Return True when getattr(super(...), name) invokes a mutating descriptor."""
+    target = _super_getattr_target(expr, class_targets)
+    return bool(target and _super_descriptor_read_triggers_workers(
+        target[0], target[1], class_targets
+    ))
+
+
 def _attribute_call_triggers_workers(
     expr,
     methods,
@@ -9986,6 +10146,17 @@ def _attribute_call_triggers_workers(
         return False
     method_name = expr.func.attr
     receiver = expr.func.value
+    if (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Name)
+        and receiver.func.id == "super"
+    ):
+        return _super_method_call_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
+        )
     if isinstance(receiver, ast.Name):
         return _name_receiver_call_triggers_workers(
             receiver,
@@ -10035,6 +10206,13 @@ def _attribute_access_triggers_workers(
         instance_read = True
     elif isinstance(expr.value, ast.Name):
         class_name = expr.value.id
+    if (
+        isinstance(expr.value, ast.Call)
+        and _explicit_super_call_class_name(expr.value, class_targets) is not None
+    ):
+        return _super_descriptor_read_triggers_workers(
+            expr.value, expr.attr, class_targets
+        )
     if class_name is None:
         return False
     get_fields = descriptor_fields.get("__get__", set())
@@ -10104,6 +10282,12 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
             instance_events,
             reference_line,
         )
+        or _getattr_super_method_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+        )
+        or _getattr_super_descriptor_read_triggers_workers(expr, class_targets)
         or _attribute_access_triggers_workers(
             expr,
             properties,
@@ -14536,7 +14720,7 @@ def _collect_operator_setitem_bindings(tree):
             'globals', 'getattr', 'object', 'staticmethod', 'classmethod', 'property',
             'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
-            'iter', 'reversed', 'vars', 'sum',
+            'iter', 'reversed', 'vars', 'sum', 'super',
         }
     }
     builtin_shadow_lines = {
@@ -15617,6 +15801,9 @@ def _scan_gunicorn_config_worker_details(tree):
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
     dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
+    # Function bodies are scanned before the late inspect-analysis bundle exists.
+    # Keep class targets in the existing metadata map, preserving tuple indices.
+    operator_bindings[32]["class_targets"] = class_targets
     import_time_workers_mutators = _collect_import_time_workers_mutators(
         tree,
         operator_bindings,
@@ -15860,6 +16047,7 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         inspect_analysis,
     )
+    inspect_analysis["class_targets"] = class_targets
     operator_bindings = (
         *operator_bindings,
         inspect_analysis,
