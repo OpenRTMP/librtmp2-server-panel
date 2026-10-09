@@ -166,7 +166,15 @@ def _validate_optional_access_keys(publish_key, play_key, stats_key):
 def _normalize_streams_list(streams):
     """Return a list of stream dicts; tolerate malformed API payloads."""
     if isinstance(streams, list):
-        return [item for item in streams if isinstance(item, dict)]
+        # index.html builds url_for() targets from stream.id, so entries
+        # without a usable id would raise BuildError and 500 the page.
+        return [
+            item
+            for item in streams
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item["id"]
+        ]
     return []
 
 
@@ -476,7 +484,13 @@ class _PanelRuntime:
         raw_players = stream.get("players")
         if not isinstance(raw_players, list):
             raw_players = []
-        players = [dict(player) for player in raw_players if isinstance(player, dict)]
+        players = [
+            dict(player)
+            for player in raw_players
+            if isinstance(player, dict)
+            and isinstance(player.get("id"), str)
+            and player["id"]
+        ]
         stream["players"] = players
         self._add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port)
         first_play_key = self._first_play_key(stream, players)
@@ -808,7 +822,13 @@ class _PanelRuntime:
             # cluster.html calls node.get(...) unguarded, so a non-object entry
             # would raise jinja2.UndefinedError and 500 the whole page. Same
             # element filter the streams/players/cluster-streams loaders apply.
-            nodes = [n for n in nodes if isinstance(n, dict)]
+            # cluster.html also builds url_for(..., node_id=node.id) targets, so
+            # a node without an id is dropped instead of raising BuildError.
+            nodes = [
+                n
+                for n in nodes
+                if isinstance(n, dict) and n.get("id") is not None
+            ]
             # cluster.html formats and divides these metrics, so a mistyped
             # scalar would raise TypeError in Jinja and 500 the whole page.
             for node in nodes:
