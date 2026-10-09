@@ -220,4 +220,75 @@ def test_module_namespace_mapping_aliases(config_module, source, expected):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
 
 
+_MATCH_PATTERN_CASES = [
+    (
+        "mapping pattern capture of workers is dynamic",
+        "workers = 1\n"
+        "match {'workers': 4}:\n"
+        "    case {'workers': workers}:\n"
+        "        pass\n",
+        (1, True),
+    ),
+    (
+        "bare name pattern capture of workers is dynamic",
+        "workers = 1\nmatch 4:\n    case workers:\n        pass\n",
+        (1, True),
+    ),
+    (
+        "star pattern capture of workers is dynamic",
+        "workers = 1\nmatch [1]:\n    case [*workers]:\n        pass\n",
+        (1, True),
+    ),
+    (
+        "mapping rest pattern capture of workers is dynamic",
+        "workers = 1\nmatch {'a': 1}:\n    case {**workers}:\n        pass\n",
+        (1, True),
+    ),
+    (
+        "class pattern capture of workers is dynamic",
+        "workers = 1\nmatch 4:\n    case int(workers):\n        pass\n",
+        (1, True),
+    ),
+    (
+        "or-pattern capture of workers is dynamic",
+        "workers = 1\nmatch 4:\n    case 1 | workers:\n        pass\n",
+        (1, True),
+    ),
+    (
+        "as-pattern capture of workers is dynamic",
+        "workers = 1\nmatch 4:\n    case 4 as workers:\n        pass\n",
+        (1, True),
+    ),
+    (
+        "mapping pattern capture of another name stays static",
+        "workers = 1\nmatch {'a': 1}:\n    case {'a': value}:\n        pass\n",
+        (1, False),
+    ),
+    (
+        "wildcard pattern stays static",
+        "workers = 1\nmatch 4:\n    case _:\n        pass\n",
+        (1, False),
+    ),
+    (
+        "function-local pattern capture stays static",
+        "workers = 1\n"
+        "def f(value):\n"
+        "    match value:\n"
+        "        case workers:\n"
+        "            return workers\n"
+        "f(4)\n",
+        (1, False),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _MATCH_PATTERN_CASES],
+    ids=[case[0] for case in _MATCH_PATTERN_CASES],
+)
+def test_match_case_pattern_bindings(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
 # --- end of round-9 scanner regressions ---

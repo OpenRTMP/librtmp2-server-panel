@@ -11033,6 +11033,30 @@ def _workers_binding_removal(node, operator_bindings=None):
     return False
 
 
+def _pattern_binds_workers(pattern):
+    """Return True when a match case pattern captures the ``workers`` name."""
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.name == "workers" or (
+            pattern.pattern is not None and _pattern_binds_workers(pattern.pattern)
+        )
+    if isinstance(pattern, ast.MatchStar):
+        return pattern.name == "workers"
+    if isinstance(pattern, ast.MatchMapping):
+        return pattern.rest == "workers" or any(
+            _pattern_binds_workers(sub_pattern) for sub_pattern in pattern.patterns
+        )
+    if isinstance(pattern, (ast.MatchSequence, ast.MatchOr)):
+        return any(
+            _pattern_binds_workers(sub_pattern) for sub_pattern in pattern.patterns
+        )
+    if isinstance(pattern, ast.MatchClass):
+        return any(
+            _pattern_binds_workers(sub_pattern)
+            for sub_pattern in (*pattern.patterns, *pattern.kwd_patterns)
+        )
+    return False
+
+
 def _worker_assignment_value(node, operator_bindings=None):
     """Return whether node assigns workers and its static value when available."""
     if _workers_binding_removal(node, operator_bindings):
@@ -11068,6 +11092,11 @@ def _worker_assignment_value(node, operator_bindings=None):
             and _target_assigns_workers(item.optional_vars)
             for item in node.items
         ):
+            return True, None
+        return False, None
+
+    if isinstance(node, ast.Match):
+        if any(_pattern_binds_workers(case.pattern) for case in node.cases):
             return True, None
         return False, None
 
