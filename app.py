@@ -108,8 +108,8 @@ def _is_usable_id(value):
 
     index.html builds its ``.../<id>/...`` links from upstream ids, and only a
     scalar id can fill one: the URL builder reads JSON null as a missing value
-    and raises BuildError, and a container would be stringified into a rule
-    value no route matches. Same id set the cluster lookups accept.
+    and raises BuildError, while a container is a malformed upstream id that
+    cannot address a stream. Same id set the cluster lookups accept.
     """
     return isinstance(value, CLUSTER_KEY_TYPES)
 

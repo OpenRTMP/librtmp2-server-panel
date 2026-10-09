@@ -650,6 +650,21 @@ def _evaluated_in_nested_scope(active=True):
         _nested_scope_depth -= 1
 
 
+def _namespace_accessor_name_is_unshadowed(node, namespace_aliases=None):
+    """Return True while an argument-less ``locals()``/``vars()`` names the builtin.
+
+    A config that binds its own ``locals``/``vars`` hides the builtin, so the
+    call returns that config value rather than the module namespace. The shadow
+    state collected for the scan travels with the alias set; a call site
+    without it stays fail-closed.
+    """
+    return _name_is_unshadowed_builtin(
+        node.func.id,
+        getattr(node, "lineno", 0),
+        getattr(namespace_aliases, "builtin_shadow_lines", None),
+    )
+
+
 def _is_module_namespace_mapping(node, namespace_aliases=None):
     """Return True for mappings known to be the current module namespace."""
     if namespace_aliases is None:
@@ -660,18 +675,17 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
         return _is_module_namespace_mapping(node.value, namespace_aliases)
     if _is_globals_call(node):
         return True
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"locals", "vars"}
-        and not node.args
-        and not node.keywords
-    ):
-        # Both calls return the module namespace only at module scope; inside a
-        # function, lambda or class body they return that body's own namespace,
-        # which cannot change the module ``workers`` binding. The walks that
-        # descend into such a body mark it with ``_evaluated_in_nested_scope``.
-        return _nested_scope_depth == 0
+    if _is_namespace_accessor_call(node):
+        # Both calls return the module namespace only at module scope, and only
+        # while the name still names the builtin: inside a function, lambda or
+        # class body they return that body's own namespace, which cannot change
+        # the module ``workers`` binding, and a config that rebinds either name
+        # has hidden the builtin. The walks that descend into such a body mark
+        # it with ``_evaluated_in_nested_scope``.
+        return _nested_scope_depth == 0 and _namespace_accessor_name_is_unshadowed(
+            node,
+            namespace_aliases,
+        )
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
         return _namespace_aliases_reference_current_module(
             node.value, namespace_aliases
@@ -729,7 +743,22 @@ def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     return _update_payload_may_set_workers(call)
 
 
-def _call_is_attribute_instance_update_workers(call, shadowed_names=None):
+def _is_namespace_accessor_call(node):
+    """Return True for an argument-less ``locals()`` or ``vars()`` call."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"locals", "vars"}
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _call_is_attribute_instance_update_workers(
+    call,
+    shadowed_names=None,
+    namespace_aliases=None,
+):
     """Return True for instance ``mapping.update({...})`` with a workers payload."""
     if not isinstance(call, ast.Call):
         return False
@@ -743,6 +772,11 @@ def _call_is_attribute_instance_update_workers(call, shadowed_names=None):
             return False
         if receiver.id == "dict":
             return False
+    elif _is_namespace_accessor_call(receiver):
+        # A ``locals()``/``vars()`` receiver names the module namespace only at
+        # module scope and only while the builtin is visible, so the update is
+        # risky in exactly that case.
+        return _is_module_namespace_mapping(receiver, namespace_aliases)
     return _update_payload_may_set_workers(call)
 
 
@@ -985,7 +1019,11 @@ def _call_is_delegated_simplenamespace_update(
 
 
 
-def _expression_has_risky_instance_update(expr, shadowed_names=None):
+def _expression_has_risky_instance_update(
+    expr,
+    shadowed_names=None,
+    namespace_aliases=None,
+):
     """Return True when an expression calls instance ``.update()`` with workers."""
     if shadowed_names is None:
         shadowed_names = set()
@@ -994,10 +1032,15 @@ def _expression_has_risky_instance_update(expr, shadowed_names=None):
     if isinstance(expr, ast.Call) and _call_is_attribute_instance_update_workers(
         expr,
         shadowed_names,
+        namespace_aliases,
     ):
         return True
     return any(
-        _expression_has_risky_instance_update(child, shadowed_names)
+        _expression_has_risky_instance_update(
+            child,
+            shadowed_names,
+            namespace_aliases,
+        )
         for child in ast.iter_child_nodes(expr)
     )
 
@@ -5821,20 +5864,22 @@ def _named_callback_mutates_workers(callback, operator_bindings):
         return True
     if not isinstance(callback, ast.Name):
         return False
-    mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
-    if callback.id in mutator_names:
-        return True
     callback_events = _future_analysis_state(operator_bindings).get(
         "callback_alias_events",
         {},
     )
-    return bool(
-        _ordered_binding_state_at_position(
-            callback_events,
-            callback.id,
-            callback,
-        )
+    active_state = _ordered_binding_state_at_position(
+        callback_events,
+        callback.id,
+        callback,
     )
+    if active_state is not None:
+        # The consumer resolves the name to the binding active at the call, so
+        # a workers-mutating definition the name no longer holds cannot make
+        # the call mutating.
+        return bool(active_state)
+    mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
+    return callback.id in mutator_names
 
 
 def _thread_pool_constructor_initializer(constructor, operator_bindings):
@@ -6345,6 +6390,26 @@ def _callback_alias_value_mutates_workers(
     )
 
 
+def _definition_mutates_workers(node, operator_bindings):
+    """Return True when this definition's own body may mutate ``workers``.
+
+    ``mutator_names`` is a property of the name: one mutating definition marks
+    every definition of that name, so a consumer that resolves the name to a
+    later safe redefinition must not inherit it. The per-definition verdict the
+    import-time fixpoint uses answers the same question here.
+    """
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
+    return _function_mutates_workers(
+        node,
+        operator_bindings,
+        mutator_names,
+        _operator_bindings_class_targets(operator_bindings),
+        _operator_bindings_dict_subclass_names(operator_bindings),
+    )
+
+
 def _record_callback_alias_events(
     node,
     operator_bindings,
@@ -6356,7 +6421,10 @@ def _record_callback_alias_events(
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         if not conditional:
             events.setdefault(node.name, []).append(
-                _future_binding_event(node, False)
+                _future_binding_event(
+                    node,
+                    _definition_mutates_workers(node, operator_bindings),
+                )
             )
         return
     for name, value in _namespace_assignment_values(node):
@@ -10138,11 +10206,21 @@ def _super_descriptor_read_triggers_workers(super_call, name, class_targets):
 
 def _operator_bindings_class_targets(operator_bindings):
     """Return class hook metadata stashed on the worker-scan binding tuple."""
+    return _operator_bindings_metadata(operator_bindings, "class_targets")
+
+
+def _operator_bindings_dict_subclass_names(operator_bindings):
+    """Return dict subclass metadata stashed on the worker-scan binding tuple."""
+    return _operator_bindings_metadata(operator_bindings, "dict_subclass_names")
+
+
+def _operator_bindings_metadata(operator_bindings, key):
+    """Return one metadata value stashed on the worker-scan binding tuple."""
     if not operator_bindings:
         return None
     for item in reversed(operator_bindings):
-        if isinstance(item, dict) and "class_targets" in item:
-            return item["class_targets"]
+        if isinstance(item, dict) and key in item:
+            return item[key]
     return None
 
 
@@ -10761,6 +10839,16 @@ def _expression_mutates_workers(
         bound_names,
     ):
         return True
+    if isinstance(
+        expr,
+        (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        return _comprehension_mutates_workers(
+            expr,
+            operator_bindings,
+            dict_subclass_names,
+            bound_names,
+        )
     return any(
         _expression_mutates_workers(
             child,
@@ -10770,6 +10858,49 @@ def _expression_mutates_workers(
         )
         for child in ast.iter_child_nodes(expr)
     )
+
+
+def _comprehension_scope_expressions(expr):
+    """Return the comprehension parts evaluated in the comprehension's scope.
+
+    A comprehension runs in an implicit function scope, so its result
+    expression and every generator condition and later iterable name that
+    scope; only the outermost iterable is evaluated in the enclosing scope.
+    """
+    if isinstance(expr, ast.DictComp):
+        expressions = [expr.key, expr.value]
+    else:
+        expressions = [expr.elt]
+    for generator in expr.generators:
+        expressions.extend(generator.ifs)
+    expressions.extend(generator.iter for generator in expr.generators[1:])
+    return expressions
+
+
+def _comprehension_mutates_workers(
+    expr,
+    operator_bindings,
+    dict_subclass_names=None,
+    bound_names=None,
+):
+    """Return True when a comprehension evaluates a workers mutation."""
+    if _expression_mutates_workers(
+        expr.generators[0].iter,
+        operator_bindings,
+        dict_subclass_names,
+        bound_names,
+    ):
+        return True
+    with _evaluated_in_nested_scope():
+        return any(
+            _expression_mutates_workers(
+                expression,
+                operator_bindings,
+                dict_subclass_names,
+                bound_names,
+            )
+            for expression in _comprehension_scope_expressions(expr)
+        )
 
 
 
@@ -10793,10 +10924,12 @@ def _lambda_mutates_workers(lambda_node, operator_bindings):
     """Return True when an invoked lambda body mutates ``workers`` indirectly."""
     if not isinstance(lambda_node, ast.Lambda):
         return False
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     with _evaluated_in_nested_scope():
         if _expression_has_risky_instance_update(
             lambda_node.body,
             _lambda_bound_names(lambda_node),
+            namespace_aliases,
         ):
             return True
         return _expression_mutates_workers(
@@ -14831,7 +14964,7 @@ def _collect_operator_setitem_bindings(tree):
             'globals', 'getattr', 'object', 'staticmethod', 'classmethod', 'property',
             'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
-            'iter', 'reversed', 'vars', 'sum', 'super',
+            'iter', 'reversed', 'vars', 'locals', 'sum', 'super',
         }
     }
     builtin_shadow_lines = {
@@ -14891,6 +15024,10 @@ def _collect_operator_setitem_bindings(tree):
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
     )
+    # ``locals()``/``vars()`` name the module namespace only while the builtin
+    # is still visible, so the alias set carries the shadow state to the call
+    # sites that classify them.
+    namespace_aliases.builtin_shadow_lines = builtin_shadow_lines
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
         tree, namespace_aliases, partial_aliases, dict_update_aliases, dict_shadow_line, dict_ior_aliases
@@ -15676,7 +15813,9 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
     already in, which is what makes a ``def`` in a plain block bind at module
     scope. Entering a function outside a class is what consults
     ``uncalled_names``: a body no reference can reach cannot run, and a hook
-    bound in it never reaches the module namespace.
+    bound in it never reaches the module namespace. A lambda or comprehension
+    body is a function scope of its own too, but it only ever holds expressions,
+    so it enters the function scope without consulting ``uncalled_names``.
     """
     in_class, declared_globals, may_run, _ = scope
     if isinstance(child, ast.ClassDef):
@@ -15690,6 +15829,16 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
             may_run and child.name not in uncalled_names,
             True,
         )
+    if isinstance(
+        child,
+        (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        # A lambda or comprehension body runs in an implicit function scope of
+        # its own, so an argument-less ``locals()``/``vars()`` inside it names
+        # that scope rather than the module namespace. Only an explicit
+        # namespace mutation can reach the module from there, and its liveness
+        # depends on the enclosing body alone, so ``may_run`` is preserved.
+        return (in_class, declared_globals, may_run, True)
     return scope
 
 
@@ -15918,6 +16067,7 @@ def _scan_gunicorn_config_worker_details(tree):
     # Function bodies are scanned before the late inspect-analysis bundle exists.
     # Keep class targets in the existing metadata map, preserving tuple indices.
     operator_bindings[32]["class_targets"] = class_targets
+    operator_bindings[32]["dict_subclass_names"] = dict_subclass_names
     import_time_workers_mutators = _collect_import_time_workers_mutators(
         tree,
         operator_bindings,

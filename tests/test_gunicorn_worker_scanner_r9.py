@@ -514,4 +514,327 @@ def test_nested_scope_locals_update_keeps_config_static(
     assert config_module._ratelimit_storage_error() is None
 
 
+_SHADOWED_NAMESPACE_ACCESSOR_CASES = [
+    (
+        "locals rebound to a lambda stays static",
+        "workers = 1\nlocals = lambda: {}\nlocals().update({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "vars rebound to a lambda stays static",
+        "workers = 1\nvars = lambda: {}\nvars().update({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "function rebound as locals stays static",
+        "workers = 1\n"
+        "def locals():\n"
+        "    return {}\n"
+        "locals().update({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "class rebound as vars stays static",
+        "workers = 1\nclass vars:\n    pass\nvars().update({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "rebound locals ior stays static",
+        "workers = 1\nlocals = dict\nlocals().__ior__({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "unshadowed locals update stays dynamic",
+        "workers = 1\nlocals().update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "unshadowed vars update stays dynamic",
+        "workers = 1\nvars().update(workers=4)\n",
+        (1, True),
+    ),
+    (
+        "locals restored from the builtins module stays dynamic",
+        "workers = 1\n"
+        "import builtins\n"
+        "locals = builtins.locals\n"
+        "locals().update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "conditional locals rebinding stays dynamic",
+        "workers = 1\n"
+        "if True:\n"
+        "    locals = lambda: {}\n"
+        "locals().update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "rebound vars does not hide locals",
+        "workers = 1\nvars = lambda: {}\nlocals().update({'workers': 4})\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _SHADOWED_NAMESPACE_ACCESSOR_CASES],
+    ids=[case[0] for case in _SHADOWED_NAMESPACE_ACCESSOR_CASES],
+)
+def test_shadowed_namespace_accessors(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+_NESTED_EXPRESSION_SCOPE_CASES = [
+    (
+        "invoked lambda locals update stays static",
+        "workers = 1\n(lambda: locals().update({'workers': 4}))()\n",
+        (1, False),
+    ),
+    (
+        "invoked lambda vars update stays static",
+        "workers = 1\n(lambda: vars().update(workers=4))()\n",
+        (1, False),
+    ),
+    (
+        "lambda key callback locals update stays static",
+        "workers = 1\n"
+        "sorted([1], key=lambda item: locals().update({'workers': 4}))\n",
+        (1, False),
+    ),
+    (
+        "list comprehension locals update stays static",
+        "workers = 1\n[locals().update({'workers': 4}) for _ in (0,)]\n",
+        (1, False),
+    ),
+    (
+        "set comprehension vars update stays static",
+        "workers = 1\n{vars().update({'workers': 4}) for _ in (0,)}\n",
+        (1, False),
+    ),
+    (
+        "dict comprehension locals update stays static",
+        "workers = 1\n{0: locals().update({'workers': 4}) for _ in (0,)}\n",
+        (1, False),
+    ),
+    (
+        "generator expression locals update stays static",
+        "workers = 1\nlist(locals().update({'workers': 4}) for _ in (0,))\n",
+        (1, False),
+    ),
+    (
+        "comprehension condition locals update stays static",
+        "workers = 1\n[1 for _ in (0,) if locals().update({'workers': 4})]\n",
+        (1, False),
+    ),
+    (
+        "lambda bound to a name and invoked stays static",
+        "workers = 1\nfn = lambda: locals().update({'workers': 4})\nfn()\n",
+        (1, False),
+    ),
+    (
+        "comprehension outermost iterable locals update stays dynamic",
+        "workers = 1\n[x for x in locals().update({'workers': 4})]\n",
+        (1, True),
+    ),
+    (
+        "invoked lambda globals update stays dynamic",
+        "workers = 1\n(lambda: globals().update({'workers': 4}))()\n",
+        (1, True),
+    ),
+    (
+        "comprehension globals update stays dynamic",
+        "workers = 1\n[globals().update({'workers': 4}) for _ in (0,)]\n",
+        (1, True),
+    ),
+    (
+        "comprehension walrus target stays dynamic",
+        "workers = 1\n[workers := 4 for _ in (0,)]\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _NESTED_EXPRESSION_SCOPE_CASES],
+    ids=[case[0] for case in _NESTED_EXPRESSION_SCOPE_CASES],
+)
+def test_nested_expression_scope_mutations(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+_CALL_SITE_CALLBACK_BINDING_CASES = [
+    (
+        "safe redefinition before the sorted call stays static",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "bump = lambda value: value\n"
+        "sorted([1], key=bump)\n",
+        (1, False),
+    ),
+    (
+        "safe redefinition before the map call stays static",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "bump = lambda value: value\n"
+        "list(map(bump, [1]))\n",
+        (1, False),
+    ),
+    (
+        "safe redefinition before the max call stays static",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "bump = lambda value: value\n"
+        "max([1], key=bump)\n",
+        (1, False),
+    ),
+    (
+        "mutating definition after the consumer call stays static",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    return value\n"
+        "sorted([1], key=bump)\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n",
+        (1, False),
+    ),
+    (
+        "safe definition then safe redefinition stays static",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    return value\n"
+        "bump = lambda value: value\n"
+        "sorted([1], key=bump)\n",
+        (1, False),
+    ),
+    (
+        "named key callback without a rebinding stays dynamic",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "sorted([1], key=bump)\n",
+        (1, True),
+    ),
+    (
+        "redefinition after the consumer call stays dynamic",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "sorted([1], key=bump)\n"
+        "bump = lambda value: value\n",
+        (1, True),
+    ),
+    (
+        "safe definition replaced by a mutating lambda stays dynamic",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    return value\n"
+        "bump = lambda value: globals().update({'workers': 4})\n"
+        "sorted([1], key=bump)\n",
+        (1, True),
+    ),
+    (
+        "conditional mutating definition stays dynamic",
+        "workers = 1\n"
+        "if True:\n"
+        "    def bump(value):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "sorted([1], key=bump)\n",
+        (1, True),
+    ),
+    (
+        "alias of a mutating definition stays dynamic",
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "alias = bump\n"
+        "sorted([1], key=alias)\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _CALL_SITE_CALLBACK_BINDING_CASES],
+    ids=[case[0] for case in _CALL_SITE_CALLBACK_BINDING_CASES],
+)
+def test_call_site_callback_bindings(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+def test_rebound_namespace_accessor_keeps_config_static(
+    monkeypatch, tmp_path, config_module
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "locals = lambda: {}\n"
+        "locals().update({'workers': 4})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (1, False)
+    assert config_module._ratelimit_storage_error() is None
+
+
+def test_comprehension_scope_keeps_config_static(monkeypatch, tmp_path, config_module):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "[locals().update({'workers': 4}) for _ in (0,)]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (1, False)
+    assert config_module._ratelimit_storage_error() is None
+
+
+def test_rebound_callback_keeps_config_static(monkeypatch, tmp_path, config_module):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def bump(value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "bump = lambda value: value\n"
+        "sorted([1], key=bump)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (1, False)
+    assert config_module._ratelimit_storage_error() is None
+
+
 # --- end of round-9 scanner regressions ---
