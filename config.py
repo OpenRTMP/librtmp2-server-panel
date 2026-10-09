@@ -4767,7 +4767,7 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
         return False
     lambda_node = call.args[0]
     if not isinstance(lambda_node, ast.Lambda):
-        return False
+        return _named_callback_mutates_workers(lambda_node, operator_bindings)
     if _lambda_mutates_workers(lambda_node, operator_bindings):
         return True
     if name == "filter" and len(call.args) > 1:
@@ -5196,8 +5196,11 @@ def _key_lambda_mutates_workers(call, operator_bindings):
     """Return True when a key callback executed by this call mutates workers."""
     return any(
         keyword.arg == 'key'
-        and isinstance(keyword.value, ast.Lambda)
-        and _lambda_mutates_workers(keyword.value, operator_bindings)
+        and (
+            _lambda_mutates_workers(keyword.value, operator_bindings)
+            if isinstance(keyword.value, ast.Lambda)
+            else _named_callback_mutates_workers(keyword.value, operator_bindings)
+        )
         for keyword in call.keywords
     )
 
@@ -5754,6 +5757,29 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     """Return whether one pool callback can mutate module workers."""
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if _expression_is_namespace_update_reference(callback, namespace_aliases):
+        return True
+    if not isinstance(callback, ast.Name):
+        return False
+    mutator_names = operator_bindings[46] if len(operator_bindings) > 46 else set()
+    if callback.id in mutator_names:
+        return True
+    callback_events = _future_analysis_state(operator_bindings).get(
+        "callback_alias_events",
+        {},
+    )
+    return bool(
+        _ordered_binding_state_at_position(
+            callback_events,
+            callback.id,
+            callback,
+        )
+    )
+
+
+def _named_callback_mutates_workers(callback, operator_bindings):
+    """Return whether a named callback can mutate module workers."""
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
         return True
