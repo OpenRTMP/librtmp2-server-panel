@@ -11054,6 +11054,15 @@ def _worker_assignment_value(node, operator_bindings=None):
     if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
         return True, _static_int_from_ast(node.value)
 
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        if any(
+            item.optional_vars is not None
+            and _target_assigns_workers(item.optional_vars)
+            for item in node.items
+        ):
+            return True, None
+        return False, None
+
     return False, None
 
 

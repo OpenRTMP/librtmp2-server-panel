@@ -99,4 +99,70 @@ def test_named_builtin_consumer_callbacks(config_module, source, expected):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
 
 
+_CONTEXT_MANAGER = (
+    "from contextlib import contextmanager\n"
+    "@contextmanager\n"
+    "def cm():\n"
+    "    yield 4\n"
+)
+
+_WITH_TARGET_CASES = [
+    (
+        "module with-statement target binding workers is dynamic",
+        "workers = 1\n" + _CONTEXT_MANAGER + "with cm() as workers:\n    pass\n",
+        (1, True),
+    ),
+    (
+        "module with-statement tuple target binding workers is dynamic",
+        "workers = 1\n"
+        + _CONTEXT_MANAGER
+        + "with cm() as (workers, other):\n"
+        "    pass\n",
+        (1, True),
+    ),
+    (
+        "second with-statement item binding workers is dynamic",
+        "workers = 1\n"
+        + _CONTEXT_MANAGER
+        + "with cm() as first, cm() as workers:\n"
+        "    pass\n",
+        (1, True),
+    ),
+    (
+        "with-statement target binding another name stays static",
+        "workers = 1\nwith open('/dev/null') as handle:\n    pass\n",
+        (1, False),
+    ),
+    (
+        "function-local with-statement target stays static",
+        "workers = 1\n"
+        "def f():\n"
+        "    with open('/dev/null') as workers:\n"
+        "        pass\n"
+        "f()\n",
+        (1, False),
+    ),
+    (
+        "global-declaring function async with target is dynamic",
+        "workers = 1\n"
+        "import asyncio\n"
+        "async def main():\n"
+        "    global workers\n"
+        "    async with asyncio.Lock() as workers:\n"
+        "        pass\n"
+        "asyncio.run(main())\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _WITH_TARGET_CASES],
+    ids=[case[0] for case in _WITH_TARGET_CASES],
+)
+def test_with_statement_target_bindings(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
 # --- end of round-9 scanner regressions ---
