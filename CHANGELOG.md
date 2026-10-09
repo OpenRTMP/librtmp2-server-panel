@@ -24,6 +24,10 @@ only begin at a future `1.0.0`.
   `operator.attrgetter('__dict__')`, `locals()`/`vars()`, walrus and lambda
   forms, `with` and `match` targets, config class constructors and named
   callbacks passed to builtins that consume them eagerly.
+- The same guard now also reads the worker count the way Gunicorn does from
+  the command line and the environment: compact config flags (`-cPATH`,
+  `-c=PATH`) and integer spellings such as `-w 1_6` or `WEB_CONCURRENCY=1_6`
+  no longer slip past it.
 
 ### Fixed
 - The panel failed to start when a Gunicorn config shadowed and later
@@ -37,10 +41,13 @@ only begin at a future `1.0.0`.
   players are listed without a delete link.
 - Cluster view: mistyped or non-object node entries and cluster-level metrics
   are normalized before rendering, and proxied publisher statistics are shown
-  instead of "offline".
-- Admin mutations (including deleting a player) use a longer timeout (30 s),
-  because the server answers only after its per-peer cluster calls; deleting a
-  stream waits for the server's full drain window before reporting failure.
+  instead of "offline". An object or array `stream_id` in
+  `/api/v1/cluster/streams` is skipped instead of failing the dashboard with
+  HTTP 500.
+- Deleting a stream or a player and the cluster node actions (drain, resume,
+  remove) use a longer timeout (30 s), because the server answers only after
+  its per-peer cluster calls; deleting a stream waits for the server's full
+  drain window before reporting failure.
 - POST routes have their default rate limits again.
 
 ### Documentation
