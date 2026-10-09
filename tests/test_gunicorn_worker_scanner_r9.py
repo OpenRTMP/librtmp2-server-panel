@@ -165,4 +165,59 @@ def test_with_statement_target_bindings(config_module, source, expected):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
 
 
+_MODULE_NAMESPACE_MAPPING_CASES = [
+    (
+        "locals update payload mutating workers is dynamic",
+        "workers = 1\nlocals().update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "argument-less vars update payload mutating workers is dynamic",
+        "workers = 1\nvars().update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "dict.update over locals is dynamic",
+        "workers = 1\ndict.update(locals(), {'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "locals setitem payload mutating workers is dynamic",
+        "workers = 1\nlocals().__setitem__('workers', 4)\n",
+        (1, True),
+    ),
+    (
+        "one-argument vars over the module namespace is still dynamic",
+        "workers = 1\n"
+        "import sys\n"
+        "vars(sys.modules[__name__]).update({'workers': 4})\n",
+        (1, True),
+    ),
+    (
+        "saved locals mapping stays static",
+        "workers = 1\nns = locals()\n",
+        (1, False),
+    ),
+    (
+        "locals update payload without workers stays static",
+        "workers = 1\nlocals().update({'other': 4})\n",
+        (1, False),
+    ),
+    (
+        "one-argument vars over a class namespace stays static",
+        "workers = 1\nclass C:\n    pass\nvars(C).update({'workers': 4})\n",
+        (1, False),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _MODULE_NAMESPACE_MAPPING_CASES],
+    ids=[case[0] for case in _MODULE_NAMESPACE_MAPPING_CASES],
+)
+def test_module_namespace_mapping_aliases(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
 # --- end of round-9 scanner regressions ---

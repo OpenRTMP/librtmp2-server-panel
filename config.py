@@ -636,6 +636,14 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
         return _is_module_namespace_mapping(node.value, namespace_aliases)
     if _is_globals_call(node):
         return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"locals", "vars"}
+        and not node.args
+        and not node.keywords
+    ):
+        return True
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
         return _namespace_aliases_reference_current_module(
             node.value, namespace_aliases
