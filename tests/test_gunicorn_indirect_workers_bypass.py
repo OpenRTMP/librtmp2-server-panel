@@ -2929,3 +2929,126 @@ def test_security_review_oct09_indirect_constructor_gaps_are_dynamic(
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #345: invoked lambda scope and inherited-constructor regressions.
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "(lambda: (Child(), None)[1])()",
+        "(lambda: [None, Child()][0])()",
+        "(lambda: {'done': Child()}['done'])()",
+    ],
+)
+def test_codex_pr345_nested_lambda_constructor_is_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("(lambda Child: Child())(Safe)", False),
+        ("(lambda Child: Child())(Child)", True),
+        ("(lambda *, Child: Child())(Child=Safe)", False),
+        ("(lambda *, Child: Child())(Child=Child)", True),
+    ],
+)
+def test_codex_pr345_lambda_shadowing_resolves_actual_argument(
+    tmp_path, dispatch, is_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "[Child][0](1)",
+        "(Child,)[0](1, named=True)",
+    ],
+)
+def test_codex_pr345_literal_constructor_with_arguments_is_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr345_dynamic_type_calls_init_subclass(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init_subclass__(cls, **kwargs):\n"
+        "        globals()['workers'] = 4\n"
+        "type('Dynamic', (Base,), {})()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "import operator\noperator.call(Child)",
+        "from functools import partial\npartial(Child)()",
+        "Child()",
+    ],
+)
+def test_codex_pr345_inherited_mutating_new_is_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __new__(cls, *args, **kwargs):\n"
+        "        globals()['workers'] = 4\n"
+        "        return object.__new__(cls)\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr345_overridden_inherited_new_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __new__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "        return object.__new__(cls)\n"
+        "class Child(Base):\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "Child()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
