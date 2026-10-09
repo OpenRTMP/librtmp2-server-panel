@@ -3077,3 +3077,36 @@ def test_codex_pr345_indirect_lambda_class_argument_binding(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (
         1, is_dynamic
     )
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "type('Dynamic', (Base,), {})",
+        "type('Dynamic', (Base,), {'__init__': lambda self: None})()",
+    ],
+)
+def test_codex_pr345_init_subclass_runs_during_class_creation(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init_subclass__(cls, **kwargs):\n"
+        "        globals()['workers'] = 4\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr345_dynamic_type_safe_init_ignores_inherited_init(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "type('Dynamic', (Child,), {'__init__': lambda self: None})()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, False
+    )
