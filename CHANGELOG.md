@@ -13,6 +13,43 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- The Gunicorn `workers` scanner, which keeps `RATELIMIT_STORAGE_URI=memory://`
+  and the per-process session store from running under a multi-worker
+  Gunicorn, now catches many more indirect ways a config can change the worker
+  count at import time and fails closed on them: frame globals
+  (`inspect.stack()`, `sys._getframe()`, `f_globals`), import hooks and
+  import-time callbacks, inherited and `super()` hooks, class bodies, instance
+  methods and properties, descriptors, enum aliases,
+  `operator.attrgetter('__dict__')`, `locals()`/`vars()`, walrus and lambda
+  forms, `with` and `match` targets, config class constructors and named
+  callbacks passed to builtins that consume them eagerly.
+
+### Fixed
+- The panel failed to start when a Gunicorn config shadowed and later
+  restored the builtin `dict`, because the scanner crashed with a
+  `TypeError` instead of returning a verdict.
+- Scanner false positives: a `workers` annotation without a value, descriptor
+  reads, true enum members, subclass attributes and later rebinding of
+  imported names are no longer treated as dynamic worker counts.
+- The dashboard no longer returns HTTP 500 when the server reports an upstream
+  or player entry with a `null` id: such upstreams are skipped, and such
+  players are listed without a delete link.
+- Cluster view: mistyped or non-object node entries and cluster-level metrics
+  are normalized before rendering, and proxied publisher statistics are shown
+  instead of "offline".
+- Admin mutations (including deleting a player) use a longer timeout (30 s),
+  because the server answers only after its per-peer cluster calls; deleting a
+  stream waits for the server's full drain window before reporting failure.
+- POST routes have their default rate limits again.
+
+### Documentation
+- The README dashboard screenshot is re-taken from the current panel against a
+  real librtmp2-server with a live stream and three players.
+
+### Accessibility
+- The login page no longer autofocuses the username field.
+
 ## [0.1.10] — 2026-09-28
 
 ### Security
