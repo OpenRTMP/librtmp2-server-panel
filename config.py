@@ -3478,9 +3478,16 @@ def _call_is_operator_call_mutating_callback(call, operator_bindings, bound_name
     if isinstance(callee, ast.Lambda):
         return _lambda_mutates_workers(callee, operator_bindings)
     if isinstance(callee, ast.Name):
-        return _mutating_callback_alias_is_active(
-            callee,
-            operator_bindings,
+        return (
+            _mutating_callback_alias_is_active(
+                callee,
+                operator_bindings,
+            )
+            or _class_name_instantiation_triggers_workers(
+                callee.id,
+                getattr(call, "lineno", 0),
+                operator_bindings,
+            )
         )
     class_targets = _operator_bindings_class_targets(operator_bindings)
     return bool(
@@ -3506,9 +3513,16 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
     if isinstance(callback, ast.Name):
-        return _mutating_callback_alias_is_active(
-            callback,
-            operator_bindings,
+        return (
+            _mutating_callback_alias_is_active(
+                callback,
+                operator_bindings,
+            )
+            or _class_name_instantiation_triggers_workers(
+                callback.id,
+                getattr(call, "lineno", 0),
+                operator_bindings,
+            )
         )
     class_targets = _operator_bindings_class_targets(operator_bindings)
     return bool(
@@ -9894,6 +9908,67 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
     return True
 
 
+def _class_name_instantiation_triggers_workers(
+    class_name,
+    reference_line,
+    operator_bindings,
+):
+    """Return True when ``ClassName()`` would run a mutating constructor hook."""
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
+        return False
+    constructors = class_targets[0]
+    synthetic = ast.Call(
+        func=ast.Name(id=class_name, ctx=ast.Load()),
+        args=[],
+        keywords=[],
+    )
+    return _class_call_triggers_workers(
+        synthetic,
+        constructors,
+        class_targets,
+        reference_line,
+    )
+
+
+def _iterable_literal_class_instantiation_triggers_workers(
+    value,
+    reference_line,
+    operator_bindings,
+):
+    """Return True when a literal container holds a risky class constructor."""
+    if not isinstance(value, (ast.List, ast.Tuple)):
+        return False
+    return any(
+        isinstance(element, ast.Name)
+        and _class_name_instantiation_triggers_workers(
+            element.id,
+            reference_line,
+            operator_bindings,
+        )
+        for element in value.elts
+    )
+
+
+def _type_constructor_bases_trigger_workers(constructor, operator_bindings):
+    """Return True when a dynamic ``type(...)`` base list includes a risky class."""
+    if len(constructor.args) < 2:
+        return False
+    bases = constructor.args[1]
+    if not isinstance(bases, (ast.Tuple, ast.List)):
+        return False
+    reference_line = getattr(constructor, "lineno", 0)
+    return any(
+        isinstance(base, ast.Name)
+        and _class_name_instantiation_triggers_workers(
+            base.id,
+            reference_line,
+            operator_bindings,
+        )
+        for base in bases.elts
+    )
+
+
 def _name_receiver_call_triggers_workers(
     receiver,
     method_name,
@@ -10382,7 +10457,9 @@ def _call_is_type_constructor_side_effect(call, operator_bindings):
         constructor.keywords,
         operator_bindings,
     )
-    return bool(keyword_effect)
+    if keyword_effect:
+        return True
+    return _type_constructor_bases_trigger_workers(constructor, operator_bindings)
 
 
 def _partial_reduce_initializer(partial_call, invocation, invocation_start):
@@ -10631,6 +10708,9 @@ def _call_expression_mutates_workers(
     bound_names=None,
 ):
     """Return True when one call expression can mutate module workers."""
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Lambda):
+        if _lambda_mutates_workers(expr.func, operator_bindings):
+            return True
     return (
         _call_consumes_mutating_generator(
             expr,
@@ -10734,6 +10814,12 @@ def _lambda_mutates_workers(lambda_node, operator_bindings):
     if _expression_has_risky_instance_update(
         lambda_node.body,
         _lambda_bound_names(lambda_node),
+    ):
+        return True
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if class_targets and _expression_triggers_class_workers_side_effect(
+        lambda_node.body,
+        class_targets,
     ):
         return True
     return _expression_mutates_workers(
@@ -13842,6 +13928,13 @@ def _call_is_literal_callback_invocation(call, operator_bindings):
     if _mutating_callback_alias_is_active(call.func, operator_bindings):
         return True
     if isinstance(call.func, ast.Subscript):
+        reference_line = getattr(call, "lineno", 0)
+        if _iterable_literal_class_instantiation_triggers_workers(
+            call.func.value,
+            reference_line,
+            operator_bindings,
+        ):
+            return True
         return _callback_container_expression_is_mutating(
             call.func.value,
             operator_bindings,

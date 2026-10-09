@@ -2896,3 +2896,36 @@ def test_codex_pr342_super_mro_safe_override_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-09: indirect inherited-constructor instantiation gaps
+_INHERITED_MUTATING_INIT_CONFIG = (
+    "workers = 1\n"
+    "class Base:\n"
+    "    def __init__(self):\n"
+    "        globals()['workers'] = 4\n"
+    "class Child(Base):\n"
+    "    pass\n"
+)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "from functools import partial\npartial(Child)()",
+        "import operator\noperator.call(Child)",
+        "(lambda: Child())()",
+        "[Child][0]()",
+        "type('', (Child,), {})()",
+    ],
+)
+def test_security_review_oct09_indirect_constructor_gaps_are_dynamic(
+    tmp_path,
+    dispatch,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
