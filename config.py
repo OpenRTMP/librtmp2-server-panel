@@ -1,4 +1,5 @@
 import ast
+import contextlib
 import ipaddress
 import os
 import re
@@ -626,6 +627,29 @@ def _is_structural_attrgetter_module_namespace_mapping(
     )
 
 
+# ``locals()`` and an argument-less ``vars()`` name the module namespace only
+# while module scope is the current scope: inside a function, lambda or class
+# body they name that body's own namespace. The walks that descend into such a
+# body raise this while they inspect it, so ``_is_module_namespace_mapping`` can
+# tell the two apart without every helper in the call chain having to carry the
+# enclosing scope.
+_nested_scope_depth = 0
+
+
+@contextlib.contextmanager
+def _evaluated_in_nested_scope(active=True):
+    """Mark the nodes inspected inside the block as nested-scope nodes."""
+    global _nested_scope_depth
+    if not active:
+        yield
+        return
+    _nested_scope_depth += 1
+    try:
+        yield
+    finally:
+        _nested_scope_depth -= 1
+
+
 def _is_module_namespace_mapping(node, namespace_aliases=None):
     """Return True for mappings known to be the current module namespace."""
     if namespace_aliases is None:
@@ -643,7 +667,11 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
         and not node.args
         and not node.keywords
     ):
-        return True
+        # Both calls return the module namespace only at module scope; inside a
+        # function, lambda or class body they return that body's own namespace,
+        # which cannot change the module ``workers`` binding. The walks that
+        # descend into such a body mark it with ``_evaluated_in_nested_scope``.
+        return _nested_scope_depth == 0
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
         return _namespace_aliases_reference_current_module(
             node.value, namespace_aliases
@@ -10765,16 +10793,17 @@ def _lambda_mutates_workers(lambda_node, operator_bindings):
     """Return True when an invoked lambda body mutates ``workers`` indirectly."""
     if not isinstance(lambda_node, ast.Lambda):
         return False
-    if _expression_has_risky_instance_update(
-        lambda_node.body,
-        _lambda_bound_names(lambda_node),
-    ):
-        return True
-    return _expression_mutates_workers(
-        lambda_node.body,
-        operator_bindings,
-        bound_names=_lambda_bound_names(lambda_node),
-    )
+    with _evaluated_in_nested_scope():
+        if _expression_has_risky_instance_update(
+            lambda_node.body,
+            _lambda_bound_names(lambda_node),
+        ):
+            return True
+        return _expression_mutates_workers(
+            lambda_node.body,
+            operator_bindings,
+            bound_names=_lambda_bound_names(lambda_node),
+        )
 
 
 def _call_is_subscript_namespace_workers_update(
@@ -11675,23 +11704,28 @@ def _function_mutates_workers(
     class_targets=None,
     dict_subclass_names=None,
 ):
-    """Return True when a function may mutate the module ``workers`` binding."""
-    if _statements_start_mutating_thread(
-        func_node.body,
-        operator_bindings,
-        mutator_names,
-    ):
-        return True
-    has_global_workers = _statements_declare_global_workers(func_node.body)
-    return _statements_mutate_workers(
-        func_node.body,
-        operator_bindings,
-        global_workers=has_global_workers,
-        mutator_names=mutator_names,
-        class_targets=class_targets,
-        dict_subclass_names=dict_subclass_names,
-        bound_names=_function_local_bound_names(func_node),
-    )
+    """Return True when a function may mutate the module ``workers`` binding.
+
+    The body runs in the function's own scope, which is what the nested-scope
+    marker around the walk below tells ``_is_module_namespace_mapping``.
+    """
+    with _evaluated_in_nested_scope():
+        if _statements_start_mutating_thread(
+            func_node.body,
+            operator_bindings,
+            mutator_names,
+        ):
+            return True
+        has_global_workers = _statements_declare_global_workers(func_node.body)
+        return _statements_mutate_workers(
+            func_node.body,
+            operator_bindings,
+            global_workers=has_global_workers,
+            mutator_names=mutator_names,
+            class_targets=class_targets,
+            dict_subclass_names=dict_subclass_names,
+            bound_names=_function_local_bound_names(func_node),
+        )
 
 
 
@@ -15201,23 +15235,24 @@ def _class_body_has_dynamic_workers_effect(
     """
     declared = global_workers_declared
     local_names = set() if bound_names is None else set(bound_names)
-    for node in statements:
-        if isinstance(node, ast.Global) and "workers" in node.names:
-            declared = True
-            continue
-        if _class_body_statement_has_dynamic_workers_effect(
-            node,
-            global_workers_mutators,
-            operator_bindings,
-            class_targets,
-            dict_subclass_names,
-            defer_annotations,
-            declared,
-            local_names,
-        ):
-            return True
-        local_names.update(_statement_bound_names(node))
-    return False
+    with _evaluated_in_nested_scope():
+        for node in statements:
+            if isinstance(node, ast.Global) and "workers" in node.names:
+                declared = True
+                continue
+            if _class_body_statement_has_dynamic_workers_effect(
+                node,
+                global_workers_mutators,
+                operator_bindings,
+                class_targets,
+                dict_subclass_names,
+                defer_annotations,
+                declared,
+                local_names,
+            ):
+                return True
+            local_names.update(_statement_bound_names(node))
+        return False
 
 
 def _handle_worker_scan_definition(
@@ -15751,12 +15786,14 @@ def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
     stack = [(tree, (False, frozenset(), True, False))]
     while stack:
         node, scope = stack.pop()
-        for child in ast.iter_child_nodes(node):
-            if _is_live_gunicorn_hook_binding(child, scope, namespace_aliases):
-                return True
-            stack.append(
-                (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
-            )
+        in_class, _declared_globals, _may_run, in_function = scope
+        with _evaluated_in_nested_scope(in_class or in_function):
+            for child in ast.iter_child_nodes(node):
+                if _is_live_gunicorn_hook_binding(child, scope, namespace_aliases):
+                    return True
+                stack.append(
+                    (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
+                )
     return False
 
 

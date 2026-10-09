@@ -343,4 +343,175 @@ def test_bare_workers_annotation_keeps_web_concurrency(
     assert config_module._ratelimit_storage_error() is not None
 
 
+_NESTED_SCOPE_NAMESPACE_MAPPING_CASES = [
+    (
+        "function locals update stays static",
+        "workers = 1\ndef f(cfg):\n    locals().update(cfg)\nf({})\n",
+        (1, False),
+    ),
+    (
+        "function argument-less vars update stays static",
+        "workers = 1\ndef f(**cfg):\n    vars().update(cfg)\nf()\n",
+        (1, False),
+    ),
+    (
+        "function vars update with keyword payload stays static",
+        "workers = 1\ndef f(cfg):\n    vars().update(workers=4)\n    return cfg\nf({})\n",
+        (1, False),
+    ),
+    (
+        "function dict.update over locals stays static",
+        "workers = 1\ndef f(cfg):\n    dict.update(locals(), cfg)\nf({})\n",
+        (1, False),
+    ),
+    (
+        "function dict.__setitem__ over locals stays static",
+        "workers = 1\n"
+        "def f(cfg):\n"
+        "    dict.__setitem__(locals(), 'workers', 4)\n"
+        "f({})\n",
+        (1, False),
+    ),
+    (
+        "function locals ior stays static",
+        "workers = 1\ndef f(cfg):\n    locals().__ior__(cfg)\nf({})\n",
+        (1, False),
+    ),
+    (
+        "function locals subscript store stays static",
+        "workers = 1\n"
+        "def f(name, value):\n"
+        "    locals()[name] = value\n"
+        "f('workers', 4)\n",
+        (1, False),
+    ),
+    (
+        "function subscript store in a loop stays static",
+        "workers = 1\n"
+        "def f(cfg):\n"
+        "    for k, v in cfg.items():\n"
+        "        locals()[k] = v\n"
+        "f({})\n",
+        (1, False),
+    ),
+    (
+        "function try-block vars update stays static",
+        "workers = 1\n"
+        "def f(cfg):\n"
+        "    try:\n"
+        "        vars().update(cfg)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "f({})\n",
+        (1, False),
+    ),
+    (
+        "async function locals update stays static",
+        "workers = 1\nasync def f(cfg):\n    locals().update(cfg)\nf({})\n",
+        (1, False),
+    ),
+    (
+        "generator locals update stays static",
+        "workers = 1\n"
+        "def f(cfg):\n"
+        "    yield 1\n"
+        "    locals().update(cfg)\n"
+        "list(f({}))\n",
+        (1, False),
+    ),
+    (
+        "nested function argument-less vars update stays static",
+        "workers = 1\n"
+        "def g():\n"
+        "    def f(cfg):\n"
+        "        vars().update(cfg)\n"
+        "    f({})\n"
+        "g()\n",
+        (1, False),
+    ),
+    (
+        "decorated helper locals update stays static",
+        "workers = 1\n"
+        "def deco(fn):\n"
+        "    locals().update({'workers': 4})\n"
+        "    return fn\n"
+        "@deco\n"
+        "def hook():\n"
+        "    pass\n",
+        (1, False),
+    ),
+    (
+        "method locals update stays static",
+        "workers = 1\nclass C:\n    def m(self):\n        locals().update(workers=4)\n",
+        (1, False),
+    ),
+    (
+        "method dict.update over locals stays static",
+        "workers = 1\n"
+        "class C:\n"
+        "    def m(self, cfg):\n"
+        "        dict.update(locals(), cfg)\n",
+        (1, False),
+    ),
+    (
+        "class body locals update stays static",
+        "workers = 1\nclass C:\n    locals().update({'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "class body dict.update over locals stays static",
+        "workers = 1\n"
+        "class C:\n"
+        "    dict.update(locals(), {'workers': 4})\n",
+        (1, False),
+    ),
+    (
+        "module-level dict.__setitem__ over locals stays dynamic",
+        "workers = 1\ndict.__setitem__(locals(), 'workers', 4)\n",
+        (1, True),
+    ),
+    (
+        "module-level argument-less vars update with keywords stays dynamic",
+        "workers = 1\nvars().update(workers=4)\n",
+        (1, True),
+    ),
+    (
+        "module-level locals update in a block stays dynamic",
+        "workers = 1\nif True:\n    locals().update({'workers': 4})\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _NESTED_SCOPE_NAMESPACE_MAPPING_CASES],
+    ids=[case[0] for case in _NESTED_SCOPE_NAMESPACE_MAPPING_CASES],
+)
+def test_nested_scope_namespace_mapping_aliases(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+def test_nested_scope_locals_update_keeps_config_static(
+    monkeypatch, tmp_path, config_module
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def load(cfg):\n"
+        "    vars().update(cfg)\n"
+        "load({'debug': True})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (1, False)
+    assert config_module._ratelimit_storage_error() is None
+
+
 # --- end of round-9 scanner regressions ---
