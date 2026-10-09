@@ -3476,7 +3476,14 @@ def _call_is_operator_call_mutating_callback(call, operator_bindings, bound_name
         return False
     callee = call.args[0]
     if isinstance(callee, ast.Lambda):
-        return _lambda_mutates_workers(callee, operator_bindings)
+        invocation = ast.Call(
+            func=callee,
+            args=call.args[1:],
+            keywords=call.keywords,
+        )
+        return _lambda_mutates_workers(
+            callee, operator_bindings, invocation=invocation
+        )
     if isinstance(callee, ast.Name):
         return (
             _mutating_callback_alias_is_active(
@@ -3502,7 +3509,7 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
         return False
     partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    partial_call, _ = _resolve_partial_invocation(
+    partial_call, invocation_start = _resolve_partial_invocation(
         call,
         partial_aliases,
         builtin_shadow_lines,
@@ -3511,7 +3518,14 @@ def _call_is_partial_mutating_callback_invocation(call, operator_bindings):
         return False
     callback = partial_call.args[0]
     if isinstance(callback, ast.Lambda):
-        return _lambda_mutates_workers(callback, operator_bindings)
+        invocation = ast.Call(
+            func=callback,
+            args=[*partial_call.args[1:], *call.args[invocation_start:]],
+            keywords=[*partial_call.keywords, *call.keywords],
+        )
+        return _lambda_mutates_workers(
+            callback, operator_bindings, invocation=invocation
+        )
     if isinstance(callback, ast.Name):
         return (
             _mutating_callback_alias_is_active(
