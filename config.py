@@ -9978,35 +9978,38 @@ def _iterable_literal_class_instantiation_triggers_workers(
     )
 
 
-def _type_constructor_bases_trigger_workers(constructor, operator_bindings):
-    """Return True when a dynamic ``type(...)`` base list includes a risky class."""
+def _type_constructor_bases_trigger_workers(
+    constructor, operator_bindings, *, creation_only=False, skip_init=False
+):
+    """Detect mutating base hooks during dynamic class creation or instantiation."""
     if len(constructor.args) < 2:
         return False
     bases = constructor.args[1]
     if not isinstance(bases, (ast.Tuple, ast.List)):
         return False
-    reference_line = getattr(constructor, "lineno", 0)
     class_targets = _operator_bindings_class_targets(operator_bindings)
-    return any(
-        isinstance(base, ast.Name)
-        and (
-            _class_name_instantiation_triggers_workers(
-                base.id,
-                reference_line,
-                operator_bindings,
-            )
-            or (
-                class_targets
-                and _class_mro_hook_triggers_workers(
-                    base.id,
-                    "__init_subclass__",
-                    class_targets,
-                    reference_line,
-                )
-            )
-        )
-        for base in bases.elts
-    )
+    if not class_targets:
+        return False
+    reference_line = getattr(constructor, "lineno", 0)
+    for base in bases.elts:
+        if not isinstance(base, ast.Name):
+            continue
+        if _class_mro_hook_triggers_workers(
+            base.id, "__init_subclass__", class_targets, reference_line
+        ):
+            return True
+        if creation_only:
+            continue
+        if skip_init:
+            if _class_mro_hook_triggers_workers(
+                base.id, "__new__", class_targets, reference_line
+            ):
+                return True
+        elif _class_name_instantiation_triggers_workers(
+            base.id, reference_line, operator_bindings
+        ):
+            return True
+    return False
 
 
 def _name_receiver_call_triggers_workers(
@@ -10479,20 +10482,35 @@ def _keyword_init_lambda_workers_effect(keywords, operator_bindings):
 
 
 def _call_is_type_constructor_side_effect(call, operator_bindings):
-    """Return True for an immediately instantiated dynamic type with risky init."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Call):
+    """Detect side effects of dynamic type creation and subsequent instantiation."""
+    if not isinstance(call, ast.Call):
         return False
-    constructor = call.func
+    constructor = call.func if isinstance(call.func, ast.Call) else call
     func = constructor.func
     if not (isinstance(func, ast.Name) and func.id == "type"):
         return False
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    if not _name_is_unshadowed_builtin(
+        "type", getattr(constructor, "lineno", 0), shadow_lines
+    ):
+        return False
+    if constructor is call:
+        # __init_subclass__ runs when the new class is created, even if the
+        # resulting class is never instantiated.
+        return _type_constructor_bases_trigger_workers(
+            constructor, operator_bindings, creation_only=True
+        )
     namespace_dict = constructor.args[2] if len(constructor.args) >= 3 else None
     dict_effect = _dict_init_lambda_workers_effect(
         namespace_dict,
         operator_bindings,
     )
     if dict_effect is not None:
-        return dict_effect
+        # A safe replacement __init__ suppresses inherited __init__, but
+        # cannot prevent class-creation hooks or inherited __new__.
+        return bool(dict_effect) or _type_constructor_bases_trigger_workers(
+            constructor, operator_bindings, skip_init=True
+        )
     keyword_effect = _keyword_init_lambda_workers_effect(
         constructor.keywords,
         operator_bindings,
