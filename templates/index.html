@@ -85,7 +85,7 @@
                         {{ player.play_key }}
                     </button>
                     <span class="copy-feedback"></span>
-                    {% if stream.get('players')|length > 1 %}
+                    {% if stream.get('players')|length > 1 and is_usable_id(player.id) %}
                     <form method="post" action="{{ url_for('delete_player', stream_id=stream.id, player_id=player.id) }}" class="mt-2">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-sm btn-outline-danger">Delete Player</button>

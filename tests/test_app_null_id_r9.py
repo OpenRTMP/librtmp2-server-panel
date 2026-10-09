@@ -109,6 +109,70 @@ def test_normalize_streams_list_keeps_scalar_ids():
     ]
 
 
+def test_index_renders_player_with_null_id(monkeypatch):
+    players = [
+        {"id": None, "name": "Ghost", "play_key": "pl_ghost"},
+        {"id": "vi_1", "name": "Player 1", "play_key": "pl_1"},
+    ]
+    streams = [_stream_row("stream42", players)]
+
+    with _panel_client(monkeypatch, streams) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Player 1" in response.data
+    # The entry is kept: name, play key and count must survive.
+    assert b"Ghost" in response.data
+    assert b"pl_ghost" in response.data
+    # Only the delete form of the unusable id is suppressed.
+    assert b"/streams/stream42/players/vi_1/delete" in response.data
+    assert b"/streams/stream42/players/None/delete" not in response.data
+
+
+@pytest.mark.parametrize("player_id", [7, 1.5, True])
+def test_index_renders_player_with_scalar_id(monkeypatch, player_id):
+    players = [
+        {"id": player_id, "name": "Seven", "play_key": "pl_seven"},
+        {"id": "vi_2", "name": "Real", "play_key": "pl_real"},
+    ]
+    streams = [_stream_row("stream42", players)]
+
+    with _panel_client(monkeypatch, streams) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Seven" in response.data
+    assert b"pl_seven" in response.data
+    assert b"Real" in response.data
+    assert b"/streams/stream42/players/vi_2/delete" in response.data
+
+
+def test_single_player_with_null_id_keeps_its_play_key(monkeypatch):
+    players = [{"id": None, "name": "Ghost", "play_key": "pl_ghost"}]
+    streams = [_stream_row("stream42", players)]
+
+    with _panel_client(monkeypatch, streams) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Ghost" in response.data
+    # _first_play_key must still read the kept player, not the stream key.
+    assert b"/pl_ghost" in response.data
+    assert b"/pl_k" not in response.data
+
+
+def test_stream_created_keeps_player_with_null_id(monkeypatch):
+    players = [{"id": None, "name": "Ghost", "play_key": "pl_ghost"}]
+    streams = [_stream_row("stream42", players)]
+
+    with _panel_client(monkeypatch, streams) as client:
+        response = client.get("/streams/created?stream_id=stream42")
+
+    assert response.status_code == 200
+    assert b"Ghost" in response.data
+    assert b"pl_ghost" in response.data
+
+
 def test_cluster_renders_node_with_null_id(monkeypatch):
     nodes = [
         {"id": 2, "name": "node-2", "role": "follower", "state": "ready"},

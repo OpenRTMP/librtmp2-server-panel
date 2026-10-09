@@ -495,13 +495,11 @@ class _PanelRuntime:
         raw_players = stream.get("players")
         if not isinstance(raw_players, list):
             raw_players = []
-        players = [
-            dict(player)
-            for player in raw_players
-            if isinstance(player, dict)
-            and isinstance(player.get("id"), str)
-            and player["id"]
-        ]
+        # index.html and stream_created.html render every player's name, play URL
+        # and play key, and _first_play_key reads the first entry, so the list is
+        # kept intact. Only delete_player's URL needs an id, and index.html skips
+        # that one form when the id cannot fill the rule.
+        players = [dict(player) for player in raw_players if isinstance(player, dict)]
         stream["players"] = players
         self._add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port)
         first_play_key = self._first_play_key(stream, players)
