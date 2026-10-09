@@ -11071,9 +11071,14 @@ def _worker_assignment_value(node, operator_bindings=None):
             return False, None
         return True, _static_int_from_ast(node.value)
 
-    if isinstance(node, ast.AnnAssign) and node.target and (
-        _target_assigns_workers(node.target)
-        or _globals_workers_subscript(node.target, operator_bindings)
+    if (
+        isinstance(node, ast.AnnAssign)
+        and node.value is not None
+        and node.target
+        and (
+            _target_assigns_workers(node.target)
+            or _globals_workers_subscript(node.target, operator_bindings)
+        )
     ):
         return True, _static_int_from_ast(node.value)
 

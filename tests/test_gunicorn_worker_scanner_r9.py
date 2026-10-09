@@ -4,6 +4,7 @@ The shared ``config_module`` fixture lives in ``tests/conftest.py``.
 """
 
 import ast
+import sys
 
 import pytest
 
@@ -289,6 +290,57 @@ _MATCH_PATTERN_CASES = [
 )
 def test_match_case_pattern_bindings(config_module, source, expected):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+_ANNOTATION_CASES = [
+    (
+        "bare workers annotation stays static",
+        "workers: int\n",
+        (1, False),
+    ),
+    (
+        "bare workers annotation after a static assignment stays static",
+        "workers = 1\nworkers: int\n",
+        (1, False),
+    ),
+    (
+        "annotated static workers assignment stays static",
+        "workers: int = 1\n",
+        (1, False),
+    ),
+    (
+        "annotated dynamic workers value stays dynamic",
+        "workers: int = max(2, 3)\n",
+        (1, True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [case[1:] for case in _ANNOTATION_CASES],
+    ids=[case[0] for case in _ANNOTATION_CASES],
+)
+def test_annotated_workers_assignments(config_module, source, expected):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+def test_bare_workers_annotation_keeps_web_concurrency(
+    monkeypatch, tmp_path, config_module
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("workers: int\n", encoding="utf-8")
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gunicorn", "-c", str(config_file), "app:app"],
+    )
+
+    assert config_module._detect_worker_settings() == (4, False)
+
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    assert config_module._ratelimit_storage_error() is not None
 
 
 # --- end of round-9 scanner regressions ---
