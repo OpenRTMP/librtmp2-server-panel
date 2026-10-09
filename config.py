@@ -9861,22 +9861,11 @@ def _instance_hook_is_active(
     return False
 
 
-def _class_call_triggers_workers(expr, constructors, class_targets, reference_line):
-    """Return True when a ``ClassName(...)`` call constructs a risky class."""
-    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
-        return False
-    if not _class_binding_is_active(class_targets, expr.func.id, reference_line):
-        return False
-    if expr.func.id in constructors:
-        return True
-    metaclass_bypass_events = (
-        class_targets[12] if len(class_targets) > 12 else {}
-    )
-    if _class_metaclass_bypasses_at_line(
-        metaclass_bypass_events,
-        expr.func.id,
-        reference_line,
-    ):
+def _class_mro_hook_triggers_workers(
+    class_name, hook_name, class_targets, reference_line
+):
+    """Return whether the effective inherited hook can mutate workers."""
+    if not _class_binding_is_active(class_targets, class_name, reference_line):
         return False
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
@@ -9884,28 +9873,53 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         class_targets[1],
         class_methods,
         None,
-        _class_mro_names(expr.func.id, class_bases),
-        "__init__",
+        _class_mro_names(class_name, class_bases),
+        hook_name,
     )
-    if owner is None or owner == expr.func.id:
-        return owner is not None
+    if owner is None:
+        return False
+    if owner == class_name:
+        return True
     class_definition_lines = (
         class_targets[11] if len(class_targets) > 11 else {}
     )
     class_def_line = _class_definition_line_at(
         class_definition_lines,
-        expr.func.id,
+        class_name,
         reference_line,
     )
-    if class_def_line and not _class_binding_is_active(
-        class_targets,
-        owner,
-        class_def_line,
-    ):
-        # The subclass captured an earlier (non-mutating) binding of the base
-        # name, so a later mutating redefinition cannot provide its __init__.
+    # A subclass captures its base at definition time; a later rebinding
+    # of the base name must not make the inherited hook look mutating.
+    return not (
+        class_def_line
+        and not _class_binding_is_active(class_targets, owner, class_def_line)
+    )
+
+
+def _class_call_triggers_workers(expr, constructors, class_targets, reference_line):
+    """Return True when a ``ClassName(...)`` call constructs a risky class."""
+    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
         return False
-    return True
+    class_name = expr.func.id
+    if not _class_binding_is_active(class_targets, class_name, reference_line):
+        return False
+    if class_name in constructors:
+        return True
+    metaclass_bypass_events = (
+        class_targets[12] if len(class_targets) > 12 else {}
+    )
+    if _class_metaclass_bypasses_at_line(
+        metaclass_bypass_events,
+        class_name,
+        reference_line,
+    ):
+        return False
+    return any(
+        _class_mro_hook_triggers_workers(
+            class_name, hook_name, class_targets, reference_line
+        )
+        for hook_name in ("__new__", "__init__")
+    )
 
 
 def _class_name_instantiation_triggers_workers(
@@ -9958,12 +9972,24 @@ def _type_constructor_bases_trigger_workers(constructor, operator_bindings):
     if not isinstance(bases, (ast.Tuple, ast.List)):
         return False
     reference_line = getattr(constructor, "lineno", 0)
+    class_targets = _operator_bindings_class_targets(operator_bindings)
     return any(
         isinstance(base, ast.Name)
-        and _class_name_instantiation_triggers_workers(
-            base.id,
-            reference_line,
-            operator_bindings,
+        and (
+            _class_name_instantiation_triggers_workers(
+                base.id,
+                reference_line,
+                operator_bindings,
+            )
+            or (
+                class_targets
+                and _class_mro_hook_triggers_workers(
+                    base.id,
+                    "__init_subclass__",
+                    class_targets,
+                    reference_line,
+                )
+            )
         )
         for base in bases.elts
     )
@@ -10709,7 +10735,9 @@ def _call_expression_mutates_workers(
 ):
     """Return True when one call expression can mutate module workers."""
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Lambda):
-        if _lambda_mutates_workers(expr.func, operator_bindings):
+        if _lambda_mutates_workers(
+            expr.func, operator_bindings, invocation=expr
+        ):
             return True
     return (
         _call_consumes_mutating_generator(
@@ -10807,25 +10835,51 @@ def _lambda_bound_names(lambda_node):
     return names
 
 
-def _lambda_mutates_workers(lambda_node, operator_bindings):
+def _lambda_class_argument_aliases(lambda_node, invocation):
+    """Resolve simple class names passed to an immediately invoked lambda."""
+    if invocation is None:
+        return {}
+    params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
+    aliases = {
+        param.arg: value.id
+        for param, value in zip(params, invocation.args)
+        if isinstance(value, ast.Name)
+    }
+    keyword_params = {
+        param.arg for param in (*lambda_node.args.args, *lambda_node.args.kwonlyargs)
+    }
+    aliases.update(
+        {
+            keyword.arg: keyword.value.id
+            for keyword in invocation.keywords
+            if keyword.arg in keyword_params and isinstance(keyword.value, ast.Name)
+        }
+    )
+    return aliases
+
+
+def _lambda_mutates_workers(lambda_node, operator_bindings, invocation=None):
     """Return True when an invoked lambda body mutates ``workers`` indirectly."""
     if not isinstance(lambda_node, ast.Lambda):
         return False
+    bound_names = _lambda_bound_names(lambda_node)
     if _expression_has_risky_instance_update(
         lambda_node.body,
-        _lambda_bound_names(lambda_node),
+        bound_names,
     ):
         return True
     class_targets = _operator_bindings_class_targets(operator_bindings)
-    if class_targets and _expression_triggers_class_workers_side_effect(
+    if class_targets and _expression_has_class_workers_side_effect(
         lambda_node.body,
         class_targets,
+        bound_names=bound_names,
+        bound_class_aliases=_lambda_class_argument_aliases(lambda_node, invocation),
     ):
         return True
     return _expression_mutates_workers(
         lambda_node.body,
         operator_bindings,
-        bound_names=_lambda_bound_names(lambda_node),
+        bound_names=bound_names,
     )
 
 
@@ -11375,16 +11429,46 @@ def _statement_invokes_function(node, func_names):
     )
 
 
-def _expression_has_class_workers_side_effect(expr, class_targets):
+def _expression_has_class_workers_side_effect(
+    expr, class_targets, bound_names=None, bound_class_aliases=None
+):
     """Recursively inspect evaluated expressions without entering lambda scopes."""
     if isinstance(expr, ast.Lambda):
         return False
     if _comprehension_hook_write_triggers_workers(expr, class_targets):
         return True
-    if _expression_triggers_class_workers_side_effect(expr, class_targets):
+    shadowed_call = (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and bound_names
+        and expr.func.id in bound_names
+    )
+    if shadowed_call:
+        actual_name = (bound_class_aliases or {}).get(expr.func.id)
+        if actual_name and _class_mro_hook_triggers_workers(
+            actual_name,
+            "__new__",
+            class_targets,
+            getattr(expr, "lineno", 0),
+        ):
+            return True
+        if actual_name and _class_call_triggers_workers(
+            ast.Call(
+                func=ast.Name(id=actual_name, ctx=ast.Load()),
+                args=expr.args,
+                keywords=expr.keywords,
+            ),
+            class_targets[0],
+            class_targets,
+            getattr(expr, "lineno", 0),
+        ):
+            return True
+    elif _expression_triggers_class_workers_side_effect(expr, class_targets):
         return True
     return any(
-        _expression_has_class_workers_side_effect(child, class_targets)
+        _expression_has_class_workers_side_effect(
+            child, class_targets, bound_names, bound_class_aliases
+        )
         for child in ast.iter_child_nodes(expr)
         if isinstance(child, ast.AST)
     )
@@ -13923,18 +14007,22 @@ def _callback_container_expression_is_mutating(value, operator_bindings):
 
 def _call_is_literal_callback_invocation(call, operator_bindings):
     """Return True for proven direct callback/container callback execution."""
-    if not isinstance(call, ast.Call) or call.args or call.keywords:
+    if not isinstance(call, ast.Call):
+        return False
+    # Class constructors can accept arguments; only literal callbacks below
+    # require a zero-argument invocation.
+    if isinstance(call.func, ast.Subscript):
+        if _iterable_literal_class_instantiation_triggers_workers(
+            call.func.value,
+            getattr(call, "lineno", 0),
+            operator_bindings,
+        ):
+            return True
+    if call.args or call.keywords:
         return False
     if _mutating_callback_alias_is_active(call.func, operator_bindings):
         return True
     if isinstance(call.func, ast.Subscript):
-        reference_line = getattr(call, "lineno", 0)
-        if _iterable_literal_class_instantiation_triggers_workers(
-            call.func.value,
-            reference_line,
-            operator_bindings,
-        ):
-            return True
         return _callback_container_expression_is_mutating(
             call.func.value,
             operator_bindings,
