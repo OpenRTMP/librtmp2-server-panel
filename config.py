@@ -10147,16 +10147,28 @@ def _type_constructor_bases_trigger_workers(
             return True
         if creation_only:
             continue
-        if skip_init:
-            if _class_mro_hook_triggers_workers(
-                base.id, "__new__", class_targets, reference_line
-            ):
-                return True
-        elif _class_name_instantiation_triggers_workers(
-            base.id, reference_line, operator_bindings
+        if _dynamic_type_base_constructor_triggers_workers(
+            base.id,
+            reference_line,
+            operator_bindings,
+            class_targets,
+            skip_init,
         ):
             return True
     return False
+
+
+def _dynamic_type_base_constructor_triggers_workers(
+    base_name, reference_line, operator_bindings, class_targets, skip_init
+):
+    """Check inherited construction hooks, respecting an explicit safe __init__."""
+    if skip_init:
+        return _class_mro_hook_triggers_workers(
+            base_name, "__new__", class_targets, reference_line
+        )
+    return _class_name_instantiation_triggers_workers(
+        base_name, reference_line, operator_bindings
+    )
 
 
 def _name_receiver_call_triggers_workers(
@@ -10923,11 +10935,14 @@ def _call_expression_mutates_workers(
     bound_names=None,
 ):
     """Return True when one call expression can mutate module workers."""
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Lambda):
-        if _lambda_mutates_workers(
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Lambda)
+        and _lambda_mutates_workers(
             expr.func, operator_bindings, invocation=expr
-        ):
-            return True
+        )
+    ):
+        return True
     return (
         _call_consumes_mutating_generator(
             expr,
@@ -14306,13 +14321,15 @@ def _call_is_literal_callback_invocation(call, operator_bindings):
         return False
     # Class constructors can accept arguments; only literal callbacks below
     # require a zero-argument invocation.
-    if isinstance(call.func, ast.Subscript):
-        if _iterable_literal_class_instantiation_triggers_workers(
+    if (
+        isinstance(call.func, ast.Subscript)
+        and _iterable_literal_class_instantiation_triggers_workers(
             call.func.value,
             getattr(call, "lineno", 0),
             operator_bindings,
-        ):
-            return True
+        )
+    ):
+        return True
     if call.args or call.keywords:
         return False
     if _mutating_callback_alias_is_active(call.func, operator_bindings):
