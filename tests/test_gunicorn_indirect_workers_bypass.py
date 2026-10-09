@@ -3052,3 +3052,28 @@ def test_codex_pr345_overridden_inherited_new_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("import operator\noperator.call(lambda Child: Child(), Safe)", False),
+        ("import operator\noperator.call(lambda Child: Child(), Child)", True),
+        ("from functools import partial\npartial(lambda Child: Child(), Safe)()", False),
+        ("from functools import partial\npartial(lambda Child: Child(), Child)()", True),
+    ],
+)
+def test_codex_pr345_indirect_lambda_class_argument_binding(
+    tmp_path, dispatch, is_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
