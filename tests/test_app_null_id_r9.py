@@ -2,13 +2,15 @@
 
 index.html and cluster.html interpolate upstream ``id`` values into
 ``url_for()``, so a JSON-null id used to raise werkzeug BuildError and turn the
-whole page into an HTTP 500.
+whole page into an HTTP 500. Only ids that cannot fill a URL rule may be
+dropped: a numeric or boolean upstream id is a usable id and keeps rendering.
 """
 
 import contextlib
 import os
 from unittest.mock import patch
 
+import pytest
 from flask_test_utils import configure_testing_app
 
 
@@ -68,20 +70,43 @@ def test_index_renders_stream_with_null_id(monkeypatch):
 
     assert response.status_code == 200
     assert b"/streams/stream42/players/new" in response.data
+    # The null id never reaches url_for(), so no URL is built from it.
+    assert b"/streams/None/" not in response.data
 
 
-def test_index_renders_player_with_null_id(monkeypatch):
-    players = [
-        {"id": None, "name": "Ghost", "play_key": "pl_ghost"},
-        {"id": "vi_1", "name": "Player 1", "play_key": "pl_1"},
-    ]
-    streams = [_stream_row("stream42", players)]
+@pytest.mark.parametrize("stream_id", [123, 4.5, True, "stream-42"])
+def test_index_renders_stream_with_scalar_id(monkeypatch, stream_id):
+    streams = [_stream_row(stream_id)]
 
     with _panel_client(monkeypatch, streams) as client:
         response = client.get("/")
 
     assert response.status_code == 200
-    assert b"Player 1" in response.data
+    assert b"Camera" in response.data
+    assert f"/streams/{stream_id}/players/new".encode() in response.data
+
+
+def test_normalize_streams_list_keeps_scalar_ids():
+    import app as app_module
+
+    streams = [
+        {"id": "stream42"},
+        {"id": 123},
+        {"id": 4.5},
+        {"id": True},
+        {"id": None},
+        {"id": {"nested": 1}},
+        {"id": ["a"]},
+        {"id": ("a",)},
+        "not-a-dict",
+    ]
+
+    assert app_module._normalize_streams_list(streams) == [
+        {"id": "stream42"},
+        {"id": 123},
+        {"id": 4.5},
+        {"id": True},
+    ]
 
 
 def test_cluster_renders_node_with_null_id(monkeypatch):

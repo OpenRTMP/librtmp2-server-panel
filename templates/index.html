@@ -95,6 +95,7 @@
                 {% else %}
                 <p class="text-muted"><em>No play keys configured</em></p>
                 {% endfor %}
+                {% if is_usable_id(stream.id) %}
                 <form method="post" action="{{ url_for('add_player', stream_id=stream.id) }}" class="mt-2">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <label for="player-name-{{ stream.id }}" class="visually-hidden">Player name</label>
@@ -106,6 +107,7 @@
                     <input id="player-key-{{ stream.id }}" type="text" class="form-control form-control-sm" name="play_key"
                            placeholder="Custom play key (optional)" autocomplete="off">
                 </form>
+                {% endif %}
                 <br>
 
                 {% if cluster_enabled and stream.get('cluster') %}
@@ -148,10 +150,12 @@
                     <p>Loading stats...</p>
                 </div>
 
+                {% if is_usable_id(stream.id) %}
                 <form method="post" action="{{ url_for('delete_stream', stream_id=stream.id) }}" class="mt-3">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-danger">Delete Stream</button>
                 </form>
+                {% endif %}
             </div>
         </div>
     </div>
