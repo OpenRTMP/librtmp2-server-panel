@@ -429,6 +429,13 @@ def _globals_workers_subscript(node, operator_bindings=None):
     return _is_module_namespace_mapping(base, namespace_aliases)
 
 
+def _target_assigns_workers_or_globals(node, operator_bindings=None):
+    """Return True when a target binds workers directly or via ``globals``."""
+    return _target_assigns_workers(node) or _globals_workers_subscript(
+        node, operator_bindings
+    )
+
+
 def _dict_literal_sets_workers(node):
     """Return True when a dict literal may introduce a ``workers`` key."""
     if not isinstance(node, ast.Dict):
@@ -665,35 +672,19 @@ def _namespace_accessor_name_is_unshadowed(node, namespace_aliases=None):
     )
 
 
-def _is_module_namespace_mapping(node, namespace_aliases=None):
-    """Return True for mappings known to be the current module namespace."""
-    if namespace_aliases is None:
-        namespace_aliases = set()
-    if isinstance(node, ast.Name) and node.id in namespace_aliases:
-        return True
-    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
-        return _is_module_namespace_mapping(node.value, namespace_aliases)
-    if _is_globals_call(node):
-        return True
-    if _is_namespace_accessor_call(node):
-        # Both calls return the module namespace only at module scope, and only
-        # while the name still names the builtin: inside a function, lambda or
-        # class body they return that body's own namespace, which cannot change
-        # the module ``workers`` binding, and a config that rebinds either name
-        # has hidden the builtin. The walks that descend into such a body mark
-        # it with ``_evaluated_in_nested_scope``.
-        return _nested_scope_depth == 0 and _namespace_accessor_name_is_unshadowed(
-            node,
-            namespace_aliases,
-        )
+def _is_module_namespace_attribute_mapping(node, namespace_aliases):
+    """Return True for ``x.__dict__`` and attrgetter module forms."""
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
         return _namespace_aliases_reference_current_module(
             node.value, namespace_aliases
         )
-    if _is_structural_attrgetter_module_namespace_mapping(
+    return _is_structural_attrgetter_module_namespace_mapping(
         node, namespace_aliases
-    ):
-        return True
+    )
+
+
+def _is_module_namespace_alias_call(node, namespace_aliases):
+    """Return True for call forms that alias the module namespace."""
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return False
     if node.func.id == "vars":
@@ -715,6 +706,32 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
             and node.args[1].value == "__dict__"
         )
     return False
+
+
+def _is_module_namespace_mapping(node, namespace_aliases=None):
+    """Return True for mappings known to be the current module namespace."""
+    if namespace_aliases is None:
+        namespace_aliases = set()
+    if isinstance(node, ast.Name) and node.id in namespace_aliases:
+        return True
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        return _is_module_namespace_mapping(node.value, namespace_aliases)
+    if _is_globals_call(node):
+        return True
+    if _is_namespace_accessor_call(node):
+        # Both calls return the module namespace only at module scope, and only
+        # while the name still names the builtin: inside a function, lambda or
+        # class body they return that body's own namespace, which cannot change
+        # the module ``workers`` binding, and a config that rebinds either name
+        # has hidden the builtin. The walks that descend into such a body mark
+        # it with ``_evaluated_in_nested_scope``.
+        return _nested_scope_depth == 0 and _namespace_accessor_name_is_unshadowed(
+            node,
+            namespace_aliases,
+        )
+    if _is_module_namespace_attribute_mapping(node, namespace_aliases):
+        return True
+    return _is_module_namespace_alias_call(node, namespace_aliases)
 
 
 def _update_payload_may_set_workers(call, start_index=0):
@@ -11219,14 +11236,27 @@ def _pattern_binds_workers(pattern):
     return False
 
 
+def _with_items_assign_workers(node):
+    """Return True when a ``with`` statement's optional vars bind workers."""
+    return any(
+        item.optional_vars is not None
+        and _target_assigns_workers(item.optional_vars)
+        for item in node.items
+    )
+
+
+def _match_cases_bind_workers(node):
+    """Return True when a ``match`` statement's cases bind workers."""
+    return any(_pattern_binds_workers(case.pattern) for case in node.cases)
+
+
 def _worker_assignment_value(node, operator_bindings=None):
     """Return whether node assigns workers and its static value when available."""
     if _workers_binding_removal(node, operator_bindings):
         return True, None
     if isinstance(node, ast.Assign):
         targets_workers = any(
-            _target_assigns_workers(target)
-            or _globals_workers_subscript(target, operator_bindings)
+            _target_assigns_workers_or_globals(target, operator_bindings)
             for target in node.targets
         )
         if not targets_workers:
@@ -11237,16 +11267,12 @@ def _worker_assignment_value(node, operator_bindings=None):
         isinstance(node, ast.AnnAssign)
         and node.value is not None
         and node.target
-        and (
-            _target_assigns_workers(node.target)
-            or _globals_workers_subscript(node.target, operator_bindings)
-        )
+        and _target_assigns_workers_or_globals(node.target, operator_bindings)
     ):
         return True, _static_int_from_ast(node.value)
 
-    if isinstance(node, ast.AugAssign) and (
-        _target_assigns_workers(node.target)
-        or _globals_workers_subscript(node.target, operator_bindings)
+    if isinstance(node, ast.AugAssign) and _target_assigns_workers_or_globals(
+        node.target, operator_bindings
     ):
         return True, None
 
@@ -11254,18 +11280,10 @@ def _worker_assignment_value(node, operator_bindings=None):
         return True, _static_int_from_ast(node.value)
 
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        if any(
-            item.optional_vars is not None
-            and _target_assigns_workers(item.optional_vars)
-            for item in node.items
-        ):
-            return True, None
-        return False, None
+        return _with_items_assign_workers(node), None
 
     if isinstance(node, ast.Match):
-        if any(_pattern_binds_workers(case.pattern) for case in node.cases):
-            return True, None
-        return False, None
+        return _match_cases_bind_workers(node), None
 
     return False, None
 
