@@ -24,8 +24,11 @@ only begin at a future `1.0.0`.
   import-time callbacks, inherited and `super()` hooks, class bodies, instance
   methods and properties, descriptors, enum aliases,
   `operator.attrgetter('__dict__')`, `locals()`/`vars()`, walrus and lambda
-  forms, `with` and `match` targets, config class constructors and named
-  callbacks passed to builtins that consume them eagerly.
+  forms, `with` and `match` targets, config class constructors (also when the
+  class is reached through `getattr()`, `operator.attrgetter()`,
+  `object.__getattribute__()`, `__mro__`, a container subscript or
+  `types.new_class()`) and named callbacks passed to builtins that consume them
+  eagerly.
 - The same guard now also reads the worker count the way Gunicorn does from
   the command line and the environment: compact config flags (`-cPATH`,
   `-c=PATH`) and integer spellings such as `-w 1_6` or `WEB_CONCURRENCY=1_6`
@@ -71,7 +74,7 @@ only begin at a future `1.0.0`.
   the image ships (it previously tested Gunicorn 26.0.0 while the image had
   26.2.0) and dependency installs are reproducible. All workflow actions are pinned
   to commit SHAs.
-- Changelog version `0.1.10` → `0.1.11`.
+- Runtime dependency `redis` updated from 7.4.1 to 8.1.0.
 
 ### Documentation
 - The README dashboard screenshot is re-taken from the current panel against a
