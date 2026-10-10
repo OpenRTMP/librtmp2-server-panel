@@ -2,10 +2,12 @@
 {% block title %}Streams on librtmp2-server{% endblock %}
 {% block content %}
 <h1>Streams on librtmp2-server</h1>
+{% if config.REQUIRE_LOGIN %}
 <form method="post" action="{{ url_for('logout') }}" class="d-inline">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
 </form>
+{% endif %}
 <a href="{{ url_for('create_stream') }}" class="btn btn-success mb-3">Create Stream</a>
 {% if show_cluster_nav is defined and show_cluster_nav %}
 <a href="{{ url_for('cluster_overview') }}" class="btn btn-outline-info mb-3">Cluster</a>
