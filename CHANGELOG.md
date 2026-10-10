@@ -64,9 +64,13 @@ only begin at a future `1.0.0`.
   build unannounced. The build stage no longer installs an unused Rust and C
   toolchain and the runtime image no longer adds the `openssl` command-line
   tool, which makes the multi-architecture build faster and the image smaller.
-- The test and release workflows install the pinned versions from
-  `requirements.txt`, so they test the same Gunicorn 26.2.0 the image ships
-  instead of 26.0.0, and all workflow actions are pinned to commit SHAs.
+- Every dependency, including transitive ones, is now locked with hashes in
+  `requirements.txt` (runtime) and `requirements-dev.txt` (tests), generated
+  from `requirements.in`. The Docker image and the test and release workflows
+  install from these files with `--require-hashes`, so CI tests exactly what
+  the image ships (it previously tested Gunicorn 26.0.0 while the image had
+  26.2.0) and image builds are reproducible. All workflow actions are pinned
+  to commit SHAs.
 - Changelog version `0.1.10` → `0.1.11`.
 
 ### Documentation

@@ -42,6 +42,7 @@ CLUSTER_KEY_TYPES = (str, int, float, bool)
 CLUSTER_TEMPLATE = "cluster.html"
 INDEX_HTML = "index.html"
 CREATE_STREAM_HTML = "create_stream.html"
+LOGIN_HTML = "login.html"
 ERR_INVALID_STREAM_ID = "Invalid stream ID"
 
 ACCESS_KEY_HELP = (
@@ -557,7 +558,7 @@ class _PanelRuntime:
             if user_ok and pass_ok:
                 return self._complete_login()
             error = "Invalid credentials"
-        return render_template("login.html", error=error)
+        return render_template(LOGIN_HTML, error=error)
 
     def _complete_login(self):
         try:
@@ -565,7 +566,7 @@ class _PanelRuntime:
         except SessionBackendUnavailable:
             self.app.logger.exception("Session backend unavailable during login")
             error = "Authentication service temporarily unavailable. Please try again."
-            return render_template("login.html", error=error), 503
+            return render_template(LOGIN_HTML, error=error), 503
         return redirect(url_for("index"))
 
     def handle_csrf_error(self, error):
@@ -576,7 +577,7 @@ class _PanelRuntime:
         """
         if request.endpoint == "login":
             message = "The login form expired. Please try again."
-            return render_template("login.html", error=message), 400
+            return render_template(LOGIN_HTML, error=message), 400
         session["flash_error"] = (
             "The form expired or was invalid, so nothing was changed. "
             "Please try again."

@@ -160,11 +160,21 @@ Prebuilt multi-architecture images are published for `amd64`, `arm64`, and `risc
 ```bash
 python3 -m venv venv
 . venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements-dev.txt
 cp .env.example .env
 # Edit the required values, then:
 export $(grep -v '^#' .env | xargs)
 python3 app.py
+```
+
+`requirements.in` lists the direct dependencies. `requirements.txt` (runtime,
+used by the Docker image) and `requirements-dev.txt` (adds pytest) pin every
+transitive dependency with hashes and are generated from it. After changing
+`requirements.in` or `requirements-dev.in`, regenerate both:
+
+```bash
+uv pip compile --universal --python-version 3.14 --generate-hashes -o requirements.txt requirements.in
+uv pip compile --universal --python-version 3.14 --generate-hashes -o requirements-dev.txt requirements-dev.in
 ```
 
 ## Features

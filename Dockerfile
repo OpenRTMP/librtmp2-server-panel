@@ -6,7 +6,7 @@ FROM python:3.14-alpine AS builder
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --only-binary :all: --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --only-binary :all: --require-hashes --prefix=/install -r requirements.txt
 
 FROM python:3.14-alpine
 
