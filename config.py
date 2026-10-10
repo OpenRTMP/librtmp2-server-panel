@@ -10211,29 +10211,22 @@ def _deque_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
-    """Resolve an indexed class from a known MRO or a proven literal container."""
-    if not isinstance(sub, ast.Subscript):
+def _mro_subscript_class_name(value, index, operator_bindings):
+    """Resolve an indexed MRO element without evaluating configuration code."""
+    if not isinstance(value.value, ast.Name):
         return None
-    index = _subscript_constant_index(sub.slice)
-    if index is None:
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
         return None
-    value = sub.value
-    if isinstance(value, ast.Attribute) and value.attr == "__mro__":
-        if not isinstance(value.value, ast.Name):
-            return None
-        class_targets = _operator_bindings_class_targets(operator_bindings)
-        if not class_targets:
-            return None
-        class_bases = class_targets[7] if len(class_targets) > 7 else {}
-        mro = _class_mro_names(value.value.id, class_bases)
-        if "object" not in mro:
-            mro = (*mro, "object")
-        return mro[index] if -len(mro) <= index < len(mro) else None
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    mro = _class_mro_names(value.value.id, class_bases)
+    if "object" not in mro:
+        mro = (*mro, "object")
+    return mro[index] if -len(mro) <= index < len(mro) else None
 
-    name = _literal_container_element_class_name(value, index)
-    if name is not None:
-        return name
+
+def _container_call_subscript_class_name(value, index, operator_bindings):
+    """Resolve constructors in imported deque or builtin sequence wrappers."""
     if not isinstance(value, ast.Call) or not value.args:
         return None
     reference_line = getattr(value, "lineno", 0)
@@ -10247,6 +10240,22 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
     if not _name_is_unshadowed_builtin(value.func.id, reference_line, shadow_lines):
         return None
     return _literal_container_element_class_name(value.args[0], index)
+
+
+def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
+    """Resolve indexed class constructors through narrowly scoped helpers."""
+    if not isinstance(sub, ast.Subscript):
+        return None
+    index = _subscript_constant_index(sub.slice)
+    if index is None:
+        return None
+    value = sub.value
+    if isinstance(value, ast.Attribute) and value.attr == "__mro__":
+        return _mro_subscript_class_name(value, index, operator_bindings)
+    name = _literal_container_element_class_name(value, index)
+    if name is not None:
+        return name
+    return _container_call_subscript_class_name(value, index, operator_bindings)
 
 
 def _getattr_resolves_class_name(func, class_targets, attr_name):
