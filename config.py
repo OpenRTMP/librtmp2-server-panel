@@ -14650,35 +14650,44 @@ def _callback_container_expression_is_mutating(value, operator_bindings):
     return _mutating_callback_container_is_active(value, operator_bindings)
 
 
+def _subscript_callback_constructor_mutates_workers(call, operator_bindings):
+    """Return True when a subscript selects a workers-mutating class constructor."""
+    reference_line = getattr(call, "lineno", 0)
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if class_targets:
+        class_name = _subscript_expression_resolves_class_name(
+            call.func,
+            operator_bindings,
+        )
+        if (
+            class_name is not None
+            and _class_name_instantiation_triggers_workers_for_targets(
+                class_name,
+                reference_line,
+                class_targets,
+            )
+        ):
+            return True
+    return _iterable_literal_class_instantiation_triggers_workers(
+        call.func.value,
+        reference_line,
+        operator_bindings,
+    )
+
+
 def _call_is_literal_callback_invocation(call, operator_bindings):
     """Return True for proven direct callback/container callback execution."""
     if not isinstance(call, ast.Call):
         return False
     # Class constructors can accept arguments; only literal callbacks below
     # require a zero-argument invocation.
-    if isinstance(call.func, ast.Subscript):
-        reference_line = getattr(call, "lineno", 0)
-        class_targets = _operator_bindings_class_targets(operator_bindings)
-        if class_targets:
-            class_name = _subscript_expression_resolves_class_name(
-                call.func,
-                operator_bindings,
-            )
-            if (
-                class_name is not None
-                and _class_name_instantiation_triggers_workers_for_targets(
-                    class_name,
-                    reference_line,
-                    class_targets,
-                )
-            ):
-                return True
-        if _iterable_literal_class_instantiation_triggers_workers(
-            call.func.value,
-            reference_line,
-            operator_bindings,
-        ):
-            return True
+    if (
+        isinstance(call.func, ast.Subscript)
+        and _subscript_callback_constructor_mutates_workers(
+            call, operator_bindings
+        )
+    ):
+        return True
     if call.args or call.keywords:
         return False
     if _mutating_callback_alias_is_active(call.func, operator_bindings):
