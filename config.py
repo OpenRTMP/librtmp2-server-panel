@@ -10129,9 +10129,16 @@ def _class_name_instantiation_triggers_workers_for_targets(
 
 
 def _subscript_constant_index(slice_node):
-    """Return an integer subscript index when it is a static constant."""
-    if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+    """Return an integer index, including statically negated subscripts."""
+    if isinstance(slice_node, ast.Constant) and type(slice_node.value) is int:
         return slice_node.value
+    if (
+        isinstance(slice_node, ast.UnaryOp)
+        and isinstance(slice_node.op, ast.USub)
+        and isinstance(slice_node.operand, ast.Constant)
+        and type(slice_node.operand.value) is int
+    ):
+        return -slice_node.operand.value
     return None
 
 
