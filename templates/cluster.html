@@ -3,10 +3,12 @@
 {% block content %}
 <h1>Cluster</h1>
 <a href="{{ url_for('index') }}" class="btn btn-outline-light mb-3">Back to Streams</a>
+{% if config.REQUIRE_LOGIN %}
 <form method="post" action="{{ url_for('logout') }}" class="d-inline">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit" class="btn btn-outline-light mb-3">Logout</button>
 </form>
+{% endif %}
 
 {% if flash_error is defined and flash_error %}
 <div class="alert alert-danger">{{ flash_error }}</div>

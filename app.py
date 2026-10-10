@@ -12,7 +12,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session, u
 from flask_limiter import Limiter
 from flask_limiter.constants import ExemptionScope
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFError, CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
@@ -42,6 +42,7 @@ CLUSTER_KEY_TYPES = (str, int, float, bool)
 CLUSTER_TEMPLATE = "cluster.html"
 INDEX_HTML = "index.html"
 CREATE_STREAM_HTML = "create_stream.html"
+LOGIN_HTML = "login.html"
 ERR_INVALID_STREAM_ID = "Invalid stream ID"
 
 ACCESS_KEY_HELP = (
@@ -271,6 +272,11 @@ def _configure_security_defaults(app):
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=app.config["SESSION_COOKIE_SECURE"],
         PERMANENT_SESSION_LIFETIME=app.config["SESSION_LIFETIME"],
+        # Flask-WTF's default one-hour token lifetime made every form on a
+        # dashboard left open longer than that fail with a bare HTTP 400, even
+        # though the login itself stays valid for SESSION_LIFETIME. The token is
+        # bound to the session, so it can live exactly as long as the session.
+        WTF_CSRF_TIME_LIMIT=int(app.config["SESSION_LIFETIME"].total_seconds()),
     )
 
 
@@ -298,6 +304,7 @@ class _PanelRuntime:
     def register_post_csrf(self):
         self._register_stats_rate_limits()
         self.app.after_request(self.set_security_headers)
+        self.app.register_error_handler(CSRFError, self.handle_csrf_error)
         self._register_routes()
 
     def _rate_limit_remote_addr(self):
@@ -551,7 +558,7 @@ class _PanelRuntime:
             if user_ok and pass_ok:
                 return self._complete_login()
             error = "Invalid credentials"
-        return render_template("login.html", error=error)
+        return render_template(LOGIN_HTML, error=error)
 
     def _complete_login(self):
         try:
@@ -559,8 +566,39 @@ class _PanelRuntime:
         except SessionBackendUnavailable:
             self.app.logger.exception("Session backend unavailable during login")
             error = "Authentication service temporarily unavailable. Please try again."
-            return render_template("login.html", error=error), 503
+            return render_template(LOGIN_HTML, error=error), 503
         return redirect(url_for("index"))
+
+    def handle_csrf_error(self, error):
+        """Answer a rejected form (expired session, stale page) with a usable page.
+
+        Nothing was changed, so the operator is sent back to where they can
+        retry instead of a bare HTTP 400.
+        """
+        if request.endpoint == "login":
+            message = "The login form expired. Please try again."
+            return render_template(LOGIN_HTML, error=message), 400
+        if not self._csrf_session_still_valid():
+            # The dashboard would bounce to /login, which drops a queued flash
+            # message, so answer with the login page and the reason directly.
+            message = (
+                "Your session expired, so nothing was changed. "
+                "Please sign in again."
+            )
+            return render_template(LOGIN_HTML, error=message), 400
+        session["flash_error"] = (
+            "The form expired or was invalid, so nothing was changed. "
+            "Please try again."
+        )
+        return redirect(url_for("index"))
+
+    def _csrf_session_still_valid(self):
+        if not self.app.config["REQUIRE_LOGIN"]:
+            return True
+        try:
+            return self._session_is_authenticated()
+        except SessionBackendUnavailable:
+            return False
 
     def logout(self):
         validation_error = self._validate_logout_session()

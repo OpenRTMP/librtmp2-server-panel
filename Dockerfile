@@ -1,27 +1,18 @@
-FROM python:alpine AS builder
+# Pin the Python minor version: pip installs wheels only (--only-binary :all:),
+# so an unannounced jump of the floating `alpine` tag to a Python release that
+# some dependency has no musllinux wheel for yet would break the image build.
+FROM python:3.14-alpine AS builder
 
 WORKDIR /app
 
-RUN apk add --no-cache \
-    cargo \
-    gcc \
-    libffi-dev \
-    musl-dev \
-    openssl-dev \
-    rust
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir --only-binary :all: --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --only-binary :all: --require-hashes --prefix=/install -r requirements.txt
 
-FROM python:alpine
+FROM python:3.14-alpine
 
 ARG APP_VERSION=""
 
 WORKDIR /app
-
-RUN apk add --no-cache \
-    libffi \
-    openssl
 
 COPY --from=builder /install /usr/local
 COPY app.py config.py lrtmp2_client.py session_store.py ./

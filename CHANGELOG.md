@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-10-10
+
 ### Security
 - The Gunicorn `workers` scanner, which keeps `RATELIMIT_STORAGE_URI=memory://`
   and the per-process session store from running under a multi-worker
@@ -49,6 +51,27 @@ only begin at a future `1.0.0`.
   its per-peer cluster calls; deleting a stream waits for the server's full
   drain window before reporting failure.
 - POST routes have their default rate limits again.
+- Forms no longer fail with a bare "The CSRF token has expired" HTTP 400 page
+  once the dashboard has been open for more than an hour. Form tokens now stay
+  valid as long as the login itself (8 hours), and a rejected form changes
+  nothing and sends the operator back to the dashboard, or to the login page,
+  with a message.
+- The Logout button is no longer shown when `REQUIRE_LOGIN=False`.
+
+### Changed
+- The Docker image is based on `python:3.14-alpine` instead of the floating
+  `python:alpine` tag, so a new Python release cannot break the wheel-only
+  build unannounced. The build stage no longer installs an unused Rust and C
+  toolchain and the runtime image no longer adds the `openssl` command-line
+  tool, which makes the multi-architecture build faster and the image smaller.
+- Every dependency, including transitive ones, is now locked with hashes in
+  `requirements.txt` (runtime) and `requirements-dev.txt` (tests), generated
+  from `requirements.in`. The Docker image and the test and release workflows
+  install from these files with `--require-hashes`, so CI tests exactly what
+  the image ships (it previously tested Gunicorn 26.0.0 while the image had
+  26.2.0) and dependency installs are reproducible. All workflow actions are pinned
+  to commit SHAs.
+- Changelog version `0.1.10` → `0.1.11`.
 
 ### Documentation
 - The README dashboard screenshot is re-taken from the current panel against a
@@ -358,7 +381,9 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.10...v0.1.11
+[0.1.10]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.6...v0.1.7
