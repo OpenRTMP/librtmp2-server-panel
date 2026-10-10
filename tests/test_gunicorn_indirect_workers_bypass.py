@@ -3110,3 +3110,27 @@ def test_codex_pr345_dynamic_type_safe_init_ignores_inherited_init(tmp_path):
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (
         1, False
     )
+
+
+# Security review 2026-10-10: class __call__ resolver and container subscript gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "getattr(Child, '__call__')()",
+        "import operator\noperator.attrgetter('__call__')(Child)()",
+        "object.__getattribute__(Child, '__call__')()",
+        "(Child.__mro__[0])()",
+        "from collections import deque\ndeque([Child], maxlen=1)[0]()",
+        "import types\ntypes.new_class('X', (Child,))()",
+    ],
+)
+def test_security_review_oct10_class_call_resolver_gaps_are_dynamic(
+    tmp_path,
+    dispatch,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
