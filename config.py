@@ -10106,6 +10106,326 @@ def _class_name_instantiation_triggers_workers(
     )
 
 
+def _class_name_instantiation_triggers_workers_for_targets(
+    class_name,
+    reference_line,
+    class_targets,
+):
+    """Like ``_class_name_instantiation_triggers_workers`` without operator bindings."""
+    if not class_targets:
+        return False
+    constructors = class_targets[0]
+    synthetic = ast.Call(
+        func=ast.Name(id=class_name, ctx=ast.Load()),
+        args=[],
+        keywords=[],
+    )
+    return _class_call_triggers_workers(
+        synthetic,
+        constructors,
+        class_targets,
+        reference_line,
+    )
+
+
+def _subscript_constant_index(slice_node):
+    """Return an integer index, including statically negated subscripts."""
+    if isinstance(slice_node, ast.Constant) and type(slice_node.value) is int:
+        return slice_node.value
+    if (
+        isinstance(slice_node, ast.UnaryOp)
+        and isinstance(slice_node.op, ast.USub)
+        and isinstance(slice_node.operand, ast.Constant)
+        and type(slice_node.operand.value) is int
+    ):
+        return -slice_node.operand.value
+    return None
+
+
+
+def _literal_container_element_class_name(container, index):
+    """Return the class at a Python list/tuple literal's indexed position."""
+    if not isinstance(container, (ast.List, ast.Tuple)):
+        return None
+    if not -len(container.elts) <= index < len(container.elts):
+        return None
+    element = container.elts[index]
+    return element.id if isinstance(element, ast.Name) else None
+
+
+
+def _is_proven_collections_deque(func, operator_bindings, reference_line):
+    """Accept deque only while its collections import binding is active."""
+    if not operator_bindings or len(operator_bindings) <= 32:
+        return False
+    metadata = operator_bindings[32]
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            metadata.get("collections_deque_alias_events", {}),
+            func.id,
+            reference_line,
+        )
+    if isinstance(func, ast.Attribute) and func.attr == "deque":
+        return _module_alias_active_at_line(
+            func.value,
+            set(),
+            metadata.get("collections_module_alias_events", {}),
+            reference_line,
+        )
+    return False
+
+
+def _deque_maxlen_argument(call):
+    """Return the positional or keyword maxlen expression."""
+    if len(call.args) > 1:
+        return call.args[1]
+    return next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "maxlen"),
+        None,
+    )
+
+
+def _risky_class_in_unknown_deque_suffix(call, elements, operator_bindings):
+    """Conservatively recognize a worker-mutating class under unknown maxlen."""
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    return next(
+        (
+            element.id for element in elements
+            if isinstance(element, ast.Name)
+            and _class_name_instantiation_triggers_workers_for_targets(
+                element.id,
+                getattr(call, "lineno", 0),
+                class_targets,
+            )
+        ),
+        None,
+    )
+
+
+def _deque_subscript_class_name(call, index, operator_bindings):
+    """Apply bounded deque truncation before selecting a constructor."""
+    if not call.args or not isinstance(call.args[0], (ast.List, ast.Tuple)):
+        return None
+    elements = call.args[0].elts
+    maxlen = _deque_maxlen_argument(call)
+    if maxlen is not None:
+        if not (
+            isinstance(maxlen, ast.Constant)
+            and type(maxlen.value) is int
+            and maxlen.value >= 0
+        ):
+            return _risky_class_in_unknown_deque_suffix(
+                call, elements, operator_bindings
+            )
+        elements = elements[-maxlen.value:] if maxlen.value else []
+    return _literal_container_element_class_name(
+        ast.List(elts=elements, ctx=ast.Load()),
+        index,
+    )
+
+
+def _mro_subscript_class_name(value, index, operator_bindings):
+    """Resolve an indexed MRO element without evaluating configuration code."""
+    if not isinstance(value.value, ast.Name):
+        return None
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
+        return None
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    mro = _class_mro_names(value.value.id, class_bases)
+    if "object" not in mro:
+        mro = (*mro, "object")
+    return mro[index] if -len(mro) <= index < len(mro) else None
+
+
+def _container_call_subscript_class_name(value, index, operator_bindings):
+    """Resolve constructors in imported deque or builtin sequence wrappers."""
+    if not isinstance(value, ast.Call) or not value.args:
+        return None
+    reference_line = getattr(value, "lineno", 0)
+    if _is_proven_collections_deque(value.func, operator_bindings, reference_line):
+        return _deque_subscript_class_name(value, index, operator_bindings)
+    if not isinstance(value.func, ast.Name) or value.func.id not in {"list", "tuple"}:
+        return None
+    shadow_lines = (
+        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+    )
+    if not _name_is_unshadowed_builtin(value.func.id, reference_line, shadow_lines):
+        return None
+    return _literal_container_element_class_name(value.args[0], index)
+
+
+def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
+    """Resolve indexed class constructors through narrowly scoped helpers."""
+    if not isinstance(sub, ast.Subscript):
+        return None
+    index = _subscript_constant_index(sub.slice)
+    if index is None:
+        return None
+    value = sub.value
+    if isinstance(value, ast.Attribute) and value.attr == "__mro__":
+        return _mro_subscript_class_name(value, index, operator_bindings)
+    name = _literal_container_element_class_name(value, index)
+    if name is not None:
+        return name
+    return _container_call_subscript_class_name(value, index, operator_bindings)
+
+
+def _getattr_resolves_class_name(func, class_targets, attr_name):
+    """Return a class name when ``getattr`` resolves a descriptor on a class."""
+    target = _super_getattr_target(func, class_targets)
+    if target is None or target[1] != attr_name:
+        return None
+    receiver = target[0]
+    if isinstance(receiver, ast.Name):
+        return receiver.id
+    return None
+
+
+def _object_getattribute_resolves_class_name(func, class_targets, attr_name):
+    """Return a class name for ``object.__getattribute__(Class, attr)``."""
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return None
+    reference_line = getattr(func, "lineno", 0)
+    shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+    if not _uses_builtin_object_getattribute(func.func, reference_line, shadow_lines):
+        return None
+    key = func.args[1]
+    if not (isinstance(key, ast.Constant) and key.value == attr_name):
+        return None
+    receiver = func.args[0]
+    if isinstance(receiver, ast.Name):
+        return receiver.id
+    return None
+
+
+def _attrgetter_call_resolves_class_name(func, operator_bindings, attr_name):
+    """Return a class name for ``operator.attrgetter(attr)(Class)``."""
+    if not isinstance(func, ast.Call) or not isinstance(func.func, ast.Call):
+        return None
+    factory = func.func
+    if not _is_operator_attrgetter_factory(factory, operator_bindings):
+        return None
+    if _operator_attrgetter_method_name(factory) != attr_name:
+        return None
+    if len(func.args) != 1 or not isinstance(func.args[0], ast.Name):
+        return None
+    return func.args[0].id
+
+
+
+def _resolved_class_name_from_callable(
+    func,
+    class_targets,
+    operator_bindings=None,
+):
+    """Resolve only genuinely indirect class construction expressions.
+
+    A direct Name call is handled by the scope-aware class scanner, which
+    respects lambda argument bindings that can shadow module class names.
+    """
+    if class_targets:
+        class_name = _getattr_resolves_class_name(func, class_targets, "__call__")
+        if class_name is not None:
+            return class_name
+        class_name = _object_getattribute_resolves_class_name(
+            func,
+            class_targets,
+            "__call__",
+        )
+        if class_name is not None:
+            return class_name
+    if operator_bindings is not None:
+        class_name = _attrgetter_call_resolves_class_name(
+            func,
+            operator_bindings,
+            "__call__",
+        )
+        if class_name is not None:
+            return class_name
+    if isinstance(func, ast.Attribute) and func.attr == "__call__":
+        if isinstance(func.value, ast.Name):
+            return func.value.id
+    if isinstance(func, ast.Subscript):
+        return _subscript_expression_resolves_class_name(func, operator_bindings)
+    return None
+
+
+
+def _class_dunder_call_mutation_state(class_name, class_targets, reference_line):
+    """Return a defined __call__ method's risk, or None for metaclass dispatch."""
+    if not _class_binding_is_active(class_targets, class_name, reference_line):
+        return None
+    methods = class_targets[1]
+    defined = class_targets[8] if len(class_targets) > 8 else set()
+    attributes = class_targets[10] if len(class_targets) > 10 else set()
+    bases = class_targets[7] if len(class_targets) > 7 else {}
+    for owner in _class_mro_names(class_name, bases):
+        key = (owner, "__call__")
+        if key in methods:
+            return _class_mro_hook_triggers_workers(
+                class_name, "__call__", class_targets, reference_line
+            )
+        if key in defined or key in attributes:
+            return False
+    return None
+
+
+def _call_invokes_resolved_risky_class_constructor(
+    call,
+    operator_bindings,
+    class_targets=None,
+):
+    """Inspect resolved callable's own __call__ before constructor fallback."""
+    if not isinstance(call, ast.Call):
+        return False
+    if class_targets is None:
+        class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    class_name = _resolved_class_name_from_callable(
+        call.func,
+        class_targets,
+        operator_bindings,
+    )
+    if class_name is None:
+        return False
+    if not isinstance(call.func, ast.Subscript):
+        method_effect = _class_dunder_call_mutation_state(
+            class_name, class_targets, reference_line
+        )
+        if method_effect is not None:
+            return method_effect
+    return _class_name_instantiation_triggers_workers_for_targets(
+        class_name,
+        reference_line,
+        class_targets,
+    )
+
+
+
+def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
+    """Check new_class base hooks at creation, and constructors if invoked."""
+    if not isinstance(call, ast.Call):
+        return False
+    inner = call.func if isinstance(call.func, ast.Call) else call
+    types_module_aliases = operator_bindings[25] if len(operator_bindings) > 25 else set()
+    func = inner.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "new_class"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in types_module_aliases
+    ):
+        return False
+    return _type_constructor_bases_trigger_workers(
+        inner,
+        operator_bindings,
+        creation_only=(inner is call),
+    )
+
+
 def _iterable_literal_class_instantiation_triggers_workers(
     value,
     reference_line,
@@ -10560,7 +10880,15 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
     instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(expr, 'lineno', 0)
     return (
-        _class_subscript_triggers_workers(expr, class_targets)
+        (
+            isinstance(expr, ast.Call)
+            and _call_invokes_resolved_risky_class_constructor(
+                expr,
+                None,
+                class_targets=class_targets,
+            )
+        )
+        or _class_subscript_triggers_workers(expr, class_targets)
         or _class_call_triggers_workers(expr, constructors, class_targets, reference_line)
         or _attribute_call_triggers_workers(
             expr,
@@ -10916,6 +11244,11 @@ def _call_has_secondary_worker_mutation(
         or _call_is_dict_subclass_update_on_module_namespace(expr, namespace_aliases, dict_subclass_names)
         or _call_is_literal_callback_invocation(expr, operator_bindings)
         or _call_is_operator_call_mutating_callback(expr, operator_bindings, bound_names)
+        or _call_invokes_resolved_risky_class_constructor(
+            expr,
+            operator_bindings,
+        )
+        or _call_is_types_new_class_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_mutating_callback_invocation(expr, operator_bindings)
         or _call_is_exit_stack_callback_mutation(expr, operator_bindings)
         or _call_is_weakref_finalize_mutation(
@@ -13222,6 +13555,8 @@ def _active_frame_globals_dict_names_at_line(inspect_analysis, reference_line):
 
 def _uses_builtin_object_getattribute(func, reference_line, shadow_lines):
     """Return True for a proven builtin object.__getattribute__ resolver."""
+    if not _name_is_unshadowed_builtin("object", reference_line, shadow_lines):
+        return False
     if isinstance(func, ast.Attribute):
         return (
             func.attr == "__getattribute__"
@@ -14315,6 +14650,31 @@ def _callback_container_expression_is_mutating(value, operator_bindings):
     return _mutating_callback_container_is_active(value, operator_bindings)
 
 
+def _subscript_callback_constructor_mutates_workers(call, operator_bindings):
+    """Return True when a subscript selects a workers-mutating class constructor."""
+    reference_line = getattr(call, "lineno", 0)
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if class_targets:
+        class_name = _subscript_expression_resolves_class_name(
+            call.func,
+            operator_bindings,
+        )
+        if (
+            class_name is not None
+            and _class_name_instantiation_triggers_workers_for_targets(
+                class_name,
+                reference_line,
+                class_targets,
+            )
+        ):
+            return True
+    return _iterable_literal_class_instantiation_triggers_workers(
+        call.func.value,
+        reference_line,
+        operator_bindings,
+    )
+
+
 def _call_is_literal_callback_invocation(call, operator_bindings):
     """Return True for proven direct callback/container callback execution."""
     if not isinstance(call, ast.Call):
@@ -14323,10 +14683,8 @@ def _call_is_literal_callback_invocation(call, operator_bindings):
     # require a zero-argument invocation.
     if (
         isinstance(call.func, ast.Subscript)
-        and _iterable_literal_class_instantiation_triggers_workers(
-            call.func.value,
-            getattr(call, "lineno", 0),
-            operator_bindings,
+        and _subscript_callback_constructor_mutates_workers(
+            call, operator_bindings
         )
     ):
         return True
@@ -16245,6 +16603,12 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32]["builtins_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "builtins")
+    )
+    operator_bindings[32]["collections_deque_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "collections", {"deque"})
+    )
+    operator_bindings[32]["collections_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "collections")
     )
     operator_bindings[32]["builtins_dunder_import_replacement_lines"] = (
         _collect_builtins_dunder_import_replacement_lines(tree, operator_bindings)
