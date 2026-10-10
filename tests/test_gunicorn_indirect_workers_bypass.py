@@ -3134,3 +3134,139 @@ def test_security_review_oct10_class_call_resolver_gaps_are_dynamic(
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #348: class-call semantics, MRO indexing, and bounded deque checks.
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("Child.__mro__[1]()", True),
+        ("Child.__mro__[-2]()", True),
+        ("Child.__mro__[0]()", False),
+    ],
+)
+def test_codex_pr348_mro_index_resolves_actual_class(tmp_path, dispatch, is_dynamic):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "getattr(Child, '__call__')(None)",
+        "import operator\noperator.attrgetter('__call__')(Child)(None)",
+        "object.__getattribute__(Child, '__call__')(None)",
+        "Child.__call__(None)",
+    ],
+)
+def test_codex_pr348_class_defined_call_mutates_workers(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Child:\n"
+        "    def __call__(self, *args):\n"
+        "        globals()['workers'] = 4\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "getattr(Child, '__call__')(None)",
+        "import operator\noperator.attrgetter('__call__')(Child)(None)",
+        "object.__getattribute__(Child, '__call__')(None)",
+    ],
+)
+def test_codex_pr348_safe_class_call_does_not_invoke_mutating_init(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        "    def __call__(self):\n"
+        "        return None\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("from collections import deque\ndeque([Safe, Child], maxlen=1)[0]()", True),
+        ("from collections import deque\ndeque([Child, Safe], maxlen=1)[0]()", False),
+        ("from collections import deque as q\nq([Safe, Child], maxlen=1)[0]()", True),
+        ("import collections as c\nc.deque([Safe, Child], maxlen=1)[0]()", True),
+        ("deque([Child], maxlen=1)[0]()", False),
+        (
+            "from collections import deque\n"
+            "def deque(items, maxlen=None): return [lambda: None]\n"
+            "deque([Child], maxlen=1)[0]()",
+            False,
+        ),
+    ],
+)
+def test_codex_pr348_deque_requires_import_and_honors_maxlen(
+    tmp_path, dispatch, is_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
+
+
+@pytest.mark.parametrize("dispatch", ["types.new_class('X', (Base,))", "types.new_class('X', (Base,))()"])
+def test_codex_pr348_new_class_runs_init_subclass_on_creation(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import types\n"
+        "class Base:\n"
+        "    def __init_subclass__(cls, **kwargs):\n"
+        "        globals()['workers'] = 4\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr348_shadowed_object_getattribute_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Helper:\n"
+        "    @staticmethod\n"
+        "    def __getattribute__(target, attr):\n"
+        "        return lambda: None\n"
+        "object = Helper\n"
+        "object.__getattribute__(Child, '__call__')()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
