@@ -69,7 +69,7 @@ only begin at a future `1.0.0`.
   from `requirements.in`. The Docker image and the test and release workflows
   install from these files with `--require-hashes`, so CI tests exactly what
   the image ships (it previously tested Gunicorn 26.0.0 while the image had
-  26.2.0) and image builds are reproducible. All workflow actions are pinned
+  26.2.0) and dependency installs are reproducible. All workflow actions are pinned
   to commit SHAs.
 - Changelog version `0.1.10` → `0.1.11`.
 

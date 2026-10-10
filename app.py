@@ -578,11 +578,27 @@ class _PanelRuntime:
         if request.endpoint == "login":
             message = "The login form expired. Please try again."
             return render_template(LOGIN_HTML, error=message), 400
+        if not self._csrf_session_still_valid():
+            # The dashboard would bounce to /login, which drops a queued flash
+            # message, so answer with the login page and the reason directly.
+            message = (
+                "Your session expired, so nothing was changed. "
+                "Please sign in again."
+            )
+            return render_template(LOGIN_HTML, error=message), 400
         session["flash_error"] = (
             "The form expired or was invalid, so nothing was changed. "
             "Please try again."
         )
         return redirect(url_for("index"))
+
+    def _csrf_session_still_valid(self):
+        if not self.app.config["REQUIRE_LOGIN"]:
+            return True
+        try:
+            return self._session_is_authenticated()
+        except SessionBackendUnavailable:
+            return False
 
     def logout(self):
         validation_error = self._validate_logout_session()

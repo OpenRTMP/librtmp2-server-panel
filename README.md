@@ -157,6 +157,8 @@ Prebuilt multi-architecture images are published for `amd64`, `arm64`, and `risc
 
 ## Local Python development
 
+Requires Python 3.10 or newer (the Docker image uses 3.14).
+
 ```bash
 python3 -m venv venv
 . venv/bin/activate
@@ -173,8 +175,8 @@ transitive dependency with hashes and are generated from it. After changing
 `requirements.in` or `requirements-dev.in`, regenerate both:
 
 ```bash
-uv pip compile --universal --python-version 3.14 --generate-hashes -o requirements.txt requirements.in
-uv pip compile --universal --python-version 3.14 --generate-hashes -o requirements-dev.txt requirements-dev.in
+uv pip compile --universal --python-version 3.10 --generate-hashes -o requirements.txt requirements.in
+uv pip compile --universal --python-version 3.10 --generate-hashes -o requirements-dev.txt requirements-dev.in
 ```
 
 ## Features

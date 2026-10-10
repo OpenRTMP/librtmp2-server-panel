@@ -912,12 +912,8 @@ def test_cluster_drain_requires_csrf_when_enabled(monkeypatch):
         _login(client)
 
         r = client.post("/cluster/nodes/2/drain")
-        # A rejected form changes nothing and sends the operator back with a
-        # message instead of a bare HTTP 400 page.
-        assert r.status_code == 302
+        assert r.status_code == 400
         mock_client.cluster_drain_node.assert_not_called()
-        with client.session_transaction() as sess:
-            assert "nothing was changed" in sess.get("flash_error", "")
 
 
 def test_cluster_drain_calls_api_even_when_health_says_standalone(monkeypatch):

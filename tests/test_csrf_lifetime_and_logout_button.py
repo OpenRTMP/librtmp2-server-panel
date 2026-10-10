@@ -101,6 +101,22 @@ def test_rejected_login_form_shows_the_login_page(monkeypatch, mock_client):
         assert not sess.get("logged_in")
 
 
+def test_rejected_form_after_session_expiry_explains_on_login_page(
+    monkeypatch, mock_client
+):
+    application = _csrf_app(monkeypatch)
+    client = application.test_client()
+    _login(client)
+    with client.session_transaction() as sess:
+        sess["session_token"] = "expired-or-revoked"
+
+    response = client.post("/streams/demo/delete", data={"csrf_token": "stale"})
+
+    assert response.status_code == 400
+    assert b"Your session expired, so nothing was changed" in response.data
+    mock_client.delete_stream.assert_not_called()
+
+
 @pytest.mark.parametrize("page", ["/", "/cluster"])
 def test_logout_button_only_when_login_is_required(monkeypatch, mock_client, page):
     mock_client.cluster_status.return_value = {"enabled": False}
