@@ -10175,36 +10175,49 @@ def _is_proven_collections_deque(func, operator_bindings, reference_line):
     return False
 
 
+def _deque_maxlen_argument(call):
+    """Return the positional or keyword maxlen expression."""
+    if len(call.args) > 1:
+        return call.args[1]
+    return next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "maxlen"),
+        None,
+    )
+
+
+def _risky_class_in_unknown_deque_suffix(call, elements, operator_bindings):
+    """Conservatively recognize a worker-mutating class under unknown maxlen."""
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    return next(
+        (
+            element.id for element in elements
+            if isinstance(element, ast.Name)
+            and _class_name_instantiation_triggers_workers_for_targets(
+                element.id,
+                getattr(call, "lineno", 0),
+                class_targets,
+            )
+        ),
+        None,
+    )
+
+
 def _deque_subscript_class_name(call, index, operator_bindings):
     """Apply bounded deque truncation before selecting a constructor."""
     if not call.args or not isinstance(call.args[0], (ast.List, ast.Tuple)):
         return None
     elements = call.args[0].elts
-    maxlen = (
-        call.args[1] if len(call.args) > 1 else next(
-            (keyword.value for keyword in call.keywords if keyword.arg == "maxlen"),
-            None,
-        )
-    )
+    maxlen = _deque_maxlen_argument(call)
     if maxlen is not None:
-        if isinstance(maxlen, ast.Constant) and type(maxlen.value) is int and maxlen.value >= 0:
-            elements = elements[-maxlen.value:] if maxlen.value else []
-        else:
-            # Unknown maxlen may retain any suffix; fail closed for a
-            # candidate constructor that could modify the worker count.
-            class_targets = _operator_bindings_class_targets(operator_bindings)
-            return next(
-                (
-                    element.id for element in elements
-                    if isinstance(element, ast.Name)
-                    and _class_name_instantiation_triggers_workers_for_targets(
-                        element.id,
-                        getattr(call, "lineno", 0),
-                        class_targets,
-                    )
-                ),
-                None,
+        if not (
+            isinstance(maxlen, ast.Constant)
+            and type(maxlen.value) is int
+            and maxlen.value >= 0
+        ):
+            return _risky_class_in_unknown_deque_suffix(
+                call, elements, operator_bindings
             )
+        elements = elements[-maxlen.value:] if maxlen.value else []
     return _literal_container_element_class_name(
         ast.List(elts=elements, ctx=ast.Load()),
         index,
