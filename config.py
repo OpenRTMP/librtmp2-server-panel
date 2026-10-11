@@ -12423,6 +12423,34 @@ def _statement_has_class_workers_side_effect(node, class_targets):
 
 
 
+def _generator_expression_runs_workers_walrus(genexp):
+    """Return True when an eagerly consumed generator expression binds ``workers``.
+
+    ``_node_has_workers_walrus`` treats a generator as deferred and only inspects
+    its outermost iterable. When a known eager builtin drains the generator, the
+    element and inner clauses run too, so those must be inspected.
+    """
+    parts = [genexp.elt]
+    for generator in genexp.generators:
+        parts.append(generator.iter)
+        parts.extend(generator.ifs)
+    return any(_node_has_workers_walrus(part) for part in parts)
+
+
+def _statement_eagerly_consumes_workers_walrus(node, operator_bindings, bound_names):
+    """Return True when an eager builtin drains a generator binding ``workers``."""
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    if _generator_consumer_name(call, operator_bindings, bound_names) is None:
+        return False
+    return any(
+        isinstance(arg, ast.GeneratorExp)
+        and _generator_expression_runs_workers_walrus(arg)
+        for arg in call.args
+    )
+
+
 def _statement_mutates_workers(
     node,
     operator_bindings,
@@ -12436,7 +12464,13 @@ def _statement_mutates_workers(
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
         return True
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # A nested function's decorators and default arguments are evaluated
+        # when the nested ``def`` runs, in this scope, so under ``global
+        # workers`` a ``workers`` walrus there rebinds the module attribute. The
+        # body is deferred and must not be scanned.
+        return bool(global_workers) and _node_has_workers_walrus(node)
+    if isinstance(node, ast.ClassDef):
         return False
     if _statement_has_class_workers_side_effect(node, class_targets):
         return True
@@ -12462,6 +12496,10 @@ def _statement_mutates_workers(
         global_workers
         and isinstance(node, (ast.For, ast.AsyncFor))
         and _target_assigns_workers(node.target)
+    ):
+        return True
+    if global_workers and _statement_eagerly_consumes_workers_walrus(
+        node, operator_bindings, bound_names
     ):
         return True
     if _statement_removes_namespace_workers(node, operator_bindings):

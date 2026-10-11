@@ -68,6 +68,35 @@ _GLOBAL_BINDING_CASES = [
         (1, True),
     ),
     (
+        "nested function default walrus rebinding workers is dynamic",
+        "workers = 1\n"
+        "def configure_workers():\n"
+        "    global workers\n"
+        "    def inner(value=(workers := 4)):\n"
+        "        pass\n"
+        "    inner()\n"
+        "configure_workers()\n",
+        (1, True),
+    ),
+    (
+        "eager consumer of a workers walrus generator is dynamic",
+        "workers = 1\n"
+        "def configure_workers():\n"
+        "    global workers\n"
+        "    list((workers := 4) for _ in [0])\n"
+        "configure_workers()\n",
+        (1, True),
+    ),
+    (
+        "unconsumed workers walrus generator stays static",
+        "workers = 1\n"
+        "def configure_workers():\n"
+        "    global workers\n"
+        "    ((workers := 4) for _ in [0])\n"
+        "configure_workers()\n",
+        (1, False),
+    ),
+    (
         "for-loop target without a global declaration stays static",
         "workers = 1\n"
         "def configure_workers():\n"
