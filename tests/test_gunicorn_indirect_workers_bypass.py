@@ -3270,3 +3270,145 @@ def test_codex_pr348_shadowed_object_getattribute_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-11: __bases__ and mro() class-resolution gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "Child.__bases__[0]()",
+        "Child.mro()[1]()",
+        "list(Child.mro())[1]()",
+        "getattr(Child.__bases__[0], '__call__')()",
+        "Child.__bases__[0].__call__()",
+        "object.__getattribute__(Child.__bases__[0], '__call__')()",
+        "import operator\noperator.attrgetter('__call__')(Child.__bases__[0])()",
+    ],
+)
+def test_security_review_oct11_bases_and_mro_gaps_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("Child.mro()[0]()", True),
+        (
+            "class SafeChild(Child):\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "SafeChild.mro()[0]()",
+            False,
+        ),
+    ],
+)
+def test_security_review_oct11_mro_index_respects_constructor(
+    tmp_path, dispatch, is_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
+
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "Safe.mro()[0]()",
+        "list(Safe.mro())[0]()",
+        "tuple(Safe.mro())[0]()",
+        "getattr(Safe.mro()[0], '__call__')()",
+    ],
+)
+def test_codex_pr355_overridden_mro_cannot_hide_mutating_constructor(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Safe:\n"
+        "    @classmethod\n"
+        "    def mro(cls):\n"
+        "        return [Risky]\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "Child.__bases__[0]()",
+        "Child.mro()[1]()",
+        "tuple(Child.mro())[1]()",
+        "getattr(Child.__bases__[0], '__call__')()",
+        "Child.__bases__[0].__call__()",
+    ],
+)
+def test_codex_pr355_captured_base_survives_name_rebinding(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        "class Safe:\n"
+        "    pass\n"
+        "Risky = Safe\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_codex_pr355_tuple_wrapped_mro_constructor_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + "tuple(Child.mro())[1]()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("Child.mro()[-1]()", False),
+        ("Child.mro()[-2]()", True),
+        ("tuple(Child.mro())[-1]()", False),
+        ("tuple(Child.mro())[-2]()", True),
+    ],
+)
+def test_codex_pr355_local_object_distinct_from_builtin_root(
+    tmp_path, dispatch, is_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class object:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(object):\n"
+        "    pass\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
