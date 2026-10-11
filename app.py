@@ -416,6 +416,11 @@ class _PanelRuntime:
                 return view_func(*args, **kwargs)
             try:
                 if not self._session_is_authenticated():
+                    if request.path.endswith(".json"):
+                        # JSON callers (e.g. the stats poller) cannot consume
+                        # the login redirect's HTML, so answer them with a
+                        # machine-readable 401 instead of a 302 to the page.
+                        return jsonify({"error": "authentication required"}), 401
                     return redirect(url_for("login"))
             except SessionBackendUnavailable:
                 self.app.logger.exception(

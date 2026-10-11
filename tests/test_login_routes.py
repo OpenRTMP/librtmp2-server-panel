@@ -563,7 +563,9 @@ def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
 
         for _ in range(30):
             r = client.get("/streams/s1/stats.json")
-            assert r.status_code == 302
+            # JSON callers get a machine-readable 401 (not the HTML login
+            # redirect) so the poller can detect the expired session.
+            assert r.status_code == 401
             assert r.status_code != 429
 
         client.post(

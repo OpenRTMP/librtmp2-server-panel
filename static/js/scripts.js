@@ -317,6 +317,13 @@ function loadStats(streamId) {
         signal: controller.signal,
     })
         .then(response => {
+            if (response.status === 401) {
+                // Session expired: the JSON endpoint now answers 401 instead
+                // of an HTML login redirect. Send the operator back to login
+                // instead of silently rendering the "not available" placeholder.
+                window.location.assign('/login');
+                throw new Error('Authentication required');
+            }
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
