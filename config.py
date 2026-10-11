@@ -12423,31 +12423,19 @@ def _statement_has_class_workers_side_effect(node, class_targets):
 
 
 
-def _generator_expression_runs_workers_walrus(genexp):
-    """Return True when an eagerly consumed generator expression binds ``workers``.
-
-    ``_node_has_workers_walrus`` treats a generator as deferred and only inspects
-    its outermost iterable. When a known eager builtin drains the generator, the
-    element and inner clauses run too, so those must be inspected.
-    """
+def _generator_expression_runs_workers_walrus(
+    genexp, operator_bindings, bound_names, defer_annotations
+):
+    """Inspect generator parts when an eager builtin consumes its first argument."""
     parts = [genexp.elt]
     for generator in genexp.generators:
         parts.append(generator.iter)
         parts.extend(generator.ifs)
-    return any(_node_has_workers_walrus(part) for part in parts)
-
-
-def _statement_eagerly_consumes_workers_walrus(node, operator_bindings, bound_names):
-    """Return True when an eager builtin drains a generator binding ``workers``."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    call = node.value
-    if _generator_consumer_name(call, operator_bindings, bound_names) is None:
-        return False
     return any(
-        isinstance(arg, ast.GeneratorExp)
-        and _generator_expression_runs_workers_walrus(arg)
-        for arg in call.args
+        _node_has_workers_walrus(
+            part, operator_bindings, bound_names, defer_annotations
+        )
+        for part in parts
     )
 
 
@@ -12460,6 +12448,7 @@ def _statement_mutates_workers(
     class_targets=None,
     dict_subclass_names=None,
     bound_names=None,
+    defer_annotations=False,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
@@ -12469,7 +12458,9 @@ def _statement_mutates_workers(
         # when the nested ``def`` runs, in this scope, so under ``global
         # workers`` a ``workers`` walrus there rebinds the module attribute. The
         # body is deferred and must not be scanned.
-        return bool(global_workers) and _node_has_workers_walrus(node)
+        return bool(global_workers) and _node_has_workers_walrus(
+            node, operator_bindings, bound_names, defer_annotations
+        )
     if isinstance(node, ast.ClassDef):
         return False
     if _statement_has_class_workers_side_effect(node, class_targets):
@@ -12490,16 +12481,14 @@ def _statement_mutates_workers(
     # ``global workers`` ``for``/``async for`` loop target. Both mutate the
     # module attribute at import time, so treat them as mutations like the
     # direct assignment above.
-    if global_workers and _node_has_workers_walrus(node):
+    if global_workers and _node_has_workers_walrus(
+        node, operator_bindings, bound_names, defer_annotations
+    ):
         return True
     if (
         global_workers
         and isinstance(node, (ast.For, ast.AsyncFor))
         and _target_assigns_workers(node.target)
-    ):
-        return True
-    if global_workers and _statement_eagerly_consumes_workers_walrus(
-        node, operator_bindings, bound_names
     ):
         return True
     if _statement_removes_namespace_workers(node, operator_bindings):
@@ -12515,6 +12504,7 @@ def _statement_mutates_workers(
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
+            defer_annotations=defer_annotations,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -12530,6 +12520,7 @@ def _statements_mutate_workers(
     class_targets=None,
     dict_subclass_names=None,
     bound_names=None,
+    defer_annotations=False,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -12543,6 +12534,7 @@ def _statements_mutate_workers(
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
+            defer_annotations=defer_annotations,
         )
         for node in statements
     )
@@ -12614,6 +12606,7 @@ def _function_mutates_workers(
     mutator_names=None,
     class_targets=None,
     dict_subclass_names=None,
+    defer_annotations=False,
 ):
     """Return True when a function may mutate the module ``workers`` binding.
 
@@ -12636,6 +12629,7 @@ def _function_mutates_workers(
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
             bound_names=_function_local_bound_names(func_node),
+            defer_annotations=defer_annotations,
         )
 
 
@@ -12680,6 +12674,7 @@ def _collect_import_time_workers_mutators(
                     mutators,
                     class_targets,
                     dict_subclass_names,
+                    _config_defers_annotations(tree),
                 )
                 for node in nodes
             ):
@@ -15993,6 +15988,19 @@ def _definition_time_expressions(node, defer_annotations=False):
     )
     if defer_annotations:
         return expressions
+    args = node.args
+    parameters = (
+        *args.posonlyargs,
+        *args.args,
+        *args.kwonlyargs,
+        args.vararg,
+        args.kwarg,
+    )
+    expressions.extend(
+        arg.annotation
+        for arg in parameters
+        if arg is not None and arg.annotation is not None
+    )
     returns = getattr(node, "returns", None)  # ast.Lambda has no annotation
     if returns is not None:
         expressions.append(returns)
@@ -16037,34 +16045,51 @@ def _worker_scan_defaults(
 
 
 
-def _node_has_workers_walrus(node):
-    """Return True when an evaluated walrus expression in ``node`` binds ``workers``.
-
-    Only expressions that actually run while the enclosing definition is created
-    count. A ``def`` evaluates its decorators and default arguments at definition
-    time but defers its body, and a lambda defers its body while still evaluating
-    its defaults, so ``cb = lambda x=(workers := 2): None`` binds module-level
-    ``workers`` even though ``lambda: (workers := 2)`` never does.
-
-    A generator expression defers everything except its outermost iterable:
-    ``(x for x in range((workers := 4)))`` binds ``workers`` when the generator
-    object is created, while ``((workers := 4) for _ in ())`` does not bind it
-    unless the generator is actually iterated.
-    """
+def _node_has_workers_walrus(
+    node, operator_bindings=None, bound_names=None, defer_annotations=False
+):
+    """Detect evaluated workers walruses without entering deferred scopes."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         expressions = [
             *getattr(node, "decorator_list", ()),
-            *_definition_time_expressions(node),
+            *_definition_time_expressions(node, defer_annotations),
         ]
-        return any(_node_has_workers_walrus(expression) for expression in expressions)
-    if isinstance(node, ast.GeneratorExp):
-        return _node_has_workers_walrus(node.generators[0].iter)
-    if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
-        return True
-    return any(_node_has_workers_walrus(child) for child in ast.iter_child_nodes(node))
+    elif isinstance(node, ast.ClassDef):
+        # A class body has its own namespace. Only its bases and decorators
+        # execute in the enclosing function's (possibly global) scope.
+        expressions = [
+            *node.bases,
+            *(keyword.value for keyword in node.keywords),
+            *node.decorator_list,
+        ]
+    elif isinstance(node, ast.GeneratorExp):
+        # Creating a generator evaluates just its outermost iterable.
+        expressions = [node.generators[0].iter]
+    else:
+        if isinstance(node, ast.NamedExpr) and _target_assigns_workers(node.target):
+            return True
+        if (
+            operator_bindings is not None
+            and isinstance(node, ast.Call)
+            and _generator_consumer_name(node, operator_bindings, bound_names)
+            and isinstance(node.args[0], ast.GeneratorExp)
+            and _generator_expression_runs_workers_walrus(
+                node.args[0], operator_bindings, bound_names, defer_annotations
+            )
+        ):
+            return True
+        expressions = ast.iter_child_nodes(node)
+    return any(
+        _node_has_workers_walrus(
+            child, operator_bindings, bound_names, defer_annotations
+        )
+        for child in expressions
+    )
 
 
-def _class_body_statement_assigns_workers(node):
+def _class_body_statement_assigns_workers(
+    node, operator_bindings=None, bound_names=None, defer_annotations=False
+):
     """Return True when the statement binds the bare name ``workers``."""
     if isinstance(node, ast.Assign):
         targets = node.targets
@@ -16076,7 +16101,9 @@ def _class_body_statement_assigns_workers(node):
         targets = []
     if any(_target_assigns_workers(target) for target in targets):
         return True
-    return _node_has_workers_walrus(node)
+    return _node_has_workers_walrus(
+        node, operator_bindings, bound_names, defer_annotations
+    )
 
 
 def _class_body_statement_has_dynamic_workers_effect(
@@ -16128,7 +16155,9 @@ def _class_body_statement_has_dynamic_workers_effect(
                 defer_annotations,
             )
         )
-    if global_workers_declared and _class_body_statement_assigns_workers(node):
+    if global_workers_declared and _class_body_statement_assigns_workers(
+        node, operator_bindings, bound_names, defer_annotations
+    ):
         return True
     if _statement_invokes_function(node, global_workers_mutators):
         return True
@@ -16235,7 +16264,9 @@ def _handle_worker_scan_definition(
                 dict_subclass_names,
                 defer_annotations,
             )
-            or _node_has_workers_walrus(node)
+            or _node_has_workers_walrus(
+                node, operator_bindings, defer_annotations=defer_annotations
+            )
         ):
             state.dynamic = True
         return True
@@ -16308,7 +16339,9 @@ def _walk_gunicorn_workers_statements(
             dict_subclass_names=dict_subclass_names,
         ):
             state.dynamic = True
-        if _node_has_workers_walrus(node):
+        if _node_has_workers_walrus(
+            node, operator_bindings, defer_annotations=defer_annotations
+        ):
             state.dynamic = True
         _record_walrus_workers_assignment(
             node,
