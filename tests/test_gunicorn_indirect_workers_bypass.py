@@ -3294,11 +3294,27 @@ def test_security_review_oct11_bases_and_mro_gaps_are_dynamic(tmp_path, dispatch
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
-def test_security_review_oct11_safe_mro_index_stays_static(tmp_path):
-    dispatch = "Child.mro()[0]()"
+@pytest.mark.parametrize(
+    ("dispatch", "is_dynamic"),
+    [
+        ("Child.mro()[0]()", True),
+        (
+            "class SafeChild(Child):\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "SafeChild.mro()[0]()",
+            False,
+        ),
+    ],
+)
+def test_security_review_oct11_mro_index_respects_constructor(
+    tmp_path, dispatch, is_dynamic
+):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
         _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
         encoding="utf-8",
     )
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, is_dynamic
+    )
