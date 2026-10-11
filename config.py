@@ -12450,6 +12450,20 @@ def _statement_mutates_workers(
     assigns_workers, _ = _worker_assignment_value(node, operator_bindings)
     if global_workers and assigns_workers:
         return True
+    # A statement may rebind the module ``workers`` binding in a shape
+    # ``_worker_assignment_value`` does not model: a ``global workers`` walrus
+    # in an ``if``/``while`` test (or any evaluated expression), and a
+    # ``global workers`` ``for``/``async for`` loop target. Both mutate the
+    # module attribute at import time, so treat them as mutations like the
+    # direct assignment above.
+    if global_workers and _node_has_workers_walrus(node):
+        return True
+    if (
+        global_workers
+        and isinstance(node, (ast.For, ast.AsyncFor))
+        and _target_assigns_workers(node.target)
+    ):
+        return True
     if _statement_removes_namespace_workers(node, operator_bindings):
         # ``globals()`` names the module namespace from any function scope, so a
         # removal through it needs no ``global workers`` declaration to apply.
