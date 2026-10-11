@@ -188,8 +188,12 @@ def test_global_for_loop_rebinding_rejects_memory_rate_limit(
     ],
 )
 def test_evaluated_worker_walruses(
-    config_module, snippet, expected
+    config_module, monkeypatch, snippet, expected
 ):
+    if snippet.startswith("def nested"):
+        # Model the eager evaluation used by Python <= 3.13 even when CI
+        # executes on Python 3.14+ with PEP 649 deferred annotations.
+        monkeypatch.setattr(config_module, "_config_defers_annotations", lambda tree: False)
     source = (
         "workers = 1\n"
         "def configure_workers():\n"
