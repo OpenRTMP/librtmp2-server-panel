@@ -11,6 +11,7 @@ The shared ``config_module`` fixture lives in ``tests/conftest.py``.
 
 import ast
 import sys
+import textwrap
 
 import pytest
 
@@ -40,11 +41,13 @@ _GLOBAL_BINDING_CASES = [
         "global async for-loop target rebinding workers is dynamic",
         "workers = 1\n"
         "import asyncio\n"
+        "async def stream():\n"
+        "    yield 4\n"
         "async def configure_workers(stream):\n"
         "    global workers\n"
         "    async for workers in stream:\n"
         "        pass\n"
-        "asyncio.run(configure_workers([]))\n",
+        "asyncio.run(configure_workers(stream()))\n",
         (1, True),
     ),
     (
@@ -159,6 +162,66 @@ def test_global_for_loop_rebinding_rejects_memory_rate_limit(
 
     assert config_module._detect_worker_settings() == (1, True)
     assert config_module._ratelimit_storage_error() is not None
+
+
+
+@pytest.mark.parametrize(
+    ("snippet", "expected"),
+    [
+        ("return sum((workers := 4) for _ in [0])", (1, True)),
+        ("result = list((workers := 4) for _ in [0])", (1, True)),
+        ("if list((workers := 4) for _ in [0]):\n    pass", (1, True)),
+        ("for item in tuple((workers := 4) for _ in [0]):\n    pass", (1, True)),
+        (
+            "result = list(sum((workers := 4) for _ in [0]) for _ in [0])",
+            (1, True),
+        ),
+        (
+            "result = next((x for x in []), ((workers := 4) for _ in [0]))",
+            (1, False),
+        ),
+        ("return ((workers := 4) for _ in [0])", (1, False)),
+        ("if True:\n    class Holder:\n        (workers := 4)", (1, False)),
+        ("def nested(value: (workers := 4)):\n    pass", (1, True)),
+        ("def nested(*, value: (workers := 4)):\n    pass", (1, True)),
+        ("def nested() -> (workers := 4):\n    pass", (1, True)),
+    ],
+)
+def test_evaluated_worker_walruses(
+    config_module, snippet, expected
+):
+    source = (
+        "workers = 1\n"
+        "def configure_workers():\n"
+        "    global workers\n"
+        + textwrap.indent(snippet, "    ")
+        + "\nconfigure_workers()\n"
+    )
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == expected
+
+
+def test_future_annotations_defer_nested_parameter_walrus(config_module):
+    source = (
+        "from __future__ import annotations\n"
+        "workers = 1\n"
+        "def configure_workers():\n"
+        "    global workers\n"
+        "    def nested(value: (workers := 4)):\n"
+        "        pass\n"
+        "configure_workers()\n"
+    )
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (1, False)
+
+
+def test_async_for_worker_fixture_executes():
+    source = next(
+        item[1]
+        for item in _GLOBAL_BINDING_CASES
+        if item[0] == "global async for-loop target rebinding workers is dynamic"
+    )
+    namespace = {}
+    exec(compile(source, "<async for regression>", "exec"), namespace)
+    assert namespace["workers"] == 4
 
 
 # --- end of round-11 scanner regressions ---
