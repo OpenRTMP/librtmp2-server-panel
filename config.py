@@ -10224,18 +10224,86 @@ def _deque_subscript_class_name(call, index, operator_bindings):
     )
 
 
+def _class_mro_index_class_name(class_name, index, operator_bindings):
+    """Resolve a class name from a static MRO index without running config code."""
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
+        return None
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    mro = _class_mro_names(class_name, class_bases)
+    if "object" not in mro:
+        mro = (*mro, "object")
+    return mro[index] if -len(mro) <= index < len(mro) else None
+
+
 def _mro_subscript_class_name(value, index, operator_bindings):
     """Resolve an indexed MRO element without evaluating configuration code."""
+    if not isinstance(value.value, ast.Name):
+        return None
+    return _class_mro_index_class_name(value.value.id, index, operator_bindings)
+
+
+def _bases_subscript_class_name(value, index, operator_bindings):
+    """Resolve ``Class.__bases__[index]`` to a defined base class name."""
+    if not (isinstance(value, ast.Attribute) and value.attr == "__bases__"):
+        return None
     if not isinstance(value.value, ast.Name):
         return None
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return None
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
-    mro = _class_mro_names(value.value.id, class_bases)
-    if "object" not in mro:
-        mro = (*mro, "object")
-    return mro[index] if -len(mro) <= index < len(mro) else None
+    bases = class_bases.get(value.value.id, ())
+    if not -len(bases) <= index < len(bases):
+        return None
+    return bases[index]
+
+
+def _is_class_mro_method_call(call):
+    """Return True for ``Class.mro()`` with no arguments."""
+    return (
+        isinstance(call, ast.Call)
+        and not call.args
+        and not call.keywords
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "mro"
+        and isinstance(call.func.value, ast.Name)
+    )
+
+
+def _class_mro_method_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``Class.mro()[index]`` without evaluating the MRO tuple."""
+    if not _is_class_mro_method_call(call):
+        return None
+    return _class_mro_index_class_name(call.func.value.id, index, operator_bindings)
+
+
+def _list_mro_method_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``list(Class.mro())[index]`` when list is the unshadowed builtin."""
+    if not isinstance(call, ast.Call) or len(call.args) != 1:
+        return None
+    reference_line = getattr(call, "lineno", 0)
+    shadow_lines = (
+        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+    )
+    if not (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "list"
+        and _name_is_unshadowed_builtin("list", reference_line, shadow_lines)
+    ):
+        return None
+    return _class_mro_method_subscript_class_name(
+        call.args[0], index, operator_bindings
+    )
+
+
+def _expression_resolves_class_name(expr, operator_bindings=None):
+    """Return a class name for simple static class references."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Subscript):
+        return _subscript_expression_resolves_class_name(expr, operator_bindings)
+    return None
 
 
 def _container_call_subscript_class_name(value, index, operator_bindings):
@@ -10265,24 +10333,35 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
     value = sub.value
     if isinstance(value, ast.Attribute) and value.attr == "__mro__":
         return _mro_subscript_class_name(value, index, operator_bindings)
+    if isinstance(value, ast.Attribute) and value.attr == "__bases__":
+        return _bases_subscript_class_name(value, index, operator_bindings)
+    if isinstance(value, ast.Call):
+        name = _class_mro_method_subscript_class_name(value, index, operator_bindings)
+        if name is not None:
+            return name
+        name = _list_mro_method_subscript_class_name(value, index, operator_bindings)
+        if name is not None:
+            return name
     name = _literal_container_element_class_name(value, index)
     if name is not None:
         return name
     return _container_call_subscript_class_name(value, index, operator_bindings)
 
 
-def _getattr_resolves_class_name(func, class_targets, attr_name):
+def _getattr_resolves_class_name(
+    func, class_targets, attr_name, operator_bindings=None
+):
     """Return a class name when ``getattr`` resolves a descriptor on a class."""
     target = _super_getattr_target(func, class_targets)
     if target is None or target[1] != attr_name:
         return None
     receiver = target[0]
-    if isinstance(receiver, ast.Name):
-        return receiver.id
-    return None
+    return _expression_resolves_class_name(receiver, operator_bindings)
 
 
-def _object_getattribute_resolves_class_name(func, class_targets, attr_name):
+def _object_getattribute_resolves_class_name(
+    func, class_targets, attr_name, operator_bindings=None
+):
     """Return a class name for ``object.__getattribute__(Class, attr)``."""
     if not isinstance(func, ast.Call) or len(func.args) < 2:
         return None
@@ -10294,9 +10373,7 @@ def _object_getattribute_resolves_class_name(func, class_targets, attr_name):
     if not (isinstance(key, ast.Constant) and key.value == attr_name):
         return None
     receiver = func.args[0]
-    if isinstance(receiver, ast.Name):
-        return receiver.id
-    return None
+    return _expression_resolves_class_name(receiver, operator_bindings)
 
 
 def _attrgetter_call_resolves_class_name(func, operator_bindings, attr_name):
@@ -10308,10 +10385,9 @@ def _attrgetter_call_resolves_class_name(func, operator_bindings, attr_name):
         return None
     if _operator_attrgetter_method_name(factory) != attr_name:
         return None
-    if len(func.args) != 1 or not isinstance(func.args[0], ast.Name):
+    if len(func.args) != 1:
         return None
-    return func.args[0].id
-
+    return _expression_resolves_class_name(func.args[0], operator_bindings)
 
 
 def _resolved_class_name_from_callable(
@@ -10325,13 +10401,16 @@ def _resolved_class_name_from_callable(
     respects lambda argument bindings that can shadow module class names.
     """
     if class_targets:
-        class_name = _getattr_resolves_class_name(func, class_targets, "__call__")
+        class_name = _getattr_resolves_class_name(
+            func, class_targets, "__call__", operator_bindings
+        )
         if class_name is not None:
             return class_name
         class_name = _object_getattribute_resolves_class_name(
             func,
             class_targets,
             "__call__",
+            operator_bindings,
         )
         if class_name is not None:
             return class_name
@@ -10344,8 +10423,9 @@ def _resolved_class_name_from_callable(
         if class_name is not None:
             return class_name
     if isinstance(func, ast.Attribute) and func.attr == "__call__":
-        if isinstance(func.value, ast.Name):
-            return func.value.id
+        resolved = _expression_resolves_class_name(func.value, operator_bindings)
+        if resolved is not None:
+            return resolved
     if isinstance(func, ast.Subscript):
         return _subscript_expression_resolves_class_name(func, operator_bindings)
     return None

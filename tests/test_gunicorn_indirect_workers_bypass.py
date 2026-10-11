@@ -3270,3 +3270,35 @@ def test_codex_pr348_shadowed_object_getattribute_stays_static(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Security review 2026-10-11: __bases__ and mro() class-resolution gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "Child.__bases__[0]()",
+        "Child.mro()[1]()",
+        "list(Child.mro())[1]()",
+        "getattr(Child.__bases__[0], '__call__')()",
+        "Child.__bases__[0].__call__()",
+        "object.__getattribute__(Child.__bases__[0], '__call__')()",
+        "import operator\noperator.attrgetter('__call__')(Child.__bases__[0])()",
+    ],
+)
+def test_security_review_oct11_bases_and_mro_gaps_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_security_review_oct11_safe_mro_index_stays_static(tmp_path):
+    dispatch = "Child.mro()[0]()"
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
