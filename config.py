@@ -10319,6 +10319,36 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
+def _subscript_uses_dynamic_class_introspection(sub):
+    """Identify indexed runtime class lookups that cannot be resolved safely."""
+    value = sub.value
+    if isinstance(value, ast.ListComp):
+        return any(
+            isinstance(gen.iter, ast.Attribute) and gen.iter.attr == "__mro__"
+            for gen in value.generators
+        )
+    if not isinstance(value, ast.Call):
+        return False
+    if isinstance(value.func, ast.Attribute):
+        return value.func.attr == "__subclasses__"
+    return (
+        isinstance(value.func, ast.Name)
+        and value.func.id in {"list", "tuple"}
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Attribute)
+        and value.args[0].attr == "__mro__"
+    )
+
+
+def _call_uses_dynamic_class_introspection(call):
+    """Conservatively reject constructors selected by runtime class metadata."""
+    return any(
+        _subscript_uses_dynamic_class_introspection(node)
+        for node in ast.walk(call.func)
+        if isinstance(node, ast.Subscript)
+    )
+
+
 def _expression_resolves_class_name(expr, operator_bindings=None):
     """Return a class name for simple static class references."""
     if isinstance(expr, ast.Name):
@@ -10531,6 +10561,8 @@ def _call_invokes_resolved_risky_class_constructor(
     """Inspect resolved callable's own __call__ before constructor fallback."""
     if not isinstance(call, ast.Call):
         return False
+    if _call_uses_dynamic_class_introspection(call):
+        return True
     if class_targets is None:
         class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
