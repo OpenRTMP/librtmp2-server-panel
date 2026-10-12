@@ -10319,81 +10319,34 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _sequence_mro_attribute_subscript_class_name(call, index, operator_bindings):
-    """Resolve unshadowed ``list/tuple(Class.__mro__)[index]`` expressions."""
-    if not isinstance(call, ast.Call) or len(call.args) != 1 or call.keywords:
-        return None
-    reference_line = getattr(call, "lineno", 0)
-    shadow_lines = (
-        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
-    )
-    if not (
-        isinstance(call.func, ast.Name)
-        and call.func.id in {"list", "tuple"}
-        and _name_is_unshadowed_builtin(call.func.id, reference_line, shadow_lines)
-    ):
-        return None
-    arg = call.args[0]
-    if not (
-        isinstance(arg, ast.Attribute)
-        and arg.attr == "__mro__"
-        and isinstance(arg.value, ast.Name)
-    ):
-        return None
-    return _class_mro_index_class_name(arg.value.id, index, operator_bindings)
-
-
-def _direct_subclass_names(class_name, class_bases):
-    """Return locally defined direct subclasses in source definition order."""
-    return tuple(
-        name for name, bases in class_bases.items() if class_name in bases
+def _subscript_uses_dynamic_class_introspection(sub):
+    """Identify indexed runtime class lookups that cannot be resolved safely."""
+    value = sub.value
+    if isinstance(value, ast.ListComp):
+        return any(
+            isinstance(gen.iter, ast.Attribute) and gen.iter.attr == "__mro__"
+            for gen in value.generators
+        )
+    if not isinstance(value, ast.Call):
+        return False
+    if isinstance(value.func, ast.Attribute):
+        return value.func.attr == "__subclasses__"
+    return (
+        isinstance(value.func, ast.Name)
+        and value.func.id in {"list", "tuple"}
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Attribute)
+        and value.args[0].attr == "__mro__"
     )
 
 
-def _subclasses_call_subscript_class_name(call, index, operator_bindings):
-    """Resolve ``Class.__subclasses__()[index]`` for locally defined classes."""
-    if not (
-        isinstance(call, ast.Call)
-        and not call.args
-        and not call.keywords
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "__subclasses__"
-        and isinstance(call.func.value, ast.Name)
-    ):
-        return None
-    class_targets = _operator_bindings_class_targets(operator_bindings)
-    if not class_targets:
-        return None
-    class_bases = class_targets[7] if len(class_targets) > 7 else {}
-    subclasses = _direct_subclass_names(call.func.value.id, class_bases)
-    if not -len(subclasses) <= index < len(subclasses):
-        return None
-    return subclasses[index]
-
-
-def _mro_list_comp_subscript_class_name(comp, index, operator_bindings):
-    """Resolve ``[name for name in Class.__mro__][index]`` identity comprehensions."""
-    if not (
-        isinstance(comp, ast.ListComp)
-        and len(comp.generators) == 1
-        and not comp.generators[0].ifs
-    ):
-        return None
-    generator = comp.generators[0]
-    if not (
-        isinstance(generator.target, ast.Name)
-        and isinstance(comp.elt, ast.Name)
-        and generator.target.id == comp.elt.id
-    ):
-        return None
-    iter_node = generator.iter
-    if not (
-        isinstance(iter_node, ast.Attribute)
-        and iter_node.attr == "__mro__"
-        and isinstance(iter_node.value, ast.Name)
-    ):
-        return None
-    return _class_mro_index_class_name(iter_node.value.id, index, operator_bindings)
+def _call_uses_dynamic_class_introspection(call):
+    """Conservatively reject constructors selected by runtime class metadata."""
+    return any(
+        _subscript_uses_dynamic_class_introspection(node)
+        for node in ast.walk(call.func)
+        if isinstance(node, ast.Subscript)
+    )
 
 
 def _expression_resolves_class_name(expr, operator_bindings=None):
@@ -10439,22 +10392,6 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
         if name is not None:
             return name
         name = _sequence_mro_method_subscript_class_name(value, index, operator_bindings)
-        if name is not None:
-            return name
-        name = _sequence_mro_attribute_subscript_class_name(
-            value, index, operator_bindings
-        )
-        if name is not None:
-            return name
-        name = _subclasses_call_subscript_class_name(
-            value, index, operator_bindings
-        )
-        if name is not None:
-            return name
-    if isinstance(value, ast.ListComp):
-        name = _mro_list_comp_subscript_class_name(
-            value, index, operator_bindings
-        )
         if name is not None:
             return name
     name = _literal_container_element_class_name(value, index)
@@ -10564,12 +10501,6 @@ def _mro_subscript_owner_name(sub):
             inner = value.args[0]
         if _is_class_mro_method_call(inner):
             return inner.func.value.id
-        if (
-            isinstance(inner, ast.Attribute)
-            and inner.attr == "__mro__"
-            and isinstance(inner.value, ast.Name)
-        ):
-            return inner.value.id
     return None
 
 
@@ -10630,6 +10561,8 @@ def _call_invokes_resolved_risky_class_constructor(
     """Inspect resolved callable's own __call__ before constructor fallback."""
     if not isinstance(call, ast.Call):
         return False
+    if _call_uses_dynamic_class_introspection(call):
+        return True
     if class_targets is None:
         class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
