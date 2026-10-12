@@ -3439,3 +3439,75 @@ def test_security_review_oct12_mro_wrappers_and_subclasses_are_dynamic(
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            "class Base:\n"
+            "    @classmethod\n"
+            "    def __subclasses__(cls):\n"
+            "        return [Risky]\n"
+            "class Child(Base):\n"
+            "    pass\n"
+            "Base.__subclasses__()[0]()\n"
+        ),
+        (
+            "Alias = Risky\n"
+            "class Child(Alias):\n"
+            "    pass\n"
+            "Risky.__subclasses__()[0]()\n"
+        ),
+        (
+            "class Child(Risky):\n"
+            "    pass\n"
+            "class Safe:\n"
+            "    pass\n"
+            "Risky = Safe\n"
+            "[c for c in Child.__mro__][1]()\n"
+        ),
+        (
+            "class Base:\n"
+            "    pass\n"
+            "class Child(Risky, Base):\n"
+            "    pass\n"
+            "class Safe:\n"
+            "    pass\n"
+            "Child = Safe\n"
+            "Base.__subclasses__()[0]()\n"
+        ),
+        (
+            "if True:\n"
+            "    class Child(Risky):\n"
+            "        pass\n"
+            "Risky.__subclasses__()[0]()\n"
+        ),
+        (
+            "class Child(Risky):\n"
+            "    pass\n"
+            "[c for c in Child.__mro__ if True][1]()\n"
+        ),
+        (
+            "class Meta(type):\n"
+            "    def __getattribute__(cls, name):\n"
+            "        if name == '__mro__':\n"
+            "            return (cls, Risky, object)\n"
+            "        return super().__getattribute__(name)\n"
+            "class Safe(metaclass=Meta):\n"
+            "    pass\n"
+            "tuple(Safe.__mro__)[1]()\n"
+        ),
+    ],
+)
+def test_codex_pr360_dynamic_class_introspection_fails_closed(tmp_path, case):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        + case,
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
