@@ -3412,3 +3412,30 @@ def test_codex_pr355_local_object_distinct_from_builtin_root(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (
         1, is_dynamic
     )
+
+
+# Security review 2026-10-12: __mro__ sequence wrappers and __subclasses__ gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "tuple(Child.__mro__)[1]()",
+        "list(Child.__mro__)[1]()",
+        "[c for c in Child.__mro__][1]()",
+        "Risky.__subclasses__()[0]()",
+    ],
+)
+def test_security_review_oct12_mro_wrappers_and_subclasses_are_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
