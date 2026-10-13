@@ -16589,15 +16589,14 @@ def _method_binds_hook_name(call, receiver, namespace_aliases):
 def _is_object_setattr_callable(func, namespace_aliases=None):
     """Return True for ``object.__setattr__`` / ``getattr(object, '__setattr__')``.
 
-    A config that rebinds ``object`` binds its own attribute writer, so the
-    call no longer reaches the module namespace; the shadow state collected for
-    the scan decides that, and a call site without it stays fail-closed.
+    A config that rebinds ``object`` (or ``getattr``) binds its own attribute
+    reader/writer, so the call no longer reaches the module namespace; the
+    shadow state collected for the scan decides that, and a call site without it
+    stays fail-closed.
     """
-    if not _name_is_unshadowed_builtin(
-        "object",
-        getattr(func, "lineno", 0),
-        getattr(namespace_aliases, "builtin_shadow_lines", None),
-    ):
+    reference_line = getattr(func, "lineno", 0)
+    shadow_lines = getattr(namespace_aliases, "builtin_shadow_lines", None)
+    if not _name_is_unshadowed_builtin("object", reference_line, shadow_lines):
         return False
     if isinstance(func, ast.Attribute):
         return (
@@ -16607,6 +16606,7 @@ def _is_object_setattr_callable(func, namespace_aliases=None):
         )
     return (
         isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin("getattr", reference_line, shadow_lines)
         and isinstance(func.func, ast.Name)
         and func.func.id == "getattr"
         and len(func.args) >= 2
@@ -16617,18 +16617,36 @@ def _is_object_setattr_callable(func, namespace_aliases=None):
     )
 
 
-def _operator_setitem_aliases(operator_bindings):
-    """Return ``(setitem_aliases, module_aliases)`` from the worker bindings."""
+def _operator_setitem_active_at_line(
+    func, operator_bindings, reference_line, setitem_alias_events=None
+):
+    """Return True when the operator ``setitem`` spelling is still bound there.
+
+    Mirrors ``_is_operator_call_factory``: an alias only counts while the
+    collected alias events still show ``operator`` (or the imported ``setitem``
+    name) pointing at the real callable at that line, so a config that rebinds
+    either one is not reported as installing a hook.
+    """
     if not operator_bindings:
-        return set(), set()
-    module_aliases, setitem_aliases, _, _, _ = _unpack_operator_bindings(
-        operator_bindings
-    )
-    return setitem_aliases, module_aliases
+        return False
+    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
+    setitem_aliases = operator_bindings[1] if len(operator_bindings) > 1 else set()
+    if isinstance(func, ast.Attribute) and func.attr == "setitem":
+        module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
+        return _module_alias_active_at_line(
+            func.value, module_aliases, module_events, reference_line
+        ) or _is_operator_import(func.value)
+    if not isinstance(func, ast.Name):
+        return False
+    if setitem_alias_events and func.id in setitem_alias_events:
+        state = _binding_state_at_line(setitem_alias_events, func.id, reference_line)
+        if state is not None:
+            return bool(state)
+    return func.id in setitem_aliases
 
 
 def _is_type_bound_hook_mutator_callable(
-    func, operator_bindings, namespace_aliases=None
+    func, operator_bindings, namespace_aliases=None, setitem_alias_events=None
 ):
     """Return True for namespace mutators whose *first argument* is the namespace.
 
@@ -16644,7 +16662,6 @@ def _is_type_bound_hook_mutator_callable(
     dict_shadow_line = (
         operator_bindings[21] if operator_bindings and len(operator_bindings) > 21 else None
     )
-    setitem_aliases, module_aliases = _operator_setitem_aliases(operator_bindings)
     return (
         _is_object_setattr_callable(func, namespace_aliases)
         or _is_dict_type_setitem_callable(
@@ -16652,7 +16669,12 @@ def _is_type_bound_hook_mutator_callable(
             reference_line=getattr(func, "lineno", 0),
             dict_shadow_line=dict_shadow_line,
         )
-        or _is_operator_setitem_callable(func, setitem_aliases, module_aliases)
+        or _operator_setitem_active_at_line(
+            func,
+            operator_bindings,
+            getattr(func, "lineno", 0),
+            setitem_alias_events,
+        )
     )
 
 
@@ -16665,12 +16687,19 @@ def _type_bound_hook_store_name(call, namespace_aliases):
     return _hook_store_key_name(call.args[1])
 
 
-def _call_binds_hook_name(call, namespace_aliases=None, operator_bindings=None):
+def _call_binds_hook_name(
+    call,
+    namespace_aliases=None,
+    operator_bindings=None,
+    setitem_alias_events=None,
+):
     """Return a hook name a call binds into the config namespace, if any.
 
     ``operator_bindings`` carries the operator/sys/module aliases the worker
-    scan already collected so the type-bound mutator spellings above are
-    detected exactly like their workers counterparts instead of failing open.
+    scan already collected, and ``setitem_alias_events`` the source-ordered
+    binding events for an imported ``setitem``, so the type-bound mutator
+    spellings above are detected exactly like their workers counterparts
+    instead of failing open.
     """
     if not isinstance(call, ast.Call):
         return None
@@ -16679,15 +16708,21 @@ def _call_binds_hook_name(call, namespace_aliases=None, operator_bindings=None):
         return _setattr_binds_hook_name(call, namespace_aliases)
     if isinstance(func, ast.Name):
         # ``from operator import setitem`` then ``setitem(globals(), 'when_ready', hook)``.
-        setitem_aliases, module_aliases = _operator_setitem_aliases(operator_bindings)
-        if _is_operator_setitem_callable(func, setitem_aliases, module_aliases):
+        if _operator_setitem_active_at_line(
+            func,
+            operator_bindings,
+            getattr(func, "lineno", 0),
+            setitem_alias_events,
+        ):
             return _type_bound_hook_store_name(call, namespace_aliases)
         return None
     if isinstance(func, ast.Attribute):
         name = _method_binds_hook_name(call, func.value, namespace_aliases)
         if name is not None:
             return name
-    if _is_type_bound_hook_mutator_callable(func, operator_bindings, namespace_aliases):
+    if _is_type_bound_hook_mutator_callable(
+        func, operator_bindings, namespace_aliases, setitem_alias_events
+    ):
         return _type_bound_hook_store_name(call, namespace_aliases)
     return None
 
@@ -16710,7 +16745,9 @@ def _single_hook_binding(name, explicit):
     return (name,), explicit
 
 
-def _gunicorn_hook_binding_names(child, namespace_aliases=None, operator_bindings=None):
+def _gunicorn_hook_binding_names(
+    child, namespace_aliases=None, operator_bindings=None, setitem_alias_events=None
+):
     """Return ``(hook names, explicit)`` a node may bind into the module namespace.
 
     ``explicit`` marks bindings that target the module namespace directly
@@ -16732,7 +16769,10 @@ def _gunicorn_hook_binding_names(child, namespace_aliases=None, operator_binding
         )
     if isinstance(child, ast.Call):
         return _single_hook_binding(
-            _call_binds_hook_name(child, namespace_aliases, operator_bindings), True
+            _call_binds_hook_name(
+                child, namespace_aliases, operator_bindings, setitem_alias_events
+            ),
+            True,
         )
     return (), False
 
@@ -16756,7 +16796,9 @@ def _hook_binding_name_is_live(child, name, explicit, scope):
     return may_run
 
 
-def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None, operator_bindings=None):
+def _is_live_gunicorn_hook_binding(
+    child, scope, namespace_aliases=None, operator_bindings=None, setitem_alias_events=None
+):
     """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
@@ -16774,7 +16816,7 @@ def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None, operato
     counts whenever the enclosing body can run.
     """
     names, explicit = _gunicorn_hook_binding_names(
-        child, namespace_aliases, operator_bindings
+        child, namespace_aliases, operator_bindings, setitem_alias_events
     )
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
@@ -16903,7 +16945,9 @@ def _provably_uncalled_function_names(tree):
     )
 
 
-def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None, operator_bindings=None):
+def _gunicorn_config_has_runtime_hooks(
+    tree, namespace_aliases=None, operator_bindings=None
+):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
@@ -16911,9 +16955,14 @@ def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None, operator_bi
     scope into the nodes below it. ``namespace_aliases`` resolves aliases such
     as ``namespace = globals()`` so hook stores through them are recognized,
     and ``operator_bindings`` lets the hook walk recognize the same type-bound
-    mutator spellings the worker scan already treats as dynamic.
+    mutator spellings the worker scan already treats as dynamic, including the
+    source-ordered alias state that decides whether those spellings still name
+    the real builtin or module.
     """
     uncalled_names = _provably_uncalled_function_names(tree)
+    setitem_alias_events = _collect_imported_name_alias_events(
+        tree, "operator", {"setitem"}
+    )
     stack = [(tree, (False, frozenset(), True, False))]
     while stack:
         node, scope = stack.pop()
@@ -16921,7 +16970,11 @@ def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None, operator_bi
         with _evaluated_in_nested_scope(in_class or in_function):
             for child in ast.iter_child_nodes(node):
                 if _is_live_gunicorn_hook_binding(
-                    child, scope, namespace_aliases, operator_bindings
+                    child,
+                    scope,
+                    namespace_aliases,
+                    operator_bindings,
+                    setitem_alias_events,
                 ):
                     return True
                 stack.append(

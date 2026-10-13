@@ -144,6 +144,30 @@ _INERT_MUTATOR_CASES = [
         + "object = type('object', (), {})\n"
         "getattr(object, '__setattr__')(globals(), 'on_starting', hook)\n",
     ),
+    (
+        "a shadowed getattr name is not the builtin",
+        "workers = 1\n"
+        + _HOOK
+        + "def getattr(obj, name):\n"
+        "    return None\n"
+        "getattr(object, '__setattr__')(globals(), 'on_starting', hook)\n",
+    ),
+    (
+        "operator rebinding makes the setitem spelling inert",
+        "import operator\n"
+        "workers = 1\n"
+        + _HOOK
+        + "operator = object()\n"
+        "operator.setitem(globals(), 'on_starting', hook)\n",
+    ),
+    (
+        "a rebound imported setitem name is inert",
+        "from operator import setitem\n"
+        "workers = 1\n"
+        + _HOOK
+        + "setitem = lambda *args: None\n"
+        "setitem(globals(), 'on_starting', hook)\n",
+    ),
 ]
 
 
