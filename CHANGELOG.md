@@ -13,6 +13,18 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.12] — 2026-10-14
+
+### Security
+- The Gunicorn worker-count gate now treats additional import-time ways of changing `workers` as dynamic, including class introspection and rebinds inside functions. A memory-backed rate limit is still refused when the config can raise the worker count.
+- The runtime-hook detector now recognizes the same namespace updates as the worker-count gate, including when the builtin or imported name used for the update has been rebound.
+
+### Fixed
+- Unauthenticated requests for JSON routes now receive a machine-readable 401 instead of an HTML login redirect. The dashboard stats poller sends the operator to the login page in that case.
+
+### Changed
+- Python 3.15 for CI, locked dependencies, and the Docker base image.
+
 ## [0.1.11] — 2026-10-10
 
 ### Security
@@ -384,7 +396,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.8...v0.1.9
