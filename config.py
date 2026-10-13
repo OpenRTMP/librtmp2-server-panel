@@ -16586,16 +16586,97 @@ def _method_binds_hook_name(call, receiver, namespace_aliases):
     return None
 
 
-def _call_binds_hook_name(call, namespace_aliases=None):
-    """Return a hook name a call binds into the config namespace, if any."""
+def _is_object_setattr_callable(func):
+    """Return True for ``object.__setattr__`` / ``getattr(object, '__setattr__')``."""
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == "__setattr__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "object"
+        )
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Name)
+        and func.args[0].id == "object"
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "__setattr__"
+    )
+
+
+def _operator_setitem_aliases(operator_bindings):
+    """Return ``(setitem_aliases, module_aliases)`` from the worker bindings."""
+    if not operator_bindings:
+        return set(), set()
+    module_aliases, setitem_aliases, _, _, _ = _unpack_operator_bindings(
+        operator_bindings
+    )
+    return setitem_aliases, module_aliases
+
+
+def _is_type_bound_hook_mutator_callable(func, operator_bindings):
+    """Return True for namespace mutators whose *first argument* is the namespace.
+
+    ``_method_binds_hook_name`` reads the module namespace off the attribute
+    receiver, which is what identifies ``globals().__setitem__('on_starting',
+    hook)``. The low-level spellings -- ``dict.__setitem__(globals(), ...)``,
+    ``object.__setattr__(sys.modules[__name__], ...)`` and
+    ``operator.setitem(globals(), ...)`` -- pass the namespace as the first
+    argument instead, so they are recognized here the same way the workers scan
+    already recognizes them. Without this the hook gate stays False and a live
+    hook can raise the worker count past a static ``workers = 1``.
+    """
+    dict_shadow_line = (
+        operator_bindings[21] if operator_bindings and len(operator_bindings) > 21 else None
+    )
+    setitem_aliases, module_aliases = _operator_setitem_aliases(operator_bindings)
+    return (
+        _is_object_setattr_callable(func)
+        or _is_dict_type_setitem_callable(
+            func,
+            reference_line=getattr(func, "lineno", 0),
+            dict_shadow_line=dict_shadow_line,
+        )
+        or _is_operator_setitem_callable(func, setitem_aliases, module_aliases)
+    )
+
+
+def _type_bound_hook_store_name(call, namespace_aliases):
+    """Return the hook name a type-bound mutator call may bind, if any."""
+    if len(call.args) < 2:
+        return None
+    if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
+        return None
+    return _hook_store_key_name(call.args[1])
+
+
+def _call_binds_hook_name(call, namespace_aliases=None, operator_bindings=None):
+    """Return a hook name a call binds into the config namespace, if any.
+
+    ``operator_bindings`` carries the operator/sys/module aliases the worker
+    scan already collected so the type-bound mutator spellings above are
+    detected exactly like their workers counterparts instead of failing open.
+    """
     if not isinstance(call, ast.Call):
         return None
     func = call.func
     if isinstance(func, ast.Name) and func.id == "setattr":
         return _setattr_binds_hook_name(call, namespace_aliases)
-    if not isinstance(func, ast.Attribute):
+    if isinstance(func, ast.Name):
+        # ``from operator import setitem`` then ``setitem(globals(), 'when_ready', hook)``.
+        setitem_aliases, module_aliases = _operator_setitem_aliases(operator_bindings)
+        if _is_operator_setitem_callable(func, setitem_aliases, module_aliases):
+            return _type_bound_hook_store_name(call, namespace_aliases)
         return None
-    return _method_binds_hook_name(call, func.value, namespace_aliases)
+    if isinstance(func, ast.Attribute):
+        name = _method_binds_hook_name(call, func.value, namespace_aliases)
+        if name is not None:
+            return name
+    if _is_type_bound_hook_mutator_callable(func, operator_bindings):
+        return _type_bound_hook_store_name(call, namespace_aliases)
+    return None
 
 
 def _import_from_bound_names(child):
@@ -16616,7 +16697,7 @@ def _single_hook_binding(name, explicit):
     return (name,), explicit
 
 
-def _gunicorn_hook_binding_names(child, namespace_aliases=None):
+def _gunicorn_hook_binding_names(child, namespace_aliases=None, operator_bindings=None):
     """Return ``(hook names, explicit)`` a node may bind into the module namespace.
 
     ``explicit`` marks bindings that target the module namespace directly
@@ -16638,7 +16719,7 @@ def _gunicorn_hook_binding_names(child, namespace_aliases=None):
         )
     if isinstance(child, ast.Call):
         return _single_hook_binding(
-            _call_binds_hook_name(child, namespace_aliases), True
+            _call_binds_hook_name(child, namespace_aliases, operator_bindings), True
         )
     return (), False
 
@@ -16662,7 +16743,7 @@ def _hook_binding_name_is_live(child, name, explicit, scope):
     return may_run
 
 
-def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
+def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None, operator_bindings=None):
     """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
@@ -16679,7 +16760,9 @@ def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
     name was declared ``global``, and an explicit module-namespace mutation
     counts whenever the enclosing body can run.
     """
-    names, explicit = _gunicorn_hook_binding_names(child, namespace_aliases)
+    names, explicit = _gunicorn_hook_binding_names(
+        child, namespace_aliases, operator_bindings
+    )
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
             continue
@@ -16807,13 +16890,15 @@ def _provably_uncalled_function_names(tree):
     )
 
 
-def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
+def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None, operator_bindings=None):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
     count, and ``_gunicorn_hook_binding_scope`` carries the enclosing binding
     scope into the nodes below it. ``namespace_aliases`` resolves aliases such
-    as ``namespace = globals()`` so hook stores through them are recognized.
+    as ``namespace = globals()`` so hook stores through them are recognized,
+    and ``operator_bindings`` lets the hook walk recognize the same type-bound
+    mutator spellings the worker scan already treats as dynamic.
     """
     uncalled_names = _provably_uncalled_function_names(tree)
     stack = [(tree, (False, frozenset(), True, False))]
@@ -16822,7 +16907,9 @@ def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
         in_class, _declared_globals, _may_run, in_function = scope
         with _evaluated_in_nested_scope(in_class or in_function):
             for child in ast.iter_child_nodes(node):
-                if _is_live_gunicorn_hook_binding(child, scope, namespace_aliases):
+                if _is_live_gunicorn_hook_binding(
+                    child, scope, namespace_aliases, operator_bindings
+                ):
                     return True
                 stack.append(
                     (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
@@ -16835,7 +16922,9 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree, namespace_aliases)
+    runtime_dynamic = _gunicorn_config_has_runtime_hooks(
+        tree, namespace_aliases, operator_bindings
+    )
     operator_call_alias_events = _collect_imported_name_alias_events(
         tree,
         "operator",
