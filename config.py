@@ -16586,8 +16586,19 @@ def _method_binds_hook_name(call, receiver, namespace_aliases):
     return None
 
 
-def _is_object_setattr_callable(func):
-    """Return True for ``object.__setattr__`` / ``getattr(object, '__setattr__')``."""
+def _is_object_setattr_callable(func, namespace_aliases=None):
+    """Return True for ``object.__setattr__`` / ``getattr(object, '__setattr__')``.
+
+    A config that rebinds ``object`` binds its own attribute writer, so the
+    call no longer reaches the module namespace; the shadow state collected for
+    the scan decides that, and a call site without it stays fail-closed.
+    """
+    if not _name_is_unshadowed_builtin(
+        "object",
+        getattr(func, "lineno", 0),
+        getattr(namespace_aliases, "builtin_shadow_lines", None),
+    ):
+        return False
     if isinstance(func, ast.Attribute):
         return (
             func.attr == "__setattr__"
@@ -16616,7 +16627,9 @@ def _operator_setitem_aliases(operator_bindings):
     return setitem_aliases, module_aliases
 
 
-def _is_type_bound_hook_mutator_callable(func, operator_bindings):
+def _is_type_bound_hook_mutator_callable(
+    func, operator_bindings, namespace_aliases=None
+):
     """Return True for namespace mutators whose *first argument* is the namespace.
 
     ``_method_binds_hook_name`` reads the module namespace off the attribute
@@ -16633,7 +16646,7 @@ def _is_type_bound_hook_mutator_callable(func, operator_bindings):
     )
     setitem_aliases, module_aliases = _operator_setitem_aliases(operator_bindings)
     return (
-        _is_object_setattr_callable(func)
+        _is_object_setattr_callable(func, namespace_aliases)
         or _is_dict_type_setitem_callable(
             func,
             reference_line=getattr(func, "lineno", 0),
@@ -16674,7 +16687,7 @@ def _call_binds_hook_name(call, namespace_aliases=None, operator_bindings=None):
         name = _method_binds_hook_name(call, func.value, namespace_aliases)
         if name is not None:
             return name
-    if _is_type_bound_hook_mutator_callable(func, operator_bindings):
+    if _is_type_bound_hook_mutator_callable(func, operator_bindings, namespace_aliases):
         return _type_bound_hook_store_name(call, namespace_aliases)
     return None
 

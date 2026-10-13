@@ -130,6 +130,20 @@ _INERT_MUTATOR_CASES = [
         + "dict = {}\n"
         "dict.__setitem__(globals(), 'on_starting', hook)\n",
     ),
+    (
+        "a shadowed object name is not the builtin",
+        "workers = 1\n"
+        + _HOOK
+        + "object = type('object', (), {})\n"
+        "object.__setattr__(globals(), 'on_starting', hook)\n",
+    ),
+    (
+        "a shadowed getattr-object form is not the builtin",
+        "workers = 1\n"
+        + _HOOK
+        + "object = type('object', (), {})\n"
+        "getattr(object, '__setattr__')(globals(), 'on_starting', hook)\n",
+    ),
 ]
 
 
