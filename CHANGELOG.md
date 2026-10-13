@@ -17,7 +17,7 @@ only begin at a future `1.0.0`.
 
 ### Security
 - The Gunicorn worker-count gate now treats additional import-time ways of changing `workers` as dynamic, including class introspection and rebinds inside functions. A memory-backed rate limit is still refused when the config can raise the worker count.
-- The runtime-hook detector now recognizes the same namespace updates as the worker-count gate, including when the builtin or imported name used for the update has been rebound.
+- The runtime-hook detector now recognizes the same namespace updates as the worker-count gate, while the builtin or imported name still refers to the real mutator. A rebound name is not treated as installing a hook.
 
 ### Fixed
 - Unauthenticated requests for JSON routes now receive a machine-readable 401 instead of an HTML login redirect. The dashboard stats poller sends the operator to the login page in that case.

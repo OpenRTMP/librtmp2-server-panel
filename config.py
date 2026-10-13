@@ -1412,8 +1412,15 @@ def _is_dict_type_setitem_callable(
     *,
     reference_line=0,
     dict_shadow_line=None,
+    builtin_shadow_lines=None,
 ):
-    """Return True for builtin ``dict.__setitem__`` variants."""
+    """Return True for builtin ``dict.__setitem__`` variants.
+
+    ``dict.__setitem__`` only depends on ``dict`` still naming the builtin.
+    ``getattr(dict, '__setitem__')`` also depends on ``getattr``: a rebound
+    ``getattr`` does not fetch the builtin mutator, so that spelling is not
+    one unless the collected shadow state still shows the builtin.
+    """
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
         return False
     if isinstance(func, ast.Attribute):
@@ -1424,6 +1431,11 @@ def _is_dict_type_setitem_callable(
         )
     return (
         isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
+        )
         and isinstance(func.func, ast.Name)
         and func.func.id == "getattr"
         and len(func.args) >= 2
@@ -1447,6 +1459,7 @@ def _call_is_dict_type_setitem_on_module_namespace(
         call.func,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtin_shadow_lines=getattr(namespace_aliases, "builtin_shadow_lines", None),
     ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
@@ -13994,6 +14007,9 @@ def _call_is_dict_type_setitem_on_proven_frame_globals(
         call.func,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtin_shadow_lines=(
+            operator_bindings[32] if len(operator_bindings) > 32 else None
+        ),
     ):
         return False
     inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
@@ -16684,6 +16700,9 @@ def _is_type_bound_hook_mutator_callable(
             func,
             reference_line=getattr(func, "lineno", 0),
             dict_shadow_line=dict_shadow_line,
+            builtin_shadow_lines=getattr(
+                namespace_aliases, "builtin_shadow_lines", None
+            ),
         )
         or _operator_setitem_active_at_line(
             func,

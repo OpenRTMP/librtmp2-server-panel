@@ -153,6 +153,14 @@ _INERT_MUTATOR_CASES = [
         "getattr(object, '__setattr__')(globals(), 'on_starting', hook)\n",
     ),
     (
+        "a shadowed getattr does not fetch dict.__setitem__",
+        "workers = 1\n"
+        + _HOOK
+        + "def getattr(obj, name):\n"
+        "    return None\n"
+        "getattr(dict, '__setitem__')(globals(), 'on_starting', hook)\n",
+    ),
+    (
         "operator rebinding makes the setitem spelling inert",
         "import operator\n"
         "workers = 1\n"
