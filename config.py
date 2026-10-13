@@ -717,7 +717,15 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
     if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
         return _is_module_namespace_mapping(node.value, namespace_aliases)
     if _is_globals_call(node):
-        return True
+        # A config that rebinds ``globals`` binds its own callable, so the call
+        # no longer names the module namespace. This mirrors the ``locals()``/
+        # ``vars()`` branch below; a call site without the collected shadow
+        # state stays fail-closed.
+        return _name_is_unshadowed_builtin(
+            "globals",
+            getattr(node, "lineno", 0),
+            getattr(namespace_aliases, "builtin_shadow_lines", None),
+        )
     if _is_namespace_accessor_call(node):
         # Both calls return the module namespace only at module scope, and only
         # while the name still names the builtin: inside a function, lambda or
@@ -1404,8 +1412,15 @@ def _is_dict_type_setitem_callable(
     *,
     reference_line=0,
     dict_shadow_line=None,
+    builtin_shadow_lines=None,
 ):
-    """Return True for builtin ``dict.__setitem__`` variants."""
+    """Return True for builtin ``dict.__setitem__`` variants.
+
+    ``dict.__setitem__`` only depends on ``dict`` still naming the builtin.
+    ``getattr(dict, '__setitem__')`` also depends on ``getattr``: a rebound
+    ``getattr`` does not fetch the builtin mutator, so that spelling is not
+    one unless the collected shadow state still shows the builtin.
+    """
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
         return False
     if isinstance(func, ast.Attribute):
@@ -1416,6 +1431,11 @@ def _is_dict_type_setitem_callable(
         )
     return (
         isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
+        )
         and isinstance(func.func, ast.Name)
         and func.func.id == "getattr"
         and len(func.args) >= 2
@@ -1439,6 +1459,7 @@ def _call_is_dict_type_setitem_on_module_namespace(
         call.func,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtin_shadow_lines=getattr(namespace_aliases, "builtin_shadow_lines", None),
     ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
@@ -1999,6 +2020,7 @@ def _resolve_module_namespace_aliases(
     sys_aliases=None,
     importlib_aliases=None,
     importlib_module_aliases=None,
+    builtin_shadow_lines=None,
 ):
     """Resolve aliases transitively until no additional names can be proven."""
     aliases = _ModuleNamespaceAliases(
@@ -2006,6 +2028,10 @@ def _resolve_module_namespace_aliases(
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
     )
+    # ``ns = globals()`` only names the module namespace while ``globals`` still
+    # is the builtin, so resolution has to see the shadow state from the start.
+    if builtin_shadow_lines is not None:
+        aliases.builtin_shadow_lines = builtin_shadow_lines
     unresolved = set(assignments)
     while unresolved:
         discovered = {
@@ -2026,6 +2052,7 @@ def _collect_module_namespace_aliases(
     sys_aliases=None,
     importlib_aliases=None,
     importlib_module_aliases=None,
+    builtin_shadow_lines=None,
 ):
     """Collect names that are always assigned a module namespace mapping."""
     assignments = {}
@@ -2035,6 +2062,7 @@ def _collect_module_namespace_aliases(
         sys_aliases=sys_aliases,
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
+        builtin_shadow_lines=builtin_shadow_lines,
     )
 
 
@@ -13979,6 +14007,9 @@ def _call_is_dict_type_setitem_on_proven_frame_globals(
         call.func,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtin_shadow_lines=(
+            operator_bindings[32] if len(operator_bindings) > 32 else None
+        ),
     ):
         return False
     inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
@@ -15869,10 +15900,11 @@ def _collect_operator_setitem_bindings(tree):
         sys_aliases=sys_aliases,
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
+        builtin_shadow_lines=builtin_shadow_lines,
     )
-    # ``locals()``/``vars()`` name the module namespace only while the builtin
-    # is still visible, so the alias set carries the shadow state to the call
-    # sites that classify them.
+    # ``locals()``/``vars()``/``globals()`` name the module namespace only while
+    # the builtin is still visible, so the alias set carries the shadow state to
+    # the call sites that classify them.
     namespace_aliases.builtin_shadow_lines = builtin_shadow_lines
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
@@ -16586,16 +16618,148 @@ def _method_binds_hook_name(call, receiver, namespace_aliases):
     return None
 
 
-def _call_binds_hook_name(call, namespace_aliases=None):
-    """Return a hook name a call binds into the config namespace, if any."""
+def _is_object_setattr_callable(func, namespace_aliases=None):
+    """Return True for ``object.__setattr__`` / ``getattr(object, '__setattr__')``.
+
+    A config that rebinds ``object`` (or ``getattr``) binds its own attribute
+    reader/writer, so the call no longer reaches the module namespace; the
+    shadow state collected for the scan decides that, and a call site without it
+    stays fail-closed.
+    """
+    reference_line = getattr(func, "lineno", 0)
+    shadow_lines = getattr(namespace_aliases, "builtin_shadow_lines", None)
+    if not _name_is_unshadowed_builtin("object", reference_line, shadow_lines):
+        return False
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == "__setattr__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "object"
+        )
+    return (
+        isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin("getattr", reference_line, shadow_lines)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Name)
+        and func.args[0].id == "object"
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "__setattr__"
+    )
+
+
+def _operator_setitem_active_at_line(
+    func, operator_bindings, reference_line, setitem_alias_events=None
+):
+    """Return True when the operator ``setitem`` spelling is still bound there.
+
+    Mirrors ``_is_operator_call_factory``: an alias only counts while the
+    collected alias events still show ``operator`` (or the imported ``setitem``
+    name) pointing at the real callable at that line, so a config that rebinds
+    either one is not reported as installing a hook.
+    """
+    if not operator_bindings:
+        return False
+    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
+    setitem_aliases = operator_bindings[1] if len(operator_bindings) > 1 else set()
+    if isinstance(func, ast.Attribute) and func.attr == "setitem":
+        module_events = operator_bindings[31] if len(operator_bindings) > 31 else {}
+        return _module_alias_active_at_line(
+            func.value, module_aliases, module_events, reference_line
+        ) or _is_operator_import(func.value)
+    if not isinstance(func, ast.Name):
+        return False
+    if setitem_alias_events and func.id in setitem_alias_events:
+        state = _binding_state_at_line(setitem_alias_events, func.id, reference_line)
+        if state is not None:
+            return bool(state)
+    return func.id in setitem_aliases
+
+
+def _is_type_bound_hook_mutator_callable(
+    func, operator_bindings, namespace_aliases=None, setitem_alias_events=None
+):
+    """Return True for namespace mutators whose *first argument* is the namespace.
+
+    ``_method_binds_hook_name`` reads the module namespace off the attribute
+    receiver, which is what identifies ``globals().__setitem__('on_starting',
+    hook)``. The low-level spellings -- ``dict.__setitem__(globals(), ...)``,
+    ``object.__setattr__(sys.modules[__name__], ...)`` and
+    ``operator.setitem(globals(), ...)`` -- pass the namespace as the first
+    argument instead, so they are recognized here the same way the workers scan
+    already recognizes them. Without this the hook gate stays False and a live
+    hook can raise the worker count past a static ``workers = 1``.
+    """
+    dict_shadow_line = (
+        operator_bindings[21] if operator_bindings and len(operator_bindings) > 21 else None
+    )
+    return (
+        _is_object_setattr_callable(func, namespace_aliases)
+        or _is_dict_type_setitem_callable(
+            func,
+            reference_line=getattr(func, "lineno", 0),
+            dict_shadow_line=dict_shadow_line,
+            builtin_shadow_lines=getattr(
+                namespace_aliases, "builtin_shadow_lines", None
+            ),
+        )
+        or _operator_setitem_active_at_line(
+            func,
+            operator_bindings,
+            getattr(func, "lineno", 0),
+            setitem_alias_events,
+        )
+    )
+
+
+def _type_bound_hook_store_name(call, namespace_aliases):
+    """Return the hook name a type-bound mutator call may bind, if any."""
+    if len(call.args) < 2:
+        return None
+    if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
+        return None
+    return _hook_store_key_name(call.args[1])
+
+
+def _call_binds_hook_name(
+    call,
+    namespace_aliases=None,
+    operator_bindings=None,
+    setitem_alias_events=None,
+):
+    """Return a hook name a call binds into the config namespace, if any.
+
+    ``operator_bindings`` carries the operator/sys/module aliases the worker
+    scan already collected, and ``setitem_alias_events`` the source-ordered
+    binding events for an imported ``setitem``, so the type-bound mutator
+    spellings above are detected exactly like their workers counterparts
+    instead of failing open.
+    """
     if not isinstance(call, ast.Call):
         return None
     func = call.func
     if isinstance(func, ast.Name) and func.id == "setattr":
         return _setattr_binds_hook_name(call, namespace_aliases)
-    if not isinstance(func, ast.Attribute):
+    if isinstance(func, ast.Name):
+        # ``from operator import setitem`` then ``setitem(globals(), 'when_ready', hook)``.
+        if _operator_setitem_active_at_line(
+            func,
+            operator_bindings,
+            getattr(func, "lineno", 0),
+            setitem_alias_events,
+        ):
+            return _type_bound_hook_store_name(call, namespace_aliases)
         return None
-    return _method_binds_hook_name(call, func.value, namespace_aliases)
+    if isinstance(func, ast.Attribute):
+        name = _method_binds_hook_name(call, func.value, namespace_aliases)
+        if name is not None:
+            return name
+    if _is_type_bound_hook_mutator_callable(
+        func, operator_bindings, namespace_aliases, setitem_alias_events
+    ):
+        return _type_bound_hook_store_name(call, namespace_aliases)
+    return None
 
 
 def _import_from_bound_names(child):
@@ -16616,7 +16780,9 @@ def _single_hook_binding(name, explicit):
     return (name,), explicit
 
 
-def _gunicorn_hook_binding_names(child, namespace_aliases=None):
+def _gunicorn_hook_binding_names(
+    child, namespace_aliases=None, operator_bindings=None, setitem_alias_events=None
+):
     """Return ``(hook names, explicit)`` a node may bind into the module namespace.
 
     ``explicit`` marks bindings that target the module namespace directly
@@ -16638,7 +16804,10 @@ def _gunicorn_hook_binding_names(child, namespace_aliases=None):
         )
     if isinstance(child, ast.Call):
         return _single_hook_binding(
-            _call_binds_hook_name(child, namespace_aliases), True
+            _call_binds_hook_name(
+                child, namespace_aliases, operator_bindings, setitem_alias_events
+            ),
+            True,
         )
     return (), False
 
@@ -16662,7 +16831,9 @@ def _hook_binding_name_is_live(child, name, explicit, scope):
     return may_run
 
 
-def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
+def _is_live_gunicorn_hook_binding(
+    child, scope, namespace_aliases=None, operator_bindings=None, setitem_alias_events=None
+):
     """Return True when a node binds a hook name into the module namespace.
 
     A hook is live whenever the name reaches the module namespace, so a ``def``
@@ -16679,7 +16850,9 @@ def _is_live_gunicorn_hook_binding(child, scope, namespace_aliases=None):
     name was declared ``global``, and an explicit module-namespace mutation
     counts whenever the enclosing body can run.
     """
-    names, explicit = _gunicorn_hook_binding_names(child, namespace_aliases)
+    names, explicit = _gunicorn_hook_binding_names(
+        child, namespace_aliases, operator_bindings, setitem_alias_events
+    )
     for name in names:
         if name != "*" and name not in _GUNICORN_RUNTIME_HOOK_NAMES:
             continue
@@ -16807,22 +16980,37 @@ def _provably_uncalled_function_names(tree):
     )
 
 
-def _gunicorn_config_has_runtime_hooks(tree, namespace_aliases=None):
+def _gunicorn_config_has_runtime_hooks(
+    tree, namespace_aliases=None, operator_bindings=None
+):
     """Return True when the config defines hooks that can mutate workers at runtime.
 
     Walks every node; ``_is_live_gunicorn_hook_binding`` decides which bindings
     count, and ``_gunicorn_hook_binding_scope`` carries the enclosing binding
     scope into the nodes below it. ``namespace_aliases`` resolves aliases such
-    as ``namespace = globals()`` so hook stores through them are recognized.
+    as ``namespace = globals()`` so hook stores through them are recognized,
+    and ``operator_bindings`` lets the hook walk recognize the same type-bound
+    mutator spellings the worker scan already treats as dynamic, including the
+    source-ordered alias state that decides whether those spellings still name
+    the real builtin or module.
     """
     uncalled_names = _provably_uncalled_function_names(tree)
+    setitem_alias_events = _collect_imported_name_alias_events(
+        tree, "operator", {"setitem"}
+    )
     stack = [(tree, (False, frozenset(), True, False))]
     while stack:
         node, scope = stack.pop()
         in_class, _declared_globals, _may_run, in_function = scope
         with _evaluated_in_nested_scope(in_class or in_function):
             for child in ast.iter_child_nodes(node):
-                if _is_live_gunicorn_hook_binding(child, scope, namespace_aliases):
+                if _is_live_gunicorn_hook_binding(
+                    child,
+                    scope,
+                    namespace_aliases,
+                    operator_bindings,
+                    setitem_alias_events,
+                ):
                     return True
                 stack.append(
                     (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
@@ -16835,7 +17023,9 @@ def _scan_gunicorn_config_worker_details(tree):
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    runtime_dynamic = _gunicorn_config_has_runtime_hooks(tree, namespace_aliases)
+    runtime_dynamic = _gunicorn_config_has_runtime_hooks(
+        tree, namespace_aliases, operator_bindings
+    )
     operator_call_alias_events = _collect_imported_name_alias_events(
         tree,
         "operator",
