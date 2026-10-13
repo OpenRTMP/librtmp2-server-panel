@@ -168,6 +168,21 @@ _INERT_MUTATOR_CASES = [
         + "setitem = lambda *args: None\n"
         "setitem(globals(), 'on_starting', hook)\n",
     ),
+    (
+        "a rebound globals is not the module namespace",
+        "workers = 1\n"
+        + _HOOK
+        + "globals = lambda: {}\n"
+        "dict.__setitem__(globals(), 'on_starting', hook)\n",
+    ),
+    (
+        "a rebound globals makes its alias inert",
+        "workers = 1\n"
+        + _HOOK
+        + "globals = lambda: {}\n"
+        "ns = globals()\n"
+        "ns.__setitem__('on_starting', hook)\n",
+    ),
 ]
 
 

@@ -717,7 +717,15 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
     if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
         return _is_module_namespace_mapping(node.value, namespace_aliases)
     if _is_globals_call(node):
-        return True
+        # A config that rebinds ``globals`` binds its own callable, so the call
+        # no longer names the module namespace. This mirrors the ``locals()``/
+        # ``vars()`` branch below; a call site without the collected shadow
+        # state stays fail-closed.
+        return _name_is_unshadowed_builtin(
+            "globals",
+            getattr(node, "lineno", 0),
+            getattr(namespace_aliases, "builtin_shadow_lines", None),
+        )
     if _is_namespace_accessor_call(node):
         # Both calls return the module namespace only at module scope, and only
         # while the name still names the builtin: inside a function, lambda or
@@ -1999,6 +2007,7 @@ def _resolve_module_namespace_aliases(
     sys_aliases=None,
     importlib_aliases=None,
     importlib_module_aliases=None,
+    builtin_shadow_lines=None,
 ):
     """Resolve aliases transitively until no additional names can be proven."""
     aliases = _ModuleNamespaceAliases(
@@ -2006,6 +2015,10 @@ def _resolve_module_namespace_aliases(
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
     )
+    # ``ns = globals()`` only names the module namespace while ``globals`` still
+    # is the builtin, so resolution has to see the shadow state from the start.
+    if builtin_shadow_lines is not None:
+        aliases.builtin_shadow_lines = builtin_shadow_lines
     unresolved = set(assignments)
     while unresolved:
         discovered = {
@@ -2026,6 +2039,7 @@ def _collect_module_namespace_aliases(
     sys_aliases=None,
     importlib_aliases=None,
     importlib_module_aliases=None,
+    builtin_shadow_lines=None,
 ):
     """Collect names that are always assigned a module namespace mapping."""
     assignments = {}
@@ -2035,6 +2049,7 @@ def _collect_module_namespace_aliases(
         sys_aliases=sys_aliases,
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
+        builtin_shadow_lines=builtin_shadow_lines,
     )
 
 
@@ -15869,10 +15884,11 @@ def _collect_operator_setitem_bindings(tree):
         sys_aliases=sys_aliases,
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
+        builtin_shadow_lines=builtin_shadow_lines,
     )
-    # ``locals()``/``vars()`` name the module namespace only while the builtin
-    # is still visible, so the alias set carries the shadow state to the call
-    # sites that classify them.
+    # ``locals()``/``vars()``/``globals()`` name the module namespace only while
+    # the builtin is still visible, so the alias set carries the shadow state to
+    # the call sites that classify them.
     namespace_aliases.builtin_shadow_lines = builtin_shadow_lines
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
