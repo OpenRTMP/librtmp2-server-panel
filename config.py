@@ -10376,7 +10376,10 @@ def _subscript_uses_dynamic_class_introspection(sub):
     """Identify indexed runtime class lookups that cannot be resolved safely."""
     if not isinstance(sub, ast.Subscript):
         return False
-    return _expression_uses_dynamic_class_introspection(sub.value)
+    value = sub.value
+    if isinstance(value, ast.Attribute) and value.attr == "__mro__":
+        return False
+    return _expression_uses_dynamic_class_introspection(value)
 
 
 def _call_uses_dynamic_class_introspection(call):
