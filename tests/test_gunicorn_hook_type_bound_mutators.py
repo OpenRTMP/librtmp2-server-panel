@@ -86,6 +86,28 @@ _TYPE_BOUND_HOOK_CASES = [
         + _HOOK
         + "getattr(object, '__setattr__')(sys.modules[__name__], 'post_fork', hook)\n",
     ),
+    (
+        "builtins setattr on the module object is dynamic",
+        "import sys\n"
+        "import builtins\n"
+        "workers = 1\n"
+        + _HOOK
+        + "builtins.setattr(sys.modules[__name__], 'on_starting', hook)\n",
+    ),
+    (
+        "getattr operator setitem on globals is dynamic",
+        "import operator\n"
+        "workers = 1\n"
+        + _HOOK
+        + "getattr(operator, 'setitem')(globals(), 'on_starting', hook)\n",
+    ),
+    (
+        "partial dict setitem on globals is dynamic",
+        "from functools import partial\n"
+        "workers = 1\n"
+        + _HOOK
+        + "partial(dict.__setitem__, globals())('on_starting', hook)\n",
+    ),
 ]
 
 

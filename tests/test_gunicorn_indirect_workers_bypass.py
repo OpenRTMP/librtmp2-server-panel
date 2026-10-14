@@ -3511,3 +3511,30 @@ def test_codex_pr360_dynamic_class_introspection_fails_closed(tmp_path, case):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-14: set/frozenset __mro__ wrappers around list/tuple gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "list(set(Child.__mro__))[1]()",
+        "list(frozenset(Child.__mro__))[1]()",
+        "tuple(set(Child.__mro__))[1]()",
+    ],
+)
+def test_security_review_oct14_set_frozenset_mro_wrappers_are_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

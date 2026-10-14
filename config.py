@@ -10347,25 +10347,36 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _subscript_uses_dynamic_class_introspection(sub):
-    """Identify indexed runtime class lookups that cannot be resolved safely."""
-    value = sub.value
-    if isinstance(value, ast.ListComp):
+def _expression_uses_dynamic_class_introspection(expr):
+    """Return True when an expression selects constructors via runtime class metadata."""
+    if isinstance(expr, ast.Attribute) and expr.attr == "__mro__":
+        return True
+    if isinstance(expr, ast.ListComp):
         return any(
             isinstance(gen.iter, ast.Attribute) and gen.iter.attr == "__mro__"
-            for gen in value.generators
+            for gen in expr.generators
         )
-    if not isinstance(value, ast.Call):
+    if not isinstance(expr, ast.Call):
         return False
-    if isinstance(value.func, ast.Attribute):
-        return value.func.attr == "__subclasses__"
-    return (
-        isinstance(value.func, ast.Name)
-        and value.func.id in {"list", "tuple"}
-        and len(value.args) == 1
-        and isinstance(value.args[0], ast.Attribute)
-        and value.args[0].attr == "__mro__"
-    )
+    if isinstance(expr.func, ast.Attribute):
+        return expr.func.attr == "__subclasses__"
+    if (
+        isinstance(expr.func, ast.Name)
+        and expr.func.id in {"list", "tuple", "set", "frozenset"}
+        and len(expr.args) == 1
+    ):
+        arg = expr.args[0]
+        if isinstance(arg, ast.Attribute) and arg.attr == "__mro__":
+            return True
+        return _expression_uses_dynamic_class_introspection(arg)
+    return False
+
+
+def _subscript_uses_dynamic_class_introspection(sub):
+    """Identify indexed runtime class lookups that cannot be resolved safely."""
+    if not isinstance(sub, ast.Subscript):
+        return False
+    return _expression_uses_dynamic_class_introspection(sub.value)
 
 
 def _call_uses_dynamic_class_introspection(call):
@@ -10393,12 +10404,19 @@ def _container_call_subscript_class_name(value, index, operator_bindings):
     reference_line = getattr(value, "lineno", 0)
     if _is_proven_collections_deque(value.func, operator_bindings, reference_line):
         return _deque_subscript_class_name(value, index, operator_bindings)
-    if not isinstance(value.func, ast.Name) or value.func.id not in {"list", "tuple"}:
+    if not isinstance(value.func, ast.Name) or value.func.id not in {
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+    }:
         return None
     shadow_lines = (
         operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
     )
     if not _name_is_unshadowed_builtin(value.func.id, reference_line, shadow_lines):
+        return None
+    if _expression_uses_dynamic_class_introspection(value.args[0]):
         return None
     return _literal_container_element_class_name(value.args[0], index)
 
@@ -10523,7 +10541,7 @@ def _mro_subscript_owner_name(sub):
         inner = value
         if (
             isinstance(value.func, ast.Name)
-            and value.func.id in {"list", "tuple"}
+            and value.func.id in {"list", "tuple", "set", "frozenset"}
             and len(value.args) == 1
         ):
             inner = value.args[0]
@@ -16649,6 +16667,31 @@ def _is_object_setattr_callable(func, namespace_aliases=None):
     )
 
 
+def _is_builtins_setattr_callable(func, namespace_aliases=None):
+    """Return True for ``builtins.setattr`` / ``getattr(builtins, 'setattr')``."""
+    reference_line = getattr(func, "lineno", 0)
+    shadow_lines = getattr(namespace_aliases, "builtin_shadow_lines", None)
+    if not _name_is_unshadowed_builtin("builtins", reference_line, shadow_lines):
+        return False
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == "setattr"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "builtins"
+        )
+    return (
+        isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin("getattr", reference_line, shadow_lines)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Name)
+        and func.args[0].id == "builtins"
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "setattr"
+    )
+
+
 def _operator_setitem_active_at_line(
     func, operator_bindings, reference_line, setitem_alias_events=None
 ):
@@ -16696,6 +16739,7 @@ def _is_type_bound_hook_mutator_callable(
     )
     return (
         _is_object_setattr_callable(func, namespace_aliases)
+        or _is_builtins_setattr_callable(func, namespace_aliases)
         or _is_dict_type_setitem_callable(
             func,
             reference_line=getattr(func, "lineno", 0),
@@ -16720,6 +16764,34 @@ def _type_bound_hook_store_name(call, namespace_aliases):
     if not _is_current_module_namespace_object(call.args[0], namespace_aliases):
         return None
     return _hook_store_key_name(call.args[1])
+
+
+def _partial_call_binds_hook_store_name(call, operator_bindings, namespace_aliases):
+    """Return a hook name bound via ``partial(dict.__setitem__, globals())(...)``."""
+    if not isinstance(call, ast.Call) or operator_bindings is None:
+        return None
+    _, _, _, _, partial_aliases = _unpack_operator_bindings(operator_bindings)
+    dict_update_aliases = operator_bindings[7] if len(operator_bindings) > 7 else set()
+    dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
+    dict_ior_aliases = operator_bindings[23] if len(operator_bindings) > 23 else set()
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    partial_call, start_index = _resolve_partial_invocation(
+        call,
+        partial_aliases,
+        builtin_shadow_lines,
+    )
+    if partial_call is None:
+        return None
+    method = _partial_unbound_dict_namespace_method(
+        partial_call,
+        namespace_aliases,
+        dict_update_aliases,
+        dict_ior_aliases,
+        dict_shadow_line,
+    )
+    if method != "__setitem__" or len(call.args) <= start_index:
+        return None
+    return _hook_store_key_name(call.args[start_index])
 
 
 def _call_binds_hook_name(
@@ -16751,6 +16823,15 @@ def _call_binds_hook_name(
         ):
             return _type_bound_hook_store_name(call, namespace_aliases)
         return None
+    if isinstance(func, ast.Call):
+        module_aliases = operator_bindings[0] if operator_bindings else set()
+        if _getattr_operator_method_name(func, module_aliases) == "setitem":
+            return _type_bound_hook_store_name(call, namespace_aliases)
+    partial_hook = _partial_call_binds_hook_store_name(
+        call, operator_bindings, namespace_aliases
+    )
+    if partial_hook is not None:
+        return partial_hook
     if isinstance(func, ast.Attribute):
         name = _method_binds_hook_name(call, func.value, namespace_aliases)
         if name is not None:
