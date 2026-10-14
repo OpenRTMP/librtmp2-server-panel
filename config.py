@@ -10370,8 +10370,10 @@ def _expression_uses_dynamic_class_introspection(expr):
         arg = expr.args[0]
         if isinstance(arg, ast.Attribute) and arg.attr == "__mro__":
             return True
-        if _is_class_mro_method_call(arg) and expr.func.id in {"list", "tuple"}:
-            return False
+        if _is_class_mro_method_call(arg):
+            return expr.func.id in {"set", "frozenset"}
+        if any(_is_class_mro_method_call(node) for node in ast.walk(arg)):
+            return True
         return _expression_uses_dynamic_class_introspection(arg)
     return False
 
