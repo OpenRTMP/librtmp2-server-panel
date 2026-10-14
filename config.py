@@ -16797,6 +16797,23 @@ def _partial_call_binds_hook_store_name(call, operator_bindings, namespace_alias
     return _hook_store_key_name(call.args[start_index])
 
 
+def _named_hook_mutator_binds_hook_name(
+    call, namespace_aliases, operator_bindings, setitem_alias_events
+):
+    """Handle bare setattr and imported operator.setitem calls."""
+    func = call.func
+    if func.id == "setattr":
+        return _setattr_binds_hook_name(call, namespace_aliases)
+    if _operator_setitem_active_at_line(
+        func,
+        operator_bindings,
+        getattr(func, "lineno", 0),
+        setitem_alias_events,
+    ):
+        return _type_bound_hook_store_name(call, namespace_aliases)
+    return None
+
+
 def _call_binds_hook_name(
     call,
     namespace_aliases=None,
@@ -16814,18 +16831,10 @@ def _call_binds_hook_name(
     if not isinstance(call, ast.Call):
         return None
     func = call.func
-    if isinstance(func, ast.Name) and func.id == "setattr":
-        return _setattr_binds_hook_name(call, namespace_aliases)
     if isinstance(func, ast.Name):
-        # ``from operator import setitem`` then ``setitem(globals(), 'when_ready', hook)``.
-        if _operator_setitem_active_at_line(
-            func,
-            operator_bindings,
-            getattr(func, "lineno", 0),
-            setitem_alias_events,
-        ):
-            return _type_bound_hook_store_name(call, namespace_aliases)
-        return None
+        return _named_hook_mutator_binds_hook_name(
+            call, namespace_aliases, operator_bindings, setitem_alias_events
+        )
     if isinstance(func, ast.Call):
         module_aliases = operator_bindings[0] if operator_bindings else set()
         if _getattr_operator_method_name(func, module_aliases) == "setitem":
