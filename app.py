@@ -51,9 +51,10 @@ ACCESS_KEY_HELP = (
 )
 DIRECT_REMOTE_ADDR_KEY = "openrtmp.direct_remote_addr"
 # Gunicorn's default Docker CMD uses gthread with four threads. Each draining
-# delete can block a thread for up to DELETE_STREAM_DRAIN_WAIT_SECONDS while
-# polling librtmp2-server, so cap concurrent drain operations and leave worker
-# threads available for login, navigation, and stats polling.
+# delete can block a thread for up to DELETE_STREAM_DRAIN_WAIT_SECONDS (plus
+# one admin DELETE budget) while polling librtmp2-server — keep --timeout ≥
+# DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS. Cap concurrent drain operations so
+# worker threads remain available for login, navigation, and stats polling.
 MAX_CONCURRENT_STREAM_DELETE_DRAINS = 2
 _stream_delete_drain_slots = threading.BoundedSemaphore(MAX_CONCURRENT_STREAM_DELETE_DRAINS)
 

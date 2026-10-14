@@ -22,6 +22,13 @@ DELETE_STREAM_DRAIN_WAIT_SECONDS = 400
 # grows with the peer count, so a large cluster may need a larger value.
 ADMIN_REQUEST_TIMEOUT_SECONDS = 30
 
+# Synchronous panel delete routes block for one admin DELETE (up to
+# ADMIN_REQUEST_TIMEOUT_SECONDS) plus polling through the drain window. Docker
+# Gunicorn --timeout must stay above this or workers are killed mid-poll.
+DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS = (
+    DELETE_STREAM_DRAIN_WAIT_SECONDS + ADMIN_REQUEST_TIMEOUT_SECONDS + 20
+)
+
 
 def _api_error(resp, operation):
     """Return a user-safe error; log details only in the exception message prefix."""

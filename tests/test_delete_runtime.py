@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 from flask_test_utils import configure_testing_app
 
+from lrtmp2_client import DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS
+
 
 def test_container_uses_threaded_gunicorn_for_long_running_deletes():
     repository_root = Path(__file__).resolve().parents[1]
@@ -19,7 +21,9 @@ def test_container_uses_threaded_gunicorn_for_long_running_deletes():
     assert command[0] == "gunicorn"
     assert command[command.index("--worker-class") + 1] == "gthread"
     assert command[command.index("--threads") + 1] == "4"
-    assert command[command.index("--timeout") + 1] == "330"
+    assert int(command[command.index("--timeout") + 1]) >= (
+        DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS
+    )
 
 
 def test_delete_stream_logs_api_failure(monkeypatch):
