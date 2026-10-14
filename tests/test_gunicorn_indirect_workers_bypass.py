@@ -3538,3 +3538,30 @@ def test_security_review_oct14_set_frozenset_mro_wrappers_are_dynamic(
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "list(set(Child.mro()))[1]()",
+        "list(frozenset(Child.mro()))[1]()",
+        "tuple(set(Child.mro()))[1]()",
+        "list(tuple(Child.mro()))[1]()",
+    ],
+)
+def test_security_review_oct14_nested_mro_method_wrappers_are_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
