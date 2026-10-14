@@ -108,6 +108,45 @@ _TYPE_BOUND_HOOK_CASES = [
         + _HOOK
         + "partial(dict.__setitem__, globals())('on_starting', hook)\n",
     ),
+    (
+        "aliased builtins setattr installs a hook",
+        "import sys\nimport builtins as bi\nworkers = 1\n"
+        + _HOOK
+        + "bi.setattr(sys.modules[__name__], 'on_starting', hook)\n",
+    ),
+    (
+        "saved builtins module alias installs a hook",
+        "import sys\nimport builtins as bi\nworkers = 1\n"
+        + _HOOK
+        + "alias = bi\nalias.setattr(sys.modules[__name__], 'on_starting', hook)\n",
+    ),
+    (
+        "getattr aliased builtins setattr installs a hook",
+        "import sys\nimport builtins as bi\nworkers = 1\n"
+        + _HOOK
+        + "getattr(bi, 'setattr')(sys.modules[__name__], 'on_starting', hook)\n",
+    ),
+    (
+        "saved partial setitem installs a hook",
+        "from functools import partial\nworkers = 1\n"
+        + _HOOK
+        + "setter = partial(dict.__setitem__, globals())\n"
+        "setter('on_starting', hook)\n",
+    ),
+    (
+        "saved partial alias installs a hook",
+        "from functools import partial\nworkers = 1\n"
+        + _HOOK
+        + "setter = partial(dict.__setitem__, globals())\n"
+        "alias = setter\nalias('when_ready', hook)\n",
+    ),
+    (
+        "saved partial with bound hook key installs a hook",
+        "from functools import partial\nworkers = 1\n"
+        + _HOOK
+        + "setter = partial(dict.__setitem__, globals(), 'on_starting')\n"
+        "setter(hook)\n",
+    ),
 ]
 
 
@@ -212,6 +251,27 @@ _INERT_MUTATOR_CASES = [
         + "globals = lambda: {}\n"
         "ns = globals()\n"
         "ns.__setitem__('on_starting', hook)\n",
+    ),
+    (
+        "rebound builtins alias no longer installs a hook",
+        "import sys\nimport builtins as bi\nworkers = 1\n"
+        + _HOOK
+        + "bi = object()\nbi.setattr(sys.modules[__name__], 'on_starting', hook)\n",
+    ),
+    (
+        "saved partial rebind no longer installs a hook",
+        "from functools import partial\nworkers = 1\n"
+        + _HOOK
+        + "setter = partial(dict.__setitem__, globals())\n"
+        "setter = lambda *args: None\n"
+        "setter('on_starting', hook)\n",
+    ),
+    (
+        "saved partial with unrelated literal key is inert",
+        "from functools import partial\nworkers = 1\n"
+        + _HOOK
+        + "setter = partial(dict.__setitem__, globals())\n"
+        "setter('unrelated', hook)\n",
     ),
 ]
 
