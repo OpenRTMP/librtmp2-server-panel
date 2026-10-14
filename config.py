@@ -10347,6 +10347,24 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
+def _container_wrapper_uses_dynamic_class_introspection(call):
+    """Identify runtime class metadata inside builtin container conversions."""
+    if (
+        not isinstance(call.func, ast.Name)
+        or call.func.id not in {"list", "tuple", "set", "frozenset"}
+        or len(call.args) != 1
+    ):
+        return False
+    arg = call.args[0]
+    if isinstance(arg, ast.Attribute) and arg.attr == "__mro__":
+        return True
+    if _is_class_mro_method_call(arg):
+        return call.func.id in {"set", "frozenset"}
+    if any(_is_class_mro_method_call(node) for node in ast.walk(arg)):
+        return True
+    return _expression_uses_dynamic_class_introspection(arg)
+
+
 def _expression_uses_dynamic_class_introspection(expr):
     """Return True when an expression selects constructors via runtime class metadata."""
     if isinstance(expr, ast.Attribute) and expr.attr == "__mro__":
@@ -10362,20 +10380,7 @@ def _expression_uses_dynamic_class_introspection(expr):
         return False
     if isinstance(expr.func, ast.Attribute):
         return expr.func.attr == "__subclasses__"
-    if (
-        isinstance(expr.func, ast.Name)
-        and expr.func.id in {"list", "tuple", "set", "frozenset"}
-        and len(expr.args) == 1
-    ):
-        arg = expr.args[0]
-        if isinstance(arg, ast.Attribute) and arg.attr == "__mro__":
-            return True
-        if _is_class_mro_method_call(arg):
-            return expr.func.id in {"set", "frozenset"}
-        if any(_is_class_mro_method_call(node) for node in ast.walk(arg)):
-            return True
-        return _expression_uses_dynamic_class_introspection(arg)
-    return False
+    return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
 def _subscript_uses_dynamic_class_introspection(sub):
