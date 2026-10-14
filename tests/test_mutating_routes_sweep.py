@@ -12,15 +12,20 @@ from unittest.mock import patch
 
 import pytest
 
-MUTATORS = {
-    "create_stream",
-    "delete_stream",
-    "create_player",
-    "delete_player",
-    "cluster_drain_node",
-    "cluster_resume_node",
-    "cluster_remove_node",
+# Client calls that only read. Anything else an unauthorised or forged request
+# makes is counted as a mutation, so new client mutators are covered without
+# having to be listed here.
+READ_ONLY = {
+    "health",
+    "list_streams",
+    "stream_stats",
+    "stream_stats_by_id",
+    "cluster_status",
+    "cluster_nodes",
+    "cluster_streams",
+    "cluster_enabled_from_health",
 }
+VALID_PLAYER_ID = "vi_" + "0" * 32
 UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 
@@ -39,14 +44,21 @@ def panel(monkeypatch):
         yield application, upstream
 
 
+def _placeholder(name):
+    """A syntactically valid id, so a missing guard would reach the upstream."""
+    if "node" in name:
+        return "1"
+    if "player" in name:
+        return VALID_PLAYER_ID
+    return "demo"
+
+
 def _mutating_urls(application):
     urls = []
     for rule in application.url_map.iter_rules():
         if rule.endpoint == "static" or not (rule.methods & UNSAFE):
             continue
-        url = re.sub(
-            r"<([^>]+)>", lambda m: "1" if "node" in m.group(1) else "demo", rule.rule
-        )
+        url = re.sub(r"<([^>]+)>", lambda m: _placeholder(m.group(1)), rule.rule)
         for method in sorted(rule.methods & UNSAFE):
             urls.append((method, url, rule.endpoint))
     return urls
@@ -72,7 +84,7 @@ def _login(client):
 
 
 def _mutations(upstream):
-    return [c for c in upstream.method_calls if c[0] in MUTATORS]
+    return [c for c in upstream.method_calls if c[0] not in READ_ONLY]
 
 
 def test_url_map_contains_the_expected_mutating_routes(panel):
@@ -113,6 +125,25 @@ def test_anonymous_forged_requests_cannot_mutate(panel, content_type):
             response.status_code,
         )
         assert "Access-Control-Allow-Origin" not in response.headers
+    assert _mutations(upstream) == []
+
+
+def test_anonymous_requests_with_a_valid_csrf_token_are_sent_to_login(panel):
+    """Authentication is exercised on its own, not masked by the CSRF check."""
+    application, upstream = panel
+    for method, url, endpoint in _mutating_urls(application):
+        if endpoint in ("login", "logout"):
+            continue  # not login-protected by design
+        client = application.test_client()
+        token = _token(client, "/login")
+        response = client.open(
+            url,
+            method=method,
+            data={"csrf_token": token, "stream_name": "x"},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 302, (method, url, response.status_code)
+        assert "/login" in response.headers["Location"], (method, url)
     assert _mutations(upstream) == []
 
 
