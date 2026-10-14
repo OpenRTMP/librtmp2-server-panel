@@ -35,12 +35,25 @@ def panel(monkeypatch):
 
     monkeypatch.setattr(app_module.Config, "SESSION_COOKIE_SECURE", False)
     monkeypatch.setattr(app_module.Config, "REQUIRE_LOGIN", True)
-    with patch("app.Lrtmp2Client") as client_cls:
+    # Record every run of the panel's CSRF error handler, so the sweep proves
+    # CSRF validation rejected a request instead of inferring it from the
+    # status code (the handler turns Flask-WTF's 400 into a redirect).
+    csrf_errors = []
+    original_handler = app_module._PanelRuntime.handle_csrf_error
+
+    def record_csrf_error(runtime, error):
+        csrf_errors.append(error)
+        return original_handler(runtime, error)
+
+    with patch("app.Lrtmp2Client") as client_cls, patch.object(
+        app_module._PanelRuntime, "handle_csrf_error", record_csrf_error
+    ):
         upstream = client_cls.return_value
         upstream.health.return_value = {"rtmps_enabled": False}
         upstream.list_streams.return_value = []
         application = app_module.create_app()
         application.config.update(TESTING=True, WTF_CSRF_ENABLED=True)
+        application.extensions["test_csrf_errors"] = csrf_errors
         yield application, upstream
 
 
@@ -83,6 +96,10 @@ def _login(client):
     assert response.status_code == 302
 
 
+def _csrf_errors(application):
+    return application.extensions["test_csrf_errors"]
+
+
 def _mutations(upstream):
     return [c for c in upstream.method_calls if c[0] not in READ_ONLY]
 
@@ -112,6 +129,7 @@ def test_anonymous_forged_requests_cannot_mutate(panel, content_type):
     application, upstream = panel
     for method, url, endpoint in _mutating_urls(application):
         client = application.test_client()
+        before = len(_csrf_errors(application))
         response = client.open(
             url,
             method=method,
@@ -123,6 +141,9 @@ def test_anonymous_forged_requests_cannot_mutate(panel, content_type):
             method,
             url,
             response.status_code,
+        )
+        assert len(_csrf_errors(application)) == before + 1, (
+            f"CSRF validation did not reject {method} {url}"
         )
         assert "Access-Control-Allow-Origin" not in response.headers
     assert _mutations(upstream) == []
@@ -145,6 +166,7 @@ def test_anonymous_requests_with_a_valid_csrf_token_are_sent_to_login(panel):
         assert response.status_code == 302, (method, url, response.status_code)
         assert "/login" in response.headers["Location"], (method, url)
     assert _mutations(upstream) == []
+    assert _csrf_errors(application) == [], "a valid token must pass CSRF"
 
 
 def test_logged_in_session_without_valid_csrf_token_cannot_mutate(panel):
@@ -159,6 +181,7 @@ def test_logged_in_session_without_valid_csrf_token_cannot_mutate(panel):
         if endpoint in ("login", "logout"):
             continue
         for data in forged_tokens:
+            before = len(_csrf_errors(application))
             response = client.open(
                 url,
                 method=method,
@@ -166,10 +189,15 @@ def test_logged_in_session_without_valid_csrf_token_cannot_mutate(panel):
                 headers={"Origin": "https://evil.example"},
             )
             assert response.status_code in (302, 400, 403), (method, url, data)
+            assert len(_csrf_errors(application)) == before + 1, (
+                f"CSRF validation did not reject {method} {url} with {data}"
+            )
     assert _mutations(upstream) == []
 
     for data in forged_tokens:
+        before = len(_csrf_errors(application))
         assert client.post("/logout", data=data).status_code in (302, 400, 403)
+        assert len(_csrf_errors(application)) == before + 1, "forged logout"
         assert client.get("/").status_code == 200, "forged logout ended the session"
 
 
@@ -180,6 +208,7 @@ def test_valid_csrf_token_still_allows_the_legitimate_mutation(panel):
     response = client.post("/streams/demo/delete", data={"csrf_token": _token(client, "/")})
     assert response.status_code == 302
     upstream.delete_stream.assert_called_once_with("demo")
+    assert _csrf_errors(application) == []
 
 
 def test_session_cookie_is_httponly_and_samesite_strict(panel):
