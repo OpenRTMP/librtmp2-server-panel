@@ -12659,6 +12659,13 @@ def _match_case_invokes_mutating_callback(
     )
 
 
+# ``ast.TryStar`` (except*) is a sibling of ``ast.Try``, not a subclass, and
+# only exists on Python 3.11+.
+_TRY_STATEMENT_NODES = (ast.Try,) + (
+    (ast.TryStar,) if hasattr(ast, "TryStar") else ()
+)
+
+
 def _compound_statement_body_mutates_workers(
     node,
     operator_bindings,
@@ -12685,7 +12692,7 @@ def _compound_statement_body_mutates_workers(
         bodies = [case.body for case in node.cases]
     elif isinstance(node, ast.While):
         bodies = [node.body]
-    elif isinstance(node, ast.Try):
+    elif isinstance(node, _TRY_STATEMENT_NODES):
         bodies = [node.body, node.orelse, node.finalbody]
         bodies.extend(handler.body for handler in node.handlers)
     else:
@@ -16081,7 +16088,7 @@ def _compound_statement_blocks(node):
         yield node.orelse
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         yield node.body
-    elif isinstance(node, ast.Try):
+    elif isinstance(node, _TRY_STATEMENT_NODES):
         yield node.body
         for handler in node.handlers:
             yield handler.body
