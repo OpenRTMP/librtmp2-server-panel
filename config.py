@@ -9537,10 +9537,35 @@ def _record_descriptor_targets(class_name, targets, hooks, descriptor_fields):
     return found
 
 
-def _record_descriptor_field_assignments(class_node, methods, descriptor_fields):
+def _property_hook_decorator_name(stmt):
+    """Return the descriptor hook a ``@name.setter``/``.deleter`` installs."""
+    for decorator in stmt.decorator_list:
+        if isinstance(decorator, ast.Attribute) and decorator.attr in {
+            "setter",
+            "deleter",
+        }:
+            return "__set__" if decorator.attr == "setter" else "__delete__"
+    return None
+
+
+def _record_descriptor_field_assignments(
+    class_node,
+    methods,
+    descriptor_fields,
+    operator_bindings,
+):
     """Record descriptor fields keyed by the hook an access kind invokes."""
     found = False
     for stmt in class_node.body:
+        if isinstance(stmt, ast.FunctionDef):
+            hook = _property_hook_decorator_name(stmt)
+            if hook is not None and _function_mutates_workers(
+                stmt,
+                operator_bindings,
+            ):
+                descriptor_fields[hook].add((class_node.name, stmt.name))
+                found = True
+            continue
         if not isinstance(stmt, ast.Assign):
             continue
         if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
@@ -9603,6 +9628,7 @@ def _scan_class_side_effect_bindings(
                         node,
                         methods,
                         descriptor_fields,
+                        operator_bindings,
                     )
                     or risky
                 )
