@@ -8642,17 +8642,67 @@ _EAGER_GENERATOR_CONSUMER_BUILTINS = _EAGER_LAZY_ITERATOR_CONSUMERS | {"sum"}
 _HEAPQ_ORDERED_CALLBACK_METHODS = frozenset({"nsmallest", "nlargest"})
 
 
-def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
-    """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-        return False
-    if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
-        return False
-    receiver = call.func.value
+def _heapq_module_alias_events(operator_bindings):
+    """Return heapq module alias events stashed on the worker-scan bindings."""
+    return (
+        _operator_bindings_metadata(
+            operator_bindings,
+            "heapq_module_alias_events",
+        )
+        or {}
+    )
+
+
+def _heapq_ordered_callback_alias_events(operator_bindings):
+    """Return heapq nsmallest/nlargest name alias events on the bindings."""
+    return (
+        _operator_bindings_metadata(
+            operator_bindings,
+            "heapq_ordered_callback_alias_events",
+        )
+        or {}
+    )
+
+
+def _heapq_receiver_may_be_module(receiver, events, reference_line):
+    """Return True unless the receiver is proven to no longer name heapq."""
     if not isinstance(receiver, ast.Name):
         return False
-    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
-    if receiver.id not in module_aliases and receiver.id != "heapq":
+    if receiver.id == "heapq" or not events or receiver.id not in events:
+        # An alias the import collector cannot resolve still fails closed.
+        return True
+    return _module_alias_active_at_line(receiver, set(), events, reference_line)
+
+
+def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
+    """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
+    if not isinstance(call, ast.Call):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(call.func, ast.Attribute):
+        if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
+            return False
+        if not _heapq_receiver_may_be_module(
+            call.func.value,
+            _heapq_module_alias_events(operator_bindings),
+            reference_line,
+        ):
+            return False
+    elif isinstance(call.func, ast.Name):
+        name_alias_events = _heapq_ordered_callback_alias_events(
+            operator_bindings
+        )
+        if call.func.id not in _HEAPQ_ORDERED_CALLBACK_METHODS and not (
+            name_alias_events
+            and _module_alias_active_at_line(
+                call.func,
+                set(),
+                name_alias_events,
+                reference_line,
+            )
+        ):
+            return False
+    else:
         return False
     if len(call.args) < 2:
         return False
@@ -16141,6 +16191,21 @@ def _collect_operator_setitem_bindings(tree):
         tree,
         'threading',
         {'Thread', 'Timer'},
+    )
+    heapq_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        'heapq',
+    )
+    heapq_ordered_callback_alias_events = _collect_imported_name_alias_events(
+        tree,
+        'heapq',
+        {'nsmallest', 'nlargest'},
+    )
+    # The binding tuple indices are fixed, so the heapq alias events travel in
+    # the metadata map exactly like the late-collected module alias events.
+    builtin_shadow_lines["heapq_module_alias_events"] = heapq_module_alias_events
+    builtin_shadow_lines["heapq_ordered_callback_alias_events"] = (
+        heapq_ordered_callback_alias_events
     )
     dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
     dict_update_aliases = _collect_dict_update_aliases(
