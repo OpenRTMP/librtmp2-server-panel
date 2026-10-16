@@ -10376,13 +10376,25 @@ def _container_wrapper_uses_dynamic_class_introspection(call):
     ):
         return False
     arg = call.args[0]
-    if _ast_references_class_introspection(arg):
-        return True
     if _is_class_mro_method_call(arg):
         return call.func.id in {"set", "frozenset"}
-    if any(_is_class_mro_method_call(node) for node in ast.walk(arg)):
+    if _ast_references_class_introspection(arg):
         return True
     return _expression_uses_dynamic_class_introspection(arg)
+
+
+def _call_uses_mro_reordering_or_subclasses(call):
+    """Identify introspection-sensitive reordering helpers and subclass calls."""
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr == "__subclasses__" or (
+            call.func.attr in _MRO_REORDERING_ATTRS
+            and _ast_references_class_introspection(call)
+        )
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id in _MRO_REORDERING_BUILTINS
+        and _ast_references_class_introspection(call)
+    )
 
 
 def _expression_uses_dynamic_class_introspection(expr):
@@ -10403,20 +10415,7 @@ def _expression_uses_dynamic_class_introspection(expr):
         )
     if not isinstance(expr, ast.Call):
         return False
-    if isinstance(expr.func, ast.Attribute):
-        if expr.func.attr == "__subclasses__":
-            return True
-        if (
-            expr.func.attr in _MRO_REORDERING_ATTRS
-            and _ast_references_class_introspection(expr)
-        ):
-            return True
-        return False
-    if (
-        isinstance(expr.func, ast.Name)
-        and expr.func.id in _MRO_REORDERING_BUILTINS
-        and _ast_references_class_introspection(expr)
-    ):
+    if _call_uses_mro_reordering_or_subclasses(expr):
         return True
     return _container_wrapper_uses_dynamic_class_introspection(expr)
 
