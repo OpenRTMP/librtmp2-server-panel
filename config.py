@@ -13359,6 +13359,7 @@ def _sync_callback_tracking(scan_state):
             "userlist_constructors": set(),
             "containers": {},
             "mutating": set(),
+            "mutating_callback_names": set(),
             "mutating_subscript_indexes": {},
             "sched_event_ids": {},
             "sched_pending_events": {},
@@ -13547,6 +13548,7 @@ def _clear_sync_callback_name_tracking(name, tracking):
     """Clear stale callback-container state after a definite rebinding."""
     tracking["containers"].pop(name, None)
     tracking["mutating"].discard(name)
+    tracking["mutating_callback_names"].discard(name)
     tracking["queue_modules"].discard(name)
     tracking["collections_modules"].discard(name)
     tracking["sched_modules"].discard(name)
@@ -13622,6 +13624,40 @@ def _record_sync_callback_assignment(node, tracking, operator_bindings):
             starts_mutating,
             existing_subscript_indexes,
         )
+
+
+def _sync_callback_dispatch_result_holds_callback(value, tracking):
+    """Return True when a call reads a callback out of a mutating container."""
+    if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)):
+        return False
+    receiver = value.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    kind = tracking["containers"].get(receiver.id)
+    method = value.func.attr
+    dispatch_methods = {
+        "queue": {"get", "get_nowait"},
+        "deque": {"pop", "popleft"},
+        "list": {"pop"},
+        "userlist": {"pop"},
+    }
+    return method in dispatch_methods.get(kind, set()) and (
+        _sync_callback_accessor_arguments_are_valid(value, kind, method)
+    )
+
+
+def _record_sync_callback_dispatch_result(node, tracking):
+    """Track names bound from a mutating container's callback accessor.
+
+    ``cb = q.get()`` holds the callback the container was proven to carry, so
+    a later ``cb()`` executes it synchronously; the inline ``q.get()()`` form
+    is already recognized by ``_sync_callback_dispatch_mutates``, and this
+    records the same proven source under the bound name.
+    """
+    value = _statement_value_expression(node)
+    if not _sync_callback_dispatch_result_holds_callback(value, tracking):
+        return
+    tracking["mutating_callback_names"].update(_simple_assignment_names(node))
 
 
 def _statement_value_expression(node):
@@ -16035,6 +16071,13 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         return True
     if expr.args or expr.keywords:
         return False
+    if (
+        isinstance(expr.func, ast.Name)
+        and expr.func.id in tracking["mutating_callback_names"]
+    ):
+        # A name read out of a mutating container holds that container's
+        # callback, so invoking it executes the proven mutation.
+        return True
     if _sync_callback_direct_dispatch_mutates(expr, tracking):
         return True
     inner = expr.func
@@ -16087,6 +16130,7 @@ def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
         operator_bindings,
     )
     _record_sync_callback_assignment(node, tracking, operator_bindings)
+    _record_sync_callback_dispatch_result(node, tracking)
     _record_sync_callback_insert(node, tracking, operator_bindings)
     return dispatch_mutates
 
