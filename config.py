@@ -8942,7 +8942,7 @@ def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
         name_alias_events = _heapq_ordered_callback_alias_events(
             operator_bindings
         )
-        if call.func.id not in _HEAPQ_ORDERED_CALLBACK_METHODS and not (
+        if not (
             name_alias_events
             and _module_alias_active_at_line(
                 call.func,
