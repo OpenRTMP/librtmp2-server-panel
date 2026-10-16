@@ -6107,10 +6107,12 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
     if isinstance(callback, ast.Subscript):
-        element = _future_subscript_callback_value(callback, operator_bindings)
-        return element is not None and _thread_pool_callback_mutates_workers(
-            element,
-            operator_bindings,
+        return any(
+            _thread_pool_callback_mutates_workers(element, operator_bindings)
+            for element in _future_subscript_callback_values(
+                callback,
+                operator_bindings,
+            )
         )
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
@@ -6757,23 +6759,24 @@ def _collect_callback_alias_events(tree, operator_bindings):
     return events
 
 
-def _scan_callback_container_events(statements, events):
+def _scan_callback_container_events(statements, events, *, conditional=False):
     """Collect literal callback containers by name in source order."""
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         for name, value in _namespace_assignment_values(node):
-            events.setdefault(name, []).append(
-                (
-                    getattr(node, "lineno", 0),
-                    getattr(node, "col_offset", 0),
-                    value
-                    if isinstance(value, (ast.Tuple, ast.List, ast.Dict))
-                    else None,
-                )
+            event = (
+                getattr(node, "lineno", 0),
+                getattr(node, "col_offset", 0),
+                value
+                if isinstance(value, (ast.Tuple, ast.List, ast.Dict))
+                else None,
             )
+            if conditional:
+                event += (True,)
+            events.setdefault(name, []).append(event)
         for block in _compound_statement_blocks(node):
-            _scan_callback_container_events(block, events)
+            _scan_callback_container_events(block, events, conditional=True)
 
 
 def _collect_callback_container_events(tree):
@@ -6783,53 +6786,97 @@ def _collect_callback_container_events(tree):
     return events
 
 
-def _future_callback_container_value(value, analysis):
-    """Resolve a saved literal callback container reference."""
+def _future_callback_container_candidates_at_position(events, name, reference):
+    """Return candidate container values visible at a reference position.
+
+    The latest unconditional binding is the base; conditional bindings after it
+    are kept as additional candidates because the branch may or may not have
+    run, so the callback scan must fail closed for any of them.
+    """
+    if isinstance(reference, ast.AST):
+        reference_position = (
+            getattr(reference, "lineno", 0),
+            getattr(reference, "col_offset", 0),
+        )
+    else:
+        reference_position = (int(reference or 0), 10**9)
+    base = None
+    conditionals = []
+    for event in events.get(name, ()):
+        event_position = (event[0], event[1])
+        if event_position > reference_position:
+            break
+        if len(event) > 3:
+            conditionals.append(event[2])
+        else:
+            base = event[2]
+            conditionals = []
+    candidates = ([base] if base is not None else []) + conditionals
+    return [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, (ast.Tuple, ast.List, ast.Dict))
+    ]
+
+
+def _future_callback_container_values(value, analysis):
+    """Resolve saved literal callback container candidates for a reference."""
     if not isinstance(value, ast.Name):
-        return None
-    state = _ordered_binding_state_at_position(
+        return [value]
+    return _future_callback_container_candidates_at_position(
         analysis.get("callback_container_events", {}),
         value.id,
         value,
     )
-    return state if isinstance(state, (ast.Tuple, ast.List, ast.Dict)) else None
 
 
-def _future_subscript_callback_value(callback, operator_bindings):
-    """Resolve a constant-index subscript into a saved literal container."""
+def _future_subscript_callback_values(callback, operator_bindings):
+    """Resolve constant-index subscripts into saved literal container candidates."""
     if not isinstance(callback, ast.Subscript):
-        return None
+        return []
     index = callback.slice
     if not (isinstance(index, ast.Constant) and type(index.value) is int):
-        return None
-    container = _future_callback_container_value(
+        return []
+    if not isinstance(callback.value, ast.Name):
+        return []
+    elements = []
+    for container in _future_callback_container_candidates_at_position(
+        _future_analysis_state(operator_bindings).get(
+            "callback_container_events",
+            {},
+        ),
+        callback.value.id,
         callback.value,
-        _future_analysis_state(operator_bindings),
-    )
-    if not isinstance(container, (ast.Tuple, ast.List)):
-        return None
-    if not -len(container.elts) <= index.value < len(container.elts):
-        return None
-    return container.elts[index.value]
+    ):
+        if not isinstance(container, (ast.Tuple, ast.List)):
+            continue
+        if not -len(container.elts) <= index.value < len(container.elts):
+            continue
+        elements.append(container.elts[index.value])
+    return elements
 
 
 def _future_starred_callback_values(value, analysis):
-    """Extract the sole positional callback from a literal expanded argument."""
-    value = _future_callback_container_value(value, analysis) or value
-    if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
-        return [value.elts[0]]
-    return []
+    """Extract the sole positional callback from literal expanded arguments."""
+    callbacks = []
+    for container in _future_callback_container_values(value, analysis):
+        if (
+            isinstance(container, (ast.Tuple, ast.List))
+            and len(container.elts) == 1
+        ):
+            callbacks.append(container.elts[0])
+    return callbacks
 
 
 def _future_expanded_keyword_callbacks(value, analysis):
-    """Extract fn from a literal expanded keyword mapping."""
-    value = _future_callback_container_value(value, analysis) or value
-    if not isinstance(value, ast.Dict):
-        return []
+    """Extract fn from literal expanded keyword mappings."""
     callbacks = []
-    for key, callback in zip(value.keys, value.values):
-        if isinstance(key, ast.Constant) and key.value == "fn":
-            callbacks.append(callback)
+    for mapping in _future_callback_container_values(value, analysis):
+        if not isinstance(mapping, ast.Dict):
+            continue
+        for key, callback in zip(mapping.keys, mapping.values):
+            if isinstance(key, ast.Constant) and key.value == "fn":
+                callbacks.append(callback)
     return callbacks
 
 
