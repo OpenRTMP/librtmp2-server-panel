@@ -115,6 +115,11 @@ def _proxy_network_v4_equivalent(network):
     )
 
 
+def _contains_v4_mapped_proxy_network(network):
+    """Return True for IPv6 ranges that cover the whole ``::ffff:0:0/96``."""
+    return network.version == 6 and network.supernet_of(_V4_MAPPED_PROXY_NETWORK)
+
+
 def _is_overly_broad_proxy_network(network):
     """Return True for CIDR ranges broad enough to trust arbitrary clients."""
     min_prefix = _MIN_TRUSTED_PROXY_PREFIXLEN.get(network.version)
@@ -124,11 +129,19 @@ def _is_overly_broad_proxy_network(network):
         # ``::ffff:0:0/96`` is every IPv4 client on a dual-stack bind, so its
         # subnets are only as specific as their IPv4 prefix length.
         return network.prefixlen - _V4_MAPPED_PROXY_NETWORK.prefixlen < min_prefix
+    if _contains_v4_mapped_proxy_network(network):
+        # A range containing the whole v4-mapped /96 covers every IPv4 client
+        # on a dual-stack bind, however specific its own prefix length looks.
+        return True
     return network.prefixlen < min_prefix
 
 
 def _proxy_networks_cover_entire_address_space(networks):
     """Return True when the configured union covers all of IPv4 or all of IPv6."""
+    if any(_contains_v4_mapped_proxy_network(network) for network in networks):
+        # Covering ``::ffff:0:0/96`` is covering every IPv4 client on a
+        # dual-stack bind, which is the whole IPv4 address space.
+        return True
     normalized = [
         _proxy_network_v4_equivalent(network)
         if _is_v4_mapped_proxy_network(network)
