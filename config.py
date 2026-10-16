@@ -13689,7 +13689,7 @@ def _sync_callback_direct_insert_argument(expr, kind):
         "deque": {"append", "appendleft"},
         "list": {"append"},
         "userlist": {"append"},
-        "sched": {"enter"},
+        "sched": {"enter", "enterabs"},
     }
     if expr.func.attr not in direct_callback_methods.get(kind, set()):
         return None
