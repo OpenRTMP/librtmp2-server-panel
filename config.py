@@ -9400,6 +9400,16 @@ def _explicit_metaclass_name(class_node):
     return None
 
 
+def _iter_class_definitions(statements):
+    """Yield class definitions reachable through import-time compound blocks."""
+    for node in statements:
+        if isinstance(node, ast.ClassDef):
+            yield node
+            continue
+        for block in _compound_statement_blocks(node):
+            yield from _iter_class_definitions(block)
+
+
 def _classes_with_mutating_effective_metaclass(
     tree,
     operator_bindings,
@@ -9412,9 +9422,7 @@ def _classes_with_mutating_effective_metaclass(
         hook_names,
     )
     affected = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _iter_class_definitions(tree.body):
         explicit = _explicit_metaclass_name(node)
         inherited = any(
             isinstance(base, ast.Name) and base.id in affected
@@ -9823,9 +9831,7 @@ def _collect_class_definition_metadata(tree):
     class_bases = {}
     class_methods = set()
     class_attributes = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _iter_class_definitions(tree.body):
         class_bases[node.name] = tuple(
             base.id for base in node.bases if isinstance(base, ast.Name)
         )
