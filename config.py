@@ -9347,6 +9347,32 @@ def _function_is_property_method(func_node, operator_bindings=None):
 
 
 
+def _super_invocation_method_name(func):
+    """Return the method name for direct and getattr super() invocations."""
+    if isinstance(func, ast.Attribute):
+        super_call = func.value
+        if (
+            isinstance(super_call, ast.Call)
+            and isinstance(super_call.func, ast.Name)
+            and super_call.func.id == "super"
+        ):
+            return func.attr
+        return None
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Call)
+        and isinstance(func.args[0].func, ast.Name)
+        and func.args[0].func.id == "super"
+        and isinstance(func.args[1], ast.Constant)
+        and isinstance(func.args[1].value, str)
+    ):
+        return func.args[1].value
+    return None
+
+
 def _function_invokes_mutating_super_method(
     func_node,
     class_name,
@@ -9354,22 +9380,22 @@ def _function_invokes_mutating_super_method(
     methods,
     class_methods=None,
 ):
-    """Return True when super().method() reaches a mutating MRO implementation."""
+    """Return True when super().method() reaches a mutating MRO implementation.
+
+    The ``getattr(super(...), 'method')()`` spelling reaches the same
+    implementation and has to be recorded as well.
+    """
     for node in ast.walk(func_node):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        if not isinstance(node, ast.Call):
             continue
-        super_call = node.func.value
-        if not (
-            isinstance(super_call, ast.Call)
-            and isinstance(super_call.func, ast.Name)
-            and super_call.func.id == "super"
-        ):
+        method_name = _super_invocation_method_name(node.func)
+        if method_name is None:
             continue
         if _class_super_method_mutates(
             methods,
             class_bases,
             class_name,
-            node.func.attr,
+            method_name,
             class_methods,
         ):
             return True
