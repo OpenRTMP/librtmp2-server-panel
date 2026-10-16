@@ -10104,17 +10104,34 @@ def _collect_class_name_aliases(tree, class_names):
         if not discovered:
             break
         for name in discovered:
-            aliases[name] = next(
-                aliases.get(value.id, value.id)
+            aliases[name] = [
+                (
+                    getattr(value, "lineno", 0),
+                    value.id
+                    if value.id in class_names
+                    else _class_name_alias_target(
+                        value.id,
+                        aliases,
+                        getattr(value, "lineno", 0),
+                    ),
+                )
                 for value in assignments[name]
-            )
+            ]
         unresolved.difference_update(discovered)
     return aliases
 
 
-def _class_name_alias_target(name, class_name_aliases):
-    """Resolve a module-level simple class alias to its class name."""
-    return class_name_aliases.get(name, name)
+def _class_name_alias_target(name, class_name_aliases, reference_line=0):
+    """Resolve a module-level simple class alias at one source line."""
+    events = class_name_aliases.get(name)
+    if not events:
+        return name
+    target = name
+    for event_line, event_target in events:
+        if reference_line and event_line > reference_line:
+            break
+        target = event_target
+    return target
 
 
 def _collect_metaclass_call_constructor_names(tree, operator_bindings):
@@ -10835,13 +10852,17 @@ def _deque_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _class_mro_index_class_name(class_name, index, operator_bindings):
+def _class_mro_index_class_name(class_name, index, operator_bindings, reference_line=0):
     """Resolve a class name from a static MRO index without running config code."""
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return None
     class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
-    class_name = _class_name_alias_target(class_name, class_name_aliases)
+    class_name = _class_name_alias_target(
+        class_name,
+        class_name_aliases,
+        reference_line,
+    )
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     mro = _class_mro_names(class_name, class_bases)
     if "object" in class_bases:
@@ -10851,14 +10872,19 @@ def _class_mro_index_class_name(class_name, index, operator_bindings):
         mro = (*mro, "object")
     if not -len(mro) <= index < len(mro):
         return None
-    return _class_name_alias_target(mro[index], class_name_aliases)
+    return _class_name_alias_target(mro[index], class_name_aliases, reference_line)
 
 
 def _mro_subscript_class_name(value, index, operator_bindings):
     """Resolve an indexed MRO element without evaluating configuration code."""
     if not isinstance(value.value, ast.Name):
         return None
-    return _class_mro_index_class_name(value.value.id, index, operator_bindings)
+    return _class_mro_index_class_name(
+        value.value.id,
+        index,
+        operator_bindings,
+        getattr(value, "lineno", 0),
+    )
 
 
 def _bases_subscript_class_name(value, index, operator_bindings):
@@ -10912,7 +10938,12 @@ def _class_mro_method_subscript_class_name(call, index, operator_bindings):
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if class_targets and _class_mro_method_is_overridden(call, class_targets):
         return None
-    return _class_mro_index_class_name(call.func.value.id, index, operator_bindings)
+    return _class_mro_index_class_name(
+        call.func.value.id,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
 
 
 def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
@@ -11356,7 +11387,11 @@ def _type_constructor_bases_trigger_workers(
     for base in bases:
         if not isinstance(base, ast.Name):
             continue
-        base_name = _class_name_alias_target(base.id, class_name_aliases)
+        base_name = _class_name_alias_target(
+            base.id,
+            class_name_aliases,
+            reference_line,
+        )
         if _class_mro_hook_triggers_workers(
             base_name, "__init_subclass__", class_targets, reference_line
         ):
@@ -11818,10 +11853,11 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     if class_node.name in metaclass_definitions:
         return True
     class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    reference_line = getattr(class_node, "lineno", 0)
     return any(
         isinstance(base, ast.Name)
         and (
-            _class_name_alias_target(base.id, class_name_aliases),
+            _class_name_alias_target(base.id, class_name_aliases, reference_line),
             "__init_subclass__",
         )
         in methods
