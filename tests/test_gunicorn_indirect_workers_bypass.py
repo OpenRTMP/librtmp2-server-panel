@@ -3565,3 +3565,35 @@ def test_security_review_oct14_nested_mro_method_wrappers_are_dynamic(
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-16: builtin reordering helpers and non-constant MRO slices
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "list(filter(lambda c: True, Child.__mro__))[1]()",
+        "list(map(lambda c: c, Child.__mro__))[1]()",
+        "import itertools\nlist(itertools.chain(Child.__mro__))[1]()",
+        "sorted(Child.__mro__, key=lambda c: 0)[1]()",
+        "list(zip(Child.__mro__, Child.__mro__))[1][0]()",
+        "list(enumerate(Child.__mro__))[1][1]()",
+        "tuple(iter(Child.__mro__))[1]()",
+        "from collections import deque\nlist(deque(Child.__mro__))[1]()",
+        "Child.__mro__[1:2][0]()",
+        "(Child.__mro__ + ())[1]()",
+    ],
+)
+def test_security_review_oct16_mro_reordering_wrappers_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
