@@ -5554,7 +5554,11 @@ def _thread_target_mutates_workers(
         return True
     payload = _thread_arguments_payload(call, operator_bindings)
     if target.attr == "update":
-        return _thread_update_payload_may_set_workers(payload)
+        return _thread_update_payload_may_set_workers(
+            payload
+        ) or _thread_kwargs_payload_may_set_workers(
+            _thread_keyword_arguments_payload(call, operator_bindings)
+        )
     return _thread_key_payload_may_be_workers(payload)
 
 
@@ -5606,6 +5610,26 @@ def _thread_arguments_payload(call, operator_bindings):
     return None
 
 
+def _thread_keyword_arguments_payload(call, operator_bindings):
+    """Return the ``kwargs`` payload expression passed to a Thread target."""
+    for keyword in call.keywords:
+        if keyword.arg == "kwargs":
+            return keyword.value
+    if _thread_constructor_is_timer(
+        call.func,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
+        # Timer(interval, function, args=None, kwargs=None)
+        if len(call.args) >= 4:
+            return call.args[3]
+        return None
+    # Thread(group=None, target=None, name=None, args=(), kwargs={})
+    if len(call.args) >= 5:
+        return call.args[4]
+    return None
+
+
 def _thread_update_payload_may_set_workers(payload):
     """Return True when a Thread ``args`` payload may update ``workers``."""
     if payload is None:
@@ -5618,6 +5642,16 @@ def _thread_update_payload_may_set_workers(payload):
                 continue
             # An unresolvable argument cannot be proven to omit workers.
             return True
+        return False
+    if isinstance(payload, ast.Dict):
+        return _dict_literal_sets_workers(payload)
+    # An unresolvable payload cannot be proven to omit workers.
+    return True
+
+
+def _thread_kwargs_payload_may_set_workers(payload):
+    """Return True when a Thread ``kwargs`` payload may update ``workers``."""
+    if payload is None:
         return False
     if isinstance(payload, ast.Dict):
         return _dict_literal_sets_workers(payload)
