@@ -17117,6 +17117,24 @@ def _class_body_global_names(node):
     )
 
 
+def _function_body_global_names(node):
+    """Return the names a function body binds to the module scope via ``global``.
+
+    ``global`` inside a function keeps binding the name into the module
+    namespace rather than into the function's locals, so an import declared
+    that way reaches Gunicorn even though the import statement itself sits in
+    a function body. Nested scopes are walked too, mirroring
+    ``_class_body_global_names``; the wider set can only make the gate fail
+    closed.
+    """
+    return frozenset(
+        name
+        for child in ast.walk(node)
+        if isinstance(child, ast.Global)
+        for name in child.names
+    )
+
+
 def _is_current_module_namespace_object(node, namespace_aliases=None):
     """Return True for a mapping/object that is this config module's namespace."""
     return _is_module_namespace_mapping(
@@ -17544,7 +17562,7 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
             return scope
         return (
             False,
-            declared_globals,
+            declared_globals | _function_body_global_names(child),
             may_run and child.name not in uncalled_names,
             True,
         )
