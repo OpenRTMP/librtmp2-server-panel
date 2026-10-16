@@ -7384,7 +7384,7 @@ def _record_class_async_wrapper_bindings(
     *,
     conditional,
 ):
-    """Record callable static/class async methods on one module-level class."""
+    """Record callable static/class and undecorated instance async methods."""
     line = getattr(node, "lineno", 0)
     prefix = f"{node.name}."
     if not conditional:
@@ -7400,7 +7400,10 @@ def _record_class_async_wrapper_bindings(
     for stmt in node.body:
         if (
             isinstance(stmt, ast.AsyncFunctionDef)
-            and _function_is_static_or_class_method(stmt, operator_bindings)
+            and (
+                _function_is_static_or_class_method(stmt, operator_bindings)
+                or not stmt.decorator_list
+            )
         ):
             _record_async_wrapper_binding(
                 events,
@@ -7517,10 +7520,35 @@ def _collect_async_wrapper_binding_events(tree, operator_bindings):
     return events
 
 
+def _async_instance_method_needs_receiver(candidate, operator_bindings):
+    """Return True for an undecorated async instance method (needs a self)."""
+    return (
+        isinstance(candidate, ast.AsyncFunctionDef)
+        and not candidate.decorator_list
+        and not _function_is_static_or_class_method(candidate, operator_bindings)
+    )
+
+
+def _async_wrapper_call_passes_receiver(func, invocation):
+    """Return True when ``Class.method(...)`` receives a possible instance."""
+    if not (
+        isinstance(invocation, ast.Call)
+        and isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and invocation.args
+    ):
+        return False
+    first = invocation.args[0]
+    if isinstance(first, ast.Call) and isinstance(first.func, ast.Name):
+        return first.func.id == func.value.id
+    return isinstance(first, ast.Name)
+
+
 def _async_wrapper_candidates_at_line(
     func,
     operator_bindings,
     reference_line,
+    invocation=None,
 ):
     """Resolve a called name or class-qualified method to async candidates."""
     if len(operator_bindings) <= _ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX:
@@ -7532,10 +7560,32 @@ def _async_wrapper_candidates_at_line(
         and isinstance(func.value, ast.Name)
     ):
         key = f"{func.value.id}.{func.attr}"
+    elif (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Call)
+        and isinstance(func.value.func, ast.Name)
+    ):
+        key = f"{func.value.func.id}.{func.attr}"
     else:
         return frozenset()
     events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
-    return _async_wrapper_state(events, key, reference_line)
+    candidates = _async_wrapper_state(events, key, reference_line)
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and not _async_wrapper_call_passes_receiver(func, invocation)
+    ):
+        # ``Class.method`` without a receiver is the plain function object: an
+        # instance method would raise TypeError when called this way.
+        candidates = frozenset(
+            candidate
+            for candidate in candidates
+            if not _async_instance_method_needs_receiver(
+                candidate,
+                operator_bindings,
+            )
+        )
+    return candidates
 
 
 def _local_async_wrapper_candidates(func, local_state):
@@ -7766,6 +7816,7 @@ def _asyncio_awaitable_mutates_workers(
             expr.func,
             operator_bindings,
             reference_line,
+            expr,
         )
     return any(
         _async_function_mutates_workers_via_asyncio(
