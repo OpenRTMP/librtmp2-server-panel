@@ -5547,13 +5547,13 @@ def _thread_target_mutates_workers(
         and _is_module_namespace_mapping(target.value, namespace_aliases)
     ):
         return False
-    if target.attr not in {"update", "__setitem__", "setdefault"}:
+    if target.attr not in {"update", "__setitem__", "setdefault", "__ior__"}:
         return False
     if not isinstance(call, ast.Call):
         # Without the constructor the payload cannot be proven harmless.
         return True
     payload = _thread_arguments_payload(call, operator_bindings)
-    if target.attr == "update":
+    if target.attr in {"update", "__ior__"}:
         return _thread_update_payload_may_set_workers(
             payload
         ) or _thread_kwargs_payload_may_set_workers(
