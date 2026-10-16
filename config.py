@@ -2262,6 +2262,8 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
         return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
     if method == "__setitem__":
         return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
+    if method == "setdefault":
+        return bool(call.args) and _key_may_be_workers(call.args[0])
     return method is None
 
 
