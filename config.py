@@ -7677,6 +7677,38 @@ def _async_wrapper_call_passes_receiver(func, invocation):
     return isinstance(first, ast.Name)
 
 
+def _async_wrapper_instance_method_candidates_at_line(
+    func,
+    operator_bindings,
+    reference_line,
+):
+    """Resolve ``instance.method`` through module-level instance bindings.
+
+    Returns ``None`` when the receiver name is not a tracked instance, so the
+    caller keeps the plain class-qualified resolution path.
+    """
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets or len(class_targets) <= 6:
+        return None
+    events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
+    candidates = frozenset()
+    found = False
+    for instance_line, class_name in _instance_binding_candidates_at_line(
+        class_targets[6],
+        func.value.id,
+        reference_line,
+    ):
+        if not _class_binding_is_active(class_targets, class_name, instance_line):
+            continue
+        found = True
+        candidates |= _async_wrapper_state(
+            events,
+            f"{class_name}.{func.attr}",
+            reference_line,
+        )
+    return candidates if found else None
+
+
 def _async_wrapper_candidates_at_line(
     func,
     operator_bindings,
@@ -7701,6 +7733,16 @@ def _async_wrapper_candidates_at_line(
         key = f"{func.value.func.id}.{func.attr}"
     else:
         return frozenset()
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        instance_candidates = _async_wrapper_instance_method_candidates_at_line(
+            func,
+            operator_bindings,
+            reference_line,
+        )
+        if instance_candidates is not None:
+            # ``instance.method`` passes the receiver implicitly, so the
+            # instance method's ``self`` requirement is already satisfied.
+            return instance_candidates
     events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
     candidates = _async_wrapper_state(events, key, reference_line)
     if (
