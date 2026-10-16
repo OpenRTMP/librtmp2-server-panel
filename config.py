@@ -13863,12 +13863,23 @@ def _sync_callback_direct_insert_argument(expr, kind):
     if expr.func.attr not in direct_callback_methods.get(kind, set()):
         return None
     callback_index = 2 if kind == "sched" else 0
-    if len(expr.args) <= callback_index:
-        return None
-    callback = expr.args[callback_index]
-    if isinstance(callback, (ast.Tuple, ast.List)) and callback.elts:
-        return callback.elts[-1]
-    return callback
+    if len(expr.args) > callback_index:
+        callback = expr.args[callback_index]
+        if isinstance(callback, (ast.Tuple, ast.List)) and callback.elts:
+            return callback.elts[-1]
+        return callback
+    if kind == "sched":
+        keyword = next(
+            (
+                keyword
+                for keyword in expr.keywords
+                if keyword.arg == "action"
+            ),
+            None,
+        )
+        if keyword is not None:
+            return keyword.value
+    return None
 
 
 def _sync_callback_insert_mutates(expr, kind, operator_bindings):
@@ -13933,7 +13944,7 @@ def _record_sync_callback_insert(node, tracking, operator_bindings):
     if not isinstance(receiver, ast.Name):
         return
     kind = tracking["containers"].get(receiver.id)
-    if kind is None or not expr.args:
+    if kind is None or not (expr.args or (kind == "sched" and expr.keywords)):
         return
     if kind == "queue":
         _record_queue_mutating_subscript_indexes(
