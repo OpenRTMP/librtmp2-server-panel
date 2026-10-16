@@ -7607,6 +7607,14 @@ def _asyncio_awaitable_expression_mutates_workers(
     )
 
 
+def _asyncio_starred_awaitable_elements(argument):
+    """Return the literal elements of a starred awaitable container, or None."""
+    value = argument.value
+    if isinstance(value, (ast.List, ast.Tuple)):
+        return value.elts
+    return None
+
+
 def _asyncio_consumer_call_mutates_workers(
     call,
     operator_bindings,
@@ -7622,16 +7630,32 @@ def _asyncio_consumer_call_mutates_workers(
         local_state,
     ):
         return False
-    return any(
-        _asyncio_awaitable_expression_mutates_workers(
-            arg.value if isinstance(arg, ast.Starred) else arg,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        )
-        for arg in call.args
+    arguments = (
+        *call.args,
+        *(keyword.value for keyword in call.keywords if keyword.arg),
     )
+    for argument in arguments:
+        if isinstance(argument, ast.Starred):
+            elements = _asyncio_starred_awaitable_elements(argument)
+            if elements is None:
+                # A starred container this walk cannot resolve still fails
+                # closed: it may hold a workers-mutating awaitable.
+                return True
+            candidates = elements
+        else:
+            candidates = (argument,)
+        if any(
+            _asyncio_awaitable_expression_mutates_workers(
+                candidate,
+                operator_bindings,
+                reference_line,
+                local_state,
+                seen,
+            )
+            for candidate in candidates
+        ):
+            return True
+    return False
 
 
 def _asyncio_awaitable_mutates_workers(
@@ -7975,7 +7999,7 @@ def _asyncio_task_factory_call_mutates_workers(
     seen=None,
 ):
     """Return True when create_task/ensure_future schedules a mutating awaitable."""
-    if not isinstance(call, ast.Call) or not call.args:
+    if not isinstance(call, ast.Call) or (not call.args and not call.keywords):
         return False
     helper_names = ("create_task", "ensure_future")
     if not any(
@@ -7988,8 +8012,15 @@ def _asyncio_task_factory_call_mutates_workers(
         for helper_name in helper_names
     ):
         return False
+    scheduled = _call_argument(
+        call,
+        ("coro", "coro_or_future", "future", "main"),
+    )
+    if scheduled is None:
+        # An argument list this walk cannot resolve still fails closed.
+        return True
     return _asyncio_awaitable_expression_mutates_workers(
-        call.args[0],
+        scheduled,
         operator_bindings,
         reference_line,
         local_state=local_state,
