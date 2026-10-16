@@ -562,7 +562,7 @@ class _PanelRuntime:
     @staticmethod
     def _add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port):
         for player in players:
-            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key') or ''}"  # nosonar python:S5332
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key') or ''}"  # NOSONAR python:S5332
             if rtmps_on:
                 player["play_url_tls"] = (
                     f"rtmps://{domain}:{rtmps_port}/{app_name}/"
