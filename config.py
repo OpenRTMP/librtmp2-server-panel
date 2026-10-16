@@ -98,6 +98,21 @@ _MIN_TRUSTED_PROXY_PREFIXLEN = {
     4: 2,  # reject /0 and /1 (split catch-alls that cover all of IPv4)
     6: 2,  # reject ::/0 and ::/1 (split catch-alls that cover all of IPv6)
 }
+_V4_MAPPED_PROXY_NETWORK = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _is_v4_mapped_proxy_network(network):
+    """Return True for IPv6 ranges inside the IPv4-mapped ``::ffff:0:0/96``."""
+    return network.version == 6 and network.subnet_of(_V4_MAPPED_PROXY_NETWORK)
+
+
+def _proxy_network_v4_equivalent(network):
+    """Map a v4-mapped IPv6 range to its IPv4 equivalent."""
+    return ipaddress.ip_network(
+        f"{ipaddress.IPv4Address(int(network.network_address) & 0xFFFFFFFF)}"
+        f"/{network.prefixlen - _V4_MAPPED_PROXY_NETWORK.prefixlen}",
+        strict=False,
+    )
 
 
 def _is_overly_broad_proxy_network(network):
@@ -105,13 +120,23 @@ def _is_overly_broad_proxy_network(network):
     min_prefix = _MIN_TRUSTED_PROXY_PREFIXLEN.get(network.version)
     if min_prefix is None:
         return False
+    if _is_v4_mapped_proxy_network(network):
+        # ``::ffff:0:0/96`` is every IPv4 client on a dual-stack bind, so its
+        # subnets are only as specific as their IPv4 prefix length.
+        return network.prefixlen - _V4_MAPPED_PROXY_NETWORK.prefixlen < min_prefix
     return network.prefixlen < min_prefix
 
 
 def _proxy_networks_cover_entire_address_space(networks):
     """Return True when the configured union covers all of IPv4 or all of IPv6."""
+    normalized = [
+        _proxy_network_v4_equivalent(network)
+        if _is_v4_mapped_proxy_network(network)
+        else network
+        for network in networks
+    ]
     for version in (4, 6):
-        same_version = [network for network in networks if network.version == version]
+        same_version = [network for network in normalized if network.version == version]
         if not same_version:
             continue
         if any(
