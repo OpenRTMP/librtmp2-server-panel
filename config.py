@@ -13081,7 +13081,17 @@ def _statement_mutates_workers(
             node, operator_bindings, bound_names, defer_annotations
         )
     if isinstance(node, ast.ClassDef):
-        return False
+        # A class body runs while the ``class`` statement executes, so a
+        # module-namespace mutation inside one counts here exactly as it does
+        # at module level; a plain class attribute still does not.
+        return _class_body_has_dynamic_workers_effect(
+            node.body,
+            mutator_names,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
     if _statement_has_class_workers_side_effect(node, class_targets):
         return True
     if _is_dynamic_workers_mutation(
