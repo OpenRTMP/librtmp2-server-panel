@@ -9847,6 +9847,40 @@ def _collect_class_definition_metadata(tree):
     return class_bases, class_methods, class_attributes
 
 
+def _collect_class_name_aliases(tree, class_names):
+    """Collect module-level simple aliases bound to locally defined classes."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = {}
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if name not in class_names
+            and assignments[name]
+            and all(
+                isinstance(value, ast.Name)
+                and (value.id in class_names or value.id in aliases)
+                for value in assignments[name]
+            )
+        }
+        if not discovered:
+            break
+        for name in discovered:
+            aliases[name] = next(
+                aliases.get(value.id, value.id)
+                for value in assignments[name]
+            )
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _class_name_alias_target(name, class_name_aliases):
+    """Resolve a module-level simple class alias to its class name."""
+    return class_name_aliases.get(name, name)
+
+
 def _collect_metaclass_call_constructor_names(tree, operator_bindings):
     """Return classes whose construction runs a mutating metaclass __call__."""
     return _classes_with_mutating_effective_metaclass(
@@ -9985,6 +10019,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
+    class_name_aliases = _collect_class_name_aliases(tree, set(class_bases))
     class_definition_lines = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -10041,6 +10076,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_definition_lines,
         metaclass_bypass_events,
         operator_bindings[32] if len(operator_bindings) > 32 else {},
+        class_name_aliases,
     )
 
 
@@ -10568,6 +10604,8 @@ def _class_mro_index_class_name(class_name, index, operator_bindings):
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return None
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    class_name = _class_name_alias_target(class_name, class_name_aliases)
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     mro = _class_mro_names(class_name, class_bases)
     if "object" in class_bases:
@@ -10575,7 +10613,9 @@ def _class_mro_index_class_name(class_name, index, operator_bindings):
         mro = (*mro, "__builtin_object__")
     elif "object" not in mro:
         mro = (*mro, "object")
-    return mro[index] if -len(mro) <= index < len(mro) else None
+    if not -len(mro) <= index < len(mro):
+        return None
+    return _class_name_alias_target(mro[index], class_name_aliases)
 
 
 def _mro_subscript_class_name(value, index, operator_bindings):
@@ -11048,30 +11088,47 @@ def _iterable_literal_class_instantiation_triggers_workers(
     )
 
 
+def _type_constructor_base_elements(bases):
+    """Return literal base expressions from a dynamic type() bases argument."""
+    if isinstance(bases, (ast.Tuple, ast.List)):
+        return bases.elts
+    if (
+        isinstance(bases, ast.Call)
+        and isinstance(bases.func, ast.Name)
+        and bases.func.id in {"tuple", "list"}
+        and len(bases.args) == 1
+        and isinstance(bases.args[0], (ast.Tuple, ast.List))
+    ):
+        return bases.args[0].elts
+    return None
+
+
 def _type_constructor_bases_trigger_workers(
     constructor, operator_bindings, *, creation_only=False, skip_init=False
 ):
     """Detect mutating base hooks during dynamic class creation or instantiation."""
     if len(constructor.args) < 2:
         return False
-    bases = constructor.args[1]
-    if not isinstance(bases, (ast.Tuple, ast.List)):
+    bases = _type_constructor_base_elements(constructor.args[1])
+    if bases is None:
         return False
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return False
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     reference_line = getattr(constructor, "lineno", 0)
-    for base in bases.elts:
+    for base in bases:
         if not isinstance(base, ast.Name):
             continue
+        base_name = _class_name_alias_target(base.id, class_name_aliases)
         if _class_mro_hook_triggers_workers(
-            base.id, "__init_subclass__", class_targets, reference_line
+            base_name, "__init_subclass__", class_targets, reference_line
         ):
             return True
         if creation_only:
             continue
         if _dynamic_type_base_constructor_triggers_workers(
-            base.id,
+            base_name,
             reference_line,
             operator_bindings,
             class_targets,
@@ -11524,8 +11581,14 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     metaclass_definitions = class_targets[3]
     if class_node.name in metaclass_definitions:
         return True
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     return any(
-        isinstance(base, ast.Name) and (base.id, "__init_subclass__") in methods
+        isinstance(base, ast.Name)
+        and (
+            _class_name_alias_target(base.id, class_name_aliases),
+            "__init_subclass__",
+        )
+        in methods
         for base in class_node.bases
     )
 
