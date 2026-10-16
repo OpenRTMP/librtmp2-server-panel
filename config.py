@@ -888,11 +888,23 @@ def _collect_delegated_update_namespace_aliases(tree, namespace_aliases):
 def _binding_state_at_line(events, name, line):
     """Return the latest known boolean binding state at ``line``."""
     state = None
-    for event_line, active in events.get(name, ()):
+    for event in events.get(name, ()):
+        event_line, active = event[0], event[1]
         if line and event_line > line:
             break
         state = active
     return state
+
+
+def _alias_event_original_name(events, name, line):
+    """Return the latest recorded original import name for an alias."""
+    original = None
+    for event in events.get(name, ()):
+        event_line = event[0]
+        if line and event_line > line:
+            break
+        original = event[2] if len(event) >= 3 else None
+    return original
 
 
 def _instance_binding_candidates_at_line(events, name, line):
@@ -5527,7 +5539,7 @@ def _thread_target_mutates_workers(
     if not isinstance(call, ast.Call):
         # Without the constructor the payload cannot be proven harmless.
         return True
-    payload = _thread_arguments_payload(call)
+    payload = _thread_arguments_payload(call, operator_bindings)
     if target.attr == "update":
         return _thread_update_payload_may_set_workers(payload)
     return _thread_key_payload_may_be_workers(payload)
@@ -5544,21 +5556,33 @@ def _thread_targets(call):
     return targets
 
 
-def _thread_constructor_is_timer(reference):
+def _thread_constructor_is_timer(reference, operator_bindings, reference_line=0):
     """Return whether a Thread/Timer constructor reference names Timer."""
     if isinstance(reference, ast.Attribute):
         return reference.attr == "Timer"
     if isinstance(reference, ast.Name):
-        return reference.id == "Timer"
+        if reference.id == "Timer":
+            return True
+        if reference.id == "Thread":
+            return False
+        alias_events = operator_bindings[39] if len(operator_bindings) > 39 else {}
+        return (
+            _alias_event_original_name(alias_events, reference.id, reference_line)
+            == "Timer"
+        )
     return False
 
 
-def _thread_arguments_payload(call):
+def _thread_arguments_payload(call, operator_bindings):
     """Return the ``args`` payload expression passed to a Thread target."""
     for keyword in call.keywords:
         if keyword.arg == "args":
             return keyword.value
-    if _thread_constructor_is_timer(call.func):
+    if _thread_constructor_is_timer(
+        call.func,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
         # Timer(interval, function, args=None, kwargs=None)
         if len(call.args) >= 3:
             return call.args[2]
@@ -16353,7 +16377,7 @@ def _record_imported_name_aliases(
             continue
         name = imported.asname or imported.name
         active.add(name)
-        events.setdefault(name, []).append((line, True))
+        events.setdefault(name, []).append((line, True, imported.name))
 
 
 def _record_imported_name_alias_propagation(
@@ -16377,7 +16401,15 @@ def _record_imported_name_alias_propagation(
         )
         if alias_active:
             active.add(name)
-            events.setdefault(name, []).append((line, True))
+            source_name = None
+            if isinstance(value, ast.Name):
+                source_name = _alias_event_original_name(events, value.id, line)
+            elif isinstance(value, ast.Attribute):
+                source_name = value.attr
+            if source_name:
+                events.setdefault(name, []).append((line, True, source_name))
+            else:
+                events.setdefault(name, []).append((line, True))
 
 
 def _collect_imported_name_alias_events(tree, module_name, imported_names):
