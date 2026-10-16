@@ -17271,13 +17271,13 @@ def _function_body_global_names(node):
     ``global`` inside a function keeps binding the name into the module
     namespace rather than into the function's locals, so an import declared
     that way reaches Gunicorn even though the import statement itself sits in
-    a function body. Nested scopes are walked too, mirroring
-    ``_class_body_global_names``; the wider set can only make the gate fail
-    closed.
+    a function body. Only the function's own body counts: a nested function or
+    class opens a scope of its own, so ``_function_runtime_nodes`` stops before
+    its ``global`` declarations and they are collected when the walk enters it.
     """
     return frozenset(
         name
-        for child in ast.walk(node)
+        for child in _function_runtime_nodes(node)
         if isinstance(child, ast.Global)
         for name in child.names
     )
