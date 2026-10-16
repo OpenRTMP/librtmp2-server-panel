@@ -9942,23 +9942,70 @@ def _class_definition_line_at(definition_lines, class_name, reference_line):
     return line
 
 
+def _local_type_call_aliases(func_node):
+    """Return names bound to the builtin ``type`` inside a function body."""
+    aliases = set()
+    for node in ast.walk(func_node):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "type"
+        ):
+            aliases.update(
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            )
+    return aliases
+
+
+def _expression_yields_type_dunder_call(expr, type_aliases):
+    """Return True when an expression resolves to ``type.__call__`` itself."""
+    if isinstance(expr, ast.Attribute) and expr.attr == "__call__":
+        return (
+            isinstance(expr.value, ast.Name)
+            and (
+                expr.value.id == "type"
+                or expr.value.id in type_aliases
+            )
+        )
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+    ):
+        return False
+    if expr.func.id == "getattr":
+        return (
+            len(expr.args) >= 2
+            and isinstance(expr.args[0], ast.Name)
+            and (
+                expr.args[0].id == "type"
+                or expr.args[0].id in type_aliases
+            )
+            and isinstance(expr.args[1], ast.Constant)
+            and expr.args[1].value == "__call__"
+        )
+    if expr.func.id == "partial":
+        return bool(expr.args) and _expression_yields_type_dunder_call(
+            expr.args[0],
+            type_aliases,
+        )
+    return False
+
+
 def _function_delegates_type_call(func_node):
     """Return True when a metaclass ``__call__`` reaches ``type.__call__``."""
+    type_aliases = _local_type_call_aliases(func_node)
     for child in ast.walk(func_node):
-        if (
-            not isinstance(child, ast.Call)
-            or not isinstance(child.func, ast.Attribute)
-            or child.func.attr != "__call__"
-        ):
+        if not isinstance(child, ast.Call):
             continue
-        receiver = child.func.value
-        if (
-            isinstance(receiver, ast.Call)
-            and isinstance(receiver.func, ast.Name)
-            and receiver.func.id == "super"
-        ):
+        func = child.func
+        if isinstance(func, ast.Attribute) and func.attr == "__call__":
+            # ``super().__call__``, ``type.__call__``, a local alias of
+            # ``type`` and every receiver this walk cannot resolve all keep
+            # the initializer check engaged: only a proven bypass may skip it.
             return True
-        if isinstance(receiver, ast.Name) and receiver.id == "type":
+        if _expression_yields_type_dunder_call(func, type_aliases):
             return True
     return False
 
