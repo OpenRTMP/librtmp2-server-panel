@@ -18135,11 +18135,13 @@ def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
     i = 0
     while i < len(tokens):
         token = tokens[i]
-        if token in ("-c", "--config") and i + 1 < len(tokens):
+        # argparse accepts the unambiguous ``--conf``/``--confi`` prefixes of
+        # ``--config`` (``--con``/``--co`` stay ambiguous with --control-socket).
+        if token in ("-c", "--config", "--conf", "--confi") and i + 1 < len(tokens):
             config_path = tokens[i + 1]
             i += 2
             continue
-        if token.startswith("--config="):
+        if token.startswith(("--config=", "--conf=", "--confi=")):
             config_path = token.split("=", 1)[1]
         if token.startswith("-c") and len(token) > 2:
             # argparse gives ``-c==prod.py`` the value ``=prod.py``, so only the
