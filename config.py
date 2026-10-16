@@ -10536,22 +10536,51 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
+_DYNAMIC_CLASS_METADATA_WRAPPERS = frozenset(
+    {
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "reversed",
+        "sorted",
+        "map",
+        "filter",
+        "enumerate",
+        "zip",
+    }
+)
+
+
+def _expression_contains_class_metadata(expr):
+    """Return True when an expression subtree reads runtime class metadata."""
+    if isinstance(expr, ast.Attribute) and expr.attr in {
+        "__mro__",
+        "__subclasses__",
+    }:
+        return True
+    if _is_class_mro_method_call(expr):
+        return True
+    return any(
+        _expression_contains_class_metadata(child)
+        for child in ast.iter_child_nodes(expr)
+    )
+
+
 def _container_wrapper_uses_dynamic_class_introspection(call):
     """Identify runtime class metadata inside builtin container conversions."""
     if (
         not isinstance(call.func, ast.Name)
-        or call.func.id not in {"list", "tuple", "set", "frozenset"}
-        or len(call.args) != 1
+        or call.func.id not in _DYNAMIC_CLASS_METADATA_WRAPPERS
+        or not call.args
     ):
         return False
+    if call.func.id in {"list", "tuple", "set", "frozenset"} and len(call.args) != 1:
+        return False
     arg = call.args[0]
-    if isinstance(arg, ast.Attribute) and arg.attr == "__mro__":
-        return True
     if _is_class_mro_method_call(arg):
-        return call.func.id in {"set", "frozenset"}
-    if any(_is_class_mro_method_call(node) for node in ast.walk(arg)):
-        return True
-    return _expression_uses_dynamic_class_introspection(arg)
+        return call.func.id not in {"list", "tuple"}
+    return _expression_contains_class_metadata(arg)
 
 
 def _expression_uses_dynamic_class_introspection(expr):
@@ -10562,13 +10591,25 @@ def _expression_uses_dynamic_class_introspection(expr):
         return True
     if isinstance(expr, ast.ListComp):
         return any(
-            isinstance(gen.iter, ast.Attribute) and gen.iter.attr == "__mro__"
+            _expression_contains_class_metadata(gen.iter)
             for gen in expr.generators
         )
+    if isinstance(expr, (ast.List, ast.Tuple)) and any(
+        isinstance(element, ast.Starred) for element in expr.elts
+    ):
+        return True
     if not isinstance(expr, ast.Call):
         return False
     if isinstance(expr.func, ast.Attribute):
-        return expr.func.attr == "__subclasses__"
+        if expr.func.attr == "__subclasses__":
+            return True
+        return (
+            expr.func.attr == "fromkeys"
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "dict"
+            and bool(expr.args)
+            and _expression_contains_class_metadata(expr.args[0])
+        )
     return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
