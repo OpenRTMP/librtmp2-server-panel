@@ -16249,15 +16249,16 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
         return False
     if _sync_callback_sched_run_mutates(expr, tracking):
         return True
-    if expr.args or expr.keywords:
-        return False
     if (
         isinstance(expr.func, ast.Name)
         and expr.func.id in tracking["mutating_callback_names"]
     ):
         # A name read out of a mutating container holds that container's
-        # callback, so invoking it executes the proven mutation.
+        # callback, so invoking it executes the proven mutation; the callback's
+        # own parameters do not affect whether it mutates.
         return True
+    if expr.args or expr.keywords:
+        return False
     if _sync_callback_direct_dispatch_mutates(expr, tracking):
         return True
     inner = expr.func
