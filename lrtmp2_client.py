@@ -246,6 +246,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
             "stream_stats_by_id",
             headers=self._headers(),
+            timeout=self.admin_timeout,
         )
 
     def cluster_status(self):
