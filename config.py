@@ -5544,13 +5544,28 @@ def _thread_targets(call):
     return targets
 
 
+def _thread_constructor_is_timer(reference):
+    """Return whether a Thread/Timer constructor reference names Timer."""
+    if isinstance(reference, ast.Attribute):
+        return reference.attr == "Timer"
+    if isinstance(reference, ast.Name):
+        return reference.id == "Timer"
+    return False
+
+
 def _thread_arguments_payload(call):
     """Return the ``args`` payload expression passed to a Thread target."""
-    if len(call.args) >= 3:
-        return call.args[2]
     for keyword in call.keywords:
         if keyword.arg == "args":
             return keyword.value
+    if _thread_constructor_is_timer(call.func):
+        # Timer(interval, function, args=None, kwargs=None)
+        if len(call.args) >= 3:
+            return call.args[2]
+        return None
+    # Thread(group=None, target=None, name=None, args=(), kwargs={})
+    if len(call.args) >= 4:
+        return call.args[3]
     return None
 
 
