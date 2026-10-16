@@ -757,13 +757,31 @@ def _update_payload_may_set_workers(call, start_index=0):
     return False
 
 
+_DUNDER_CALL_MUTATOR_NAMES = frozenset(
+    {"update", "__setitem__", "setdefault", "__ior__", "ior"}
+)
+
+
+def _dunder_call_mutator_callee(func):
+    """Return the effective callee for ``X.m.__call__`` mutator spellings."""
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "__call__"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr in _DUNDER_CALL_MUTATOR_NAMES
+    ):
+        return func.value
+    return func
+
+
 def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     """Return True when module namespace ``update`` may change workers."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "update":
         return False
-    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+    if not _is_module_namespace_mapping(func.value, namespace_aliases):
         return False
     return _update_payload_may_set_workers(call)
 
@@ -1074,9 +1092,10 @@ def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     """Return True when module namespace ``__ior__`` may change workers."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__ior__":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "__ior__":
         return False
-    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+    if not _is_module_namespace_mapping(func.value, namespace_aliases):
         return False
     if not call.args:
         return False
@@ -1259,6 +1278,7 @@ def _is_dict_type_update_callable(
     """Return True for builtin ``dict.update`` or a proven alias of it."""
     if aliases is None:
         aliases = set()
+    func = _dunder_call_mutator_callee(func)
     if isinstance(func, ast.Name):
         return func.id in aliases
     if _is_direct_dict_update_attribute(func):
@@ -1421,6 +1441,7 @@ def _is_dict_type_setitem_callable(
     ``getattr`` does not fetch the builtin mutator, so that spelling is not
     one unless the collected shadow state still shows the builtin.
     """
+    func = _dunder_call_mutator_callee(func)
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
         return False
     if isinstance(func, ast.Attribute):
@@ -1477,6 +1498,7 @@ def _is_dict_type_ior_callable(
     """Return True for builtin ``dict.__ior__`` variants or proven aliases."""
     if aliases is None:
         aliases = set()
+    func = _dunder_call_mutator_callee(func)
     if isinstance(func, ast.Name):
         return func.id in aliases
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
@@ -2074,7 +2096,8 @@ def _call_sets_workers_via_setitem(call):
     """Return True for ``__setitem__('workers', ...)`` style mutations."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__setitem__":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "__setitem__":
         return False
     if not call.args:
         return False
@@ -2085,11 +2108,12 @@ def _call_is_namespace_setdefault_workers(call, namespace_aliases=None):
     """Return True for ``globals().setdefault('workers', ...)`` style binds."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "setdefault":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "setdefault":
         return False
     if not call.args or not _constant_is_workers(call.args[0]):
         return False
-    return _is_module_namespace_mapping(call.func.value, namespace_aliases)
+    return _is_module_namespace_mapping(func.value, namespace_aliases)
 
 
 def _call_is_getattr_setdefault_workers(call, namespace_aliases=None):
