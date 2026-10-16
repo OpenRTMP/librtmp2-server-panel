@@ -6020,6 +6020,12 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     """Return whether one pool callback can mutate module workers."""
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
+    if isinstance(callback, ast.Subscript):
+        element = _future_subscript_callback_value(callback, operator_bindings)
+        return element is not None and _thread_pool_callback_mutates_workers(
+            element,
+            operator_bindings,
+        )
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
         return True
@@ -6665,15 +6671,73 @@ def _collect_callback_alias_events(tree, operator_bindings):
     return events
 
 
-def _future_starred_callback_values(value):
+def _scan_callback_container_events(statements, events):
+    """Collect literal callback containers by name in source order."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name, value in _namespace_assignment_values(node):
+            events.setdefault(name, []).append(
+                (
+                    getattr(node, "lineno", 0),
+                    getattr(node, "col_offset", 0),
+                    value
+                    if isinstance(value, (ast.Tuple, ast.List, ast.Dict))
+                    else None,
+                )
+            )
+        for block in _compound_statement_blocks(node):
+            _scan_callback_container_events(block, events)
+
+
+def _collect_callback_container_events(tree):
+    """Collect saved literal callback containers for callback analysis."""
+    events = {}
+    _scan_callback_container_events(tree.body, events)
+    return events
+
+
+def _future_callback_container_value(value, analysis):
+    """Resolve a saved literal callback container reference."""
+    if not isinstance(value, ast.Name):
+        return None
+    state = _ordered_binding_state_at_position(
+        analysis.get("callback_container_events", {}),
+        value.id,
+        value,
+    )
+    return state if isinstance(state, (ast.Tuple, ast.List, ast.Dict)) else None
+
+
+def _future_subscript_callback_value(callback, operator_bindings):
+    """Resolve a constant-index subscript into a saved literal container."""
+    if not isinstance(callback, ast.Subscript):
+        return None
+    index = callback.slice
+    if not (isinstance(index, ast.Constant) and type(index.value) is int):
+        return None
+    container = _future_callback_container_value(
+        callback.value,
+        _future_analysis_state(operator_bindings),
+    )
+    if not isinstance(container, (ast.Tuple, ast.List)):
+        return None
+    if not -len(container.elts) <= index.value < len(container.elts):
+        return None
+    return container.elts[index.value]
+
+
+def _future_starred_callback_values(value, analysis):
     """Extract the sole positional callback from a literal expanded argument."""
+    value = _future_callback_container_value(value, analysis) or value
     if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
         return [value.elts[0]]
     return []
 
 
-def _future_expanded_keyword_callbacks(value):
+def _future_expanded_keyword_callbacks(value, analysis):
     """Extract fn from a literal expanded keyword mapping."""
+    value = _future_callback_container_value(value, analysis) or value
     if not isinstance(value, ast.Dict):
         return []
     callbacks = []
@@ -6683,13 +6747,15 @@ def _future_expanded_keyword_callbacks(value):
     return callbacks
 
 
-def _future_add_done_callback_arguments(call):
+def _future_add_done_callback_arguments(call, analysis):
     """Return statically provable callbacks supplied to add_done_callback."""
     callbacks = []
     if call.args:
         first = call.args[0]
         if isinstance(first, ast.Starred):
-            callbacks.extend(_future_starred_callback_values(first.value))
+            callbacks.extend(
+                _future_starred_callback_values(first.value, analysis)
+            )
         else:
             callbacks.append(first)
     for keyword in call.keywords:
@@ -6697,7 +6763,7 @@ def _future_add_done_callback_arguments(call):
             callbacks.append(keyword.value)
         elif keyword.arg is None:
             callbacks.extend(
-                _future_expanded_keyword_callbacks(keyword.value)
+                _future_expanded_keyword_callbacks(keyword.value, analysis)
             )
     return callbacks
 
@@ -6841,7 +6907,7 @@ def _call_is_future_add_done_callback_mutation(call, operator_bindings):
         return False
     return any(
         _thread_pool_callback_mutates_workers(callback, operator_bindings)
-        for callback in _future_add_done_callback_arguments(call)
+        for callback in _future_add_done_callback_arguments(call, analysis)
     )
 
 
@@ -17725,6 +17791,9 @@ def _scan_gunicorn_config_worker_details(tree):
     future_analysis["callback_alias_events"] = _collect_callback_alias_events(
         tree,
         operator_bindings,
+    )
+    future_analysis["callback_container_events"] = (
+        _collect_callback_container_events(tree)
     )
     future_analysis["callback_method_events"] = (
         _collect_future_callback_method_alias_events(
