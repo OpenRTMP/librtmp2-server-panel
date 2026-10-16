@@ -7663,18 +7663,13 @@ def _async_instance_method_needs_receiver(candidate, operator_bindings):
 
 
 def _async_wrapper_call_passes_receiver(func, invocation):
-    """Return True when ``Class.method(...)`` receives a possible instance."""
-    if not (
+    """Return True when ``Class.method(...)`` receives a possible receiver."""
+    return (
         isinstance(invocation, ast.Call)
         and isinstance(func, ast.Attribute)
         and isinstance(func.value, ast.Name)
-        and invocation.args
-    ):
-        return False
-    first = invocation.args[0]
-    if isinstance(first, ast.Call) and isinstance(first.func, ast.Name):
-        return first.func.id == func.value.id
-    return isinstance(first, ast.Name)
+        and bool(invocation.args)
+    )
 
 
 def _async_wrapper_instance_method_candidates_at_line(
