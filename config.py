@@ -5480,11 +5480,32 @@ def _thread_constructor_is_active(call, operator_bindings):
     )
 
 
-def _thread_target_mutates_workers(target, operator_bindings, mutator_names):
+def _thread_target_mutates_workers(
+    target,
+    operator_bindings,
+    mutator_names,
+    call=None,
+):
     """Return whether one Thread target can mutate workers."""
     if isinstance(target, ast.Lambda):
         return _lambda_mutates_workers(target, operator_bindings)
-    return isinstance(target, ast.Name) and target.id in mutator_names
+    if isinstance(target, ast.Name):
+        return target.id in mutator_names
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if not (
+        isinstance(target, ast.Attribute)
+        and _is_module_namespace_mapping(target.value, namespace_aliases)
+    ):
+        return False
+    if target.attr not in {"update", "__setitem__", "setdefault"}:
+        return False
+    if not isinstance(call, ast.Call):
+        # Without the constructor the payload cannot be proven harmless.
+        return True
+    payload = _thread_arguments_payload(call)
+    if target.attr == "update":
+        return _thread_update_payload_may_set_workers(payload)
+    return _thread_key_payload_may_be_workers(payload)
 
 
 def _thread_targets(call):
@@ -5496,6 +5517,44 @@ def _thread_targets(call):
         if keyword.arg in {"target", "function"}
     )
     return targets
+
+
+def _thread_arguments_payload(call):
+    """Return the ``args`` payload expression passed to a Thread target."""
+    if len(call.args) >= 3:
+        return call.args[2]
+    for keyword in call.keywords:
+        if keyword.arg == "args":
+            return keyword.value
+    return None
+
+
+def _thread_update_payload_may_set_workers(payload):
+    """Return True when a Thread ``args`` payload may update ``workers``."""
+    if payload is None:
+        return False
+    if isinstance(payload, (ast.Tuple, ast.List)):
+        for element in payload.elts:
+            if isinstance(element, ast.Dict):
+                if _dict_literal_sets_workers(element):
+                    return True
+                continue
+            # An unresolvable argument cannot be proven to omit workers.
+            return True
+        return False
+    if isinstance(payload, ast.Dict):
+        return _dict_literal_sets_workers(payload)
+    # An unresolvable payload cannot be proven to omit workers.
+    return True
+
+
+def _thread_key_payload_may_be_workers(payload):
+    """Return True when a Thread ``args`` payload key may be ``workers``."""
+    if payload is None:
+        return False
+    if isinstance(payload, (ast.Tuple, ast.List)):
+        return bool(payload.elts) and _key_may_be_workers(payload.elts[0])
+    return True
 
 
 def _thread_constructor_has_mutating_target(
@@ -5514,6 +5573,7 @@ def _thread_constructor_has_mutating_target(
             target,
             operator_bindings,
             mutator_names,
+            call,
         )
         for target in _thread_targets(call)
     )
