@@ -306,7 +306,32 @@ class _PanelRuntime:
         self._register_stats_rate_limits()
         self.app.after_request(self.set_security_headers)
         self.app.register_error_handler(CSRFError, self.handle_csrf_error)
+        self._register_limiter_storage_error_handler()
         self._register_routes()
+
+    def _register_limiter_storage_error_handler(self):
+        # limits' RedisStorage lets redis-py errors (connection refused,
+        # timeouts, ...) escape the limiter's before_request hook, so a rate
+        # limit backend outage would otherwise answer every request with an
+        # unhandled 500. redis is only installed for shared (redis://) backends.
+        try:
+            import redis
+        except ImportError:
+            return
+        self.app.register_error_handler(
+            redis.exceptions.RedisError,
+            self.handle_limiter_storage_error,
+        )
+
+    def handle_limiter_storage_error(self, error):
+        """Answer a rate-limit storage outage with the controlled 503 used for
+        session-store outages instead of an unhandled 500."""
+        self.app.logger.exception("Rate limit storage backend unavailable")
+        return (
+            "Authentication service temporarily unavailable. "
+            "Please try again.",
+            503,
+        )
 
     def _rate_limit_remote_addr(self):
         """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
