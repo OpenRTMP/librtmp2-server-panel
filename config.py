@@ -11016,6 +11016,10 @@ _DYNAMIC_CLASS_METADATA_WRAPPERS = frozenset(
         "zip",
     }
 )
+_MRO_REORDERING_BUILTINS = frozenset(
+    {"filter", "map", "sorted", "zip", "enumerate", "reversed", "iter"}
+)
+_MRO_REORDERING_ATTRS = frozenset({"chain", "islice", "deque"})
 
 
 def _expression_contains_class_metadata(expr):
@@ -11033,6 +11037,20 @@ def _expression_contains_class_metadata(expr):
     )
 
 
+def _ast_references_class_introspection(node):
+    """Return True when a subtree reads MRO, bases, mro(), or __subclasses__."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Attribute) and child.attr in {
+            "__mro__",
+            "__bases__",
+            "__subclasses__",
+        }:
+            return True
+        if _is_class_mro_method_call(child):
+            return True
+    return False
+
+
 def _container_wrapper_uses_dynamic_class_introspection(call):
     """Identify runtime class metadata inside builtin container conversions."""
     if (
@@ -11045,13 +11063,29 @@ def _container_wrapper_uses_dynamic_class_introspection(call):
         return False
     arg = call.args[0]
     if _is_class_mro_method_call(arg):
-        return call.func.id not in {"list", "tuple"}
-    return _expression_contains_class_metadata(arg)
+        return call.func.id in {"set", "frozenset"}
+    if _ast_references_class_introspection(arg):
+        return True
+    return _expression_uses_dynamic_class_introspection(arg)
+
+
+def _call_uses_mro_reordering_or_subclasses(call):
+    """Identify introspection-sensitive reordering helpers and subclass calls."""
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr == "__subclasses__" or (
+            call.func.attr in _MRO_REORDERING_ATTRS
+            and _ast_references_class_introspection(call)
+        )
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id in _MRO_REORDERING_BUILTINS
+        and _ast_references_class_introspection(call)
+    )
 
 
 def _expression_uses_dynamic_class_introspection(expr):
     """Return True when an expression selects constructors via runtime class metadata."""
-    if isinstance(expr, ast.Attribute) and expr.attr == "__mro__":
+    if isinstance(expr, ast.Attribute) and expr.attr in {"__mro__", "__bases__"}:
         return True
     if _is_class_mro_method_call(expr):
         return True
@@ -11064,11 +11098,16 @@ def _expression_uses_dynamic_class_introspection(expr):
         isinstance(element, ast.Starred) for element in expr.elts
     ):
         return True
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        return (
+            _expression_uses_dynamic_class_introspection(expr.left)
+            or _expression_uses_dynamic_class_introspection(expr.right)
+        )
     if not isinstance(expr, ast.Call):
         return False
+    if _call_uses_mro_reordering_or_subclasses(expr):
+        return True
     if isinstance(expr.func, ast.Attribute):
-        if expr.func.attr == "__subclasses__":
-            return True
         return (
             expr.func.attr == "fromkeys"
             and isinstance(expr.func.value, ast.Name)
@@ -11077,6 +11116,7 @@ def _expression_uses_dynamic_class_introspection(expr):
             and _expression_contains_class_metadata(expr.args[0])
         )
     return _container_wrapper_uses_dynamic_class_introspection(expr)
+    return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
 def _subscript_uses_dynamic_class_introspection(sub):
@@ -11084,8 +11124,8 @@ def _subscript_uses_dynamic_class_introspection(sub):
     if not isinstance(sub, ast.Subscript):
         return False
     value = sub.value
-    if isinstance(value, ast.Attribute) and value.attr == "__mro__":
-        return False
+    if isinstance(value, ast.Attribute) and value.attr in {"__mro__", "__bases__"}:
+        return not isinstance(sub.slice, ast.Constant)
     if _is_class_mro_method_call(value):
         return False
     return _expression_uses_dynamic_class_introspection(value)
