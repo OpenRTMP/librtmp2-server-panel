@@ -2291,14 +2291,16 @@ def _operator_attrgetter_method_name(factory_call):
     return None
 
 
-def _is_operator_attrgetter_factory(call, operator_bindings):
-    """Return True for imported or module-qualified ``operator.attrgetter``."""
+def _is_operator_getter_factory(call, operator_bindings, getter_name):
+    """Recognize imported and qualified operator getter factories."""
     module_aliases = operator_bindings[0] if operator_bindings else set()
-    attrgetter_aliases = operator_bindings[11] if len(operator_bindings) > 11 else set()
+    getter_aliases = (
+        operator_bindings[11] if operator_bindings and len(operator_bindings) > 11 else set()
+    )
     func = call.func
     if isinstance(func, ast.Name):
-        return func.id in attrgetter_aliases
-    if isinstance(func, ast.Attribute) and func.attr == "attrgetter":
+        return func.id in getter_aliases
+    if isinstance(func, ast.Attribute) and func.attr == getter_name:
         return isinstance(func.value, ast.Name) and func.value.id in module_aliases
     if not isinstance(func, ast.Call):
         return False
@@ -2309,8 +2311,12 @@ def _is_operator_attrgetter_factory(call, operator_bindings):
     if not isinstance(func.args[0], ast.Name) or func.args[0].id not in module_aliases:
         return False
     attr = func.args[1]
-    return isinstance(attr, ast.Constant) and attr.value == "attrgetter"
+    return isinstance(attr, ast.Constant) and attr.value == getter_name
 
+
+def _is_operator_attrgetter_factory(call, operator_bindings):
+    """Return True for imported or module-qualified ``operator.attrgetter``."""
+    return _is_operator_getter_factory(call, operator_bindings, "attrgetter")
 
 def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     """Return True for ``operator.attrgetter(...)(namespace)(...)`` mutations."""
@@ -11110,26 +11116,7 @@ def _is_operator_getitem_call(call, operator_bindings):
 
 def _is_operator_itemgetter_factory(call, operator_bindings):
     """Return True for imported or module-qualified ``operator.itemgetter``."""
-    module_aliases = operator_bindings[0] if operator_bindings else set()
-    itemgetter_aliases = (
-        operator_bindings[11] if operator_bindings and len(operator_bindings) > 11 else set()
-    )
-    func = call.func
-    if isinstance(func, ast.Name):
-        return func.id in itemgetter_aliases
-    if isinstance(func, ast.Attribute) and func.attr == "itemgetter":
-        return isinstance(func.value, ast.Name) and func.value.id in module_aliases
-    if not isinstance(func, ast.Call):
-        return False
-    if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
-        return False
-    if len(func.args) < 2:
-        return False
-    if not isinstance(func.args[0], ast.Name) or func.args[0].id not in module_aliases:
-        return False
-    attr = func.args[1]
-    return isinstance(attr, ast.Constant) and attr.value == "itemgetter"
-
+    return _is_operator_getter_factory(call, operator_bindings, "itemgetter")
 
 def _operator_getitem_call_resolves_class_name(func, operator_bindings):
     """Resolve ``operator.getitem(sequence, index)`` when sequence is class metadata."""
