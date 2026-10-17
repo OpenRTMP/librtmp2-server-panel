@@ -2291,14 +2291,16 @@ def _operator_attrgetter_method_name(factory_call):
     return None
 
 
-def _is_operator_attrgetter_factory(call, operator_bindings):
-    """Return True for imported or module-qualified ``operator.attrgetter``."""
+def _is_operator_getter_factory(call, operator_bindings, getter_name):
+    """Recognize imported and qualified operator getter factories."""
     module_aliases = operator_bindings[0] if operator_bindings else set()
-    attrgetter_aliases = operator_bindings[11] if len(operator_bindings) > 11 else set()
+    getter_aliases = (
+        operator_bindings[11] if operator_bindings and len(operator_bindings) > 11 else set()
+    )
     func = call.func
     if isinstance(func, ast.Name):
-        return func.id in attrgetter_aliases
-    if isinstance(func, ast.Attribute) and func.attr == "attrgetter":
+        return func.id in getter_aliases
+    if isinstance(func, ast.Attribute) and func.attr == getter_name:
         return isinstance(func.value, ast.Name) and func.value.id in module_aliases
     if not isinstance(func, ast.Call):
         return False
@@ -2309,8 +2311,12 @@ def _is_operator_attrgetter_factory(call, operator_bindings):
     if not isinstance(func.args[0], ast.Name) or func.args[0].id not in module_aliases:
         return False
     attr = func.args[1]
-    return isinstance(attr, ast.Constant) and attr.value == "attrgetter"
+    return isinstance(attr, ast.Constant) and attr.value == getter_name
 
+
+def _is_operator_attrgetter_factory(call, operator_bindings):
+    """Return True for imported or module-qualified ``operator.attrgetter``."""
+    return _is_operator_getter_factory(call, operator_bindings, "attrgetter")
 
 def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     """Return True for ``operator.attrgetter(...)(namespace)(...)`` mutations."""
@@ -11007,6 +11013,164 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
+def _is_type_qualified_mro_method_call(call):
+    """Return True for ``type(Class).mro(Class)``."""
+    type_call = (
+        call.func.value
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        else None
+    )
+    return (
+        isinstance(call, ast.Call)
+        and not call.keywords
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Name)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "mro"
+        and isinstance(type_call, ast.Call)
+        and isinstance(type_call.func, ast.Name)
+        and type_call.func.id == "type"
+        and len(type_call.args) == 1
+        and isinstance(type_call.args[0], ast.Name)
+        and not type_call.keywords
+    )
+
+
+def _type_qualified_mro_method_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``type(Class).mro(Class)[index]`` without running config code."""
+    if not _is_type_qualified_mro_method_call(call):
+        return None
+    return _class_mro_index_class_name(
+        call.args[0].id,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
+
+
+def _getattr_constant_dunder_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``getattr(Class, '__mro__')[index]`` and ``__bases__`` lookups."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "getattr"
+        and len(call.args) >= 2
+        and isinstance(call.args[0], ast.Name)
+        and isinstance(call.args[1], ast.Constant)
+        and isinstance(call.args[1].value, str)
+    ):
+        return None
+    attr = call.args[1].value
+    if attr == "__mro__":
+        return _class_mro_index_class_name(
+            call.args[0].id,
+            index,
+            operator_bindings,
+            getattr(call, "lineno", 0),
+        )
+    if attr == "__bases__":
+        fake = ast.Attribute(
+            value=ast.Name(id=call.args[0].id, ctx=ast.Load()),
+            attr="__bases__",
+            ctx=ast.Load(),
+        )
+        return _bases_subscript_class_name(fake, index, operator_bindings)
+    return None
+
+
+def _mro_index_class_name_from_expression(expr, index, operator_bindings):
+    """Resolve one MRO/base tuple element referenced by an arbitrary expression."""
+    if index is None:
+        return None
+    if isinstance(expr, ast.Attribute) and expr.attr == "__mro__":
+        return _mro_subscript_class_name(expr, index, operator_bindings)
+    if isinstance(expr, ast.Attribute) and expr.attr == "__bases__":
+        return _bases_subscript_class_name(expr, index, operator_bindings)
+    if isinstance(expr, ast.Call):
+        for resolver in (
+            _class_mro_method_subscript_class_name,
+            _type_qualified_mro_method_subscript_class_name,
+            _getattr_constant_dunder_subscript_class_name,
+        ):
+            name = resolver(expr, index, operator_bindings)
+            if name is not None:
+                return name
+    return None
+
+
+def _is_operator_getitem_call(call, operator_bindings):
+    """Return True for ``operator.getitem`` or a tracked import alias."""
+    if not isinstance(call, ast.Call):
+        return False
+    module_aliases = operator_bindings[0] if operator_bindings else set()
+    getitem_aliases = (
+        operator_bindings[11] if operator_bindings and len(operator_bindings) > 11 else set()
+    )
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "getitem":
+        return isinstance(func.value, ast.Name) and func.value.id in module_aliases
+    if isinstance(func, ast.Name):
+        return func.id in getitem_aliases
+    return False
+
+
+def _is_operator_itemgetter_factory(call, operator_bindings):
+    """Return True for imported or module-qualified ``operator.itemgetter``."""
+    return _is_operator_getter_factory(call, operator_bindings, "itemgetter")
+
+def _operator_getitem_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``operator.getitem(sequence, index)`` when sequence is class metadata."""
+    if not isinstance(func, ast.Call) or len(func.args) < 2:
+        return None
+    if not _is_operator_getitem_call(func, operator_bindings):
+        return None
+    index = _subscript_constant_index(func.args[1])
+    return _mro_index_class_name_from_expression(
+        func.args[0], index, operator_bindings
+    )
+
+
+def _itemgetter_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``itemgetter(index)(sequence)`` when sequence is class metadata."""
+    if not isinstance(func, ast.Call) or not isinstance(func.func, ast.Call):
+        return None
+    factory = func.func
+    if not _is_operator_itemgetter_factory(factory, operator_bindings):
+        return None
+    if len(factory.args) != 1 or len(func.args) != 1:
+        return None
+    index = _subscript_constant_index(factory.args[0])
+    return _mro_index_class_name_from_expression(
+        func.args[0], index, operator_bindings
+    )
+
+
+def _mro_getitem_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``Class.__mro__.__getitem__(index)`` without using subscript syntax."""
+    if not isinstance(func, ast.Call) or len(func.args) != 1:
+        return None
+    if not isinstance(func.func, ast.Attribute) or func.func.attr != "__getitem__":
+        return None
+    index = _subscript_constant_index(func.args[0])
+    return _mro_index_class_name_from_expression(
+        func.func.value, index, operator_bindings
+    )
+
+
+def _stdlib_call_preserves_class_metadata_selection(call):
+    """Identify copy/heapq helpers that preserve runtime class metadata tuples."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+        receiver = call.func.value.id
+        method = call.func.attr
+        if receiver == "copy" and method in {"copy", "deepcopy"}:
+            return _expression_contains_class_metadata(call.args[0])
+        if receiver == "heapq" and method in {"nlargest", "nsmallest"}:
+            return _ast_references_class_introspection(call)
+    return False
+
+
 _DYNAMIC_CLASS_METADATA_WRAPPERS = frozenset(
     {
         "list",
@@ -11110,6 +11274,8 @@ def _expression_uses_dynamic_class_introspection(expr):
         )
     if not isinstance(expr, ast.Call):
         return False
+    if _stdlib_call_preserves_class_metadata_selection(expr):
+        return True
     if _call_uses_mro_reordering_or_subclasses(expr):
         return True
     if isinstance(expr.func, ast.Attribute):
@@ -11190,12 +11356,15 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
     if isinstance(value, ast.Attribute) and value.attr == "__bases__":
         return _bases_subscript_class_name(value, index, operator_bindings)
     if isinstance(value, ast.Call):
-        name = _class_mro_method_subscript_class_name(value, index, operator_bindings)
-        if name is not None:
-            return name
-        name = _sequence_mro_method_subscript_class_name(value, index, operator_bindings)
-        if name is not None:
-            return name
+        for resolver in (
+            _class_mro_method_subscript_class_name,
+            _type_qualified_mro_method_subscript_class_name,
+            _getattr_constant_dunder_subscript_class_name,
+            _sequence_mro_method_subscript_class_name,
+        ):
+            name = resolver(value, index, operator_bindings)
+            if name is not None:
+                return name
     name = _literal_container_element_class_name(value, index)
     if name is not None:
         return name
@@ -11244,6 +11413,36 @@ def _attrgetter_call_resolves_class_name(func, operator_bindings, attr_name):
     return _expression_resolves_class_name(func.args[0], operator_bindings)
 
 
+def _class_name_from_indirect_class_target(func, class_targets, operator_bindings):
+    """Try class descriptor resolvers without evaluating the target."""
+    for resolver in (
+        _getattr_resolves_class_name,
+        _object_getattribute_resolves_class_name,
+    ):
+        class_name = resolver(func, class_targets, "__call__", operator_bindings)
+        if class_name is not None:
+            return class_name
+    return None
+
+
+def _class_name_from_operator_callable(func, operator_bindings):
+    """Resolve operator-based constructor selection in the original priority order."""
+    class_name = _attrgetter_call_resolves_class_name(
+        func, operator_bindings, "__call__"
+    )
+    if class_name is not None:
+        return class_name
+    for resolver in (
+        _operator_getitem_call_resolves_class_name,
+        _itemgetter_call_resolves_class_name,
+        _mro_getitem_call_resolves_class_name,
+    ):
+        class_name = resolver(func, operator_bindings)
+        if class_name is not None:
+            return class_name
+    return None
+
+
 def _resolved_class_name_from_callable(
     func,
     class_targets,
@@ -11255,25 +11454,13 @@ def _resolved_class_name_from_callable(
     respects lambda argument bindings that can shadow module class names.
     """
     if class_targets:
-        class_name = _getattr_resolves_class_name(
-            func, class_targets, "__call__", operator_bindings
-        )
-        if class_name is not None:
-            return class_name
-        class_name = _object_getattribute_resolves_class_name(
-            func,
-            class_targets,
-            "__call__",
-            operator_bindings,
+        class_name = _class_name_from_indirect_class_target(
+            func, class_targets, operator_bindings
         )
         if class_name is not None:
             return class_name
     if operator_bindings is not None:
-        class_name = _attrgetter_call_resolves_class_name(
-            func,
-            operator_bindings,
-            "__call__",
-        )
+        class_name = _class_name_from_operator_callable(func, operator_bindings)
         if class_name is not None:
             return class_name
     if isinstance(func, ast.Attribute) and func.attr == "__call__":
@@ -16455,6 +16642,8 @@ def _record_operator_import(
             "ior": ior_aliases,
             "methodcaller": methodcaller_aliases,
             "attrgetter": attrgetter_aliases,
+            "itemgetter": attrgetter_aliases,
+            "getitem": attrgetter_aliases,
         },
         "functools": {"partial": partial_aliases},
     }.get(node.module)

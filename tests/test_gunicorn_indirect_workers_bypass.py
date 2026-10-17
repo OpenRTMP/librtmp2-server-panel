@@ -3597,3 +3597,32 @@ def test_security_review_oct16_mro_reordering_wrappers_are_dynamic(tmp_path, dis
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-17: alternate MRO element selection and constructor dispatch
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "getattr(Child, '__mro__')[1]()",
+        "import operator\noperator.getitem(Child.__mro__, 1)()",
+        "from operator import itemgetter\nitemgetter(1)(Child.__mro__)()",
+        "import copy\ncopy.copy(Child.__mro__)[1]()",
+        "import heapq\nheapq.nlargest(2, Child.__mro__, key=lambda c: 0)[1]()",
+        "Child.__mro__.__getitem__(1)()",
+        "type(Child).mro(Child)[1]()",
+    ],
+)
+def test_security_review_oct17_mro_selection_wrappers_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
