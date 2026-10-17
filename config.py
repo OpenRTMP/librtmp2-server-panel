@@ -11413,6 +11413,36 @@ def _attrgetter_call_resolves_class_name(func, operator_bindings, attr_name):
     return _expression_resolves_class_name(func.args[0], operator_bindings)
 
 
+def _class_name_from_indirect_class_target(func, class_targets, operator_bindings):
+    """Try class descriptor resolvers without evaluating the target."""
+    for resolver in (
+        _getattr_resolves_class_name,
+        _object_getattribute_resolves_class_name,
+    ):
+        class_name = resolver(func, class_targets, "__call__", operator_bindings)
+        if class_name is not None:
+            return class_name
+    return None
+
+
+def _class_name_from_operator_callable(func, operator_bindings):
+    """Resolve operator-based constructor selection in the original priority order."""
+    class_name = _attrgetter_call_resolves_class_name(
+        func, operator_bindings, "__call__"
+    )
+    if class_name is not None:
+        return class_name
+    for resolver in (
+        _operator_getitem_call_resolves_class_name,
+        _itemgetter_call_resolves_class_name,
+        _mro_getitem_call_resolves_class_name,
+    ):
+        class_name = resolver(func, operator_bindings)
+        if class_name is not None:
+            return class_name
+    return None
+
+
 def _resolved_class_name_from_callable(
     func,
     class_targets,
@@ -11424,43 +11454,13 @@ def _resolved_class_name_from_callable(
     respects lambda argument bindings that can shadow module class names.
     """
     if class_targets:
-        class_name = _getattr_resolves_class_name(
-            func, class_targets, "__call__", operator_bindings
-        )
-        if class_name is not None:
-            return class_name
-        class_name = _object_getattribute_resolves_class_name(
-            func,
-            class_targets,
-            "__call__",
-            operator_bindings,
+        class_name = _class_name_from_indirect_class_target(
+            func, class_targets, operator_bindings
         )
         if class_name is not None:
             return class_name
     if operator_bindings is not None:
-        class_name = _attrgetter_call_resolves_class_name(
-            func,
-            operator_bindings,
-            "__call__",
-        )
-        if class_name is not None:
-            return class_name
-        class_name = _operator_getitem_call_resolves_class_name(
-            func,
-            operator_bindings,
-        )
-        if class_name is not None:
-            return class_name
-        class_name = _itemgetter_call_resolves_class_name(
-            func,
-            operator_bindings,
-        )
-        if class_name is not None:
-            return class_name
-        class_name = _mro_getitem_call_resolves_class_name(
-            func,
-            operator_bindings,
-        )
+        class_name = _class_name_from_operator_callable(func, operator_bindings)
         if class_name is not None:
             return class_name
     if isinstance(func, ast.Attribute) and func.attr == "__call__":
