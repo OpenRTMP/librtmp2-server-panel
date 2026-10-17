@@ -2330,6 +2330,11 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     if not _is_module_namespace_mapping(bound.args[0], namespace_aliases):
         return False
     method = _operator_attrgetter_method_name(factory)
+    return _operator_attrgetter_method_may_set_workers(method, call)
+
+
+def _operator_attrgetter_method_may_set_workers(method, call):
+    """Return True when an attrgetter-bound namespace method may set workers."""
     if method == "update":
         return _update_payload_may_set_workers(call)
     if method in {"__ior__", "ior"}:
@@ -16318,6 +16323,29 @@ def _sync_callback_direct_dispatch_mutates(expr, tracking):
     return any(checks)
 
 
+def _sync_callback_inner_accessor_dispatch_mutates(inner, tracking):
+    """Return True for a proven mutating container accessor dispatch."""
+    if not isinstance(inner.func, ast.Attribute):
+        return False
+    receiver = inner.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+
+    kind = tracking["containers"].get(receiver.id)
+    method = inner.func.attr
+    dispatch_methods = {
+        "queue": {"get", "get_nowait"},
+        "deque": {"pop", "popleft"},
+        "list": {"pop"},
+        "userlist": {"pop"},
+        "sched": {"run"},
+    }
+    return (
+        method in dispatch_methods.get(kind, set())
+        and _sync_callback_accessor_arguments_are_valid(inner, kind, method)
+    )
+
+
 def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     """Return True only for proven synchronous execution of a mutating callback."""
     expr = _statement_value_expression(node)
@@ -16355,25 +16383,7 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     if _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
         return True
 
-    if not isinstance(inner.func, ast.Attribute):
-        return False
-    receiver = inner.func.value
-    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
-        return False
-
-    kind = tracking["containers"].get(receiver.id)
-    method = inner.func.attr
-    dispatch_methods = {
-        "queue": {"get", "get_nowait"},
-        "deque": {"pop", "popleft"},
-        "list": {"pop"},
-        "userlist": {"pop"},
-        "sched": {"run"},
-    }
-    return (
-        method in dispatch_methods.get(kind, set())
-        and _sync_callback_accessor_arguments_are_valid(inner, kind, method)
-    )
+    return _sync_callback_inner_accessor_dispatch_mutates(inner, tracking)
 
 
 def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
