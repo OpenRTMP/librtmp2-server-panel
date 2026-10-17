@@ -11116,7 +11116,6 @@ def _expression_uses_dynamic_class_introspection(expr):
             and _expression_contains_class_metadata(expr.args[0])
         )
     return _container_wrapper_uses_dynamic_class_introspection(expr)
-    return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
 def _subscript_uses_dynamic_class_introspection(sub):
