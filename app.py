@@ -306,7 +306,32 @@ class _PanelRuntime:
         self._register_stats_rate_limits()
         self.app.after_request(self.set_security_headers)
         self.app.register_error_handler(CSRFError, self.handle_csrf_error)
+        self._register_limiter_storage_error_handler()
         self._register_routes()
+
+    def _register_limiter_storage_error_handler(self):
+        # limits' RedisStorage lets redis-py errors (connection refused,
+        # timeouts, ...) escape the limiter's before_request hook, so a rate
+        # limit backend outage would otherwise answer every request with an
+        # unhandled 500. redis is only installed for shared (redis://) backends.
+        try:
+            import redis
+        except ImportError:
+            return
+        self.app.register_error_handler(
+            redis.exceptions.RedisError,
+            self.handle_limiter_storage_error,
+        )
+
+    def handle_limiter_storage_error(self, error):
+        """Answer a rate-limit storage outage with the controlled 503 used for
+        session-store outages instead of an unhandled 500."""
+        self.app.logger.exception("Rate limit storage backend unavailable")
+        return (
+            "Authentication service temporarily unavailable. "
+            "Please try again.",
+            503,
+        )
 
     def _rate_limit_remote_addr(self):
         """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
@@ -518,13 +543,13 @@ class _PanelRuntime:
         first_play_key = self._first_play_key(stream, players)
         urls = {
             "publish_url": publish_url,
-            "publish_key": stream.get("publish_key", ""),
+            "publish_key": stream.get("publish_key") or "",
             "play_url": f"rtmp://{domain}:{port}/{app_name}/{first_play_key}",  # nosonar python:S5332
             "play_key": first_play_key,
             "rtmps_enabled": rtmps_on,
             "stats_url": (
                 f"{self.app.config['LRTMP2_STATS_URL']}/stats?"
-                f"{urlencode({'key': stream.get('stats_key', '')})}"
+                f"{urlencode({'key': stream.get('stats_key') or ''})}"
             ),
         }
         if rtmps_on:
@@ -537,17 +562,17 @@ class _PanelRuntime:
     @staticmethod
     def _add_player_urls(players, domain, port, app_name, rtmps_on, rtmps_port):
         for player in players:
-            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key', '')}"  # nosonar python:S5332
+            player["play_url"] = f"rtmp://{domain}:{port}/{app_name}/{player.get('play_key') or ''}"  # NOSONAR python:S5332
             if rtmps_on:
                 player["play_url_tls"] = (
                     f"rtmps://{domain}:{rtmps_port}/{app_name}/"
-                    f"{player.get('play_key', '')}"
+                    f"{player.get('play_key') or ''}"
                 )
 
     @staticmethod
     def _first_play_key(stream, players):
         if players:
-            return players[0].get("play_key", "")
+            return players[0].get("play_key") or ""
         return stream.get("play_key", "") or ""
 
     def login(self):

@@ -98,6 +98,26 @@ _MIN_TRUSTED_PROXY_PREFIXLEN = {
     4: 2,  # reject /0 and /1 (split catch-alls that cover all of IPv4)
     6: 2,  # reject ::/0 and ::/1 (split catch-alls that cover all of IPv6)
 }
+_V4_MAPPED_PROXY_NETWORK = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _is_v4_mapped_proxy_network(network):
+    """Return True for IPv6 ranges inside the IPv4-mapped ``::ffff:0:0/96``."""
+    return network.version == 6 and network.subnet_of(_V4_MAPPED_PROXY_NETWORK)
+
+
+def _proxy_network_v4_equivalent(network):
+    """Map a v4-mapped IPv6 range to its IPv4 equivalent."""
+    return ipaddress.ip_network(
+        f"{ipaddress.IPv4Address(int(network.network_address) & 0xFFFFFFFF)}"
+        f"/{network.prefixlen - _V4_MAPPED_PROXY_NETWORK.prefixlen}",
+        strict=False,
+    )
+
+
+def _contains_v4_mapped_proxy_network(network):
+    """Return True for IPv6 ranges that cover the whole ``::ffff:0:0/96``."""
+    return network.version == 6 and network.supernet_of(_V4_MAPPED_PROXY_NETWORK)
 
 
 def _is_overly_broad_proxy_network(network):
@@ -105,13 +125,31 @@ def _is_overly_broad_proxy_network(network):
     min_prefix = _MIN_TRUSTED_PROXY_PREFIXLEN.get(network.version)
     if min_prefix is None:
         return False
+    if _is_v4_mapped_proxy_network(network):
+        # ``::ffff:0:0/96`` is every IPv4 client on a dual-stack bind, so its
+        # subnets are only as specific as their IPv4 prefix length.
+        return network.prefixlen - _V4_MAPPED_PROXY_NETWORK.prefixlen < min_prefix
+    if _contains_v4_mapped_proxy_network(network):
+        # A range containing the whole v4-mapped /96 covers every IPv4 client
+        # on a dual-stack bind, however specific its own prefix length looks.
+        return True
     return network.prefixlen < min_prefix
 
 
 def _proxy_networks_cover_entire_address_space(networks):
     """Return True when the configured union covers all of IPv4 or all of IPv6."""
+    if any(_contains_v4_mapped_proxy_network(network) for network in networks):
+        # Covering ``::ffff:0:0/96`` is covering every IPv4 client on a
+        # dual-stack bind, which is the whole IPv4 address space.
+        return True
+    normalized = [
+        _proxy_network_v4_equivalent(network)
+        if _is_v4_mapped_proxy_network(network)
+        else network
+        for network in networks
+    ]
     for version in (4, 6):
-        same_version = [network for network in networks if network.version == version]
+        same_version = [network for network in normalized if network.version == version]
         if not same_version:
             continue
         if any(
@@ -757,13 +795,31 @@ def _update_payload_may_set_workers(call, start_index=0):
     return False
 
 
+_DUNDER_CALL_MUTATOR_NAMES = frozenset(
+    {"update", "__setitem__", "setdefault", "__ior__", "ior"}
+)
+
+
+def _dunder_call_mutator_callee(func):
+    """Return the effective callee for ``X.m.__call__`` mutator spellings."""
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "__call__"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr in _DUNDER_CALL_MUTATOR_NAMES
+    ):
+        return func.value
+    return func
+
+
 def _call_is_module_namespace_workers_update(call, namespace_aliases=None):
     """Return True when module namespace ``update`` may change workers."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "update":
         return False
-    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+    if not _is_module_namespace_mapping(func.value, namespace_aliases):
         return False
     return _update_payload_may_set_workers(call)
 
@@ -845,11 +901,23 @@ def _collect_delegated_update_namespace_aliases(tree, namespace_aliases):
 def _binding_state_at_line(events, name, line):
     """Return the latest known boolean binding state at ``line``."""
     state = None
-    for event_line, active in events.get(name, ()):
+    for event in events.get(name, ()):
+        event_line, active = event[0], event[1]
         if line and event_line > line:
             break
         state = active
     return state
+
+
+def _alias_event_original_name(events, name, line):
+    """Return the latest recorded original import name for an alias."""
+    original = None
+    for event in events.get(name, ()):
+        event_line = event[0]
+        if line and event_line > line:
+            break
+        original = event[2] if len(event) >= 3 else None
+    return original
 
 
 def _instance_binding_candidates_at_line(events, name, line):
@@ -1074,9 +1142,10 @@ def _call_is_module_namespace_workers_ior(call, namespace_aliases=None):
     """Return True when module namespace ``__ior__`` may change workers."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__ior__":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "__ior__":
         return False
-    if not _is_module_namespace_mapping(call.func.value, namespace_aliases):
+    if not _is_module_namespace_mapping(func.value, namespace_aliases):
         return False
     if not call.args:
         return False
@@ -1259,6 +1328,7 @@ def _is_dict_type_update_callable(
     """Return True for builtin ``dict.update`` or a proven alias of it."""
     if aliases is None:
         aliases = set()
+    func = _dunder_call_mutator_callee(func)
     if isinstance(func, ast.Name):
         return func.id in aliases
     if _is_direct_dict_update_attribute(func):
@@ -1421,6 +1491,7 @@ def _is_dict_type_setitem_callable(
     ``getattr`` does not fetch the builtin mutator, so that spelling is not
     one unless the collected shadow state still shows the builtin.
     """
+    func = _dunder_call_mutator_callee(func)
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
         return False
     if isinstance(func, ast.Attribute):
@@ -1477,6 +1548,7 @@ def _is_dict_type_ior_callable(
     """Return True for builtin ``dict.__ior__`` variants or proven aliases."""
     if aliases is None:
         aliases = set()
+    func = _dunder_call_mutator_callee(func)
     if isinstance(func, ast.Name):
         return func.id in aliases
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
@@ -2074,7 +2146,8 @@ def _call_sets_workers_via_setitem(call):
     """Return True for ``__setitem__('workers', ...)`` style mutations."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "__setitem__":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "__setitem__":
         return False
     if not call.args:
         return False
@@ -2085,11 +2158,12 @@ def _call_is_namespace_setdefault_workers(call, namespace_aliases=None):
     """Return True for ``globals().setdefault('workers', ...)`` style binds."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "setdefault":
+    func = _dunder_call_mutator_callee(call.func)
+    if not isinstance(func, ast.Attribute) or func.attr != "setdefault":
         return False
     if not call.args or not _constant_is_workers(call.args[0]):
         return False
-    return _is_module_namespace_mapping(call.func.value, namespace_aliases)
+    return _is_module_namespace_mapping(func.value, namespace_aliases)
 
 
 def _call_is_getattr_setdefault_workers(call, namespace_aliases=None):
@@ -2256,12 +2330,19 @@ def _call_is_operator_attrgetter_namespace_mutation(call, operator_bindings):
     if not _is_module_namespace_mapping(bound.args[0], namespace_aliases):
         return False
     method = _operator_attrgetter_method_name(factory)
+    return _operator_attrgetter_method_may_set_workers(method, call)
+
+
+def _operator_attrgetter_method_may_set_workers(method, call):
+    """Return True when an attrgetter-bound namespace method may set workers."""
     if method == "update":
         return _update_payload_may_set_workers(call)
     if method in {"__ior__", "ior"}:
         return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
     if method == "__setitem__":
         return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
+    if method == "setdefault":
+        return bool(call.args) and _key_may_be_workers(call.args[0])
     return method is None
 
 
@@ -5454,11 +5535,36 @@ def _thread_constructor_is_active(call, operator_bindings):
     )
 
 
-def _thread_target_mutates_workers(target, operator_bindings, mutator_names):
+def _thread_target_mutates_workers(
+    target,
+    operator_bindings,
+    mutator_names,
+    call=None,
+):
     """Return whether one Thread target can mutate workers."""
     if isinstance(target, ast.Lambda):
         return _lambda_mutates_workers(target, operator_bindings)
-    return isinstance(target, ast.Name) and target.id in mutator_names
+    if isinstance(target, ast.Name):
+        return target.id in mutator_names
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if not (
+        isinstance(target, ast.Attribute)
+        and _is_module_namespace_mapping(target.value, namespace_aliases)
+    ):
+        return False
+    if target.attr not in {"update", "__setitem__", "setdefault", "__ior__"}:
+        return False
+    if not isinstance(call, ast.Call):
+        # Without the constructor the payload cannot be proven harmless.
+        return True
+    payload = _thread_arguments_payload(call, operator_bindings)
+    if target.attr in {"update", "__ior__"}:
+        return _thread_update_payload_may_set_workers(
+            payload
+        ) or _thread_kwargs_payload_may_set_workers(
+            _thread_keyword_arguments_payload(call, operator_bindings)
+        )
+    return _thread_key_payload_may_be_workers(payload)
 
 
 def _thread_targets(call):
@@ -5470,6 +5576,101 @@ def _thread_targets(call):
         if keyword.arg in {"target", "function"}
     )
     return targets
+
+
+def _thread_constructor_is_timer(reference, operator_bindings, reference_line=0):
+    """Return whether a Thread/Timer constructor reference names Timer."""
+    if isinstance(reference, ast.Attribute):
+        return reference.attr == "Timer"
+    if isinstance(reference, ast.Name):
+        if reference.id == "Timer":
+            return True
+        if reference.id == "Thread":
+            return False
+        alias_events = operator_bindings[39] if len(operator_bindings) > 39 else {}
+        return (
+            _alias_event_original_name(alias_events, reference.id, reference_line)
+            == "Timer"
+        )
+    return False
+
+
+def _thread_arguments_payload(call, operator_bindings):
+    """Return the ``args`` payload expression passed to a Thread target."""
+    for keyword in call.keywords:
+        if keyword.arg == "args":
+            return keyword.value
+    if _thread_constructor_is_timer(
+        call.func,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
+        # Timer(interval, function, args=None, kwargs=None)
+        if len(call.args) >= 3:
+            return call.args[2]
+        return None
+    # Thread(group=None, target=None, name=None, args=(), kwargs={})
+    if len(call.args) >= 4:
+        return call.args[3]
+    return None
+
+
+def _thread_keyword_arguments_payload(call, operator_bindings):
+    """Return the ``kwargs`` payload expression passed to a Thread target."""
+    for keyword in call.keywords:
+        if keyword.arg == "kwargs":
+            return keyword.value
+    if _thread_constructor_is_timer(
+        call.func,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
+        # Timer(interval, function, args=None, kwargs=None)
+        if len(call.args) >= 4:
+            return call.args[3]
+        return None
+    # Thread(group=None, target=None, name=None, args=(), kwargs={})
+    if len(call.args) >= 5:
+        return call.args[4]
+    return None
+
+
+def _thread_update_payload_may_set_workers(payload):
+    """Return True when a Thread ``args`` payload may update ``workers``."""
+    if payload is None:
+        return False
+    if isinstance(payload, (ast.Tuple, ast.List)):
+        for element in payload.elts:
+            if isinstance(element, ast.Dict):
+                if _dict_literal_sets_workers(element):
+                    return True
+                continue
+            # An unresolvable argument cannot be proven to omit workers.
+            return True
+        return False
+    if isinstance(payload, ast.Dict):
+        return _dict_literal_sets_workers(payload)
+    # An unresolvable payload cannot be proven to omit workers.
+    return True
+
+
+def _thread_kwargs_payload_may_set_workers(payload):
+    """Return True when a Thread ``kwargs`` payload may update ``workers``."""
+    if payload is None:
+        return False
+    if isinstance(payload, ast.Dict):
+        return _dict_literal_sets_workers(payload)
+    # An unresolvable payload cannot be proven to omit workers.
+    return True
+
+
+def _thread_key_payload_may_be_workers(payload):
+    """Return True when a Thread ``args`` payload key may be ``workers``."""
+    if payload is None:
+        return False
+    if isinstance(payload, (ast.Tuple, ast.List)):
+        return bool(payload.elts) and _key_may_be_workers(payload.elts[0])
+    return True
 
 
 def _thread_constructor_has_mutating_target(
@@ -5488,6 +5689,7 @@ def _thread_constructor_has_mutating_target(
             target,
             operator_bindings,
             mutator_names,
+            call,
         )
         for target in _thread_targets(call)
     )
@@ -5909,6 +6111,14 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
     """Return whether one pool callback can mutate module workers."""
     if isinstance(callback, ast.Lambda):
         return _lambda_mutates_workers(callback, operator_bindings)
+    if isinstance(callback, ast.Subscript):
+        return any(
+            _thread_pool_callback_mutates_workers(element, operator_bindings)
+            for element in _future_subscript_callback_values(
+                callback,
+                operator_bindings,
+            )
+        )
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
         return True
@@ -6554,31 +6764,136 @@ def _collect_callback_alias_events(tree, operator_bindings):
     return events
 
 
-def _future_starred_callback_values(value):
-    """Extract the sole positional callback from a literal expanded argument."""
-    if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
-        return [value.elts[0]]
-    return []
+def _scan_callback_container_events(statements, events, *, conditional=False):
+    """Collect literal callback containers by name in source order."""
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name, value in _namespace_assignment_values(node):
+            event = (
+                getattr(node, "lineno", 0),
+                getattr(node, "col_offset", 0),
+                value
+                if isinstance(value, (ast.Tuple, ast.List, ast.Dict))
+                else None,
+            )
+            if conditional:
+                event += (True,)
+            events.setdefault(name, []).append(event)
+        for block in _compound_statement_blocks(node):
+            _scan_callback_container_events(block, events, conditional=True)
 
 
-def _future_expanded_keyword_callbacks(value):
-    """Extract fn from a literal expanded keyword mapping."""
-    if not isinstance(value, ast.Dict):
+def _collect_callback_container_events(tree):
+    """Collect saved literal callback containers for callback analysis."""
+    events = {}
+    _scan_callback_container_events(tree.body, events)
+    return events
+
+
+def _future_callback_container_candidates_at_position(events, name, reference):
+    """Return candidate container values visible at a reference position.
+
+    The latest unconditional binding is the base; conditional bindings after it
+    are kept as additional candidates because the branch may or may not have
+    run, so the callback scan must fail closed for any of them.
+    """
+    if isinstance(reference, ast.AST):
+        reference_position = (
+            getattr(reference, "lineno", 0),
+            getattr(reference, "col_offset", 0),
+        )
+    else:
+        reference_position = (int(reference or 0), 10**9)
+    base = None
+    conditionals = []
+    for event in events.get(name, ()):
+        event_position = (event[0], event[1])
+        if event_position > reference_position:
+            break
+        if len(event) > 3:
+            conditionals.append(event[2])
+        else:
+            base = event[2]
+            conditionals = []
+    candidates = ([base] if base is not None else []) + conditionals
+    return [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, (ast.Tuple, ast.List, ast.Dict))
+    ]
+
+
+def _future_callback_container_values(value, analysis):
+    """Resolve saved literal callback container candidates for a reference."""
+    if not isinstance(value, ast.Name):
+        return [value]
+    return _future_callback_container_candidates_at_position(
+        analysis.get("callback_container_events", {}),
+        value.id,
+        value,
+    )
+
+
+def _future_subscript_callback_values(callback, operator_bindings):
+    """Resolve constant-index subscripts into saved literal container candidates."""
+    if not isinstance(callback, ast.Subscript):
         return []
+    index = callback.slice
+    if not (isinstance(index, ast.Constant) and type(index.value) is int):
+        return []
+    if not isinstance(callback.value, ast.Name):
+        return []
+    elements = []
+    for container in _future_callback_container_candidates_at_position(
+        _future_analysis_state(operator_bindings).get(
+            "callback_container_events",
+            {},
+        ),
+        callback.value.id,
+        callback.value,
+    ):
+        if not isinstance(container, (ast.Tuple, ast.List)):
+            continue
+        if not -len(container.elts) <= index.value < len(container.elts):
+            continue
+        elements.append(container.elts[index.value])
+    return elements
+
+
+def _future_starred_callback_values(value, analysis):
+    """Extract the sole positional callback from literal expanded arguments."""
     callbacks = []
-    for key, callback in zip(value.keys, value.values):
-        if isinstance(key, ast.Constant) and key.value == "fn":
-            callbacks.append(callback)
+    for container in _future_callback_container_values(value, analysis):
+        if (
+            isinstance(container, (ast.Tuple, ast.List))
+            and len(container.elts) == 1
+        ):
+            callbacks.append(container.elts[0])
     return callbacks
 
 
-def _future_add_done_callback_arguments(call):
+def _future_expanded_keyword_callbacks(value, analysis):
+    """Extract fn from literal expanded keyword mappings."""
+    callbacks = []
+    for mapping in _future_callback_container_values(value, analysis):
+        if not isinstance(mapping, ast.Dict):
+            continue
+        for key, callback in zip(mapping.keys, mapping.values):
+            if isinstance(key, ast.Constant) and key.value == "fn":
+                callbacks.append(callback)
+    return callbacks
+
+
+def _future_add_done_callback_arguments(call, analysis):
     """Return statically provable callbacks supplied to add_done_callback."""
     callbacks = []
     if call.args:
         first = call.args[0]
         if isinstance(first, ast.Starred):
-            callbacks.extend(_future_starred_callback_values(first.value))
+            callbacks.extend(
+                _future_starred_callback_values(first.value, analysis)
+            )
         else:
             callbacks.append(first)
     for keyword in call.keywords:
@@ -6586,7 +6901,7 @@ def _future_add_done_callback_arguments(call):
             callbacks.append(keyword.value)
         elif keyword.arg is None:
             callbacks.extend(
-                _future_expanded_keyword_callbacks(keyword.value)
+                _future_expanded_keyword_callbacks(keyword.value, analysis)
             )
     return callbacks
 
@@ -6730,7 +7045,7 @@ def _call_is_future_add_done_callback_mutation(call, operator_bindings):
         return False
     return any(
         _thread_pool_callback_mutates_workers(callback, operator_bindings)
-        for callback in _future_add_done_callback_arguments(call)
+        for callback in _future_add_done_callback_arguments(call, analysis)
     )
 
 
@@ -7207,7 +7522,7 @@ def _record_class_async_wrapper_bindings(
     *,
     conditional,
 ):
-    """Record callable static/class async methods on one module-level class."""
+    """Record callable static/class and undecorated instance async methods."""
     line = getattr(node, "lineno", 0)
     prefix = f"{node.name}."
     if not conditional:
@@ -7223,7 +7538,10 @@ def _record_class_async_wrapper_bindings(
     for stmt in node.body:
         if (
             isinstance(stmt, ast.AsyncFunctionDef)
-            and _function_is_static_or_class_method(stmt, operator_bindings)
+            and (
+                _function_is_static_or_class_method(stmt, operator_bindings)
+                or not stmt.decorator_list
+            )
         ):
             _record_async_wrapper_binding(
                 events,
@@ -7340,10 +7658,62 @@ def _collect_async_wrapper_binding_events(tree, operator_bindings):
     return events
 
 
+def _async_instance_method_needs_receiver(candidate, operator_bindings):
+    """Return True for an undecorated async instance method (needs a self)."""
+    return (
+        isinstance(candidate, ast.AsyncFunctionDef)
+        and not candidate.decorator_list
+        and not _function_is_static_or_class_method(candidate, operator_bindings)
+    )
+
+
+def _async_wrapper_call_passes_receiver(func, invocation):
+    """Return True when ``Class.method(...)`` receives a possible receiver."""
+    return (
+        isinstance(invocation, ast.Call)
+        and isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and bool(invocation.args)
+    )
+
+
+def _async_wrapper_instance_method_candidates_at_line(
+    func,
+    operator_bindings,
+    reference_line,
+):
+    """Resolve ``instance.method`` through module-level instance bindings.
+
+    Returns ``None`` when the receiver name is not a tracked instance, so the
+    caller keeps the plain class-qualified resolution path.
+    """
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets or len(class_targets) <= 6:
+        return None
+    events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
+    candidates = frozenset()
+    found = False
+    for instance_line, class_name in _instance_binding_candidates_at_line(
+        class_targets[6],
+        func.value.id,
+        reference_line,
+    ):
+        if not _class_binding_is_active(class_targets, class_name, instance_line):
+            continue
+        found = True
+        candidates |= _async_wrapper_state(
+            events,
+            f"{class_name}.{func.attr}",
+            reference_line,
+        )
+    return candidates if found else None
+
+
 def _async_wrapper_candidates_at_line(
     func,
     operator_bindings,
     reference_line,
+    invocation=None,
 ):
     """Resolve a called name or class-qualified method to async candidates."""
     if len(operator_bindings) <= _ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX:
@@ -7355,10 +7725,42 @@ def _async_wrapper_candidates_at_line(
         and isinstance(func.value, ast.Name)
     ):
         key = f"{func.value.id}.{func.attr}"
+    elif (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Call)
+        and isinstance(func.value.func, ast.Name)
+    ):
+        key = f"{func.value.func.id}.{func.attr}"
     else:
         return frozenset()
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        instance_candidates = _async_wrapper_instance_method_candidates_at_line(
+            func,
+            operator_bindings,
+            reference_line,
+        )
+        if instance_candidates is not None:
+            # ``instance.method`` passes the receiver implicitly, so the
+            # instance method's ``self`` requirement is already satisfied.
+            return instance_candidates
     events = operator_bindings[_ASYNCIO_WRAPPER_BINDING_EVENTS_INDEX]
-    return _async_wrapper_state(events, key, reference_line)
+    candidates = _async_wrapper_state(events, key, reference_line)
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and not _async_wrapper_call_passes_receiver(func, invocation)
+    ):
+        # ``Class.method`` without a receiver is the plain function object: an
+        # instance method would raise TypeError when called this way.
+        candidates = frozenset(
+            candidate
+            for candidate in candidates
+            if not _async_instance_method_needs_receiver(
+                candidate,
+                operator_bindings,
+            )
+        )
+    return candidates
 
 
 def _local_async_wrapper_candidates(func, local_state):
@@ -7496,6 +7898,14 @@ def _asyncio_awaitable_expression_mutates_workers(
     )
 
 
+def _asyncio_starred_awaitable_elements(argument):
+    """Return the literal elements of a starred awaitable container, or None."""
+    value = argument.value
+    if isinstance(value, (ast.List, ast.Tuple)):
+        return value.elts
+    return None
+
+
 def _asyncio_consumer_call_mutates_workers(
     call,
     operator_bindings,
@@ -7511,16 +7921,32 @@ def _asyncio_consumer_call_mutates_workers(
         local_state,
     ):
         return False
-    return any(
-        _asyncio_awaitable_expression_mutates_workers(
-            arg.value if isinstance(arg, ast.Starred) else arg,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        )
-        for arg in call.args
+    arguments = (
+        *call.args,
+        *(keyword.value for keyword in call.keywords if keyword.arg),
     )
+    for argument in arguments:
+        if isinstance(argument, ast.Starred):
+            elements = _asyncio_starred_awaitable_elements(argument)
+            if elements is None:
+                # A starred container this walk cannot resolve still fails
+                # closed: it may hold a workers-mutating awaitable.
+                return True
+            candidates = elements
+        else:
+            candidates = (argument,)
+        if any(
+            _asyncio_awaitable_expression_mutates_workers(
+                candidate,
+                operator_bindings,
+                reference_line,
+                local_state,
+                seen,
+            )
+            for candidate in candidates
+        ):
+            return True
+    return False
 
 
 def _asyncio_awaitable_mutates_workers(
@@ -7565,6 +7991,7 @@ def _asyncio_awaitable_mutates_workers(
             expr.func,
             operator_bindings,
             reference_line,
+            expr,
         )
     return any(
         _async_function_mutates_workers_via_asyncio(
@@ -7864,7 +8291,7 @@ def _asyncio_task_factory_call_mutates_workers(
     seen=None,
 ):
     """Return True when create_task/ensure_future schedules a mutating awaitable."""
-    if not isinstance(call, ast.Call) or not call.args:
+    if not isinstance(call, ast.Call) or (not call.args and not call.keywords):
         return False
     helper_names = ("create_task", "ensure_future")
     if not any(
@@ -7877,8 +8304,15 @@ def _asyncio_task_factory_call_mutates_workers(
         for helper_name in helper_names
     ):
         return False
+    scheduled = _call_argument(
+        call,
+        ("coro", "coro_or_future", "future", "main"),
+    )
+    if scheduled is None:
+        # An argument list this walk cannot resolve still fails closed.
+        return True
     return _asyncio_awaitable_expression_mutates_workers(
-        call.args[0],
+        scheduled,
         operator_bindings,
         reference_line,
         local_state=local_state,
@@ -8500,17 +8934,67 @@ _EAGER_GENERATOR_CONSUMER_BUILTINS = _EAGER_LAZY_ITERATOR_CONSUMERS | {"sum"}
 _HEAPQ_ORDERED_CALLBACK_METHODS = frozenset({"nsmallest", "nlargest"})
 
 
-def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
-    """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-        return False
-    if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
-        return False
-    receiver = call.func.value
+def _heapq_module_alias_events(operator_bindings):
+    """Return heapq module alias events stashed on the worker-scan bindings."""
+    return (
+        _operator_bindings_metadata(
+            operator_bindings,
+            "heapq_module_alias_events",
+        )
+        or {}
+    )
+
+
+def _heapq_ordered_callback_alias_events(operator_bindings):
+    """Return heapq nsmallest/nlargest name alias events on the bindings."""
+    return (
+        _operator_bindings_metadata(
+            operator_bindings,
+            "heapq_ordered_callback_alias_events",
+        )
+        or {}
+    )
+
+
+def _heapq_receiver_may_be_module(receiver, events, reference_line):
+    """Return True unless the receiver is proven to no longer name heapq."""
     if not isinstance(receiver, ast.Name):
         return False
-    module_aliases = operator_bindings[0] if len(operator_bindings) > 0 else set()
-    if receiver.id not in module_aliases and receiver.id != "heapq":
+    if receiver.id == "heapq" or not events or receiver.id not in events:
+        # An alias the import collector cannot resolve still fails closed.
+        return True
+    return _module_alias_active_at_line(receiver, set(), events, reference_line)
+
+
+def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
+    """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
+    if not isinstance(call, ast.Call):
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(call.func, ast.Attribute):
+        if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
+            return False
+        if not _heapq_receiver_may_be_module(
+            call.func.value,
+            _heapq_module_alias_events(operator_bindings),
+            reference_line,
+        ):
+            return False
+    elif isinstance(call.func, ast.Name):
+        name_alias_events = _heapq_ordered_callback_alias_events(
+            operator_bindings
+        )
+        if not (
+            name_alias_events
+            and _module_alias_active_at_line(
+                call.func,
+                set(),
+                name_alias_events,
+                reference_line,
+            )
+        ):
+            return False
+    else:
         return False
     if len(call.args) < 2:
         return False
@@ -9038,6 +9522,32 @@ def _function_is_property_method(func_node, operator_bindings=None):
 
 
 
+def _super_invocation_method_name(func):
+    """Return the method name for direct and getattr super() invocations."""
+    if isinstance(func, ast.Attribute):
+        super_call = func.value
+        if (
+            isinstance(super_call, ast.Call)
+            and isinstance(super_call.func, ast.Name)
+            and super_call.func.id == "super"
+        ):
+            return func.attr
+        return None
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[0], ast.Call)
+        and isinstance(func.args[0].func, ast.Name)
+        and func.args[0].func.id == "super"
+        and isinstance(func.args[1], ast.Constant)
+        and isinstance(func.args[1].value, str)
+    ):
+        return func.args[1].value
+    return None
+
+
 def _function_invokes_mutating_super_method(
     func_node,
     class_name,
@@ -9045,22 +9555,22 @@ def _function_invokes_mutating_super_method(
     methods,
     class_methods=None,
 ):
-    """Return True when super().method() reaches a mutating MRO implementation."""
+    """Return True when super().method() reaches a mutating MRO implementation.
+
+    The ``getattr(super(...), 'method')()`` spelling reaches the same
+    implementation and has to be recorded as well.
+    """
     for node in ast.walk(func_node):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        if not isinstance(node, ast.Call):
             continue
-        super_call = node.func.value
-        if not (
-            isinstance(super_call, ast.Call)
-            and isinstance(super_call.func, ast.Name)
-            and super_call.func.id == "super"
-        ):
+        method_name = _super_invocation_method_name(node.func)
+        if method_name is None:
             continue
         if _class_super_method_mutates(
             methods,
             class_bases,
             class_name,
-            node.func.attr,
+            method_name,
             class_methods,
         ):
             return True
@@ -9142,6 +9652,16 @@ def _explicit_metaclass_name(class_node):
     return None
 
 
+def _iter_class_definitions(statements):
+    """Yield class definitions reachable through import-time compound blocks."""
+    for node in statements:
+        if isinstance(node, ast.ClassDef):
+            yield node
+            continue
+        for block in _compound_statement_blocks(node):
+            yield from _iter_class_definitions(block)
+
+
 def _classes_with_mutating_effective_metaclass(
     tree,
     operator_bindings,
@@ -9154,9 +9674,7 @@ def _classes_with_mutating_effective_metaclass(
         hook_names,
     )
     affected = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _iter_class_definitions(tree.body):
         explicit = _explicit_metaclass_name(node)
         inherited = any(
             isinstance(base, ast.Name) and base.id in affected
@@ -9271,10 +9789,35 @@ def _record_descriptor_targets(class_name, targets, hooks, descriptor_fields):
     return found
 
 
-def _record_descriptor_field_assignments(class_node, methods, descriptor_fields):
+def _property_hook_decorator_name(stmt):
+    """Return the descriptor hook a ``@name.setter``/``.deleter`` installs."""
+    for decorator in stmt.decorator_list:
+        if isinstance(decorator, ast.Attribute) and decorator.attr in {
+            "setter",
+            "deleter",
+        }:
+            return "__set__" if decorator.attr == "setter" else "__delete__"
+    return None
+
+
+def _record_descriptor_field_assignments(
+    class_node,
+    methods,
+    descriptor_fields,
+    operator_bindings,
+):
     """Record descriptor fields keyed by the hook an access kind invokes."""
     found = False
     for stmt in class_node.body:
+        if isinstance(stmt, ast.FunctionDef):
+            hook = _property_hook_decorator_name(stmt)
+            if hook is not None and _function_mutates_workers(
+                stmt,
+                operator_bindings,
+            ):
+                descriptor_fields[hook].add((class_node.name, stmt.name))
+                found = True
+            continue
         if not isinstance(stmt, ast.Assign):
             continue
         if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
@@ -9337,6 +9880,7 @@ def _scan_class_side_effect_bindings(
                         node,
                         methods,
                         descriptor_fields,
+                        operator_bindings,
                     )
                     or risky
                 )
@@ -9565,9 +10109,7 @@ def _collect_class_definition_metadata(tree):
     class_bases = {}
     class_methods = set()
     class_attributes = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _iter_class_definitions(tree.body):
         class_bases[node.name] = tuple(
             base.id for base in node.bases if isinstance(base, ast.Name)
         )
@@ -9581,6 +10123,57 @@ def _collect_class_definition_metadata(tree):
             for attribute_name in _class_body_plain_attribute_names(node)
         )
     return class_bases, class_methods, class_attributes
+
+
+def _collect_class_name_aliases(tree, class_names):
+    """Collect module-level simple aliases bound to locally defined classes."""
+    assignments = {}
+    _record_module_namespace_assignments(tree.body, assignments)
+    aliases = {}
+    unresolved = set(assignments)
+    while unresolved:
+        discovered = {
+            name
+            for name in unresolved
+            if name not in class_names
+            and assignments[name]
+            and all(
+                isinstance(value, ast.Name)
+                and (value.id in class_names or value.id in aliases)
+                for value in assignments[name]
+            )
+        }
+        if not discovered:
+            break
+        for name in discovered:
+            aliases[name] = [
+                (
+                    getattr(value, "lineno", 0),
+                    value.id
+                    if value.id in class_names
+                    else _class_name_alias_target(
+                        value.id,
+                        aliases,
+                        getattr(value, "lineno", 0),
+                    ),
+                )
+                for value in assignments[name]
+            ]
+        unresolved.difference_update(discovered)
+    return aliases
+
+
+def _class_name_alias_target(name, class_name_aliases, reference_line=0):
+    """Resolve a module-level simple class alias at one source line."""
+    events = class_name_aliases.get(name)
+    if not events:
+        return name
+    target = name
+    for event_line, event_target in events:
+        if reference_line and event_line > reference_line:
+            break
+        target = event_target
+    return target
 
 
 def _collect_metaclass_call_constructor_names(tree, operator_bindings):
@@ -9721,6 +10314,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
+    class_name_aliases = _collect_class_name_aliases(tree, set(class_bases))
     class_definition_lines = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -9777,6 +10371,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_definition_lines,
         metaclass_bypass_events,
         operator_bindings[32] if len(operator_bindings) > 32 else {},
+        class_name_aliases,
     )
 
 
@@ -9800,23 +10395,70 @@ def _class_definition_line_at(definition_lines, class_name, reference_line):
     return line
 
 
+def _local_type_call_aliases(func_node):
+    """Return names bound to the builtin ``type`` inside a function body."""
+    aliases = set()
+    for node in ast.walk(func_node):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "type"
+        ):
+            aliases.update(
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            )
+    return aliases
+
+
+def _expression_yields_type_dunder_call(expr, type_aliases):
+    """Return True when an expression resolves to ``type.__call__`` itself."""
+    if isinstance(expr, ast.Attribute) and expr.attr == "__call__":
+        return (
+            isinstance(expr.value, ast.Name)
+            and (
+                expr.value.id == "type"
+                or expr.value.id in type_aliases
+            )
+        )
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+    ):
+        return False
+    if expr.func.id == "getattr":
+        return (
+            len(expr.args) >= 2
+            and isinstance(expr.args[0], ast.Name)
+            and (
+                expr.args[0].id == "type"
+                or expr.args[0].id in type_aliases
+            )
+            and isinstance(expr.args[1], ast.Constant)
+            and expr.args[1].value == "__call__"
+        )
+    if expr.func.id == "partial":
+        return bool(expr.args) and _expression_yields_type_dunder_call(
+            expr.args[0],
+            type_aliases,
+        )
+    return False
+
+
 def _function_delegates_type_call(func_node):
     """Return True when a metaclass ``__call__`` reaches ``type.__call__``."""
+    type_aliases = _local_type_call_aliases(func_node)
     for child in ast.walk(func_node):
-        if (
-            not isinstance(child, ast.Call)
-            or not isinstance(child.func, ast.Attribute)
-            or child.func.attr != "__call__"
-        ):
+        if not isinstance(child, ast.Call):
             continue
-        receiver = child.func.value
-        if (
-            isinstance(receiver, ast.Call)
-            and isinstance(receiver.func, ast.Name)
-            and receiver.func.id == "super"
-        ):
+        func = child.func
+        if isinstance(func, ast.Attribute) and func.attr == "__call__":
+            # ``super().__call__``, ``type.__call__``, a local alias of
+            # ``type`` and every receiver this walk cannot resolve all keep
+            # the initializer check engaged: only a proven bypass may skip it.
             return True
-        if isinstance(receiver, ast.Name) and receiver.id == "type":
+        if _expression_yields_type_dunder_call(func, type_aliases):
             return True
     return False
 
@@ -10252,11 +10894,17 @@ def _deque_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _class_mro_index_class_name(class_name, index, operator_bindings):
+def _class_mro_index_class_name(class_name, index, operator_bindings, reference_line=0):
     """Resolve a class name from a static MRO index without running config code."""
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return None
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    class_name = _class_name_alias_target(
+        class_name,
+        class_name_aliases,
+        reference_line,
+    )
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     mro = _class_mro_names(class_name, class_bases)
     if "object" in class_bases:
@@ -10264,14 +10912,21 @@ def _class_mro_index_class_name(class_name, index, operator_bindings):
         mro = (*mro, "__builtin_object__")
     elif "object" not in mro:
         mro = (*mro, "object")
-    return mro[index] if -len(mro) <= index < len(mro) else None
+    if not -len(mro) <= index < len(mro):
+        return None
+    return _class_name_alias_target(mro[index], class_name_aliases, reference_line)
 
 
 def _mro_subscript_class_name(value, index, operator_bindings):
     """Resolve an indexed MRO element without evaluating configuration code."""
     if not isinstance(value.value, ast.Name):
         return None
-    return _class_mro_index_class_name(value.value.id, index, operator_bindings)
+    return _class_mro_index_class_name(
+        value.value.id,
+        index,
+        operator_bindings,
+        getattr(value, "lineno", 0),
+    )
 
 
 def _bases_subscript_class_name(value, index, operator_bindings):
@@ -10325,7 +10980,12 @@ def _class_mro_method_subscript_class_name(call, index, operator_bindings):
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if class_targets and _class_mro_method_is_overridden(call, class_targets):
         return None
-    return _class_mro_index_class_name(call.func.value.id, index, operator_bindings)
+    return _class_mro_index_class_name(
+        call.func.value.id,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
 
 
 def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
@@ -10347,10 +11007,39 @@ def _sequence_mro_method_subscript_class_name(call, index, operator_bindings):
     )
 
 
+_DYNAMIC_CLASS_METADATA_WRAPPERS = frozenset(
+    {
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "reversed",
+        "sorted",
+        "map",
+        "filter",
+        "enumerate",
+        "zip",
+    }
+)
 _MRO_REORDERING_BUILTINS = frozenset(
     {"filter", "map", "sorted", "zip", "enumerate", "reversed", "iter"}
 )
 _MRO_REORDERING_ATTRS = frozenset({"chain", "islice", "deque"})
+
+
+def _expression_contains_class_metadata(expr):
+    """Return True when an expression subtree reads runtime class metadata."""
+    if isinstance(expr, ast.Attribute) and expr.attr in {
+        "__mro__",
+        "__subclasses__",
+    }:
+        return True
+    if _is_class_mro_method_call(expr):
+        return True
+    return any(
+        _expression_contains_class_metadata(child)
+        for child in ast.iter_child_nodes(expr)
+    )
 
 
 def _ast_references_class_introspection(node):
@@ -10371,9 +11060,11 @@ def _container_wrapper_uses_dynamic_class_introspection(call):
     """Identify runtime class metadata inside builtin container conversions."""
     if (
         not isinstance(call.func, ast.Name)
-        or call.func.id not in {"list", "tuple", "set", "frozenset"}
-        or len(call.args) != 1
+        or call.func.id not in _DYNAMIC_CLASS_METADATA_WRAPPERS
+        or not call.args
     ):
+        return False
+    if call.func.id in {"list", "tuple", "set", "frozenset"} and len(call.args) != 1:
         return False
     arg = call.args[0]
     if _is_class_mro_method_call(arg):
@@ -10405,9 +11096,13 @@ def _expression_uses_dynamic_class_introspection(expr):
         return True
     if isinstance(expr, ast.ListComp):
         return any(
-            isinstance(gen.iter, ast.Attribute) and gen.iter.attr == "__mro__"
+            _expression_contains_class_metadata(gen.iter)
             for gen in expr.generators
         )
+    if isinstance(expr, (ast.List, ast.Tuple)) and any(
+        isinstance(element, ast.Starred) for element in expr.elts
+    ):
+        return True
     if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
         return (
             _expression_uses_dynamic_class_introspection(expr.left)
@@ -10417,6 +11112,14 @@ def _expression_uses_dynamic_class_introspection(expr):
         return False
     if _call_uses_mro_reordering_or_subclasses(expr):
         return True
+    if isinstance(expr.func, ast.Attribute):
+        return (
+            expr.func.attr == "fromkeys"
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "dict"
+            and bool(expr.args)
+            and _expression_contains_class_metadata(expr.args[0])
+        )
     return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
@@ -10733,30 +11436,51 @@ def _iterable_literal_class_instantiation_triggers_workers(
     )
 
 
+def _type_constructor_base_elements(bases):
+    """Return literal base expressions from a dynamic type() bases argument."""
+    if isinstance(bases, (ast.Tuple, ast.List)):
+        return bases.elts
+    if (
+        isinstance(bases, ast.Call)
+        and isinstance(bases.func, ast.Name)
+        and bases.func.id in {"tuple", "list"}
+        and len(bases.args) == 1
+        and isinstance(bases.args[0], (ast.Tuple, ast.List))
+    ):
+        return bases.args[0].elts
+    return None
+
+
 def _type_constructor_bases_trigger_workers(
     constructor, operator_bindings, *, creation_only=False, skip_init=False
 ):
     """Detect mutating base hooks during dynamic class creation or instantiation."""
     if len(constructor.args) < 2:
         return False
-    bases = constructor.args[1]
-    if not isinstance(bases, (ast.Tuple, ast.List)):
+    bases = _type_constructor_base_elements(constructor.args[1])
+    if bases is None:
         return False
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return False
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     reference_line = getattr(constructor, "lineno", 0)
-    for base in bases.elts:
+    for base in bases:
         if not isinstance(base, ast.Name):
             continue
+        base_name = _class_name_alias_target(
+            base.id,
+            class_name_aliases,
+            reference_line,
+        )
         if _class_mro_hook_triggers_workers(
-            base.id, "__init_subclass__", class_targets, reference_line
+            base_name, "__init_subclass__", class_targets, reference_line
         ):
             return True
         if creation_only:
             continue
         if _dynamic_type_base_constructor_triggers_workers(
-            base.id,
+            base_name,
             reference_line,
             operator_bindings,
             class_targets,
@@ -11209,8 +11933,15 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     metaclass_definitions = class_targets[3]
     if class_node.name in metaclass_definitions:
         return True
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    reference_line = getattr(class_node, "lineno", 0)
     return any(
-        isinstance(base, ast.Name) and (base.id, "__init_subclass__") in methods
+        isinstance(base, ast.Name)
+        and (
+            _class_name_alias_target(base.id, class_name_aliases, reference_line),
+            "__init_subclass__",
+        )
+        in methods
         for base in class_node.bases
     )
 
@@ -12178,6 +12909,13 @@ def _match_case_invokes_mutating_callback(
     )
 
 
+# ``ast.TryStar`` (except*) is a sibling of ``ast.Try``, not a subclass, and
+# only exists on Python 3.11+.
+_TRY_STATEMENT_NODES = (ast.Try,) + (
+    (ast.TryStar,) if hasattr(ast, "TryStar") else ()
+)
+
+
 def _compound_statement_body_mutates_workers(
     node,
     operator_bindings,
@@ -12204,7 +12942,7 @@ def _compound_statement_body_mutates_workers(
         bodies = [case.body for case in node.cases]
     elif isinstance(node, ast.While):
         bodies = [node.body]
-    elif isinstance(node, ast.Try):
+    elif isinstance(node, _TRY_STATEMENT_NODES):
         bodies = [node.body, node.orelse, node.finalbody]
         bodies.extend(handler.body for handler in node.handlers)
     else:
@@ -12593,7 +13331,17 @@ def _statement_mutates_workers(
             node, operator_bindings, bound_names, defer_annotations
         )
     if isinstance(node, ast.ClassDef):
-        return False
+        # A class body runs while the ``class`` statement executes, so a
+        # module-namespace mutation inside one counts here exactly as it does
+        # at module level; a plain class attribute still does not.
+        return _class_body_has_dynamic_workers_effect(
+            node.body,
+            mutator_names,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
     if _statement_has_class_workers_side_effect(node, class_targets):
         return True
     if _is_dynamic_workers_mutation(
@@ -12861,6 +13609,7 @@ def _sync_callback_tracking(scan_state):
             "userlist_constructors": set(),
             "containers": {},
             "mutating": set(),
+            "mutating_callback_names": set(),
             "mutating_subscript_indexes": {},
             "sched_event_ids": {},
             "sched_pending_events": {},
@@ -13049,6 +13798,7 @@ def _clear_sync_callback_name_tracking(name, tracking):
     """Clear stale callback-container state after a definite rebinding."""
     tracking["containers"].pop(name, None)
     tracking["mutating"].discard(name)
+    tracking["mutating_callback_names"].discard(name)
     tracking["queue_modules"].discard(name)
     tracking["collections_modules"].discard(name)
     tracking["sched_modules"].discard(name)
@@ -13126,6 +13876,40 @@ def _record_sync_callback_assignment(node, tracking, operator_bindings):
         )
 
 
+def _sync_callback_dispatch_result_holds_callback(value, tracking):
+    """Return True when a call reads a callback out of a mutating container."""
+    if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)):
+        return False
+    receiver = value.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+    kind = tracking["containers"].get(receiver.id)
+    method = value.func.attr
+    dispatch_methods = {
+        "queue": {"get", "get_nowait"},
+        "deque": {"pop", "popleft"},
+        "list": {"pop"},
+        "userlist": {"pop"},
+    }
+    return method in dispatch_methods.get(kind, set()) and (
+        _sync_callback_accessor_arguments_are_valid(value, kind, method)
+    )
+
+
+def _record_sync_callback_dispatch_result(node, tracking):
+    """Track names bound from a mutating container's callback accessor.
+
+    ``cb = q.get()`` holds the callback the container was proven to carry, so
+    a later ``cb()`` executes it synchronously; the inline ``q.get()()`` form
+    is already recognized by ``_sync_callback_dispatch_mutates``, and this
+    records the same proven source under the bound name.
+    """
+    value = _statement_value_expression(node)
+    if not _sync_callback_dispatch_result_holds_callback(value, tracking):
+        return
+    tracking["mutating_callback_names"].update(_simple_assignment_names(node))
+
+
 def _statement_value_expression(node):
     """Return the import-time expression directly executed by a statement."""
     if isinstance(node, ast.Expr):
@@ -13191,17 +13975,28 @@ def _sync_callback_direct_insert_argument(expr, kind):
         "deque": {"append", "appendleft"},
         "list": {"append"},
         "userlist": {"append"},
-        "sched": {"enter"},
+        "sched": {"enter", "enterabs"},
     }
     if expr.func.attr not in direct_callback_methods.get(kind, set()):
         return None
     callback_index = 2 if kind == "sched" else 0
-    if len(expr.args) <= callback_index:
-        return None
-    callback = expr.args[callback_index]
-    if isinstance(callback, (ast.Tuple, ast.List)) and callback.elts:
-        return callback.elts[-1]
-    return callback
+    if len(expr.args) > callback_index:
+        callback = expr.args[callback_index]
+        if isinstance(callback, (ast.Tuple, ast.List)) and callback.elts:
+            return callback.elts[-1]
+        return callback
+    if kind == "sched":
+        keyword = next(
+            (
+                keyword
+                for keyword in expr.keywords
+                if keyword.arg == "action"
+            ),
+            None,
+        )
+        if keyword is not None:
+            return keyword.value
+    return None
 
 
 def _sync_callback_insert_mutates(expr, kind, operator_bindings):
@@ -13266,7 +14061,7 @@ def _record_sync_callback_insert(node, tracking, operator_bindings):
     if not isinstance(receiver, ast.Name):
         return
     kind = tracking["containers"].get(receiver.id)
-    if kind is None or not expr.args:
+    if kind is None or not (expr.args or (kind == "sched" and expr.keywords)):
         return
     if kind == "queue":
         _record_queue_mutating_subscript_indexes(
@@ -15528,12 +16323,43 @@ def _sync_callback_direct_dispatch_mutates(expr, tracking):
     return any(checks)
 
 
+def _sync_callback_inner_accessor_dispatch_mutates(inner, tracking):
+    """Return True for a proven mutating container accessor dispatch."""
+    if not isinstance(inner.func, ast.Attribute):
+        return False
+    receiver = inner.func.value
+    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
+        return False
+
+    kind = tracking["containers"].get(receiver.id)
+    method = inner.func.attr
+    dispatch_methods = {
+        "queue": {"get", "get_nowait"},
+        "deque": {"pop", "popleft"},
+        "list": {"pop"},
+        "userlist": {"pop"},
+        "sched": {"run"},
+    }
+    return (
+        method in dispatch_methods.get(kind, set())
+        and _sync_callback_accessor_arguments_are_valid(inner, kind, method)
+    )
+
+
 def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     """Return True only for proven synchronous execution of a mutating callback."""
     expr = _statement_value_expression(node)
     if not isinstance(expr, ast.Call):
         return False
     if _sync_callback_sched_run_mutates(expr, tracking):
+        return True
+    if (
+        isinstance(expr.func, ast.Name)
+        and expr.func.id in tracking["mutating_callback_names"]
+    ):
+        # A name read out of a mutating container holds that container's
+        # callback, so invoking it executes the proven mutation; the callback's
+        # own parameters do not affect whether it mutates.
         return True
     if expr.args or expr.keywords:
         return False
@@ -15557,25 +16383,7 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     if _sync_callback_getattr_dispatch_mutates(inner, tracking, operator_bindings):
         return True
 
-    if not isinstance(inner.func, ast.Attribute):
-        return False
-    receiver = inner.func.value
-    if not isinstance(receiver, ast.Name) or receiver.id not in tracking["mutating"]:
-        return False
-
-    kind = tracking["containers"].get(receiver.id)
-    method = inner.func.attr
-    dispatch_methods = {
-        "queue": {"get", "get_nowait"},
-        "deque": {"pop", "popleft"},
-        "list": {"pop"},
-        "userlist": {"pop"},
-        "sched": {"run"},
-    }
-    return (
-        method in dispatch_methods.get(kind, set())
-        and _sync_callback_accessor_arguments_are_valid(inner, kind, method)
-    )
+    return _sync_callback_inner_accessor_dispatch_mutates(inner, tracking)
 
 
 def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
@@ -15589,6 +16397,7 @@ def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
         operator_bindings,
     )
     _record_sync_callback_assignment(node, tracking, operator_bindings)
+    _record_sync_callback_dispatch_result(node, tracking)
     _record_sync_callback_insert(node, tracking, operator_bindings)
     return dispatch_mutates
 
@@ -15600,7 +16409,7 @@ def _compound_statement_blocks(node):
         yield node.orelse
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         yield node.body
-    elif isinstance(node, ast.Try):
+    elif isinstance(node, _TRY_STATEMENT_NODES):
         yield node.body
         for handler in node.handlers:
             yield handler.body
@@ -15796,7 +16605,7 @@ def _record_imported_name_aliases(
             continue
         name = imported.asname or imported.name
         active.add(name)
-        events.setdefault(name, []).append((line, True))
+        events.setdefault(name, []).append((line, True, imported.name))
 
 
 def _record_imported_name_alias_propagation(
@@ -15820,7 +16629,15 @@ def _record_imported_name_alias_propagation(
         )
         if alias_active:
             active.add(name)
-            events.setdefault(name, []).append((line, True))
+            source_name = None
+            if isinstance(value, ast.Name):
+                source_name = _alias_event_original_name(events, value.id, line)
+            elif isinstance(value, ast.Attribute):
+                source_name = value.attr
+            if source_name:
+                events.setdefault(name, []).append((line, True, source_name))
+            else:
+                events.setdefault(name, []).append((line, True))
 
 
 def _collect_imported_name_alias_events(tree, module_name, imported_names):
@@ -15948,6 +16765,21 @@ def _collect_operator_setitem_bindings(tree):
         tree,
         'threading',
         {'Thread', 'Timer'},
+    )
+    heapq_module_alias_events = _collect_imported_module_alias_events(
+        tree,
+        'heapq',
+    )
+    heapq_ordered_callback_alias_events = _collect_imported_name_alias_events(
+        tree,
+        'heapq',
+        {'nsmallest', 'nlargest'},
+    )
+    # The binding tuple indices are fixed, so the heapq alias events travel in
+    # the metadata map exactly like the late-collected module alias events.
+    builtin_shadow_lines["heapq_module_alias_events"] = heapq_module_alias_events
+    builtin_shadow_lines["heapq_ordered_callback_alias_events"] = (
+        heapq_ordered_callback_alias_events
     )
     dict_shadow_line = _collect_definite_name_shadow_line(tree, 'dict')
     dict_update_aliases = _collect_dict_update_aliases(
@@ -16614,6 +17446,24 @@ def _class_body_global_names(node):
     )
 
 
+def _function_body_global_names(node):
+    """Return the names a function body binds to the module scope via ``global``.
+
+    ``global`` inside a function keeps binding the name into the module
+    namespace rather than into the function's locals, so an import declared
+    that way reaches Gunicorn even though the import statement itself sits in
+    a function body. Only the function's own body counts: a nested function or
+    class opens a scope of its own, so ``_function_runtime_nodes`` stops before
+    its ``global`` declarations and they are collected when the walk enters it.
+    """
+    return frozenset(
+        name
+        for child in _function_runtime_nodes(node)
+        if isinstance(child, ast.Global)
+        for name in child.names
+    )
+
+
 def _is_current_module_namespace_object(node, namespace_aliases=None):
     """Return True for a mapping/object that is this config module's namespace."""
     return _is_module_namespace_mapping(
@@ -17041,7 +17891,7 @@ def _gunicorn_hook_binding_scope(child, scope, uncalled_names):
             return scope
         return (
             False,
-            declared_globals,
+            declared_globals | _function_body_global_names(child),
             may_run and child.name not in uncalled_names,
             True,
         )
@@ -17468,6 +18318,9 @@ def _scan_gunicorn_config_worker_details(tree):
         tree,
         operator_bindings,
     )
+    future_analysis["callback_container_events"] = (
+        _collect_callback_container_events(tree)
+    )
     future_analysis["callback_method_events"] = (
         _collect_future_callback_method_alias_events(
             tree,
@@ -17629,11 +18482,13 @@ def _gunicorn_config_path_from_tokens(tokens: list[str]) -> str | None:
     i = 0
     while i < len(tokens):
         token = tokens[i]
-        if token in ("-c", "--config") and i + 1 < len(tokens):
+        # argparse accepts the unambiguous ``--conf``/``--confi`` prefixes of
+        # ``--config`` (``--con``/``--co`` stay ambiguous with --control-socket).
+        if token in ("-c", "--config", "--conf", "--confi") and i + 1 < len(tokens):
             config_path = tokens[i + 1]
             i += 2
             continue
-        if token.startswith("--config="):
+        if token.startswith(("--config=", "--conf=", "--confi=")):
             config_path = token.split("=", 1)[1]
         if token.startswith("-c") and len(token) > 2:
             # argparse gives ``-c==prod.py`` the value ``=prod.py``, so only the
