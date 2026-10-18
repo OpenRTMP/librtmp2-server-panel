@@ -11078,6 +11078,74 @@ def _getattr_constant_dunder_subscript_class_name(call, index, operator_bindings
     return None
 
 
+def _inspect_getmro_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``inspect.getmro(Class)[index]`` without evaluating the MRO tuple."""
+    if not isinstance(call, ast.Call) or len(call.args) != 1 or call.keywords:
+        return None
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
+    if not _inspect_named_call_is_active(
+        call,
+        inspect_analysis,
+        "getmro",
+        "getmro_alias_events",
+    ):
+        return None
+    if not isinstance(call.args[0], ast.Name):
+        return None
+    return _class_mro_index_class_name(
+        call.args[0].id,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
+
+
+def _object_getattribute_mro_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``object.__getattribute__(Class, '__mro__')[index]``."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return None
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    shadow_lines = class_targets[13] if class_targets and len(class_targets) > 13 else {}
+    reference_line = getattr(call, "lineno", 0)
+    if not _uses_builtin_object_getattribute(call.func, reference_line, shadow_lines):
+        return None
+    key = call.args[1]
+    if not (isinstance(key, ast.Constant) and key.value == "__mro__"):
+        return None
+    if not isinstance(call.args[0], ast.Name):
+        return None
+    return _class_mro_index_class_name(
+        call.args[0].id,
+        index,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _attrgetter_mro_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``attrgetter('__mro__')(Class)[index]``."""
+    if not isinstance(call, ast.Call) or len(call.args) != 1:
+        return None
+    factory = call.func
+    if not isinstance(factory, ast.Call) or not _is_operator_attrgetter_factory(
+        factory, operator_bindings
+    ):
+        return None
+    if _operator_attrgetter_method_name(factory) != "__mro__":
+        return None
+    if len(factory.args) != 1:
+        return None
+    class_name = _expression_resolves_class_name(call.args[0], operator_bindings)
+    if class_name is None:
+        return None
+    return _class_mro_index_class_name(
+        class_name,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
+
+
 def _mro_index_class_name_from_expression(expr, index, operator_bindings):
     """Resolve one MRO/base tuple element referenced by an arbitrary expression."""
     if index is None:
@@ -11091,6 +11159,9 @@ def _mro_index_class_name_from_expression(expr, index, operator_bindings):
             _class_mro_method_subscript_class_name,
             _type_qualified_mro_method_subscript_class_name,
             _getattr_constant_dunder_subscript_class_name,
+            _inspect_getmro_subscript_class_name,
+            _object_getattribute_mro_subscript_class_name,
+            _attrgetter_mro_subscript_class_name,
         ):
             name = resolver(expr, index, operator_bindings)
             if name is not None:
@@ -11154,6 +11225,84 @@ def _mro_getitem_call_resolves_class_name(func, operator_bindings):
     index = _subscript_constant_index(func.args[0])
     return _mro_index_class_name_from_expression(
         func.func.value, index, operator_bindings
+    )
+
+
+def _getattr_dunder_getitem_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``getattr(getattr(Class, '__mro__'), '__getitem__')(index)``."""
+    if not isinstance(func, ast.Call) or len(func.args) != 1:
+        return None
+    outer = func.func
+    if not (
+        isinstance(outer, ast.Call)
+        and isinstance(outer.func, ast.Name)
+        and outer.func.id == "getattr"
+        and len(outer.args) >= 2
+        and isinstance(outer.args[1], ast.Constant)
+        and outer.args[1].value == "__getitem__"
+    ):
+        return None
+    inner = outer.args[0]
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "getattr"
+        and len(inner.args) >= 2
+        and isinstance(inner.args[1], ast.Constant)
+        and inner.args[1].value == "__mro__"
+    ):
+        return None
+    index = _subscript_constant_index(func.args[0])
+    if not isinstance(inner.args[0], ast.Name):
+        return None
+    return _class_mro_index_class_name(
+        inner.args[0].id,
+        index,
+        operator_bindings,
+        getattr(func, "lineno", 0),
+    )
+
+
+def _methodcaller_getitem_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``methodcaller('__getitem__', index)(Class.__mro__)()``."""
+    if not isinstance(func, ast.Call):
+        return None
+    bound_call = func.func if not func.args else func
+    if not isinstance(bound_call, ast.Call) or not bound_call.args:
+        return None
+    factory = _resolve_operator_methodcaller_factory(bound_call, operator_bindings)
+    if factory is None:
+        return None
+    if _methodcaller_method_name(factory) != "__getitem__":
+        return None
+    if len(factory.args) < 2:
+        return None
+    index = _subscript_constant_index(factory.args[1])
+    return _mro_index_class_name_from_expression(
+        bound_call.args[0], index, operator_bindings
+    )
+
+
+def _lambda_mro_index_call_resolves_class_name(func, operator_bindings):
+    """Resolve ``(lambda m: m[index])(Class.__mro__)``."""
+    if not isinstance(func, ast.Call) or not isinstance(func.func, ast.Lambda):
+        return None
+    if len(func.args) != 1:
+        return None
+    lam = func.func
+    if len(lam.args.args) != 1:
+        return None
+    param = lam.args.args[0].arg
+    body = lam.body
+    if not isinstance(body, ast.Subscript):
+        return None
+    index = _subscript_constant_index(body.slice)
+    if index is None:
+        return None
+    if not (isinstance(body.value, ast.Name) and body.value.id == param):
+        return None
+    return _mro_index_class_name_from_expression(
+        func.args[0], index, operator_bindings
     )
 
 
@@ -11361,6 +11510,9 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
             _type_qualified_mro_method_subscript_class_name,
             _getattr_constant_dunder_subscript_class_name,
             _sequence_mro_method_subscript_class_name,
+            _inspect_getmro_subscript_class_name,
+            _object_getattribute_mro_subscript_class_name,
+            _attrgetter_mro_subscript_class_name,
         ):
             name = resolver(value, index, operator_bindings)
             if name is not None:
@@ -11436,6 +11588,8 @@ def _class_name_from_operator_callable(func, operator_bindings):
         _operator_getitem_call_resolves_class_name,
         _itemgetter_call_resolves_class_name,
         _mro_getitem_call_resolves_class_name,
+        _getattr_dunder_getitem_call_resolves_class_name,
+        _methodcaller_getitem_call_resolves_class_name,
     ):
         class_name = resolver(func, operator_bindings)
         if class_name is not None:
@@ -11469,6 +11623,12 @@ def _resolved_class_name_from_callable(
             return resolved
     if isinstance(func, ast.Subscript):
         return _subscript_expression_resolves_class_name(func, operator_bindings)
+    if operator_bindings is not None:
+        class_name = _lambda_mro_index_call_resolves_class_name(
+            func, operator_bindings
+        )
+        if class_name is not None:
+            return class_name
     return None
 
 
@@ -12072,7 +12232,9 @@ def _class_subscript_triggers_workers(expr, class_targets):
     )
 
 
-def _expression_triggers_class_workers_side_effect(expr, class_targets):
+def _expression_triggers_class_workers_side_effect(
+    expr, class_targets, operator_bindings=None
+):
     """Return True when attribute access or construction runs a mutating class hook."""
     constructors, methods, properties = class_targets[:3]
     descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
@@ -12083,7 +12245,7 @@ def _expression_triggers_class_workers_side_effect(expr, class_targets):
             isinstance(expr, ast.Call)
             and _call_invokes_resolved_risky_class_constructor(
                 expr,
-                None,
+                operator_bindings,
                 class_targets=class_targets,
             )
         )
@@ -12673,6 +12835,7 @@ def _lambda_mutates_workers(lambda_node, operator_bindings, invocation=None):
             class_targets,
             bound_names=bound_names,
             bound_class_aliases=_lambda_class_argument_aliases(lambda_node, invocation),
+            operator_bindings=operator_bindings,
         ):
             return True
         return _expression_mutates_workers(
@@ -13281,7 +13444,11 @@ def _statement_invokes_function(node, func_names):
 
 
 def _expression_has_class_workers_side_effect(
-    expr, class_targets, bound_names=None, bound_class_aliases=None
+    expr,
+    class_targets,
+    bound_names=None,
+    bound_class_aliases=None,
+    operator_bindings=None,
 ):
     """Recursively inspect evaluated expressions without entering lambda scopes."""
     if isinstance(expr, ast.Lambda):
@@ -13314,11 +13481,17 @@ def _expression_has_class_workers_side_effect(
             getattr(expr, "lineno", 0),
         ):
             return True
-    elif _expression_triggers_class_workers_side_effect(expr, class_targets):
+    elif _expression_triggers_class_workers_side_effect(
+        expr, class_targets, operator_bindings
+    ):
         return True
     return any(
         _expression_has_class_workers_side_effect(
-            child, class_targets, bound_names, bound_class_aliases
+            child,
+            class_targets,
+            bound_names,
+            bound_class_aliases,
+            operator_bindings,
         )
         for child in ast.iter_child_nodes(expr)
         if isinstance(child, ast.AST)
@@ -13460,7 +13633,9 @@ def _statement_hook_write_triggers_workers(node, class_targets):
     )
 
 
-def _statement_has_class_workers_side_effect(node, class_targets):
+def _statement_has_class_workers_side_effect(
+    node, class_targets, operator_bindings=None
+):
     """Return True when an evaluated statement expression invokes a risky class hook."""
     if not class_targets or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return False
@@ -13468,12 +13643,16 @@ def _statement_has_class_workers_side_effect(node, class_targets):
         return True
     if isinstance(node, (ast.With, ast.AsyncWith)):
         return any(
-            _expression_has_class_workers_side_effect(item.context_expr, class_targets)
+            _expression_has_class_workers_side_effect(
+                item.context_expr, class_targets, operator_bindings=operator_bindings
+            )
             for item in node.items
         )
     return any(
         isinstance(child, ast.expr)
-        and _expression_has_class_workers_side_effect(child, class_targets)
+        and _expression_has_class_workers_side_effect(
+            child, class_targets, operator_bindings=operator_bindings
+        )
         for child in ast.iter_child_nodes(node)
     )
 
@@ -13529,7 +13708,9 @@ def _statement_mutates_workers(
             dict_subclass_names,
             defer_annotations,
         )
-    if _statement_has_class_workers_side_effect(node, class_targets):
+    if _statement_has_class_workers_side_effect(
+        node, class_targets, operator_bindings
+    ):
         return True
     if _is_dynamic_workers_mutation(
         node,
@@ -17046,7 +17227,9 @@ def _node_has_dynamic_workers_effect(
     """Return True when one statement makes the worker value non-static."""
     if _statement_invokes_function(node, global_workers_mutators):
         return True
-    if _statement_has_class_workers_side_effect(node, class_targets):
+    if _statement_has_class_workers_side_effect(
+        node, class_targets, operator_bindings
+    ):
         return True
     if isinstance(node, ast.For) and _target_assigns_workers(node.target):
         return True
@@ -17317,7 +17500,9 @@ def _class_body_statement_has_dynamic_workers_effect(
         return True
     if _statement_invokes_function(node, global_workers_mutators):
         return True
-    if _statement_has_class_workers_side_effect(node, class_targets):
+    if _statement_has_class_workers_side_effect(
+        node, class_targets, operator_bindings
+    ):
         return True
     if _is_dynamic_workers_mutation(
         node,
@@ -18550,6 +18735,11 @@ def _scan_gunicorn_config_worker_details(tree):
             tree,
             "inspect",
             {"innerframes"},
+        ),
+        "getmro_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"getmro"},
         ),
         "traceback_module_alias_events": _collect_imported_module_alias_events(
             tree,
