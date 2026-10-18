@@ -3626,3 +3626,31 @@ def test_security_review_oct17_mro_selection_wrappers_are_dynamic(tmp_path, disp
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-18: remaining MRO constructor dispatch gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "import inspect\ninspect.getmro(Child)[1]()",
+        "object.__getattribute__(Child, '__mro__')[1]()",
+        "import operator\noperator.methodcaller('__getitem__', 1)(Child.__mro__)()",
+        "from operator import attrgetter\nattrgetter('__mro__')(Child)[1]()",
+        "getattr(getattr(Child, '__mro__'), '__getitem__')(1)()",
+        "(lambda m: m[1])(Child.__mro__)()",
+    ],
+)
+def test_security_review_oct18_mro_dispatch_gaps_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
