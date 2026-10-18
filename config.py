@@ -2281,13 +2281,21 @@ def _call_is_getattr_operator_namespace_mutation(call, operator_bindings):
     return False
 
 
-def _operator_attrgetter_method_name(factory_call):
-    """Return the method name passed to ``operator.attrgetter``, if static."""
+def _operator_attrgetter_method_name(factory_call, operator_bindings=None):
+    """Return a literal or proven string-alias attrgetter attribute name."""
     if not isinstance(factory_call, ast.Call) or not factory_call.args:
         return None
     method = factory_call.args[0]
     if isinstance(method, ast.Constant) and isinstance(method.value, str):
         return method.value
+    if not isinstance(method, ast.Name) or not operator_bindings:
+        return None
+    metadata = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    events = metadata.get("literal_string_value_events", {}).get(method.id, [])
+    reference_line = getattr(factory_call, "lineno", 0)
+    for event_line, value in reversed(events):
+        if event_line <= reference_line:
+            return value
     return None
 
 
@@ -2299,7 +2307,13 @@ def _is_operator_getter_factory(call, operator_bindings, getter_name):
     )
     func = call.func
     if isinstance(func, ast.Name):
-        return func.id in getter_aliases
+        if func.id in getter_aliases:
+            return True
+        metadata = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+        events = metadata.get("attrgetter_factory_alias_events", {})
+        return getter_name == "attrgetter" and _imported_alias_is_active(
+            events, func.id, getattr(call, "lineno", 0)
+        )
     if isinstance(func, ast.Attribute) and func.attr == getter_name:
         return isinstance(func.value, ast.Name) and func.value.id in module_aliases
     if not isinstance(func, ast.Call):
@@ -10902,6 +10916,8 @@ def _deque_subscript_class_name(call, index, operator_bindings):
 
 def _class_mro_index_class_name(class_name, index, operator_bindings, reference_line=0):
     """Resolve a class name from a static MRO index without running config code."""
+    if type(index) is not int:
+        return None
     class_targets = _operator_bindings_class_targets(operator_bindings)
     if not class_targets:
         return None
@@ -11110,10 +11126,18 @@ def _object_getattribute_mro_subscript_class_name(call, index, operator_bindings
     if not _uses_builtin_object_getattribute(call.func, reference_line, shadow_lines):
         return None
     key = call.args[1]
-    if not (isinstance(key, ast.Constant) and key.value == "__mro__"):
+    if not (
+        isinstance(key, ast.Constant)
+        and key.value in {"__mro__", "__bases__"}
+    ):
         return None
     if not isinstance(call.args[0], ast.Name):
         return None
+    if key.value == "__bases__":
+        fake = ast.Attribute(
+            value=call.args[0], attr="__bases__", ctx=ast.Load()
+        )
+        return _bases_subscript_class_name(fake, index, operator_bindings)
     return _class_mro_index_class_name(
         call.args[0].id,
         index,
@@ -11131,7 +11155,7 @@ def _attrgetter_mro_subscript_class_name(call, index, operator_bindings):
         factory, operator_bindings
     ):
         return None
-    if _operator_attrgetter_method_name(factory) != "__mro__":
+    if _operator_attrgetter_method_name(factory, operator_bindings) != "__mro__":
         return None
     if len(factory.args) != 1:
         return None
@@ -11252,8 +11276,17 @@ def _getattr_dunder_getitem_call_resolves_class_name(func, operator_bindings):
         and inner.args[1].value == "__mro__"
     ):
         return None
+    reference_line = getattr(func, "lineno", 0)
+    metadata = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+    if not (
+        _name_is_unshadowed_builtin("getattr", reference_line, metadata)
+        and _name_is_unshadowed_builtin(
+            "getattr", getattr(inner, "lineno", reference_line), metadata
+        )
+    ):
+        return None
     index = _subscript_constant_index(func.args[0])
-    if not isinstance(inner.args[0], ast.Name):
+    if index is None or not isinstance(inner.args[0], ast.Name):
         return None
     return _class_mro_index_class_name(
         inner.args[0].id,
@@ -11284,25 +11317,61 @@ def _methodcaller_getitem_call_resolves_class_name(func, operator_bindings):
 
 
 def _lambda_mro_index_call_resolves_class_name(func, operator_bindings):
-    """Resolve ``(lambda m: m[index])(Class.__mro__)``."""
+    """Resolve a lambda MRO selection with positional/keyword parameter binding."""
     if not isinstance(func, ast.Call) or not isinstance(func.func, ast.Lambda):
         return None
-    if len(func.args) != 1:
-        return None
     lam = func.func
-    if len(lam.args.args) != 1:
-        return None
-    param = lam.args.args[0].arg
     body = lam.body
-    if not isinstance(body, ast.Subscript):
+    if not isinstance(body, ast.Subscript) or not isinstance(body.value, ast.Name):
         return None
     index = _subscript_constant_index(body.slice)
     if index is None:
         return None
-    if not (isinstance(body.value, ast.Name) and body.value.id == param):
+    param = body.value.id
+    positional = [arg.arg for arg in (*lam.args.posonlyargs, *lam.args.args)]
+    keyword_only = [arg.arg for arg in lam.args.kwonlyargs]
+    # Refuse indeterminate bindings and calls that cannot satisfy required args.
+    if any(kw.arg is None for kw in func.keywords):
+        return None
+    keywords = {kw.arg: kw.value for kw in func.keywords}
+    if len(keywords) != len(func.keywords):
+        return None
+    if len(func.args) > len(positional) and lam.args.vararg is None:
+        return None
+    for arg in positional[:len(func.args)]:
+        if arg in keywords:
+            return None
+    positional_required = len(positional) - len(lam.args.defaults)
+    if any(
+        i >= len(func.args) and arg not in keywords
+        for i, arg in enumerate(positional[:positional_required])
+    ):
+        return None
+    if any(
+        arg.arg not in keywords and default is None
+        for arg, default in zip(lam.args.kwonlyargs, lam.args.kw_defaults)
+    ):
+        return None
+    if any(
+        key not in positional[len(lam.args.posonlyargs):] + keyword_only
+        and (lam.args.kwarg is None or key != lam.args.kwarg.arg)
+        for key in keywords
+    ) and lam.args.kwarg is None:
+        return None
+    if param in positional:
+        pos = positional.index(param)
+        if pos < len(func.args):
+            source = func.args[pos]
+        elif pos >= len(lam.args.posonlyargs) and param in keywords:
+            source = keywords[param]
+        else:
+            return None
+    elif param in keyword_only and param in keywords:
+        source = keywords[param]
+    else:
         return None
     return _mro_index_class_name_from_expression(
-        func.args[0], index, operator_bindings
+        source, index, operator_bindings
     )
 
 
@@ -11438,25 +11507,69 @@ def _expression_uses_dynamic_class_introspection(expr):
     return _container_wrapper_uses_dynamic_class_introspection(expr)
 
 
-def _subscript_uses_dynamic_class_introspection(sub):
+def _subscript_uses_dynamic_class_introspection(sub, operator_bindings=None):
     """Identify indexed runtime class lookups that cannot be resolved safely."""
     if not isinstance(sub, ast.Subscript):
         return False
     value = sub.value
     if isinstance(value, ast.Attribute) and value.attr in {"__mro__", "__bases__"}:
-        return not isinstance(sub.slice, ast.Constant)
+        return _subscript_constant_index(sub.slice) is None
     if _is_class_mro_method_call(value):
         return False
+    if (
+        _subscript_constant_index(sub.slice) is None
+        and isinstance(value, ast.Call)
+        and _inspect_named_call_is_active(
+            value,
+            _inspect_analysis_from_bindings(operator_bindings),
+            "getmro",
+            "getmro_alias_events",
+        )
+        and len(value.args) == 1
+        and isinstance(value.args[0], ast.Name)
+    ):
+        return True
     return _expression_uses_dynamic_class_introspection(value)
 
 
-def _call_uses_dynamic_class_introspection(call):
+def _call_uses_dynamic_class_introspection(call, operator_bindings=None):
     """Conservatively reject constructors selected by runtime class metadata."""
-    return any(
-        _subscript_uses_dynamic_class_introspection(node)
+    if any(
+        _subscript_uses_dynamic_class_introspection(node, operator_bindings)
         for node in ast.walk(call.func)
         if isinstance(node, ast.Subscript)
-    )
+    ):
+        return True
+    # The nested-getattr MRO selector is dynamic when its index is not literal.
+    func = call.func
+    if (
+        isinstance(func, ast.Call)
+        and len(func.args) == 1
+        and _subscript_constant_index(func.args[0]) is None
+        and isinstance(func.func, ast.Call)
+        and isinstance(func.func.func, ast.Name)
+        and func.func.func.id == "getattr"
+        and len(func.func.args) >= 2
+        and isinstance(func.func.args[1], ast.Constant)
+        and func.func.args[1].value == "__getitem__"
+    ):
+        inner = func.func.args[0]
+        if (
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "getattr"
+            and len(inner.args) >= 2
+            and isinstance(inner.args[0], ast.Name)
+            and isinstance(inner.args[1], ast.Constant)
+            and inner.args[1].value == "__mro__"
+        ):
+            metadata = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+            return _name_is_unshadowed_builtin(
+                "getattr", getattr(func, "lineno", 0), metadata
+            ) and _name_is_unshadowed_builtin(
+                "getattr", getattr(inner, "lineno", 0), metadata
+            )
+    return False
 
 
 def _expression_resolves_class_name(expr, operator_bindings=None):
@@ -11710,7 +11823,7 @@ def _call_invokes_resolved_risky_class_constructor(
     """Inspect resolved callable's own __call__ before constructor fallback."""
     if not isinstance(call, ast.Call):
         return False
-    if _call_uses_dynamic_class_introspection(call):
+    if _call_uses_dynamic_class_introspection(call, operator_bindings):
         return True
     if class_targets is None:
         class_targets = _operator_bindings_class_targets(operator_bindings)
@@ -16941,10 +17054,12 @@ def _invalidate_imported_module_aliases(node, active, events, line):
 
 
 def _collect_imported_module_alias_events(tree, module_name):
-    """Track unconditional module import aliases and later rebindings."""
+    """Track module-scope imports, including executed compound statement bodies."""
     events = {}
     active = set()
-    for node in tree.body:
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
         line = getattr(node, 'lineno', 0)
         _record_imported_module_aliases(
             node,
@@ -17011,12 +17126,14 @@ def _record_imported_name_alias_propagation(
 
 
 def _collect_imported_name_alias_events(tree, module_name, imported_names):
-    """Track selected direct-import aliases and later top-level rebindings."""
+    """Track import-time aliases in module and compound statement bodies."""
     events = {}
     active = set()
     module_aliases = set()
     module_events = {}
-    for node in tree.body:
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
         line = getattr(node, "lineno", 0)
         _record_imported_module_aliases(
             node,
@@ -17073,6 +17190,34 @@ def _collect_literal_string_alias_events(tree):
                 events.setdefault(name, []).append((line, True))
             else:
                 _deactivate_imported_module_alias(name, active, events, line)
+    return events
+
+
+def _collect_literal_string_value_events(tree):
+    """Retain actual string values for import-time literal alias lookups."""
+    events = {}
+    active = {}
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            values = [(node.name, None)]
+        else:
+            values = _namespace_assignment_values(node)
+        for name, value in values:
+            resolved = (
+                value.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                else active.get(value.id)
+                if isinstance(value, ast.Name)
+                else None
+            )
+            if resolved is None:
+                active.pop(name, None)
+            else:
+                active[name] = resolved
+            events.setdefault(name, []).append((line, resolved))
     return events
 
 
@@ -17147,6 +17292,12 @@ def _collect_operator_setitem_bindings(tree):
     )
     # The binding tuple indices are fixed, so the heapq alias events travel in
     # the metadata map exactly like the late-collected module alias events.
+    builtin_shadow_lines["attrgetter_factory_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "operator", {"attrgetter"})
+    )
+    builtin_shadow_lines["literal_string_value_events"] = (
+        _collect_literal_string_value_events(tree)
+    )
     builtin_shadow_lines["heapq_module_alias_events"] = heapq_module_alias_events
     builtin_shadow_lines["heapq_ordered_callback_alias_events"] = (
         heapq_ordered_callback_alias_events
