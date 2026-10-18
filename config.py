@@ -2299,33 +2299,56 @@ def _operator_attrgetter_method_name(factory_call, operator_bindings=None):
     return None
 
 
-def _is_operator_getter_factory(call, operator_bindings, getter_name):
-    """Recognize imported and qualified operator getter factories."""
-    module_aliases = operator_bindings[0] if operator_bindings else set()
+def _operator_getter_name_is_active(name, operator_bindings, getter_name, line):
+    """Resolve direct and proven assignment aliases of operator getters."""
     getter_aliases = (
-        operator_bindings[11] if operator_bindings and len(operator_bindings) > 11 else set()
+        operator_bindings[11]
+        if operator_bindings and len(operator_bindings) > 11
+        else set()
     )
-    func = call.func
-    if isinstance(func, ast.Name):
-        if func.id in getter_aliases:
-            return True
-        metadata = operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
-        events = metadata.get("attrgetter_factory_alias_events", {})
-        return getter_name == "attrgetter" and _imported_alias_is_active(
-            events, func.id, getattr(call, "lineno", 0)
-        )
-    if isinstance(func, ast.Attribute) and func.attr == getter_name:
-        return isinstance(func.value, ast.Name) and func.value.id in module_aliases
-    if not isinstance(func, ast.Call):
+    if name in getter_aliases:
+        return True
+    if getter_name != "attrgetter":
         return False
+    metadata = (
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
+    )
+    events = metadata.get("attrgetter_factory_alias_events", {})
+    return _imported_alias_is_active(events, name, line)
+
+
+def _operator_getter_from_getattr(func, module_aliases, getter_name):
+    """Resolve a module-qualified getter obtained through builtin getattr."""
     if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
         return False
     if len(func.args) < 2:
         return False
-    if not isinstance(func.args[0], ast.Name) or func.args[0].id not in module_aliases:
+    receiver = func.args[0]
+    if not isinstance(receiver, ast.Name) or receiver.id not in module_aliases:
         return False
     attr = func.args[1]
     return isinstance(attr, ast.Constant) and attr.value == getter_name
+
+
+def _is_operator_getter_factory(call, operator_bindings, getter_name):
+    """Recognize imported and qualified operator getter factories."""
+    module_aliases = operator_bindings[0] if operator_bindings else set()
+    func = call.func
+    if isinstance(func, ast.Name):
+        return _operator_getter_name_is_active(
+            func.id, operator_bindings, getter_name, getattr(call, "lineno", 0)
+        )
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr == getter_name
+            and isinstance(func.value, ast.Name)
+            and func.value.id in module_aliases
+        )
+    if isinstance(func, ast.Call):
+        return _operator_getter_from_getattr(func, module_aliases, getter_name)
+    return False
 
 
 def _is_operator_attrgetter_factory(call, operator_bindings):
@@ -11316,6 +11339,58 @@ def _methodcaller_getitem_call_resolves_class_name(func, operator_bindings):
     )
 
 
+def _lambda_mro_keywords(call):
+    """Map explicit lambda keyword arguments without evaluating unpacking."""
+    if any(keyword.arg is None for keyword in call.keywords):
+        return None
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    return keywords if len(keywords) == len(call.keywords) else None
+
+
+def _lambda_mro_required_args_are_bound(lam, call, positional, keywords):
+    """Check required positional and keyword-only lambda parameters."""
+    required = len(positional) - len(lam.args.defaults)
+    positional_bound = all(
+        index < len(call.args) or name in keywords
+        for index, name in enumerate(positional[:required])
+    )
+    keyword_only_bound = all(
+        argument.arg in keywords or default is not None
+        for argument, default in zip(lam.args.kwonlyargs, lam.args.kw_defaults)
+    )
+    return positional_bound and keyword_only_bound
+
+
+def _lambda_mro_signature_is_valid(lam, call, positional, keywords):
+    """Reject invalid lambda argument combinations before resolving a receiver."""
+    if len(call.args) > len(positional) and lam.args.vararg is None:
+        return False
+    if any(name in keywords for name in positional[:len(call.args)]):
+        return False
+    if not _lambda_mro_required_args_are_bound(lam, call, positional, keywords):
+        return False
+    if lam.args.kwarg is None:
+        named_positional = positional[len(lam.args.posonlyargs):]
+        keyword_only = [argument.arg for argument in lam.args.kwonlyargs]
+        if any(name not in named_positional + keyword_only for name in keywords):
+            return False
+    return True
+
+
+def _lambda_mro_argument_source(param, lam, call, positional, keywords):
+    """Return the exact call argument bound to the MRO-index lambda parameter."""
+    if param in positional:
+        index = positional.index(param)
+        if index < len(call.args):
+            return call.args[index]
+        if index >= len(lam.args.posonlyargs):
+            return keywords.get(param)
+        return None
+    if any(argument.arg == param for argument in lam.args.kwonlyargs):
+        return keywords.get(param)
+    return None
+
+
 def _lambda_mro_index_call_resolves_class_name(func, operator_bindings):
     """Resolve a lambda MRO selection with positional/keyword parameter binding."""
     if not isinstance(func, ast.Call) or not isinstance(func.func, ast.Lambda):
@@ -11327,48 +11402,16 @@ def _lambda_mro_index_call_resolves_class_name(func, operator_bindings):
     index = _subscript_constant_index(body.slice)
     if index is None:
         return None
-    param = body.value.id
-    positional = [arg.arg for arg in (*lam.args.posonlyargs, *lam.args.args)]
-    keyword_only = [arg.arg for arg in lam.args.kwonlyargs]
-    # Refuse indeterminate bindings and calls that cannot satisfy required args.
-    if any(kw.arg is None for kw in func.keywords):
+    keywords = _lambda_mro_keywords(func)
+    if keywords is None:
         return None
-    keywords = {kw.arg: kw.value for kw in func.keywords}
-    if len(keywords) != len(func.keywords):
+    positional = [argument.arg for argument in (*lam.args.posonlyargs, *lam.args.args)]
+    if not _lambda_mro_signature_is_valid(lam, func, positional, keywords):
         return None
-    if len(func.args) > len(positional) and lam.args.vararg is None:
-        return None
-    for arg in positional[:len(func.args)]:
-        if arg in keywords:
-            return None
-    positional_required = len(positional) - len(lam.args.defaults)
-    if any(
-        i >= len(func.args) and arg not in keywords
-        for i, arg in enumerate(positional[:positional_required])
-    ):
-        return None
-    if any(
-        arg.arg not in keywords and default is None
-        for arg, default in zip(lam.args.kwonlyargs, lam.args.kw_defaults)
-    ):
-        return None
-    if any(
-        key not in positional[len(lam.args.posonlyargs):] + keyword_only
-        and (lam.args.kwarg is None or key != lam.args.kwarg.arg)
-        for key in keywords
-    ) and lam.args.kwarg is None:
-        return None
-    if param in positional:
-        pos = positional.index(param)
-        if pos < len(func.args):
-            source = func.args[pos]
-        elif pos >= len(lam.args.posonlyargs) and param in keywords:
-            source = keywords[param]
-        else:
-            return None
-    elif param in keyword_only and param in keywords:
-        source = keywords[param]
-    else:
+    source = _lambda_mro_argument_source(
+        body.value.id, lam, func, positional, keywords
+    )
+    if source is None:
         return None
     return _mro_index_class_name_from_expression(
         source, index, operator_bindings
@@ -17193,6 +17236,22 @@ def _collect_literal_string_alias_events(tree):
     return events
 
 
+def _literal_string_value_for_assignment(value, active):
+    """Resolve literal values or aliases, without evaluating config code."""
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return value.value
+    if isinstance(value, ast.Name):
+        return active.get(value.id)
+    return None
+
+
+def _literal_string_value_assignments(node):
+    """Include definitions as shadowing events alongside ordinary assignments."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [(node.name, None)]
+    return _namespace_assignment_values(node)
+
+
 def _collect_literal_string_value_events(tree):
     """Retain actual string values for import-time literal alias lookups."""
     events = {}
@@ -17201,18 +17260,8 @@ def _collect_literal_string_value_events(tree):
         if not isinstance(node, ast.stmt):
             continue
         line = getattr(node, "lineno", 0)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            values = [(node.name, None)]
-        else:
-            values = _namespace_assignment_values(node)
-        for name, value in values:
-            resolved = (
-                value.value
-                if isinstance(value, ast.Constant) and isinstance(value.value, str)
-                else active.get(value.id)
-                if isinstance(value, ast.Name)
-                else None
-            )
+        for name, value in _literal_string_value_assignments(node):
+            resolved = _literal_string_value_for_assignment(value, active)
             if resolved is None:
                 active.pop(name, None)
             else:
