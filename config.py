@@ -2752,6 +2752,48 @@ def _collect_definite_name_shadow_line(tree, name):
 
 
 
+def _module_scope_builtin_binding_shadowed(node, name, module_events, line):
+    """Return a builtin name's binding state, or None if unchanged."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return True if node.name == name else None
+    if isinstance(node, ast.ImportFrom):
+        for item in node.names:
+            if (item.asname or item.name) == name:
+                return not (node.module == "builtins" and item.name == name)
+    if isinstance(node, ast.Import):
+        for item in node.names:
+            if (item.asname or item.name.split(".")[0]) == name:
+                return True
+    for bound, value in _namespace_assignment_values(node):
+        if bound != name:
+            continue
+        restored = (
+            isinstance(value, ast.Attribute)
+            and value.attr == name
+            and _module_alias_active_at_line(
+                value.value, set(), module_events, line
+            )
+        )
+        return not restored
+    return None
+
+
+def _collect_module_scope_builtin_shadow_events(tree, name):
+    """Track rebinding in import-time blocks without visiting function bodies."""
+    module_events = _collect_imported_module_alias_events(tree, "builtins")
+    events = []
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        line = getattr(node, "lineno", 0)
+        shadowed = _module_scope_builtin_binding_shadowed(
+            node, name, module_events, line
+        )
+        if shadowed is not None:
+            events.append((line, shadowed))
+    return events
+
+
 def _is_builtins_reference(node, builtins_aliases=None):
     """Return True for the interpreter-provided ``__builtins__`` mapping."""
     if not isinstance(node, ast.Name) or node.id != "__builtins__":
@@ -18855,6 +18897,12 @@ def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    for builtin_name in ("type", "__import__"):
+        shadow_events = _collect_module_scope_builtin_shadow_events(
+            tree, builtin_name
+        )
+        if shadow_events:
+            operator_bindings[32][builtin_name] = shadow_events
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(
         tree, namespace_aliases, operator_bindings
