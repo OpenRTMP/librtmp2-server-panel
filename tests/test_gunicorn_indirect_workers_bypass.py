@@ -3748,3 +3748,30 @@ def test_codex_pr394_shadowed_builtins_stay_static(tmp_path, dispatch):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class Facade:\n"
+        "    @staticmethod\n"
+        "    def mro(cls):\n        return (cls, Safe)\n"
+        "if True:\n    type = Facade\n"
+        "type.mro(Child)[1]()",
+        "class Facade:\n"
+        "    @staticmethod\n"
+        "    def getattr(cls, name):\n        return (cls, Safe)\n"
+        "if True:\n"
+        "    def __import__(name):\n        return Facade\n"
+        "__import__('builtins').getattr(Child, '__mro__')[1]()",
+    ],
+)
+def test_codex_pr394_compound_shadowed_builtins_stay_static(tmp_path, source):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + source + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
