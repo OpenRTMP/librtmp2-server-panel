@@ -2561,6 +2561,29 @@ def _update_builtins_getattr_assignment_aliases(node, aliases, builtins_aliases)
             aliases.discard(name)
 
 
+def _track_getattr_alias_binding(name, active, aliases, events, line):
+    """Record a positive binding or invalidate a previously tracked alias."""
+    if active:
+        aliases.add(name)
+        events.setdefault(name, []).append((line, True))
+    elif name in aliases or name in events:
+        aliases.discard(name)
+        events.setdefault(name, []).append((line, False))
+
+
+def _assignment_resolves_builtin_getattr(
+    value, aliases, builtins_aliases, builtins_events, shadows, line
+):
+    """Check direct aliases and proven builtin getattr expressions."""
+    if value is None:
+        return False
+    if isinstance(value, ast.Name) and value.id in aliases:
+        return True
+    return _value_yields_getattr_resolver(
+        value, builtins_aliases, builtins_events, shadows, line
+    )
+
+
 def _collect_builtins_getattr_alias_events(
     tree, builtins_aliases, builtins_alias_events=None, shadow_lines=None
 ):
@@ -2572,35 +2595,17 @@ def _collect_builtins_getattr_alias_events(
             continue
         line = getattr(node, "lineno", 0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name in aliases or node.name in events:
-                aliases.discard(node.name)
-                events.setdefault(node.name, []).append((line, False))
+            _track_getattr_alias_binding(node.name, False, aliases, events, line)
             continue
         for name in _builtins_getattr_import_aliases(node):
-            aliases.add(name)
-            events.setdefault(name, []).append((line, True))
+            _track_getattr_alias_binding(name, True, aliases, events, line)
         for name, value in _namespace_assignment_values(node):
-            active = bool(
-                value is not None
-                and (
-                    (isinstance(value, ast.Name) and value.id in aliases)
-                    or _value_yields_getattr_resolver(
-                        value,
-                        builtins_aliases,
-                        builtins_alias_events,
-                        shadow_lines,
-                        line,
-                    )
-                )
+            active = _assignment_resolves_builtin_getattr(
+                value, aliases, builtins_aliases,
+                builtins_alias_events, shadow_lines, line
             )
-            if active:
-                aliases.add(name)
-                events.setdefault(name, []).append((line, True))
-            elif name in aliases or name in events:
-                aliases.discard(name)
-                events.setdefault(name, []).append((line, False))
+            _track_getattr_alias_binding(name, active, aliases, events, line)
     return events
-
 
 def _value_yields_exec_eval_resolver(value, builtins_aliases):
     """Return True when a value resolves to builtin exec/eval at call time."""
@@ -2752,10 +2757,8 @@ def _collect_definite_name_shadow_line(tree, name):
 
 
 
-def _module_scope_builtin_binding_shadowed(node, name, module_events, line):
-    """Return a builtin name's binding state, or None if unchanged."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return True if node.name == name else None
+def _import_rebinds_builtin_name(node, name):
+    """Describe an import rebinding of a builtin, if any."""
     if isinstance(node, ast.ImportFrom):
         for item in node.names:
             if (item.asname or item.name) == name:
@@ -2764,19 +2767,27 @@ def _module_scope_builtin_binding_shadowed(node, name, module_events, line):
         for item in node.names:
             if (item.asname or item.name.split(".")[0]) == name:
                 return True
-    for bound, value in _namespace_assignment_values(node):
-        if bound != name:
-            continue
-        restored = (
-            isinstance(value, ast.Attribute)
-            and value.attr == name
-            and _module_alias_active_at_line(
-                value.value, set(), module_events, line
-            )
-        )
-        return not restored
     return None
 
+
+def _module_scope_builtin_binding_shadowed(node, name, module_events, line):
+    """Return a builtin name's binding state, or None if unchanged."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return True if node.name == name else None
+    import_shadow = _import_rebinds_builtin_name(node, name)
+    if import_shadow is not None:
+        return import_shadow
+    for bound, value in _namespace_assignment_values(node):
+        if bound == name:
+            restored = (
+                isinstance(value, ast.Attribute)
+                and value.attr == name
+                and _module_alias_active_at_line(
+                    value.value, set(), module_events, line
+                )
+            )
+            return not restored
+    return None
 
 def _collect_module_scope_builtin_shadow_events(tree, name):
     """Track rebinding in import-time blocks without visiting function bodies."""
