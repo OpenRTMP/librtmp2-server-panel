@@ -3654,3 +3654,34 @@ def test_security_review_oct18_mro_dispatch_gaps_are_dynamic(tmp_path, dispatch)
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-19: builtins getattr and unbound type.mro MRO dispatch gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "import builtins\nbuiltins.getattr(Child, '__mro__')[1]()",
+        "import builtins as b\nb.getattr(Child, '__mro__')[1]()",
+        "from builtins import getattr as bg\nbg(Child, '__mro__')[1]()",
+        "__import__('builtins').getattr(Child, '__mro__')[1]()",
+        "import importlib\nimportlib.import_module('builtins').getattr(Child, '__mro__')[1]()",
+        "import sys\nsys.modules['builtins'].getattr(Child, '__mro__')[1]()",
+        "type.mro(Child)[1]()",
+    ],
+)
+def test_security_review_oct19_builtins_getattr_and_type_mro_are_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
