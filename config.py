@@ -2492,6 +2492,121 @@ def _builtins_exec_eval_import_aliases(node):
     }
 
 
+def _builtins_getattr_import_aliases(node):
+    """Return direct getattr names imported from builtins by one statement."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "builtins":
+        return set()
+    return {
+        imported.asname or imported.name
+        for imported in node.names
+        if imported.name == "getattr"
+    }
+
+
+def _getattr_builtins_module_is_active(
+    node, aliases, alias_events, shadow_lines, reference_line
+):
+    """Require an unshadowed importer and a live builtins module binding."""
+    if _is_builtins_import(node) and not _name_is_unshadowed_builtin(
+        "__import__", reference_line, shadow_lines
+    ):
+        return False
+    return _builtins_module_is_active_at_line(
+        node, aliases, alias_events, reference_line
+    )
+
+
+def _value_yields_getattr_resolver(
+    value,
+    builtins_aliases,
+    builtins_alias_events=None,
+    shadow_lines=None,
+    reference_line=0,
+):
+    """Return True only for a proven builtin getattr at the assignment line."""
+    module_is_active = lambda node: _getattr_builtins_module_is_active(
+        node,
+        builtins_aliases,
+        builtins_alias_events,
+        shadow_lines,
+        reference_line,
+    )
+    if isinstance(value, ast.Attribute):
+        return value.attr == "getattr" and module_is_active(value.value)
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "getattr"
+        and _name_is_unshadowed_builtin(
+            "getattr", reference_line, shadow_lines
+        )
+        and len(value.args) >= 2
+        and module_is_active(value.args[0])
+        and isinstance(value.args[1], ast.Constant)
+        and value.args[1].value == "getattr"
+    )
+
+
+def _update_builtins_getattr_assignment_aliases(node, aliases, builtins_aliases):
+    """Update direct getattr aliases for assignments in one statement."""
+    for name, value in _namespace_assignment_values(node):
+        if value is None:
+            aliases.discard(name)
+            continue
+        if isinstance(value, ast.Name) and value.id in aliases:
+            aliases.add(name)
+        elif _value_yields_getattr_resolver(value, builtins_aliases):
+            aliases.add(name)
+        else:
+            aliases.discard(name)
+
+
+def _track_getattr_alias_binding(name, active, aliases, events, line):
+    """Record a positive binding or invalidate a previously tracked alias."""
+    if active:
+        aliases.add(name)
+        events.setdefault(name, []).append((line, True))
+    elif name in aliases or name in events:
+        aliases.discard(name)
+        events.setdefault(name, []).append((line, False))
+
+
+def _assignment_resolves_builtin_getattr(
+    value, aliases, builtins_aliases, builtins_events, shadows, line
+):
+    """Check direct aliases and proven builtin getattr expressions."""
+    if value is None:
+        return False
+    if isinstance(value, ast.Name) and value.id in aliases:
+        return True
+    return _value_yields_getattr_resolver(
+        value, builtins_aliases, builtins_events, shadows, line
+    )
+
+
+def _collect_builtins_getattr_alias_events(
+    tree, builtins_aliases, builtins_alias_events=None, shadow_lines=None
+):
+    """Track source-ordered getattr aliases in module-level compound blocks."""
+    aliases = set()
+    events = {}
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _track_getattr_alias_binding(node.name, False, aliases, events, line)
+            continue
+        for name in _builtins_getattr_import_aliases(node):
+            _track_getattr_alias_binding(name, True, aliases, events, line)
+        for name, value in _namespace_assignment_values(node):
+            active = _assignment_resolves_builtin_getattr(
+                value, aliases, builtins_aliases,
+                builtins_alias_events, shadow_lines, line
+            )
+            _track_getattr_alias_binding(name, active, aliases, events, line)
+    return events
+
 def _value_yields_exec_eval_resolver(value, builtins_aliases):
     """Return True when a value resolves to builtin exec/eval at call time."""
     if _getattr_is_dynamic_exec_eval(value, builtins_aliases):
@@ -2640,6 +2755,54 @@ def _collect_definite_name_shadow_line(tree, name):
         return events[0][0]
     return events
 
+
+
+def _import_rebinds_builtin_name(node, name):
+    """Describe an import rebinding of a builtin, if any."""
+    if isinstance(node, ast.ImportFrom):
+        for item in node.names:
+            if (item.asname or item.name) == name:
+                return not (node.module == "builtins" and item.name == name)
+    if isinstance(node, ast.Import):
+        for item in node.names:
+            if (item.asname or item.name.split(".")[0]) == name:
+                return True
+    return None
+
+
+def _module_scope_builtin_binding_shadowed(node, name, module_events, line):
+    """Return a builtin name's binding state, or None if unchanged."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return True if node.name == name else None
+    import_shadow = _import_rebinds_builtin_name(node, name)
+    if import_shadow is not None:
+        return import_shadow
+    for bound, value in _namespace_assignment_values(node):
+        if bound == name:
+            restored = (
+                isinstance(value, ast.Attribute)
+                and value.attr == name
+                and _module_alias_active_at_line(
+                    value.value, set(), module_events, line
+                )
+            )
+            return not restored
+    return None
+
+def _collect_module_scope_builtin_shadow_events(tree, name):
+    """Track rebinding in import-time blocks without visiting function bodies."""
+    module_events = _collect_imported_module_alias_events(tree, "builtins")
+    events = []
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        line = getattr(node, "lineno", 0)
+        shadowed = _module_scope_builtin_binding_shadowed(
+            node, name, module_events, line
+        )
+        if shadowed is not None:
+            events.append((line, shadowed))
+    return events
 
 
 def _is_builtins_reference(node, builtins_aliases=None):
@@ -11087,12 +11250,150 @@ def _type_qualified_mro_method_subscript_class_name(call, index, operator_bindin
     )
 
 
+def _is_unbound_type_mro_call(call):
+    """Return True for ``type.mro(Class)``."""
+    return (
+        isinstance(call, ast.Call)
+        and not call.keywords
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Name)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "mro"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "type"
+    )
+
+
+def _unbound_type_mro_subscript_class_name(call, index, operator_bindings):
+    """Resolve ``type.mro(Class)[index]`` only for the builtin type."""
+    if not _is_unbound_type_mro_call(call):
+        return None
+    metadata = (
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
+    )
+    if not _name_is_unshadowed_builtin(
+        "type", getattr(call, "lineno", 0), metadata
+    ):
+        return None
+    return _class_mro_index_class_name(
+        call.args[0].id,
+        index,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    )
+
+
+def _named_call_uses_proven_getattr_resolver(func, reference_line, metadata):
+    """Recognize unshadowed builtin getattr and its tracked direct aliases."""
+    if func.id == "getattr" and _name_is_unshadowed_builtin(
+        "getattr", reference_line, metadata
+    ):
+        return True
+    alias_events = metadata.get("builtins_getattr_alias_events", {})
+    return bool(
+        alias_events
+        and _module_alias_active_at_line(
+            func, set(), alias_events, reference_line
+        )
+    )
+
+
+def _call_imports_builtins_module(value, reference_line, operator_bindings):
+    """Recognize a proven importlib import of the builtins module."""
+    if not isinstance(value, ast.Call) or not value.args:
+        return False
+    importlib_aliases = (
+        operator_bindings[16]
+        if operator_bindings and len(operator_bindings) > 16
+        else set()
+    )
+    importlib_alias_events = (
+        operator_bindings[19]
+        if operator_bindings and len(operator_bindings) > 19
+        else {}
+    )
+    importlib_module_aliases = (
+        operator_bindings[24]
+        if operator_bindings and len(operator_bindings) > 24
+        else set()
+    )
+    importlib_module_alias_events = (
+        operator_bindings[29]
+        if operator_bindings and len(operator_bindings) > 29
+        else {}
+    )
+    if not _call_uses_importlib_import_module(
+        value,
+        importlib_aliases,
+        importlib_alias_events,
+        importlib_module_aliases,
+        importlib_module_alias_events,
+        reference_line,
+    ):
+        return False
+    module_name = value.args[0]
+    return isinstance(module_name, ast.Constant) and module_name.value == "builtins"
+
+
+def _qualified_call_uses_proven_getattr_resolver(
+    func, reference_line, operator_bindings, metadata
+):
+    """Recognize getattr reached through a proven builtins module reference."""
+    if not isinstance(func, ast.Attribute) or func.attr != "getattr":
+        return False
+    builtins_aliases = (
+        operator_bindings[8]
+        if operator_bindings and len(operator_bindings) > 8
+        else set()
+    )
+    if _getattr_builtins_module_is_active(
+        func.value,
+        builtins_aliases,
+        metadata.get("builtins_module_alias_events", {}),
+        metadata,
+        reference_line,
+    ):
+        return True
+    sys_aliases = (
+        operator_bindings[13]
+        if operator_bindings and len(operator_bindings) > 13
+        else set()
+    )
+    if _subscript_is_sys_modules_builtins(func.value, sys_aliases):
+        return True
+    return _call_imports_builtins_module(
+        func.value, reference_line, operator_bindings
+    )
+
+
+def _call_uses_proven_getattr_resolver(call, operator_bindings):
+    """Return True when a call site resolves to builtin ``getattr``."""
+    if not isinstance(call, ast.Call):
+        return False
+    metadata = (
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
+    )
+    if not isinstance(metadata, dict):
+        metadata = {}
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(call.func, ast.Name):
+        return _named_call_uses_proven_getattr_resolver(
+            call.func, reference_line, metadata
+        )
+    return _qualified_call_uses_proven_getattr_resolver(
+        call.func, reference_line, operator_bindings, metadata
+    )
+
+
 def _getattr_constant_dunder_subscript_class_name(call, index, operator_bindings):
     """Resolve ``getattr(Class, '__mro__')[index]`` and ``__bases__`` lookups."""
     if not (
         isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "getattr"
+        and _call_uses_proven_getattr_resolver(call, operator_bindings)
         and len(call.args) >= 2
         and isinstance(call.args[0], ast.Name)
         and isinstance(call.args[1], ast.Constant)
@@ -11205,6 +11506,7 @@ def _mro_index_class_name_from_expression(expr, index, operator_bindings):
         for resolver in (
             _class_mro_method_subscript_class_name,
             _type_qualified_mro_method_subscript_class_name,
+            _unbound_type_mro_subscript_class_name,
             _getattr_constant_dunder_subscript_class_name,
             _inspect_getmro_subscript_class_name,
             _object_getattribute_mro_subscript_class_name,
@@ -11664,6 +11966,7 @@ def _subscript_expression_resolves_class_name(sub, operator_bindings=None):
         for resolver in (
             _class_mro_method_subscript_class_name,
             _type_qualified_mro_method_subscript_class_name,
+            _unbound_type_mro_subscript_class_name,
             _getattr_constant_dunder_subscript_class_name,
             _sequence_mro_method_subscript_class_name,
             _inspect_getmro_subscript_class_name,
@@ -17291,7 +17594,7 @@ def _collect_operator_setitem_bindings(tree):
         name: _collect_definite_name_shadow_line(tree, name)
         for name in {
             'globals', 'getattr', 'object', 'staticmethod', 'classmethod', 'property',
-            'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
+            '__import__', 'type', 'sorted', 'list', 'tuple', 'set', 'frozenset', 'any',
             'all', 'max', 'min', 'next', 'map', 'filter', 'enumerate', 'zip',
             'iter', 'reversed', 'vars', 'locals', 'sum', 'super',
         }
@@ -18605,6 +18908,12 @@ def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    for builtin_name in ("type", "__import__"):
+        shadow_events = _collect_module_scope_builtin_shadow_events(
+            tree, builtin_name
+        )
+        if shadow_events:
+            operator_bindings[32][builtin_name] = shadow_events
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(
         tree, namespace_aliases, operator_bindings
@@ -18653,6 +18962,14 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32]["builtins_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "builtins")
+    )
+    operator_bindings[32]["builtins_getattr_alias_events"] = (
+        _collect_builtins_getattr_alias_events(
+            tree,
+            operator_bindings[8],
+            operator_bindings[32]["builtins_module_alias_events"],
+            operator_bindings[32],
+        )
     )
     operator_bindings[32]["collections_deque_alias_events"] = (
         _collect_imported_name_alias_events(tree, "collections", {"deque"})

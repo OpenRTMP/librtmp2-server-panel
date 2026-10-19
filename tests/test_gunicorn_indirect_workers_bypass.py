@@ -3654,3 +3654,124 @@ def test_security_review_oct18_mro_dispatch_gaps_are_dynamic(tmp_path, dispatch)
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-19: builtins getattr and unbound type.mro MRO dispatch gaps
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "import builtins\nbuiltins.getattr(Child, '__mro__')[1]()",
+        "import builtins as b\nb.getattr(Child, '__mro__')[1]()",
+        "from builtins import getattr as bg\nbg(Child, '__mro__')[1]()",
+        "__import__('builtins').getattr(Child, '__mro__')[1]()",
+        "import importlib\nimportlib.import_module('builtins').getattr(Child, '__mro__')[1]()",
+        "import sys\nsys.modules['builtins'].getattr(Child, '__mro__')[1]()",
+        "type.mro(Child)[1]()",
+    ],
+)
+def test_security_review_oct19_builtins_getattr_and_type_mro_are_dynamic(
+    tmp_path, dispatch
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Risky:\n"
+        "    def __init__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "class Child(Risky):\n"
+        "    pass\n"
+        + dispatch
+        + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex PR #394: getattr aliases, bound builtins and unbound type.mro
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "if True:\n    from builtins import getattr as bg\n" +
+        "bg(Child, '__mro__')[1]()",
+        "try:\n    from builtins import getattr as bg\n" +
+        "except ImportError:\n    raise\n" +
+        "bg(Child, '__mro__')[1]()",
+        "if True:\n    import builtins as b\n" +
+        "    bg = b.getattr\n" +
+        "bg(Child, '__mro__')[1]()",
+    ],
+)
+def test_codex_pr394_compound_getattr_aliases_are_dynamic(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "from builtins import getattr as bg\n" +
+        "def bg(cls, attr):\n    return (cls, Safe)\n" +
+        "bg(Child, '__mro__')[1]()",
+        "from builtins import getattr as bg\n" +
+        "class bg:\n" +
+        "    def __new__(cls, *_args):\n        return (Child, Safe)\n" +
+        "bg(Child, '__mro__')[1]()",
+        "class Facade:\n" +
+        "    @staticmethod\n" +
+        "    def mro(cls):\n        return (cls, Safe)\n" +
+        "type = Facade\n" +
+        "type.mro(Child)[1]()",
+        "class Facade:\n" +
+        "    @staticmethod\n" +
+        "    def getattr(cls, name):\n        return (cls, Safe)\n" +
+        "import builtins as b\n" +
+        "b = Facade\n" +
+        "bg = b.getattr\n" +
+        "bg(Child, '__mro__')[1]()",
+        "class Facade:\n" +
+        "    @staticmethod\n" +
+        "    def getattr(cls, name):\n        return (cls, Safe)\n" +
+        "def __import__(name):\n    return Facade\n" +
+        "__import__('builtins').getattr(Child, '__mro__')[1]()",
+    ],
+)
+def test_codex_pr394_shadowed_builtins_stay_static(tmp_path, dispatch):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + dispatch + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class Facade:\n" +
+        "    @staticmethod\n" +
+        "    def mro(cls):\n        return (cls, Safe)\n" +
+        "if True:\n    type = Facade\n" +
+        "type.mro(Child)[1]()",
+        "class Facade:\n" +
+        "    @staticmethod\n" +
+        "    def getattr(cls, name):\n        return (cls, Safe)\n" +
+        "if True:\n" +
+        "    def __import__(name):\n        return Facade\n" +
+        "__import__('builtins').getattr(Child, '__mro__')[1]()",
+    ],
+)
+def test_codex_pr394_compound_shadowed_builtins_stay_static(tmp_path, source):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        _INHERITED_MUTATING_INIT_CONFIG
+        + "class Safe:\n    pass\n"
+        + source + "\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
