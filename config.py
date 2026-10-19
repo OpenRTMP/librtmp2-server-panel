@@ -11205,16 +11205,24 @@ def _call_imports_builtins_module(value, reference_line, operator_bindings):
     if not isinstance(value, ast.Call) or not value.args:
         return False
     importlib_aliases = (
-        operator_bindings[16] if operator_bindings and len(operator_bindings) > 16 else set()
+        operator_bindings[16]
+        if operator_bindings and len(operator_bindings) > 16
+        else set()
     )
     importlib_alias_events = (
-        operator_bindings[19] if operator_bindings and len(operator_bindings) > 19 else {}
+        operator_bindings[19]
+        if operator_bindings and len(operator_bindings) > 19
+        else {}
     )
     importlib_module_aliases = (
-        operator_bindings[24] if operator_bindings and len(operator_bindings) > 24 else set()
+        operator_bindings[24]
+        if operator_bindings and len(operator_bindings) > 24
+        else set()
     )
     importlib_module_alias_events = (
-        operator_bindings[29] if operator_bindings and len(operator_bindings) > 29 else {}
+        operator_bindings[29]
+        if operator_bindings and len(operator_bindings) > 29
+        else {}
     )
     if not _call_uses_importlib_import_module(
         value,
@@ -11236,7 +11244,9 @@ def _qualified_call_uses_proven_getattr_resolver(
     if not isinstance(func, ast.Attribute) or func.attr != "getattr":
         return False
     builtins_aliases = (
-        operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()
+        operator_bindings[8]
+        if operator_bindings and len(operator_bindings) > 8
+        else set()
     )
     if _builtins_module_is_active_at_line(
         func.value,
@@ -11246,7 +11256,9 @@ def _qualified_call_uses_proven_getattr_resolver(
     ):
         return True
     sys_aliases = (
-        operator_bindings[13] if operator_bindings and len(operator_bindings) > 13 else set()
+        operator_bindings[13]
+        if operator_bindings and len(operator_bindings) > 13
+        else set()
     )
     if _subscript_is_sys_modules_builtins(func.value, sys_aliases):
         return True
@@ -11260,7 +11272,9 @@ def _call_uses_proven_getattr_resolver(call, operator_bindings):
     if not isinstance(call, ast.Call):
         return False
     metadata = (
-        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
     )
     if not isinstance(metadata, dict):
         metadata = {}
