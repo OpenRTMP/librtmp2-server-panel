@@ -11185,29 +11185,25 @@ def _unbound_type_mro_subscript_class_name(call, index, operator_bindings):
     )
 
 
-def _call_uses_proven_getattr_resolver(call, operator_bindings):
-    """Return True when a call site resolves to builtin ``getattr``."""
-    if not isinstance(call, ast.Call):
+def _named_call_uses_proven_getattr_resolver(func, reference_line, metadata):
+    """Recognize unshadowed builtin getattr and its tracked direct aliases."""
+    if func.id == "getattr" and _name_is_unshadowed_builtin(
+        "getattr", reference_line, metadata
+    ):
+        return True
+    alias_events = metadata.get("builtins_getattr_alias_events", {})
+    return bool(
+        alias_events
+        and _module_alias_active_at_line(
+            func, set(), alias_events, reference_line
+        )
+    )
+
+
+def _call_imports_builtins_module(value, reference_line, operator_bindings):
+    """Recognize a proven importlib import of the builtins module."""
+    if not isinstance(value, ast.Call) or not value.args:
         return False
-    func = call.func
-    reference_line = getattr(call, "lineno", 0)
-    metadata = (
-        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
-    )
-    builtin_shadow_lines = metadata if isinstance(metadata, dict) else {}
-    builtins_aliases = (
-        operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()
-    )
-    builtins_alias_events = (
-        metadata.get("builtins_module_alias_events", {})
-        if isinstance(metadata, dict)
-        else {}
-    )
-    getattr_alias_events = (
-        metadata.get("builtins_getattr_alias_events", {})
-        if isinstance(metadata, dict)
-        else {}
-    )
     importlib_aliases = (
         operator_bindings[16] if operator_bindings and len(operator_bindings) > 16 else set()
     )
@@ -11220,40 +11216,8 @@ def _call_uses_proven_getattr_resolver(call, operator_bindings):
     importlib_module_alias_events = (
         operator_bindings[29] if operator_bindings and len(operator_bindings) > 29 else {}
     )
-    sys_aliases = (
-        operator_bindings[13] if operator_bindings and len(operator_bindings) > 13 else set()
-    )
-    if isinstance(func, ast.Name):
-        if func.id == "getattr" and _name_is_unshadowed_builtin(
-            "getattr",
-            reference_line,
-            builtin_shadow_lines,
-        ):
-            return True
-        return bool(
-            getattr_alias_events
-            and _module_alias_active_at_line(
-                func,
-                set(),
-                getattr_alias_events,
-                reference_line,
-            )
-        )
-    if not isinstance(func, ast.Attribute) or func.attr != "getattr":
-        return False
-    if _builtins_module_is_active_at_line(
-        func.value,
-        builtins_aliases,
-        builtins_alias_events,
-        reference_line,
-    ):
-        return True
-    if _subscript_is_sys_modules_builtins(func.value, sys_aliases):
-        return True
-    if not isinstance(func.value, ast.Call) or not func.value.args:
-        return False
     if not _call_uses_importlib_import_module(
-        func.value,
+        value,
         importlib_aliases,
         importlib_alias_events,
         importlib_module_aliases,
@@ -11261,8 +11225,53 @@ def _call_uses_proven_getattr_resolver(call, operator_bindings):
         reference_line,
     ):
         return False
-    module_name = func.value.args[0]
+    module_name = value.args[0]
     return isinstance(module_name, ast.Constant) and module_name.value == "builtins"
+
+
+def _qualified_call_uses_proven_getattr_resolver(
+    func, reference_line, operator_bindings, metadata
+):
+    """Recognize getattr reached through a proven builtins module reference."""
+    if not isinstance(func, ast.Attribute) or func.attr != "getattr":
+        return False
+    builtins_aliases = (
+        operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()
+    )
+    if _builtins_module_is_active_at_line(
+        func.value,
+        builtins_aliases,
+        metadata.get("builtins_module_alias_events", {}),
+        reference_line,
+    ):
+        return True
+    sys_aliases = (
+        operator_bindings[13] if operator_bindings and len(operator_bindings) > 13 else set()
+    )
+    if _subscript_is_sys_modules_builtins(func.value, sys_aliases):
+        return True
+    return _call_imports_builtins_module(
+        func.value, reference_line, operator_bindings
+    )
+
+
+def _call_uses_proven_getattr_resolver(call, operator_bindings):
+    """Return True when a call site resolves to builtin ``getattr``."""
+    if not isinstance(call, ast.Call):
+        return False
+    metadata = (
+        operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else {}
+    )
+    if not isinstance(metadata, dict):
+        metadata = {}
+    reference_line = getattr(call, "lineno", 0)
+    if isinstance(call.func, ast.Name):
+        return _named_call_uses_proven_getattr_resolver(
+            call.func, reference_line, metadata
+        )
+    return _qualified_call_uses_proven_getattr_resolver(
+        call.func, reference_line, operator_bindings, metadata
+    )
 
 
 def _getattr_constant_dunder_subscript_class_name(call, index, operator_bindings):
