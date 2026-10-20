@@ -363,7 +363,7 @@ function loadStats(streamId) {
         })
         .then(data => renderStats(statsContainer, data))
         .catch((err) => {
-            if (err && err.rateLimited) {
+            if (err?.rateLimited) {
                 console.warn('Stats request rate limited; keeping last stats', err);
                 return;
             }
