@@ -11,7 +11,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project has no fixed version; semantic-versioning guarantees
 only begin at a future `1.0.0`.
 
-## [Unreleased]
+## [0.1.13] — 2026-10-21
+
+### Security
+- Closed further Gunicorn worker-detection gaps so a memory-backed rate limit
+  and per-process session store are refused whenever a config can raise the
+  worker count at import time. The gate now also covers `operator.setitem` on
+  `sys.modules[__name__].__dict__`, `builtins.getattr`/`type.mro`, alternate
+  MRO constructor dispatch, metaclasses and aliases, `ChainMap`, partial and
+  thread-pool callback forms, annotated or computed `chdir`, namespace passing
+  to unknown callables, and additional conditional/shadowed bindings.
+- Trusted-proxy matching normalizes IPv4-mapped IPv6 peers and rejects
+  v4-mapped catch-all proxy ranges, so a dual-stack listener cannot bypass the
+  per-client rate-limit key or trust an over-broad proxy entry.
+
+### Fixed
+- The dashboard stats poller handles HTTP 429 with a per-container backoff
+  (honoring `Retry-After` when present) while keeping the last good stats
+  instead of replacing the pane with an error.
+- A rate-limit storage outage answers with the controlled 503 used for session
+  store outages instead of an unhandled 500; stream-stat reads use the admin
+  timeout budget, and null stream/player keys are normalized.
+- Additional Gunicorn scanner gaps were closed for MRO/constructor dispatch,
+  `builtins.getattr`/`type.mro`, compound-block class metadata, heapq/sched
+  callbacks, saved callback containers, and `operator.attrgetter`/`__call__`
+  spellings.
+
+### Changed
+- Internal Sonar-driven refactor: proxy candidate helpers always return
+  same-length tuples, high-complexity scanner functions were split into focused
+  helpers, unused parameters were removed, and the stats handler uses optional
+  chaining. No behavior change.
+- Dependency update: certifi 2026.10.19.
 
 ## [0.1.12] — 2026-10-14
 

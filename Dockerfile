@@ -16,11 +16,12 @@ WORKDIR /app
 
 COPY --from=builder /install /usr/local
 COPY app.py config.py lrtmp2_client.py session_store.py ./
+COPY VERSION ./
 COPY templates templates/
 COPY static static/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-RUN version="${APP_VERSION:-development}" && \
+RUN version="${APP_VERSION:-$(cat VERSION)}" && \
     mkdir -p /data /usr/local/share/openrtmp && \
     printf '%s\n' "$version" > /usr/local/share/openrtmp/VERSION && \
     chmod 0755 /usr/local/bin/entrypoint.sh && \
