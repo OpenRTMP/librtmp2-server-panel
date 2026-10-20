@@ -3797,6 +3797,8 @@ def test_codex_pr394_compound_shadowed_builtins_stay_static(tmp_path, source):
         "workers = 1\nimport builtins as bi\nbi.getattr(globals(), '__setitem__')('workers', 4)\n",
         "workers = 1\nfrom builtins import getattr as fetch\nfetch(globals(), 'update')({'workers': 4})\n",
         "workers = 1\nimport builtins\nbuiltins.getattr(builtins, 'dict').update(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\nbuiltins.getattr(dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins as b\nb.getattr(dict, 'update')(globals(), {'workers': 4})\n",
         "workers = 1\ntype(globals()).update(globals(), {'workers': 4})\n",
         "workers = 1\nglobals().__class__.update(globals(), {'workers': 4})\n",
         "workers = 1\ndict.__dict__['update'](globals(), {'workers': 4})\n",
@@ -3816,17 +3818,17 @@ def test_r15_resolved_indirect_worker_mutations_are_dynamic(
     "config_content",
     [
         # The resolved mutator must still target the module namespace.
-        "workers = 1\nclass D(dict): pass\nsettings = {}\n"
+        "workers = 1\nclass D(dict): pass\nsettings = {}\n" +
         "D.mro()[1].update(settings, {'workers': 4})\n",
-        "workers = 1\nclass D(dict): pass\nsettings = {}\n"
+        "workers = 1\nclass D(dict): pass\nsettings = {}\n" +
         "D.__bases__[0].__setitem__(settings, 'workers', 4)\n",
         # ``type(globals())`` only reaches the namespace mutator when the
         # namespace itself is passed as the receiver.
         "workers = 1\nsettings = {}\ntype(globals()).update(settings, {'workers': 4})\n",
         # A shadowed collections module is not ChainMap.
-        "workers = 1\nclass Helper:\n    @staticmethod\n    def ChainMap(*args):\n"
-        "        class Wrapper:\n            maps = [{} , {}]\n        return Wrapper()\n"
-        "collections = Helper()\n"
+        "workers = 1\nclass Helper:\n    @staticmethod\n    def ChainMap(*args):\n" +
+        "        class Wrapper:\n            maps = [{} , {}]\n        return Wrapper()\n" +
+        "collections = Helper()\n" +
         "collections.ChainMap(globals()).maps[0].update({'workers': 4})\n",
         # A shadowed namespace alias target is not the module namespace.
         "workers = 1\nimport operator\nns = {}\noperator.setitem(ns, 'workers', 4)\n",
@@ -3847,49 +3849,49 @@ def test_r15_resolved_mutator_spellings_stay_static_when_unresolved(
 @pytest.mark.parametrize(
     "config_content",
     [
-        "import abc\n"
-        "workers = 1\n"
-        "class Meta(abc.ABCMeta):\n"
-        "    def __new__(mcls, name, bases, ns):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "        return super().__new__(mcls, name, bases, ns)\n"
-        "class C(metaclass=Meta):\n"
+        "import abc\n" +
+        "workers = 1\n" +
+        "class Meta(abc.ABCMeta):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
         "    pass\n",
-        "from abc import ABCMeta\n"
-        "workers = 1\n"
-        "class Meta(ABCMeta):\n"
-        "    def __init__(cls, name, bases, ns):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "class C(metaclass=Meta):\n"
+        "from abc import ABCMeta\n" +
+        "workers = 1\n" +
+        "class Meta(ABCMeta):\n" +
+        "    def __init__(cls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "class C(metaclass=Meta):\n" +
         "    pass\n",
-        "import builtins as b\n"
-        "workers = 1\n"
-        "class Meta(b.type):\n"
-        "    def __new__(mcls, name, bases, ns):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "        return super().__new__(mcls, name, bases, ns)\n"
-        "class C(metaclass=Meta):\n"
+        "import builtins as b\n" +
+        "workers = 1\n" +
+        "class Meta(b.type):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
         "    pass\n",
-        "workers = 1\n"
-        "Base = type\n"
-        "class Meta(Base):\n"
-        "    def __new__(mcls, name, bases, ns):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "        return super().__new__(mcls, name, bases, ns)\n"
-        "class C(metaclass=Meta):\n"
+        "workers = 1\n" +
+        "Base = type\n" +
+        "class Meta(Base):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
         "    pass\n",
-        "from enum import EnumMeta\n"
-        "workers = 1\n"
-        "class Meta(EnumMeta):\n"
-        "    def __init__(cls, name, bases, ns, **kw):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "        super().__init__(name, bases, ns, **kw)\n"
-        "class C(metaclass=Meta):\n"
+        "from enum import EnumMeta\n" +
+        "workers = 1\n" +
+        "class Meta(EnumMeta):\n" +
+        "    def __init__(cls, name, bases, ns, **kw):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        super().__init__(name, bases, ns, **kw)\n" +
+        "class C(metaclass=Meta):\n" +
         "    pass\n",
     ],
     ids=[
@@ -4012,19 +4014,19 @@ def test_r15_shadowed_dict_generator_consumer_stays_static(tmp_path):
 @pytest.mark.parametrize(
     "config_content",
     [
-        "from itertools import starmap\n"
-        "workers = 1\n"
-        "def bump(x):\n"
-        "    global workers\n"
-        "    workers = 4\n"
-        "pairs = [(1,)]\n"
+        "from itertools import starmap\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "pairs = [(1,)]\n" +
         "list(starmap(bump, pairs))\n",
-        "from itertools import starmap as sm\n"
-        "workers = 1\n"
-        "def bump(x):\n"
-        "    global workers\n"
-        "    workers = 4\n"
-        "pairs = [(1,)]\n"
+        "from itertools import starmap as sm\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "pairs = [(1,)]\n" +
         "list(sm(bump, pairs))\n",
     ],
     ids=["direct-import", "aliased-import"],
@@ -4301,8 +4303,14 @@ def test_r15_shadowed_getattr_does_not_resolve_builtin_dict(tmp_path):
         "apply_settings(vars())\n",
         "apply_settings(locals())\n",
         "apply_settings(**globals())\n",
+        "__import__('settings').apply_settings(globals())\n",
+        "import importlib\nimportlib.import_module('settings').apply_settings(globals())\n",
+        "import sys\nsys.modules['settings'].apply_settings(globals())\n",
     ],
-    ids=["globals", "vars", "locals", "starred-globals"],
+    ids=[
+        "globals", "vars", "locals", "starred-globals",
+        "import-builtin", "importlib-module", "sys-modules",
+    ],
 )
 def test_r15_namespace_passed_to_imported_helper_is_dynamic(tmp_path, call):
     config_file = tmp_path / "gunicorn.conf.py"
