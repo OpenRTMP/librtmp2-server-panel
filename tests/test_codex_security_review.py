@@ -198,6 +198,102 @@ def test_gunicorn_config_alternate_workers_assignments_are_dynamic(tmp_path, con
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "setter = functools.partial(operator.setitem, sys.modules[__name__].__dict__, 'workers')\n"
+            "setter(4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "setter = functools.partial(operator.setitem, sys.modules[__name__].__dict__, 'workers')\n"
+            "alias = setter\n"
+            "alias(4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "setter = functools.partial(operator.setitem, sys.modules[__name__].__dict__)\n"
+            "setter('workers', 4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "functools.partial(operator.setitem)(sys.modules[__name__].__dict__, 'workers', 4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "functools.partial(operator.setitem, sys.modules[__name__].__dict__)('workers', 4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "functools.partial(getattr(operator, 'setitem'), sys.modules[__name__].__dict__, 'workers')(4)\n"
+        ),
+        (
+            "import functools, sys\n"
+            "workers = 1\n"
+            "functools.partial(getattr(__import__('operator'), 'setitem'), sys.modules[__name__].__dict__, 'workers')(4)\n"
+        ),
+        (
+            "import sys\n"
+            "workers = 1\n"
+            "__import__('operator').setitem(sys.modules[__name__].__dict__, 'workers', 4)\n"
+        ),
+        (
+            "import operator, sys\n"
+            "workers = 1\n"
+            "getattr(operator, 'setitem')(sys.modules[__name__].__dict__, 'workers', 4)\n"
+        ),
+    ],
+)
+def test_gunicorn_operator_setitem_worker_mutations_are_dynamic(tmp_path, source):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(source, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import functools, operator, sys, types\n"
+            "workers = 1\n"
+            "operator = types.SimpleNamespace(setitem=lambda *_args: None)\n"
+            "functools.partial(operator.setitem, sys.modules[__name__].__dict__, 'workers')(4)\n"
+        ),
+        (
+            "import functools, sys\n"
+            "from operator import setitem as put\n"
+            "workers = 1\n"
+            "put = lambda *_args: None\n"
+            "functools.partial(put, sys.modules[__name__].__dict__, 'workers')(4)\n"
+        ),
+        (
+            "import functools, operator, sys\n"
+            "workers = 1\n"
+            "functools.partial(operator.setitem, sys.modules[__name__].__dict__, 'other')(4)\n"
+        ),
+        (
+            "import functools, operator\n"
+            "workers = 1\n"
+            "settings = {}\n"
+            "functools.partial(operator.setitem, settings, 'workers')(4)\n"
+        ),
+    ],
+)
+def test_gunicorn_unrelated_operator_partials_are_not_dynamic(tmp_path, source):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(source, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
 def test_gunicorn_config_helper_local_workers_is_not_dynamic(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
