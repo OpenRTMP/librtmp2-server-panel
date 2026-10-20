@@ -13848,11 +13848,14 @@ def _call_root_is_recognized_namespace_consumer(
 ):
     """Return True when the call target already has a dedicated recognizer."""
     func = call.func
-    direct_name = isinstance(func, ast.Name) and func is root
-    direct_attr = isinstance(func, ast.Attribute) and func.value is root
-    if not (direct_name or direct_attr):
-        # Nested calls and subscripts can load arbitrary external functions;
-        # do not exempt them solely because their root is an imported module.
+    if (
+        isinstance(func, (ast.Attribute, ast.Subscript))
+        and isinstance(func.value, (ast.Call, ast.Subscript))
+    ):
+        # A helper loaded through a module factory or module registry is
+        # unknown, even if the root is a known builtin or import alias.
+        # Keep the existing recognizers for direct getattr/methodcaller
+        # invocations: they can prove certain calls do not change workers.
         return False
     if root.id in namespace_aliases:
         # ``ns.update(...)`` style calls are classified by payload.
