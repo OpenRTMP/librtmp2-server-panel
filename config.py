@@ -1665,11 +1665,12 @@ def _is_getattr_resolved_dict_update(
     builtin_shadow_lines,
 ):
     """Return True when ``getattr(...)('update')`` resolves to ``dict.update``."""
+    getattr_alias_events = {
+        "builtins_module_alias_events": builtins_alias_events or {}
+    }
     if not _is_getattr_resolver_callee(
         func.func if isinstance(func, ast.Call) else None,
-        alias_events={
-            "builtins_module_alias_events": builtins_alias_events or {}
-        },
+        alias_events=getattr_alias_events,
         builtin_shadow_lines=builtin_shadow_lines,
         reference_line=reference_line,
     ):
@@ -1687,7 +1688,7 @@ def _is_getattr_resolved_dict_update(
     target = _getattr_target_for_method(
         func,
         'update',
-        None,
+        getattr_alias_events,
         reference_line,
     )
     if target is None:
@@ -13846,6 +13847,13 @@ def _call_root_is_recognized_namespace_consumer(
     namespace_aliases,
 ):
     """Return True when the call target already has a dedicated recognizer."""
+    func = call.func
+    direct_name = isinstance(func, ast.Name) and func is root
+    direct_attr = isinstance(func, ast.Attribute) and func.value is root
+    if not (direct_name or direct_attr):
+        # Nested calls and subscripts can load arbitrary external functions;
+        # do not exempt them solely because their root is an imported module.
+        return False
     if root.id in namespace_aliases:
         # ``ns.update(...)`` style calls are classified by payload.
         return True
