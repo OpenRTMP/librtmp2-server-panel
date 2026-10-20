@@ -1801,6 +1801,26 @@ def _collect_functiontype_namespace_aliases(
 
 
 
+def _partial_unbound_operator_setitem_namespace(
+    partial_call, namespace_aliases, operator_bindings
+):
+    """Return True for ``partial(operator.setitem, <namespace>, 'workers', ...)``."""
+    if operator_bindings is None or len(partial_call.args) < 2:
+        return False
+    module_aliases, setitem_aliases = operator_bindings[:2]
+    if not _is_operator_setitem_callable(
+        partial_call.args[0],
+        setitem_aliases,
+        module_aliases,
+    ):
+        return False
+    if not _is_module_namespace_mapping(partial_call.args[1], namespace_aliases):
+        return False
+    if len(partial_call.args) >= 3:
+        return _key_may_be_workers(partial_call.args[2])
+    return True
+
+
 def _partial_unbound_dict_namespace_method(
     partial_call,
     namespace_aliases,
@@ -1861,6 +1881,7 @@ def _partial_uses_unbound_dict_namespace_mutation(
     dict_ior_aliases=None,
     invocation_call=None,
     invocation_start_index=0,
+    operator_bindings=None,
 ):
     """Return True when a bound dict mutator can set ``workers``."""
     if dict_ior_aliases is None:
@@ -1872,6 +1893,12 @@ def _partial_uses_unbound_dict_namespace_mutation(
         dict_ior_aliases,
         dict_shadow_line,
     )
+    if method is None and _partial_unbound_operator_setitem_namespace(
+        partial_call,
+        namespace_aliases,
+        operator_bindings,
+    ):
+        method = "__setitem__"
     if method is None:
         return False
     if _call_payload_may_set_workers(method, partial_call, start_index=2):
@@ -2184,10 +2211,13 @@ def _call_is_getattr_setdefault_workers(call, namespace_aliases=None):
 
 
 def _call_is_operator_setitem_workers(call, operator_bindings):
-    """Return True for imported ``operator.setitem(globals(), 'workers', ...)``."""
+    """Return True for imported ``operator.setitem`` on the module namespace."""
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
-    if not _is_globals_call(call.args[0]) or not _constant_is_workers(call.args[1]):
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
+        return False
+    if not _constant_is_workers(call.args[1]):
         return False
 
     module_aliases, setitem_aliases = operator_bindings[:2]
@@ -3699,6 +3729,7 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
         dict_ior_aliases,
         call,
         invocation_start,
+        operator_bindings,
     ):
         return True
     if _partial_call_binds_proven_frame_globals_workers_setter(
