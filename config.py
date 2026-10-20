@@ -715,6 +715,24 @@ class _PartialFactoryAliases(set):
         super().__init__(values)
         self.binding_events = binding_events if binding_events is not None else {}
 
+    def __eq__(self, other):
+        equal = set.__eq__(self, other)
+        if equal is NotImplemented:
+            return NotImplemented
+        if not equal:
+            return False
+        if isinstance(other, _PartialFactoryAliases):
+            return self.binding_events == other.binding_events
+        return True
+
+    def __ne__(self, other):
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
+
+    __hash__ = None
+
 
 def _is_structural_operator_attrgetter_factory(factory_call):
     """Return True for syntactic ``operator.attrgetter`` / imported ``attrgetter``."""
