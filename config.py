@@ -2577,9 +2577,7 @@ def _call_is_operator_setitem_workers(call, operator_bindings):
     """Detect a live operator.setitem targeting the Gunicorn module namespace."""
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
-    module_aliases, setitem_aliases, namespace_aliases = (
-        _unpack_operator_bindings(operator_bindings)[:3]
-    )
+    _, _, namespace_aliases, _, _ = _unpack_operator_bindings(operator_bindings)
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
         return False
     if not _constant_is_workers(call.args[1]):
