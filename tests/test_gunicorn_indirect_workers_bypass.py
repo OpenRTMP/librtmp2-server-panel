@@ -4078,9 +4078,9 @@ def test_r15_shadowed_itertools_starmap_name_stays_static(tmp_path):
         "ThreadPool(2).map(*args)\n",
         "from multiprocessing.pool import ThreadPool\n" +
         "workers = 1\n" +
-        "def bump(x):\n"
-        "    global workers\n"
-        "    workers = 4\n"
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
         "ThreadPool(2).map(*(bump, [1, 2]))\n",
     ],
     ids=["partial-callback", "unresolved-starred-args", "literal-starred-args"],
