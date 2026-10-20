@@ -53,6 +53,10 @@ function initializeStats() {
             if (!isVisible(container)) {
                 return;
             }
+            const retryNotBefore = Number(container.dataset.retryNotBefore || 0);
+            if (Number.isFinite(retryNotBefore) && retryNotBefore > Date.now()) {
+                return;
+            }
             const streamId = container.dataset.streamId;
             if (streamId) {
                 loadStats(streamId);
@@ -256,6 +260,7 @@ function buildStatsRows(stream, video, players, clusterRows, playerRows) {
 }
 
 function renderStats(statsContainer, data) {
+    statsContainer.dataset.hasCompletedStats = 'true';
     if (data.error) {
         const error = document.createElement('p');
         error.className = 'text-danger';
@@ -303,6 +308,24 @@ function renderStats(statsContainer, data) {
     statsContainer.replaceChildren(wrapper);
 }
 
+const STATS_RATE_LIMIT_BACKOFF_MS = 30000;
+
+function statsRetryDelayMs(response) {
+    const retryAfter = response.headers.get('Retry-After');
+    if (!retryAfter) {
+        return STATS_RATE_LIMIT_BACKOFF_MS;
+    }
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return seconds * 1000;
+    }
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isFinite(retryAt)) {
+        return Math.max(0, retryAt - Date.now());
+    }
+    return STATS_RATE_LIMIT_BACKOFF_MS;
+}
+
 function loadStats(streamId) {
     const statsContainer = document.getElementById(`stats-${streamId}`);
     if (!statsContainer || statsContainer.dataset.loading === 'true') {
@@ -324,6 +347,16 @@ function loadStats(streamId) {
                 window.location.assign('/login');
                 throw new Error('Authentication required');
             }
+            if (response.status === 429) {
+                // The per-stream limiter rejected this poll. Keep the last
+                // good stats on screen and pause this container until the
+                // advertised retry window has passed.
+                const retryDelay = statsRetryDelayMs(response);
+                statsContainer.dataset.retryNotBefore = String(Date.now() + retryDelay);
+                const rateLimited = new Error('Stats request rate limited');
+                rateLimited.rateLimited = true;
+                throw rateLimited;
+            }
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
@@ -331,6 +364,17 @@ function loadStats(streamId) {
         })
         .then(data => renderStats(statsContainer, data))
         .catch((err) => {
+            if (err?.rateLimited) {
+                console.warn('Stats request rate limited; keeping last stats', err);
+                if (statsContainer.dataset.hasCompletedStats !== 'true') {
+                    renderStatsPlaceholder(
+                        statsContainer,
+                        'Stats rate limited; retrying soon',
+                        'text-muted',
+                    );
+                }
+                return;
+            }
             console.warn('Stats request failed', err);
             const unavailable = document.createElement('p');
             const emphasis = document.createElement('em');

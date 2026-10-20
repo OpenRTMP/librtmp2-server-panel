@@ -2,12 +2,12 @@ import ipaddress
 
 import pytest
 
-from config import client_ip_for_rate_limit
+import config
 
 
 def test_client_ip_for_rate_limit_ignores_spoofed_xff_from_untrusted_direct_clients():
     networks = [ipaddress.ip_network("203.0.113.0/24")]
-    client_ip = client_ip_for_rate_limit(
+    client_ip = config.client_ip_for_rate_limit(
         direct_addr="10.0.0.5",
         forwarded_addr="198.51.100.25",
         trusted_proxy_count=1,
@@ -18,13 +18,37 @@ def test_client_ip_for_rate_limit_ignores_spoofed_xff_from_untrusted_direct_clie
 
 def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
     networks = [ipaddress.ip_network("10.0.0.0/8")]
-    client_ip = client_ip_for_rate_limit(
+    client_ip = config.client_ip_for_rate_limit(
         direct_addr="10.0.0.2",
         forwarded_addr="198.51.100.25",
         trusted_proxy_count=1,
         trusted_networks=networks,
     )
     assert client_ip == "198.51.100.25"
+
+
+def test_client_ip_for_rate_limit_uses_forwarded_ip_from_dual_stack_proxy():
+    networks = [ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("127.0.0.1/32")]
+    assert config.ip_in_trusted_proxy_networks("::ffff:10.1.2.3", networks) is True
+    assert config.ip_in_trusted_proxy_networks("::ffff:127.0.0.1", networks) is True
+    assert config.ip_in_trusted_proxy_networks("::ffff:192.0.2.10", networks) is False
+    assert (
+        config.client_ip_for_rate_limit(
+            direct_addr="::ffff:10.1.2.3",
+            forwarded_addr="198.51.100.25",
+            trusted_proxy_count=1,
+            trusted_networks=networks,
+        )
+        == "198.51.100.25"
+    )
+
+
+def test_ip_in_trusted_proxy_networks_matches_ipv4_peer_to_v4_mapped_range():
+    networks = [ipaddress.ip_network("::ffff:10.0.0.0/104")]
+    assert config.ip_in_trusted_proxy_networks("10.1.2.3", networks) is True
+    assert config.ip_in_trusted_proxy_networks("11.1.2.3", networks) is False
+    # An untrusted dual-stack peer is still not a proxy.
+    assert config.ip_in_trusted_proxy_networks("::ffff:11.1.2.3", networks) is False
 
 
 @pytest.mark.parametrize("trusted_proxy_ips", ["0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"])

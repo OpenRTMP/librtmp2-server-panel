@@ -3775,3 +3775,682 @@ def test_codex_pr394_compound_shadowed_builtins_stay_static(tmp_path, source):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# R15 AST-recognizer parity: each spelling resolves the same mutator as the
+# already-covered literal form instead of being reported as a static config.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\nimport operator\nns = globals()\noperator.setitem(ns, 'workers', 4)\n",
+        "workers = 1\nimport operator as op\nns = globals()\nop.setitem(ns, 'workers', 4)\n",
+        "workers = 1\nfrom operator import setitem\nns = globals()\nsetitem(ns, 'workers', 4)\n",
+        "workers = 1\nclass D(dict): pass\nD.mro()[1].update(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nD.__bases__[0].update(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nD.__mro__[1].update(globals(), {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nD.__bases__[0].__setitem__(globals(), 'workers', 4)\n",
+        "workers = 1\nimport collections\ncollections.ChainMap(globals()).maps[0].update({'workers': 4})\n",
+        "workers = 1\nimport collections\ncm = collections.ChainMap({'a': 1}, globals())\ncm.maps[1].update({'workers': 4})\n",
+        "workers = 1\nfrom collections import ChainMap as CM\nCM(globals()).maps[0].update({'workers': 4})\n",
+        "workers = 1\nfrom collections import ChainMap\nCM = ChainMap\nCM(globals()).maps[0].update({'workers': 4})\n",
+        "workers = 1\nimport builtins\nbuiltins.getattr(globals(), 'update')({'workers': 4})\n",
+        "workers = 1\nimport builtins as bi\nbi.getattr(globals(), '__setitem__')('workers', 4)\n",
+        "workers = 1\nfrom builtins import getattr as fetch\nfetch(globals(), 'update')({'workers': 4})\n",
+        "workers = 1\nimport builtins\nbuiltins.getattr(builtins, 'dict').update(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins\nbuiltins.getattr(dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\nimport builtins as b\nb.getattr(dict, 'update')(globals(), {'workers': 4})\n",
+        "workers = 1\ntype(globals()).update(globals(), {'workers': 4})\n",
+        "workers = 1\nglobals().__class__.update(globals(), {'workers': 4})\n",
+        "workers = 1\ndict.__dict__['update'](globals(), {'workers': 4})\n",
+    ],
+)
+def test_r15_resolved_indirect_worker_mutations_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        # The resolved mutator must still target the module namespace.
+        "workers = 1\nclass D(dict): pass\nsettings = {}\n" +
+        "D.mro()[1].update(settings, {'workers': 4})\n",
+        "workers = 1\nclass D(dict): pass\nsettings = {}\n" +
+        "D.__bases__[0].__setitem__(settings, 'workers', 4)\n",
+        # ``type(globals())`` only reaches the namespace mutator when the
+        # namespace itself is passed as the receiver.
+        "workers = 1\nsettings = {}\ntype(globals()).update(settings, {'workers': 4})\n",
+        # A shadowed collections module is not ChainMap.
+        "workers = 1\nclass Helper:\n    @staticmethod\n    def ChainMap(*args):\n" +
+        "        class Wrapper:\n            maps = [{} , {}]\n        return Wrapper()\n" +
+        "collections = Helper()\n" +
+        "collections.ChainMap(globals()).maps[0].update({'workers': 4})\n",
+        # A shadowed namespace alias target is not the module namespace.
+        "workers = 1\nimport operator\nns = {}\noperator.setitem(ns, 'workers', 4)\n",
+    ],
+)
+def test_r15_resolved_mutator_spellings_stay_static_when_unresolved(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P2-001: metaclass bases reached through stdlib module aliases,
+# direct imports, and ``Base = type`` aliases run mutating hooks at definition.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "import abc\n" +
+        "workers = 1\n" +
+        "class Meta(abc.ABCMeta):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
+        "    pass\n",
+        "from abc import ABCMeta\n" +
+        "workers = 1\n" +
+        "class Meta(ABCMeta):\n" +
+        "    def __init__(cls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "class C(metaclass=Meta):\n" +
+        "    pass\n",
+        "import builtins as b\n" +
+        "workers = 1\n" +
+        "class Meta(b.type):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
+        "    pass\n",
+        "workers = 1\n" +
+        "Base = type\n" +
+        "class Meta(Base):\n" +
+        "    def __new__(mcls, name, bases, ns):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        return super().__new__(mcls, name, bases, ns)\n" +
+        "class C(metaclass=Meta):\n" +
+        "    pass\n",
+        "from enum import EnumMeta\n" +
+        "workers = 1\n" +
+        "class Meta(EnumMeta):\n" +
+        "    def __init__(cls, name, bases, ns, **kw):\n" +
+        "        global workers\n" +
+        "        workers = 4\n" +
+        "        super().__init__(name, bases, ns, **kw)\n" +
+        "class C(metaclass=Meta):\n" +
+        "    pass\n",
+    ],
+    ids=[
+        "abc-module-attribute",
+        "abc-direct-import",
+        "builtins-module-alias",
+        "type-assignment-alias",
+        "enum-direct-import",
+    ],
+)
+def test_r15_metaclass_stdlib_base_spellings_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_metaclass_non_type_base_with_init_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import abc\n"
+        "workers = 1\n"
+        "class Meta(abc.ABC):\n"
+        "    def __init__(cls, name, bases, ns):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "class C(metaclass=Meta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_explicit_metaclass_without_type_base_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Meta:\n"
+        "    def __new__(mcls, name, bases, ns):\n"
+        "        return type(name, bases, ns)\n"
+        "    def __init__(cls, name, bases, ns):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "class C(metaclass=Meta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_chainmap_non_name_receiver_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "__import__('collections').ChainMap(globals()).maps[0].update("
+        "{'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Bug Hunter r15 P2-002: dict(generator) drains the generator and executes the
+# callbacks; the callback must return a pair for the trigger to be real.
+def test_r15_dict_generator_consumer_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def bump():\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "    return ('workers', 4)\n"
+        "cbs = [bump]\n"
+        "dict(cb() for cb in cbs)\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_dict_lazy_iterator_consumer_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def bump(_):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "    return ('workers', 4)\n"
+        "dict(map(bump, [1]))\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_shadowed_dict_generator_consumer_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def dict(value):\n"
+        "    return value\n"
+        "def bump():\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "    return ('workers', 4)\n"
+        "cbs = [bump]\n"
+        "dict(cb() for cb in cbs)\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P2-003: direct and aliased itertools.starmap imports.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "from itertools import starmap\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "pairs = [(1,)]\n" +
+        "list(starmap(bump, pairs))\n",
+        "from itertools import starmap as sm\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "pairs = [(1,)]\n" +
+        "list(sm(bump, pairs))\n",
+    ],
+    ids=["direct-import", "aliased-import"],
+)
+def test_r15_itertools_starmap_name_spellings_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_shadowed_itertools_starmap_name_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def starmap(*args):\n"
+        "    return []\n"
+        "def bump(x):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "pairs = [(1,)]\n"
+        "list(starmap(bump, pairs))\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P2-004: functools.partial callbacks and starred map arguments.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "from multiprocessing.pool import ThreadPool\n" +
+        "from functools import partial\n" +
+        "workers = 1\n" +
+        "def bump(prefix, x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        "from multiprocessing.pool import ThreadPool\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "args = (bump, [1, 2])\n" +
+        "ThreadPool(2).map(*args)\n",
+        "from multiprocessing.pool import ThreadPool\n" +
+        "workers = 1\n" +
+        "def bump(x):\n" +
+        "    global workers\n" +
+        "    workers = 4\n" +
+        "ThreadPool(2).map(*(bump, [1, 2]))\n",
+    ],
+    ids=["partial-callback", "unresolved-starred-args", "literal-starred-args"],
+)
+def test_r15_thread_pool_partial_and_starred_callbacks_are_dynamic(
+    tmp_path,
+    config_content,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_thread_pool_partial_safe_callback_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "ThreadPool(2).map(partial(str, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P2-005: positional apply_async callback/error_callback slots.
+@pytest.mark.parametrize(
+    "call",
+    [
+        "ThreadPool(2).apply_async(lambda: 0, (), {}, bump).get()\n",
+        "ThreadPool(2).apply_async(lambda: 0, (), {}, None, bump).get()\n",
+    ],
+    ids=["positional-callback", "positional-error-callback"],
+)
+def test_r15_thread_pool_apply_async_positional_callbacks_are_dynamic(
+    tmp_path,
+    call,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "workers = 1\n"
+        "def bump(_):\n"
+        "    global workers\n"
+        "    workers = 4\n" + call,
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Bug Hunter r15 P2-006: class constructor reached through a module-level alias.
+@pytest.mark.parametrize(
+    "alias_statements",
+    [
+        "Alias = Helper\nAlias()\n",
+        "Alias = Helper\nAlias2 = Alias\nAlias2()\n",
+    ],
+    ids=["direct-alias", "chained-alias"],
+)
+def test_r15_class_constructor_alias_spellings_are_dynamic(
+    tmp_path,
+    alias_statements,
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def __init__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n" + alias_statements,
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Bug Hunter r15 P3-001: annotated and computed chdir values must not make the
+# implicit PWD config disappear before the workers scan runs.
+def test_r15_annotated_chdir_keeps_pwd_config_scannable(monkeypatch, tmp_path):
+    launch_dir = tmp_path / "launch"
+    app_dir = tmp_path / "app"
+    launch_dir.mkdir()
+    app_dir.mkdir()
+    (launch_dir / "gunicorn.conf.py").write_text(
+        f"chdir: str = {str(app_dir)!r}\nworkers = 4\n",
+        encoding="utf-8",
+    )
+
+    _clear_worker_environment(monkeypatch)
+    monkeypatch.setenv("PWD", str(launch_dir))
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    assert config._detect_worker_settings() == (4, False)
+    assert config._ratelimit_storage_error() is not None
+
+
+def test_r15_computed_chdir_does_not_drop_pwd_config(monkeypatch, tmp_path):
+    launch_dir = tmp_path / "launch"
+    app_dir = tmp_path / "app"
+    launch_dir.mkdir()
+    app_dir.mkdir()
+    (launch_dir / "gunicorn.conf.py").write_text(
+        "import os\n"
+        "chdir = os.environ.get('APP_DIR')\n"
+        "workers = 4\n",
+        encoding="utf-8",
+    )
+
+    _clear_worker_environment(monkeypatch)
+    monkeypatch.setenv("PWD", str(launch_dir))
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    # The computed chdir cannot be verified, so the PWD fallback is scanned but
+    # must stay dynamic: that keeps a shared limiter/session backend required.
+    assert config._detect_worker_settings() == (4, True)
+
+
+def test_r15_stale_pwd_static_workers_stays_dynamic(monkeypatch, tmp_path):
+    """A stale PWD must not override WEB_CONCURRENCY with a static worker count."""
+    stale_dir = tmp_path / "stale"
+    app_dir = tmp_path / "app"
+    stale_dir.mkdir()
+    app_dir.mkdir()
+    (stale_dir / "gunicorn.conf.py").write_text("workers = 1\n", encoding="utf-8")
+
+    _clear_worker_environment(monkeypatch)
+    monkeypatch.setenv("PWD", str(stale_dir))
+    monkeypatch.setenv("WEB_CONCURRENCY", "8")
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    assert config._detect_worker_settings() == (8, True)
+    assert config._ratelimit_storage_error() is not None
+
+
+# Codex review (PR #395): captured aliases, conditional metaclass aliases,
+# unrelated MRO-shaped subscripts, annotation-only chdir, and shadowed getattr.
+def test_r15_captured_class_alias_survives_rebinding(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def __init__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "Alias = Helper\n"
+        "Helper = None\n"
+        "Alias()\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_conditional_metaclass_module_rebinding_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import abc\n"
+        "workers = 1\n"
+        "if False:\n"
+        "    abc = None\n"
+        "class Meta(abc.ABCMeta):\n"
+        "    def __new__(mcls, name, bases, ns):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return super().__new__(mcls, name, bases, ns)\n"
+        "class C(metaclass=Meta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_unrelated_subscript_receiver_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "helpers = {0: {}}\n"
+        "key = 0\n"
+        "helpers[key].update(globals(), {'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_r15_annotation_only_chdir_keeps_literal_value():
+    import ast
+
+    tree = ast.parse("chdir = '/app'\nchdir: str\n")
+    assert config._static_gunicorn_chdir(tree) == "/app"
+
+
+def test_r15_shadowed_getattr_does_not_resolve_builtin_dict(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import builtins\n"
+        "workers = 1\n"
+        "getattr = lambda *args: {}\n"
+        "getattr(builtins, 'dict').update(globals(), {'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P3-002: handing the module namespace to an imported helper.
+@pytest.mark.parametrize(
+    "call",
+    [
+        "apply_settings(globals())\n",
+        "apply_settings(vars())\n",
+        "apply_settings(locals())\n",
+        "apply_settings(**globals())\n",
+        "__import__('settings').apply_settings(globals())\n",
+        "import importlib\nimportlib.import_module('settings').apply_settings(globals())\n",
+        "import sys\nsys.modules['settings'].apply_settings(globals())\n",
+    ],
+    ids=[
+        "globals", "vars", "locals", "starred-globals",
+        "import-builtin", "importlib-module", "sys-modules",
+    ],
+)
+def test_r15_namespace_passed_to_imported_helper_is_dynamic(tmp_path, call):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from settings import apply_settings\n"
+        + call,
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_namespace_passed_to_in_file_helper_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def helper(namespace):\n"
+        "    return namespace\n"
+        "helper(globals())\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex P2: a definite rebinding replaces the functools.partial alias.
+def test_r15_rebound_partial_alias_callback_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_r15_reimported_partial_alias_callback_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = lambda *args, **kwargs: None\n"
+        "partial = functools.partial\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Post-fix review: partial-restore expressions and conditional restores must
+# stay fail-closed dynamic; only a proven local replacement may stay static.
+def test_r15_partial_restore_via_getattr_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "partial = getattr(functools, 'partial')\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_partial_restore_via_copy_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import copy\n"
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = copy.copy(functools.partial)\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_conditional_partial_restore_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "if True:\n"
+        "    partial = functools.partial\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_partial_none_rebinding_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = None\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
