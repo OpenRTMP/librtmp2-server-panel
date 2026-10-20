@@ -1801,6 +1801,73 @@ def _collect_functiontype_namespace_aliases(
 
 
 
+def _operator_setitem_context_from_bindings(bindings):
+    """Extract source-ordered module and callable aliases."""
+    metadata = bindings[32] if len(bindings) > 32 else {}
+    return (
+        bindings[0],
+        bindings[1],
+        bindings[31] if len(bindings) > 31 else {},
+        metadata.get("operator_setitem_alias_events", {}),
+        metadata,
+    )
+
+
+def _operator_setitem_callable_at_line(func, context):
+    """Only recognize operator.setitem while its original import remains bound."""
+    if context is None:
+        return False
+    module_aliases, setitem_aliases, module_events, setitem_events, shadows = context
+    line = getattr(func, "lineno", 0)
+
+    def is_live_module(node):
+        if _is_operator_import(node):
+            return _name_is_unshadowed_builtin("__import__", line, shadows)
+        if not isinstance(node, ast.Name):
+            return False
+        if node.id in module_events:
+            return bool(_binding_state_at_line(module_events, node.id, line))
+        return node.id in module_aliases
+
+    if isinstance(func, ast.Name):
+        if func.id in setitem_events:
+            return bool(_binding_state_at_line(setitem_events, func.id, line))
+        return func.id in setitem_aliases
+    if isinstance(func, ast.Attribute):
+        return func.attr == "setitem" and is_live_module(func.value)
+    return (
+        isinstance(func, ast.Call)
+        and _name_is_unshadowed_builtin("getattr", line, shadows)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == "setitem"
+        and is_live_module(func.args[0])
+    )
+
+
+def _partial_operator_setitem_mutates_workers(
+    partial_call, namespace_aliases, context,
+    invocation_call=None, invocation_start_index=0,
+):
+    """Join bound arguments with invocation arguments before checking the receiver."""
+    if (
+        partial_call is None
+        or not partial_call.args
+        or not _operator_setitem_callable_at_line(partial_call.args[0], context)
+    ):
+        return False
+    args = list(partial_call.args[1:])
+    if invocation_call is not None:
+        args.extend(invocation_call.args[invocation_start_index:])
+    return (
+        len(args) >= 2
+        and _is_module_namespace_mapping(args[0], namespace_aliases)
+        and _key_may_be_workers(args[1])
+    )
+
+
 def _partial_unbound_dict_namespace_method(
     partial_call,
     namespace_aliases,
@@ -1854,34 +1921,30 @@ def _call_payload_may_set_workers(method, call, start_index=0):
     return False
 
 def _partial_uses_unbound_dict_namespace_mutation(
-    partial_call,
-    namespace_aliases,
-    dict_update_aliases,
-    dict_shadow_line=None,
-    dict_ior_aliases=None,
-    invocation_call=None,
-    invocation_start_index=0,
+    partial_call, namespace_aliases, dict_update_aliases,
+    dict_shadow_line=None, dict_ior_aliases=None,
+    invocation_call=None, invocation_start_index=0,
+    operator_context=None,
 ):
-    """Return True when a bound dict mutator can set ``workers``."""
+    """Return True when an invoked partial can change Gunicorn workers."""
+    if _partial_operator_setitem_mutates_workers(
+        partial_call, namespace_aliases, operator_context,
+        invocation_call, invocation_start_index,
+    ):
+        return True
     if dict_ior_aliases is None:
         dict_ior_aliases = set()
     method = _partial_unbound_dict_namespace_method(
-        partial_call,
-        namespace_aliases,
-        dict_update_aliases,
-        dict_ior_aliases,
-        dict_shadow_line,
+        partial_call, namespace_aliases, dict_update_aliases,
+        dict_ior_aliases, dict_shadow_line,
     )
     if method is None:
         return False
     if _call_payload_may_set_workers(method, partial_call, start_index=2):
         return True
     return invocation_call is not None and _call_payload_may_set_workers(
-        method,
-        invocation_call,
-        start_index=invocation_start_index,
+        method, invocation_call, start_index=invocation_start_index,
     )
-
 
 
 def _methodcaller_method_name(call):
@@ -2184,17 +2247,17 @@ def _call_is_getattr_setdefault_workers(call, namespace_aliases=None):
 
 
 def _call_is_operator_setitem_workers(call, operator_bindings):
-    """Return True for imported ``operator.setitem(globals(), 'workers', ...)``."""
+    """Detect a live operator.setitem targeting the Gunicorn module namespace."""
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
-    if not _is_globals_call(call.args[0]) or not _constant_is_workers(call.args[1]):
-        return False
-
-    module_aliases, setitem_aliases = operator_bindings[:2]
-    func = call.func
-    if isinstance(func, ast.Attribute) and func.attr == "setitem":
-        return isinstance(func.value, ast.Name) and func.value.id in module_aliases
-    return isinstance(func, ast.Name) and func.id in setitem_aliases
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    return (
+        _is_module_namespace_mapping(call.args[0], namespace_aliases)
+        and _constant_is_workers(call.args[1])
+        and _operator_setitem_callable_at_line(
+            call.func, _operator_setitem_context_from_bindings(operator_bindings)
+        )
+    )
 
 
 def _call_is_getattr_setitem_workers(call):
@@ -3425,13 +3488,9 @@ def _partial_factory_call(node, partial_aliases):
 
 
 def _partial_value_is_workers_setter(
-    value,
-    namespace_aliases,
-    partial_aliases,
-    known_aliases,
-    dict_update_aliases=None,
-    dict_shadow_line=None,
-    dict_ior_aliases=None,
+    value, namespace_aliases, partial_aliases, known_aliases,
+    dict_update_aliases=None, dict_shadow_line=None,
+    dict_ior_aliases=None, operator_context=None,
 ):
     """Return True when a value resolves to a partial workers setter."""
     if dict_update_aliases is None:
@@ -3444,11 +3503,9 @@ def _partial_value_is_workers_setter(
     if partial_call is None or not partial_call.args:
         return False
     if _partial_uses_unbound_dict_namespace_mutation(
-        partial_call,
-        namespace_aliases,
-        dict_update_aliases,
-        dict_shadow_line,
-        dict_ior_aliases,
+        partial_call, namespace_aliases, dict_update_aliases,
+        dict_shadow_line, dict_ior_aliases,
+        operator_context=operator_context,
     ):
         return True
     if (
@@ -3463,42 +3520,29 @@ def _partial_value_is_workers_setter(
     )
 
 
-
 def _values_are_partial_workers_setters(
-    values,
-    namespace_aliases,
-    partial_aliases,
-    known_aliases,
-    dict_update_aliases=None,
-    dict_shadow_line=None,
-    dict_ior_aliases=None,
+    values, namespace_aliases, partial_aliases, known_aliases,
+    dict_update_aliases=None, dict_shadow_line=None,
+    dict_ior_aliases=None, operator_context=None,
 ):
     """Return True when every resolved assignment is a workers setter."""
     resolved = [value for value in values if value is not None]
     return bool(resolved) and all(
         _partial_value_is_workers_setter(
-            value,
-            namespace_aliases,
-            partial_aliases,
-            known_aliases,
-            dict_update_aliases,
-            dict_shadow_line,
-            dict_ior_aliases,
+            value, namespace_aliases, partial_aliases, known_aliases,
+            dict_update_aliases, dict_shadow_line, dict_ior_aliases,
+            operator_context,
         )
         for value in resolved
     )
 
 
-
 def _collect_partial_workers_setter_aliases(
-    tree,
-    namespace_aliases,
-    partial_aliases,
-    dict_update_aliases=None,
-    dict_shadow_line=None,
-    dict_ior_aliases=None,
+    tree, namespace_aliases, partial_aliases,
+    dict_update_aliases=None, dict_shadow_line=None,
+    dict_ior_aliases=None, operator_context=None,
 ):
-    """Collect names bound to partials that always set ``workers``."""
+    """Collect names bound to partials that always set workers."""
     if dict_shadow_line is None:
         dict_shadow_line = _collect_definite_name_shadow_line(tree, "dict")
     if dict_update_aliases is None:
@@ -3514,13 +3558,9 @@ def _collect_partial_workers_setter_aliases(
             name
             for name in unresolved
             if _values_are_partial_workers_setters(
-                assignments[name],
-                namespace_aliases,
-                partial_aliases,
-                aliases,
-                dict_update_aliases,
-                dict_shadow_line,
-                dict_ior_aliases,
+                assignments[name], namespace_aliases, partial_aliases,
+                aliases, dict_update_aliases, dict_shadow_line,
+                dict_ior_aliases, operator_context,
             )
         }
         if not discovered:
@@ -3530,26 +3570,30 @@ def _collect_partial_workers_setter_aliases(
     return aliases
 
 
-
 def _partial_value_dict_namespace_method(
-    value,
-    namespace_aliases,
-    partial_aliases,
-    known_aliases,
-    dict_update_aliases,
-    dict_ior_aliases,
-    dict_shadow_line,
+    value, namespace_aliases, partial_aliases, known_aliases,
+    dict_update_aliases, dict_ior_aliases, dict_shadow_line,
+    operator_context=None,
 ):
-    """Resolve a saved partial to its bound dict namespace mutator."""
+    """Resolve a saved partial to its bound module namespace mutator."""
     if isinstance(value, ast.Name):
         return known_aliases.get(value.id)
     partial_call = _partial_factory_call(value, partial_aliases)
+    if partial_call is None:
+        return None
+    if (
+        len(partial_call.args) >= 2
+        and _operator_setitem_callable_at_line(partial_call.args[0], operator_context)
+        and _is_module_namespace_mapping(partial_call.args[1], namespace_aliases)
+        and (
+            len(partial_call.args) < 3
+            or _key_may_be_workers(partial_call.args[2])
+        )
+    ):
+        return "__setitem__"
     return _partial_unbound_dict_namespace_method(
-        partial_call,
-        namespace_aliases,
-        dict_update_aliases,
-        dict_ior_aliases,
-        dict_shadow_line,
+        partial_call, namespace_aliases, dict_update_aliases,
+        dict_ior_aliases, dict_shadow_line,
     )
 
 
@@ -3560,6 +3604,7 @@ def _collect_partial_dict_namespace_mutator_alias_events(
     dict_update_aliases,
     dict_ior_aliases,
     dict_shadow_line,
+    operator_context=None,
 ):
     """Track saved partial dict mutators at each top-level binding event."""
     events = {}
@@ -3579,6 +3624,7 @@ def _collect_partial_dict_namespace_mutator_alias_events(
                     dict_update_aliases,
                     dict_ior_aliases,
                     dict_shadow_line,
+                    operator_context,
                 )
             current_aliases[name] = method
             events.setdefault(name, []).append((line, method))
@@ -3699,6 +3745,7 @@ def _call_is_partial_bound_workers_setitem(call, operator_bindings):
         dict_ior_aliases,
         call,
         invocation_start,
+        _operator_setitem_context_from_bindings(operator_bindings),
     ):
         return True
     if _partial_call_binds_proven_frame_globals_workers_setter(
@@ -17605,6 +17652,10 @@ def _collect_operator_setitem_bindings(tree):
     builtins_aliases = _collect_builtins_aliases(tree)
     builtins_alias_events = _collect_imported_module_alias_events(tree, 'builtins')
     operator_module_alias_events = _collect_imported_module_alias_events(tree, 'operator')
+    operator_setitem_alias_events = _collect_imported_name_alias_events(
+        tree, "operator", {"setitem"}
+    )
+    builtin_shadow_lines["operator_setitem_alias_events"] = operator_setitem_alias_events
     collections_module_alias_events = _collect_imported_module_alias_events(
         tree,
         'collections',
@@ -17683,11 +17734,17 @@ def _collect_operator_setitem_bindings(tree):
     # the call sites that classify them.
     namespace_aliases.builtin_shadow_lines = builtin_shadow_lines
     mutator_aliases = _collect_namespace_mutator_aliases(tree, namespace_aliases)
+    operator_context = (
+        module_aliases, setitem_aliases, operator_module_alias_events,
+        operator_setitem_alias_events, builtin_shadow_lines,
+    )
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
-        tree, namespace_aliases, partial_aliases, dict_update_aliases, dict_shadow_line, dict_ior_aliases
+        tree, namespace_aliases, partial_aliases, dict_update_aliases,
+        dict_shadow_line, dict_ior_aliases, operator_context,
     )
     partial_dict_mutator_alias_events = _collect_partial_dict_namespace_mutator_alias_events(
-        tree, namespace_aliases, partial_aliases, dict_update_aliases, dict_ior_aliases, dict_shadow_line
+        tree, namespace_aliases, partial_aliases, dict_update_aliases,
+        dict_ior_aliases, dict_shadow_line, operator_context,
     )
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
     delegated_update_aliases = _collect_delegated_update_namespace_aliases(tree, namespace_aliases)
