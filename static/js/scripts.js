@@ -260,6 +260,7 @@ function buildStatsRows(stream, video, players, clusterRows, playerRows) {
 }
 
 function renderStats(statsContainer, data) {
+    statsContainer.dataset.hasCompletedStats = 'true';
     if (data.error) {
         const error = document.createElement('p');
         error.className = 'text-danger';
@@ -365,6 +366,13 @@ function loadStats(streamId) {
         .catch((err) => {
             if (err?.rateLimited) {
                 console.warn('Stats request rate limited; keeping last stats', err);
+                if (statsContainer.dataset.hasCompletedStats !== 'true') {
+                    renderStatsPlaceholder(
+                        statsContainer,
+                        'Stats rate limited; retrying soon',
+                        'text-muted',
+                    );
+                }
                 return;
             }
             console.warn('Stats request failed', err);
