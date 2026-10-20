@@ -1,4 +1,5 @@
 import ast
+import builtins
 import contextlib
 import ipaddress
 import os
@@ -9,6 +10,10 @@ from datetime import timedelta
 from pathlib import Path
 
 from session_store import shared_session_store_supported
+
+_BUILTIN_CALLABLE_NAMES = frozenset(
+    name for name in dir(builtins) if callable(getattr(builtins, name, None))
+)
 
 _INSECURE_DEFAULTS = frozenset(
     {
@@ -681,6 +686,20 @@ def _namespace_aliases_reference_current_module(node, namespace_aliases):
         getattr(namespace_aliases, "importlib_aliases", None),
         getattr(namespace_aliases, "importlib_module_aliases", None),
     )
+
+
+class _PartialFactoryAliases(set):
+    """``functools.partial`` aliases plus definite rebinding metadata.
+
+    The import collector intentionally keeps an alias when a rebinding is only
+    conditional (fail closed), so the call sites also need the definite
+    top-level rebinding order to avoid reading a replaced ``partial`` name as
+    the real factory.
+    """
+
+    def __init__(self, values=(), *, binding_events=None):
+        super().__init__(values)
+        self.binding_events = binding_events if binding_events is not None else {}
 
 
 def _is_structural_operator_attrgetter_factory(factory_call):
@@ -3701,6 +3720,21 @@ def _call_is_operator_namespace_ior(call, operator_bindings):
     return _dict_merge_payload_may_set_workers(call.args[1])
 
 
+def _partial_factory_binding_is_active(name_node, partial_aliases):
+    """Return whether an alias still names ``functools.partial`` at its use."""
+    if not isinstance(name_node, ast.Name):
+        return False
+    events = getattr(partial_aliases, "binding_events", None)
+    if not events:
+        return True
+    state = _ordered_binding_state_at_position(
+        events,
+        name_node.id,
+        name_node,
+    )
+    return state is not False
+
+
 def _partial_factory_call(node, partial_aliases):
     """Return a ``partial(...)`` call, including ``(alias := partial(...))``."""
     if isinstance(node, ast.Call):
@@ -3713,11 +3747,17 @@ def _partial_factory_call(node, partial_aliases):
     if isinstance(partial_func, ast.Name):
         if partial_func.id not in partial_aliases:
             return None
+        if not _partial_factory_binding_is_active(partial_func, partial_aliases):
+            return None
     elif not (
         isinstance(partial_func, ast.Attribute)
         and partial_func.attr == "partial"
         and isinstance(partial_func.value, ast.Name)
         and partial_func.value.id in partial_aliases
+        and _partial_factory_binding_is_active(
+            partial_func.value,
+            partial_aliases,
+        )
     ):
         return None
     return candidate
@@ -13597,6 +13637,143 @@ def _call_has_primary_worker_mutation(expr, operator_bindings):
     )
 
 
+def _call_callee_root_name(node):
+    """Return the root ``ast.Name`` of a call target, if one exists."""
+    for _ in range(20):
+        if isinstance(node, ast.Name):
+            return node
+        if isinstance(node, ast.Attribute):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func
+        elif isinstance(node, ast.Subscript):
+            node = node.value
+        elif isinstance(node, ast.NamedExpr):
+            node = node.value
+        else:
+            return None
+    return None
+
+
+def _call_root_is_recognized_namespace_consumer(
+    root,
+    call,
+    operator_bindings,
+    namespace_aliases,
+):
+    """Return True when the call target already has a dedicated recognizer."""
+    if root.id in namespace_aliases:
+        # ``ns.update(...)`` style calls are classified by payload.
+        return True
+    reference_line = getattr(call, "lineno", 0)
+    shadow_lines = (
+        operator_bindings[32]
+        if len(operator_bindings) > 32
+        else {}
+    )
+    if root.id in _BUILTIN_CALLABLE_NAMES and _name_is_unshadowed_builtin(
+        root.id,
+        reference_line,
+        shadow_lines,
+    ):
+        # Builtins (``print``, ``getattr``, ``type``, ``dict`` ...) either do
+        # not mutate the namespace or are handled by the exec/eval and dict
+        # recognizers before this fail-closed fallback.
+        return True
+    alias_indices = (
+        0, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 22, 23, 24, 25, 26, 28,
+    )
+    for index in alias_indices:
+        if len(operator_bindings) <= index:
+            continue
+        aliases = operator_bindings[index]
+        if root.id in aliases:
+            return True
+    event_indices = (18, 19, 20, 29, 30, 31, 33, 34, 35, 36, 38, 39)
+    for index in event_indices:
+        if len(operator_bindings) <= index:
+            continue
+        events = operator_bindings[index]
+        if not isinstance(events, dict):
+            continue
+        if _ordered_binding_state_at_position(events, root.id, call):
+            return True
+    if isinstance(shadow_lines, dict):
+        for key in (
+            "heapq_module_alias_events",
+            "builtins_module_alias_events",
+            "collections_module_alias_events",
+            "collections_chainmap_alias_events",
+            "itertools_starmap_alias_events",
+        ):
+            events = shadow_lines.get(key)
+            if isinstance(events, dict) and _ordered_binding_state_at_position(
+                events,
+                root.id,
+                call,
+            ):
+                return True
+    return False
+
+
+def _call_passes_namespace_to_unknown_callee(call, operator_bindings):
+    """Return True when the config hands its module namespace to an outsider.
+
+    An imported helper such as ``apply_settings(globals())`` can assign
+    ``workers`` in the module namespace, so the scan cannot keep reporting a
+    static worker count. Calls to callables defined by the config itself and to
+    the already-recognized namespace mutator forms stay with their dedicated
+    recognizers.
+    """
+    if not isinstance(call, ast.Call) or isinstance(call.func, ast.Lambda):
+        return False
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    arguments = [*call.args, *(keyword.value for keyword in call.keywords)]
+    if not any(
+        _is_module_namespace_mapping(
+            argument.value if isinstance(argument, ast.Starred) else argument,
+            namespace_aliases,
+        )
+        for argument in arguments
+    ):
+        return False
+    root = _call_callee_root_name(call.func)
+    if root is None:
+        return False
+    if _call_root_is_recognized_namespace_consumer(
+        root,
+        call,
+        operator_bindings,
+        namespace_aliases,
+    ):
+        return False
+    shadow_lines = (
+        operator_bindings[32]
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    in_file_names = shadow_lines.get("in_file_callable_names", set())
+    if root.id in in_file_names:
+        return False
+    if isinstance(call.func, ast.Attribute) and call.func.attr in {
+        "update",
+        "__setitem__",
+        "__ior__",
+        "setdefault",
+        "ChainMap",
+    }:
+        local_values = shadow_lines.get(
+            "in_file_noncallable_value_names",
+            set(),
+        )
+        # A recognized mapping/ChainMap method call on a local object
+        # (``helpers[key].update(globals(), ...)``) targets that object, not an
+        # imported helper that can rewrite the module namespace.
+        if root.id in local_values:
+            return False
+    return True
+
+
 def _call_is_functiontype_namespace_alias(expr, aliases):
     """Return True when a saved FunctionType namespace callable is invoked."""
     return isinstance(expr.func, ast.Name) and expr.func.id in aliases
@@ -13660,6 +13837,7 @@ def _call_has_secondary_worker_mutation(
             bound_names,
         )
         or _call_is_warnings_warn_after_mutating_hook(expr, operator_bindings)
+        or _call_passes_namespace_to_unknown_callee(expr, operator_bindings)
     )
 
 
@@ -18156,6 +18334,175 @@ def _collect_literal_string_value_events(tree):
     return events
 
 
+def _collect_in_file_callable_names(tree):
+    """Collect module-level callables defined by the scanned config itself."""
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if not isinstance(value, ast.Lambda):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names.update(
+                target.id
+                for target in targets
+                if isinstance(target, ast.Name)
+            )
+    return names
+
+
+def _collect_in_file_noncallable_value_names(tree):
+    """Collect module-level names bound to values the config creates itself.
+
+    Literal containers, constructor results and other non-name assignments are
+    local objects; a method called on one of them cannot rewrite the module
+    namespace through the argument. A plain name assignment (``alias = other``)
+    is left out because it may still forward an imported callable.
+    """
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if isinstance(value, (ast.Name, ast.Lambda)) or value is None:
+                continue
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+        else:
+            continue
+        names.update(
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        )
+    return names
+
+
+def _partial_factory_value_restores(
+    value,
+    name,
+    alias_names,
+    functools_alias_events,
+    line,
+    local_callables=None,
+):
+    """Return whether a definite assignment rebinds an alias to the factory.
+
+    Fail closed for expressions that cannot be proven to be a harmless local
+    replacement: ``getattr(functools, "partial")``, ``copy.copy(...)``,
+    conditional expressions, walrus expressions and unknown imported names all
+    keep the alias treated as ``functools.partial``.
+    """
+    if isinstance(value, ast.Name):
+        if value.id == name or value.id in alias_names:
+            return True
+        if value.id in (local_callables or set()):
+            return False
+        # Unknown/imported name: it may be the real factory (or a wrapper that
+        # returns it), so do not deactivate the alias.
+        return True
+    if isinstance(value, ast.Attribute) and value.attr == "partial":
+        # A proven live functools module is the factory; any other receiver is
+        # unprovable and therefore also treated as the factory.
+        return True
+    if isinstance(value, ast.Lambda):
+        return False
+    if isinstance(value, ast.Constant) and value.value is None:
+        return False
+    # Calls, conditional/walrus expressions, copy/getattr wrappers, etc. may
+    # restore the factory. Keep the fail-closed reading.
+    return True
+
+
+def _collect_partial_factory_binding_events(tree, alias_names):
+    """Track source-ordered rebindings of ``functools.partial`` aliases.
+
+    Top-level statements always run, so a rebinding to a proven local callable
+    can deactivate the alias. Assignments/imports inside compound statements
+    are conditional: they may restore the factory but must never deactivate it
+    (fail closed). Events are ``(line, column, is_factory)`` so same-line
+    semicolon ordering is respected.
+    """
+    names = set(alias_names)
+    local_callables = set()
+    for node in _module_scope_ast_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local_callables.add(node.name)
+        elif isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Lambda):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        local_callables.add(target.id)
+    events = {}
+    functools_alias_events = _collect_imported_module_alias_events(
+        tree,
+        "functools",
+    )
+    top_level_ids = {id(node) for node in tree.body}
+
+    def record(name, line, column, is_factory):
+        events.setdefault(name, []).append((line, column, is_factory))
+
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        line = getattr(node, "lineno", 0)
+        column = getattr(node, "col_offset", 0)
+        top_level = id(node) in top_level_ids
+        bindings = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in names:
+                bindings.append((node.name, False))
+        elif isinstance(node, ast.Import):
+            for imported in node.names:
+                bound_name = imported.asname or imported.name
+                if bound_name in names:
+                    bindings.append((bound_name, imported.name == "functools"))
+        elif isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                bound_name = imported.asname or imported.name
+                if bound_name in names:
+                    bindings.append(
+                        (
+                            bound_name,
+                            node.module == "functools"
+                            and imported.name == "partial",
+                        )
+                    )
+        else:
+            for name, value in _namespace_assignment_values(node):
+                if name not in names or value is None:
+                    # Annotation-only statements and augmented assignments do
+                    # not prove a replacement factory; keep the alias active.
+                    continue
+                bindings.append(
+                    (
+                        name,
+                        _partial_factory_value_restores(
+                            value,
+                            name,
+                            names,
+                            functools_alias_events,
+                            line,
+                            local_callables,
+                        ),
+                    )
+                )
+        for name, is_factory in bindings:
+            if top_level or is_factory:
+                # Nested false events are conditional and must not deactivate
+                # the alias; nested true events are possible restores.
+                record(name, line, column, is_factory)
+    for name in events:
+        events[name].sort(key=lambda event: (event[0], event[1]))
+    return events
+
+
 def _collect_operator_setitem_bindings(tree):
     """Collect aliases used by operator and module-namespace mutation scans."""
     module_aliases = set()
@@ -18172,6 +18519,13 @@ def _collect_operator_setitem_bindings(tree):
         partial_aliases,
         methodcaller_aliases,
         attrgetter_aliases,
+    )
+    partial_aliases = _PartialFactoryAliases(
+        partial_aliases,
+        binding_events=_collect_partial_factory_binding_events(
+            tree,
+            partial_aliases,
+        ),
     )
     builtin_shadow_lines = {
         name: _collect_definite_name_shadow_line(tree, name)
@@ -18232,6 +18586,12 @@ def _collect_operator_setitem_bindings(tree):
     )
     # The binding tuple indices are fixed, so the heapq alias events travel in
     # the metadata map exactly like the late-collected module alias events.
+    builtin_shadow_lines["in_file_callable_names"] = (
+        _collect_in_file_callable_names(tree)
+    )
+    builtin_shadow_lines["in_file_noncallable_value_names"] = (
+        _collect_in_file_noncallable_value_names(tree)
+    )
     builtin_shadow_lines["attrgetter_factory_alias_events"] = (
         _collect_imported_name_alias_events(tree, "operator", {"attrgetter"})
     )

@@ -4291,3 +4291,158 @@ def test_r15_shadowed_getattr_does_not_resolve_builtin_dict(tmp_path):
     )
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Bug Hunter r15 P3-002: handing the module namespace to an imported helper.
+@pytest.mark.parametrize(
+    "call",
+    [
+        "apply_settings(globals())\n",
+        "apply_settings(vars())\n",
+        "apply_settings(locals())\n",
+        "apply_settings(**globals())\n",
+    ],
+    ids=["globals", "vars", "locals", "starred-globals"],
+)
+def test_r15_namespace_passed_to_imported_helper_is_dynamic(tmp_path, call):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from settings import apply_settings\n"
+        + call,
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_namespace_passed_to_in_file_helper_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def helper(namespace):\n"
+        "    return namespace\n"
+        "helper(globals())\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+# Codex P2: a definite rebinding replaces the functools.partial alias.
+def test_r15_rebound_partial_alias_callback_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_r15_reimported_partial_alias_callback_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = lambda *args, **kwargs: None\n"
+        "partial = functools.partial\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Post-fix review: partial-restore expressions and conditional restores must
+# stay fail-closed dynamic; only a proven local replacement may stay static.
+def test_r15_partial_restore_via_getattr_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "partial = getattr(functools, 'partial')\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_partial_restore_via_copy_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import copy\n"
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = copy.copy(functools.partial)\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_conditional_partial_restore_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import functools\n"
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "def safe_factory(func, value):\n"
+        "    return lambda *args, **kwargs: None\n"
+        "partial = safe_factory\n"
+        "if True:\n"
+        "    partial = functools.partial\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_partial_none_rebinding_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "from multiprocessing.pool import ThreadPool\n"
+        "from functools import partial\n"
+        "workers = 1\n"
+        "def bump(prefix, value):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "partial = None\n"
+        "ThreadPool(2).map(partial(bump, 1), [1, 2])\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
