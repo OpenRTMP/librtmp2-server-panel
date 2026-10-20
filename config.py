@@ -1016,6 +1016,10 @@ def _chainmap_callee_is_collections_chainmap(func, alias_events=None):
             reference_line,
         )
     if isinstance(func, ast.Attribute) and func.attr == "ChainMap":
+        if not isinstance(func.value, ast.Name):
+            # ``__import__('collections')`` / ``import_module(...)`` receivers
+            # cannot be proven to differ from collections; fail closed.
+            return True
         return _module_alias_active_at_line(
             func.value,
             set(),
@@ -1256,7 +1260,12 @@ def _is_direct_dict_update_attribute(func):
     )
 
 
-def _is_getattr_resolver_callee(func, alias_events=None, reference_line=0):
+def _is_getattr_resolver_callee(
+    func,
+    alias_events=None,
+    reference_line=0,
+    builtin_shadow_lines=None,
+):
     """Return True for the builtin ``getattr`` or a proven alias of it.
 
     ``getattr``, ``builtins.getattr`` and ``from builtins import getattr as X``
@@ -1266,7 +1275,9 @@ def _is_getattr_resolver_callee(func, alias_events=None, reference_line=0):
     reference_line = reference_line or getattr(func, "lineno", 0)
     if isinstance(func, ast.Name):
         if func.id == "getattr":
-            return True
+            return _name_is_unshadowed_builtin(
+                "getattr", reference_line, builtin_shadow_lines
+            )
         return _imported_alias_is_active(
             alias_events.get("builtins_getattr_alias_events", {}),
             func.id,
@@ -1481,8 +1492,11 @@ def _getattr_namespaces_builtin_dict_type(
         return False
     if not _is_getattr_resolver_callee(
         func.func,
-        builtin_shadow_lines if isinstance(builtin_shadow_lines, dict) else None,
-        reference_line or getattr(func, 'lineno', 0),
+        alias_events={
+            "builtins_module_alias_events": builtins_alias_events or {}
+        },
+        builtin_shadow_lines=builtin_shadow_lines,
+        reference_line=reference_line or getattr(func, 'lineno', 0),
     ):
         return False
     key = func.args[1]
@@ -1582,8 +1596,11 @@ def _is_dict_type_update_callable(
         return True
     if not _is_getattr_resolver_callee(
         func.func if isinstance(func, ast.Call) else None,
-        builtin_shadow_lines if isinstance(builtin_shadow_lines, dict) else None,
-        reference_line,
+        alias_events={
+            "builtins_module_alias_events": builtins_alias_events or {}
+        },
+        builtin_shadow_lines=builtin_shadow_lines,
+        reference_line=reference_line,
     ):
         return False
     if (
@@ -1599,7 +1616,7 @@ def _is_dict_type_update_callable(
     target = _getattr_target_for_method(
         func,
         'update',
-        builtin_shadow_lines if isinstance(builtin_shadow_lines, dict) else None,
+        None,
         reference_line,
     )
     if target is None:
@@ -4376,14 +4393,19 @@ def _mro_receiver_class_name(node, operator_bindings):
     """
     if not isinstance(node, ast.Subscript):
         return None
+    base = node.value
+    is_bases = isinstance(base, ast.Attribute) and base.attr == '__bases__'
+    is_mro_attr = isinstance(base, ast.Attribute) and base.attr == '__mro__'
+    is_mro_call = isinstance(base, ast.Call) and _is_class_mro_method_call(base)
+    if not (is_bases or is_mro_attr or is_mro_call):
+        return None
     index = _subscript_constant_index(node.slice)
     if index is None:
         return _UNRESOLVED_MRO_RECEIVER
-    base = node.value
     resolved = None
-    if isinstance(base, ast.Attribute) and base.attr == '__bases__':
+    if is_bases:
         resolved = _bases_subscript_class_name(base, index, operator_bindings)
-    elif isinstance(base, ast.Attribute) and base.attr == '__mro__':
+    elif is_mro_attr:
         if isinstance(base.value, ast.Name):
             resolved = _class_mro_index_class_name(
                 base.value.id,
@@ -4391,14 +4413,12 @@ def _mro_receiver_class_name(node, operator_bindings):
                 operator_bindings,
                 getattr(base, 'lineno', 0),
             )
-    elif isinstance(base, ast.Call) and _is_class_mro_method_call(base):
+    else:
         resolved = _class_mro_method_subscript_class_name(
             base,
             index,
             operator_bindings,
         )
-    else:
-        return None
     return _UNRESOLVED_MRO_RECEIVER if resolved is None else resolved
 
 
@@ -10301,8 +10321,17 @@ def _collect_metaclass_class_names(tree):
     class_nodes = [
         node for node in tree.body if isinstance(node, ast.ClassDef)
     ]
+    local_names = {node.name for node in class_nodes}
+    # Any locally defined class can be used as an explicit metaclass: Python
+    # calls it with (name, bases, ns) even when it does not subclass ``type``
+    # (for example ``class Meta(abc.ABC)``), so scan its hooks as well.
+    explicit_metaclasses = {
+        name
+        for node in _iter_class_definitions(tree.body)
+        if (name := _explicit_metaclass_name(node)) in local_names
+    }
     base_aliases, module_alias_events = _collect_metaclass_base_aliases(tree)
-    metaclass_names = set()
+    metaclass_names = set(explicit_metaclasses)
     while True:
         candidate_bases = base_aliases | metaclass_names
         discovered = {
@@ -11461,7 +11490,17 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         class_name_aliases,
         reference_line,
     )
-    if not _class_binding_is_active(class_targets, class_name, reference_line):
+    binding_line = reference_line
+    if class_name != expr.func.id:
+        # Resolve whether the alias captured a live class at assignment time:
+        # a later rebinding of the original name does not change what the alias
+        # already points to (``Alias = Helper; Helper = None; Alias()`` still
+        # runs ``Helper.__init__``).
+        for event_line, _target in class_name_aliases.get(expr.func.id, ()):
+            if reference_line and event_line > reference_line:
+                break
+            binding_line = event_line
+    if not _class_binding_is_active(class_targets, class_name, binding_line):
         return False
     if class_name in constructors:
         return True
@@ -17937,9 +17976,15 @@ def _invalidate_imported_module_aliases(node, active, events, line):
 
 
 def _collect_imported_module_alias_events(tree, module_name):
-    """Track module-scope imports, including executed compound statement bodies."""
+    """Track module-scope imports and definite top-level rebindings.
+
+    Assignments inside compound statements are conditional: they may not run,
+    so they must not deactivate an imported alias. Keeping the alias as a
+    possible candidate is the fail-closed direction for the worker scan.
+    """
     events = {}
     active = set()
+    top_level_nodes = {id(node) for node in tree.body}
     for node in _module_scope_ast_nodes(tree):
         if not isinstance(node, ast.stmt):
             continue
@@ -17951,7 +17996,8 @@ def _collect_imported_module_alias_events(tree, module_name):
             events,
             line,
         )
-        _invalidate_imported_module_aliases(node, active, events, line)
+        if id(node) in top_level_nodes:
+            _invalidate_imported_module_aliases(node, active, events, line)
     return events
 
 
@@ -20016,6 +20062,10 @@ def _static_gunicorn_chdir(tree):
             targets = node.targets
             node_value = node.value
         elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                # ``chdir: str`` only updates ``__annotations__``; it does not
+                # change an existing literal ``chdir`` assignment.
+                continue
             targets = [node.target]
             node_value = node.value
         else:
@@ -20180,13 +20230,16 @@ def _detect_worker_settings() -> tuple[int, bool]:
     elif _is_gunicorn_process(sys.argv):
         default_paths, default_ambiguous = _default_gunicorn_config_selection()
         if default_paths:
+            env_count = count
             count, assignment_dynamic, runtime_dynamic = (
                 _apply_gunicorn_config_worker_details(count, str(default_paths[0]))
             )
             if default_ambiguous:
                 # The config came from an unverified PWD fallback: it may not be
                 # the file Gunicorn loaded, so never treat its static worker
-                # count as authoritative for the shared-backend decision.
+                # count as authoritative for the shared-backend decision. Keep
+                # the larger environment count and force the dynamic flag.
+                count = max(count, env_count)
                 runtime_dynamic = True
 
     cmd_override = _worker_count_override_from_tokens(cmd_tokens)

@@ -3910,22 +3910,51 @@ def test_r15_metaclass_stdlib_base_spellings_are_dynamic(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
-def test_r15_metaclass_abc_base_negative_stays_static(tmp_path):
+def test_r15_metaclass_non_type_base_with_init_is_dynamic(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
         "import abc\n"
         "workers = 1\n"
         "class Meta(abc.ABC):\n"
-        "    def __new__(mcls, name, bases, ns):\n"
+        "    def __init__(cls, name, bases, ns):\n"
         "        global workers\n"
         "        workers = 4\n"
-        "        return super().__new__(mcls, name, bases, ns)\n"
         "class C(metaclass=Meta):\n"
         "    pass\n",
         encoding="utf-8",
     )
 
-    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_explicit_metaclass_without_type_base_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Meta:\n"
+        "    def __new__(mcls, name, bases, ns):\n"
+        "        return type(name, bases, ns)\n"
+        "    def __init__(cls, name, bases, ns):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "class C(metaclass=Meta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_chainmap_non_name_receiver_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "__import__('collections').ChainMap(globals()).maps[0].update("
+        "{'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
 
 # Bug Hunter r15 P2-002: dict(generator) drains the generator and executes the
@@ -4188,5 +4217,77 @@ def test_r15_stale_pwd_static_workers_stays_dynamic(monkeypatch, tmp_path):
     monkeypatch.chdir(app_dir)
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
-    assert config._detect_worker_settings() == (1, True)
+    assert config._detect_worker_settings() == (8, True)
     assert config._ratelimit_storage_error() is not None
+
+
+# Codex review (PR #395): captured aliases, conditional metaclass aliases,
+# unrelated MRO-shaped subscripts, annotation-only chdir, and shadowed getattr.
+def test_r15_captured_class_alias_survives_rebinding(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "class Helper:\n"
+        "    def __init__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "Alias = Helper\n"
+        "Helper = None\n"
+        "Alias()\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_conditional_metaclass_module_rebinding_stays_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import abc\n"
+        "workers = 1\n"
+        "if False:\n"
+        "    abc = None\n"
+        "class Meta(abc.ABCMeta):\n"
+        "    def __new__(mcls, name, bases, ns):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return super().__new__(mcls, name, bases, ns)\n"
+        "class C(metaclass=Meta):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_r15_unrelated_subscript_receiver_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "helpers = {0: {}}\n"
+        "key = 0\n"
+        "helpers[key].update(globals(), {'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_r15_annotation_only_chdir_keeps_literal_value():
+    import ast
+
+    tree = ast.parse("chdir = '/app'\nchdir: str\n")
+    assert config._static_gunicorn_chdir(tree) == "/app"
+
+
+def test_r15_shadowed_getattr_does_not_resolve_builtin_dict(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import builtins\n"
+        "workers = 1\n"
+        "getattr = lambda *args: {}\n"
+        "getattr(builtins, 'dict').update(globals(), {'workers': 4})\n",
+        encoding="utf-8",
+    )
+
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
