@@ -13368,10 +13368,9 @@ def _nested_class_attribute_call_triggers_workers(
     if (original_outer, inner_name) not in nested_pairs:
         return False
     rebinding_events = class_targets[16] if len(class_targets) > 16 else {}
-    events = rebinding_events.get((original_outer, inner_name))
-    if events and not _binding_state_at_line(
-        events, (original_outer, inner_name), reference_line,
-    ):
+    if _binding_state_at_line(
+        rebinding_events, (original_outer, inner_name), reference_line,
+    ) is False:
         return False
     return _class_binding_is_active(class_targets, original_outer, reference_line)
 
