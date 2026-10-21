@@ -11136,10 +11136,17 @@ def _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
     )
 
 
-def _enum_member_names(class_node, module_aliases, nonmember_aliases):
+def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor_classes=None):
     """Yield public simple names that create true members in an enum body."""
+    descriptor_classes = descriptor_classes or set()
     for stmt in class_node.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in descriptor_classes
+        ):
+            continue
         if isinstance(value, ast.Lambda) or _enum_value_is_nonmember(
             value,
             module_aliases,
@@ -11173,12 +11180,34 @@ def _collect_enum_member_targets(tree):
     for node in class_nodes:
         if node.name not in enum_class_names:
             continue
+        # Instances of a locally proven descriptor do not become Enum members.
+        # Ignore a descriptor name that was rebound between its definition and use.
+        descriptor_classes = set()
+        for possible in class_nodes:
+            if getattr(possible, "lineno", 0) >= getattr(node, "lineno", 0):
+                continue
+            if not any(
+                isinstance(method, ast.FunctionDef)
+                and method.name in {"__get__", "__set__", "__delete__"}
+                for method in possible.body
+            ):
+                continue
+            if any(
+                possible.name == name
+                and getattr(stmt, "lineno", 0) > getattr(possible, "lineno", 0)
+                and getattr(stmt, "lineno", 0) < getattr(node, "lineno", 0)
+                for stmt in tree.body
+                for name, _value in _namespace_assignment_values(stmt)
+            ):
+                continue
+            descriptor_classes.add(possible.name)
         members.update(
             (node.name, member_name)
             for member_name in _enum_member_names(
                 node,
                 module_aliases,
                 nonmember_aliases,
+                descriptor_classes,
             )
         )
     return members
@@ -11467,6 +11496,34 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
             class_methods,
             constructors,
         )
+    # Track definite replacements of nested class constructors at module scope.
+    # An explicitly harmless lambda no longer constructs the original class.
+    nested_attribute_bindings = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        line = getattr(node, "lineno", 0)
+        for target in targets:
+            if not (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+            ):
+                continue
+            original_outer = _class_name_alias_target(
+                target.value.id, class_name_aliases, line,
+            )
+            pair = (original_outer, target.attr)
+            if pair not in nested_constructor_pairs:
+                continue
+            harmless = (
+                isinstance(value, ast.Lambda)
+                and not _lambda_mutates_workers(value, operator_bindings)
+            )
+            nested_attribute_bindings.setdefault(pair, []).append(
+                (line, not harmless)
+            )
     return (
         constructors,
         methods,
@@ -11484,6 +11541,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         operator_bindings[32] if len(operator_bindings) > 32 else {},
         class_name_aliases,
         nested_constructor_pairs,
+        nested_attribute_bindings,
     )
 
 
@@ -13308,6 +13366,12 @@ def _nested_class_attribute_call_triggers_workers(
     aliases = class_targets[14] if len(class_targets) > 14 else {}
     original_outer = _class_name_alias_target(outer_name, aliases, reference_line)
     if (original_outer, inner_name) not in nested_pairs:
+        return False
+    rebinding_events = class_targets[16] if len(class_targets) > 16 else {}
+    events = rebinding_events.get((original_outer, inner_name))
+    if events and not _binding_state_at_line(
+        events, (original_outer, inner_name), reference_line,
+    ):
         return False
     return _class_binding_is_active(class_targets, original_outer, reference_line)
 
