@@ -4463,29 +4463,35 @@ def test_r15_partial_none_rebinding_stays_static(tmp_path):
     [
         "workers = 1\nimport builtins\nbuiltins.dict.__setitem__(globals(), 'workers', 4)\n",
         "workers = 1\nimport builtins\ngetattr(builtins.dict, '__setitem__')(globals(), 'workers', 4)\n",
-        "workers = 1\n"
-        "class Meta(type):\n"
-        "    @classmethod\n"
-        "    def __prepare__(mcls, name, bases):\n"
-        "        global workers\n"
-        "        workers = 4\n"
-        "        return {}\n"
-        "class C(metaclass=Meta):\n"
-        "    pass\n",
-        "workers = 1\n"
-        "from enum import Enum, auto\n"
-        "class E(Enum):\n"
-        "    A = auto()\n"
-        "    def __init__(self, v):\n"
-        "        global workers\n"
-        "        workers = 4\n",
-        "workers = 1\n"
-        "class Outer:\n"
-        "    class Inner:\n"
-        "        def __init__(self):\n"
-        "            global workers\n"
-        "            workers = 4\n"
-        "Outer.Inner()\n",
+        (
+            "workers = 1\n"
+            "class Meta(type):\n"
+            "    @classmethod\n"
+            "    def __prepare__(mcls, name, bases):\n"
+            "        global workers\n"
+            "        workers = 4\n"
+            "        return {}\n"
+            "class C(metaclass=Meta):\n"
+            "    pass\n"
+        ),
+        (
+            "workers = 1\n"
+            "from enum import Enum, auto\n"
+            "class E(Enum):\n"
+            "    A = auto()\n"
+            "    def __init__(self, v):\n"
+            "        global workers\n"
+            "        workers = 4\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Outer:\n"
+            "    class Inner:\n"
+            "        def __init__(self):\n"
+            "            global workers\n"
+            "            workers = 4\n"
+            "Outer.Inner()\n"
+        ),
     ],
     ids=[
         "builtins-dict-setitem",
