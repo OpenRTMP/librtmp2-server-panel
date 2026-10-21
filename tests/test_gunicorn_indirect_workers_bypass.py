@@ -4505,3 +4505,134 @@ def test_security_review_oct21_worker_scan_gaps_are_dynamic(tmp_path, config_con
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Codex review 2026-10-21: test worker-count scanner blind spots and false positives.
+@pytest.mark.parametrize(
+    "config_content, expected_dynamic",
+    [
+        (
+            '''workers = 1
+import builtins
+from functools import partial
+partial(builtins.dict.__setitem__, globals())('workers', 4)
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+class Outer:
+    class Inner:
+        def __init__(self):
+            global workers
+            workers = 4
+Alias = Outer
+Alias.Inner()
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+from enum import Enum
+class Base(Enum):
+    pass
+class E(Base):
+    A = 1
+    def __init__(self, value):
+        global workers
+        workers = 4
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+class Meta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        global workers
+        workers = 4
+        return {}
+Alias = Meta
+class C(metaclass=Alias):
+    pass
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+from enum import Enum
+class E(Enum):
+    A = 1
+    def __new__(cls, value):
+        global workers
+        workers = 4
+        member = object.__new__(cls)
+        member._value_ = value
+        return member
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+class Outer:
+    class Base:
+        def __init__(self):
+            global workers
+            workers = 4
+    class Inner(Base):
+        pass
+Outer.Inner()
+''',
+            True,
+        ),
+        (
+            '''workers = 1
+from enum import Enum
+class Descriptor:
+    def __get__(self, instance, owner=None):
+        return 1
+class E(Enum):
+    field = Descriptor()
+    def __init__(self, value):
+        global workers
+        workers = 4
+''',
+            False,
+        ),
+        (
+            '''workers = 1
+class Outer:
+    class Inner:
+        def __init__(self):
+            global workers
+            workers = 4
+Outer.Inner = lambda: None
+Outer.Inner()
+''',
+            False,
+        ),
+        (
+            '''workers = 1
+class Outer:
+    class Meta(type):
+        @classmethod
+        def __prepare__(mcls, name, bases):
+            global workers
+            workers = 4
+            return {}
+    class Inner(metaclass=Meta):
+        pass
+''',
+            True,
+        ),
+    ],
+    ids=["partial-builtins-dict-setitem","alias-nested-constructor","indirect-enum-subclass","metaclass-alias","enum-new-mutation","inherited-nested-init","enum-descriptor-not-member","rebound-nested-constructor","class-scoped-metaclass"],
+)
+def test_codex_review_oct21_indirect_workers_regressions(
+    tmp_path, config_content, expected_dynamic
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (
+        1, expected_dynamic
+    )
