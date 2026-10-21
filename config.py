@@ -11133,21 +11133,28 @@ def _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
     )
 
 
+def _enum_assignment_does_not_create_member(
+    value, module_aliases, nonmember_aliases, descriptor_classes,
+):
+    """Check values excluded from Enum membership by Python semantics."""
+    if isinstance(value, ast.Lambda):
+        return True
+    if _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
+        return True
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in descriptor_classes
+    )
+
+
 def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor_classes=None):
     """Yield public simple names that create true members in an enum body."""
     descriptor_classes = descriptor_classes or set()
     for stmt in class_node.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        if (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id in descriptor_classes
-        ):
-            continue
-        if isinstance(value, ast.Lambda) or _enum_value_is_nonmember(
-            value,
-            module_aliases,
-            nonmember_aliases,
+        if _enum_assignment_does_not_create_member(
+            value, module_aliases, nonmember_aliases, descriptor_classes,
         ):
             continue
         for target in _statement_simple_targets(stmt):
@@ -11155,13 +11162,9 @@ def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor
                 yield target.id
 
 
-def _collect_enum_member_targets(tree):
-    """Return enum class/member pairs for direct enum definitions."""
-    module_aliases, base_aliases, nonmember_aliases = _enum_import_aliases(tree)
-    members = set()
-    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+def _local_enum_class_names(class_nodes, module_aliases, base_aliases):
+    """Resolve local Enum subclasses, including subclasses of empty Enum bases."""
     enum_class_names = set()
-    # An empty local Enum base can be extended by a member-bearing child.
     changed = True
     while changed:
         changed = False
@@ -11174,30 +11177,57 @@ def _collect_enum_member_targets(tree):
             ):
                 enum_class_names.add(node.name)
                 changed = True
+    return enum_class_names
+
+
+def _enum_descriptor_was_rebound(tree, descriptor_node, enum_node):
+    """Detect assignment to a descriptor name between its class and Enum."""
+    start = getattr(descriptor_node, "lineno", 0)
+    end = getattr(enum_node, "lineno", 0)
+    return any(
+        descriptor_node.name == name
+        and start < getattr(stmt, "lineno", 0) < end
+        for stmt in tree.body
+        for name, _value in _namespace_assignment_values(stmt)
+    )
+
+
+def _enum_descriptor_is_active(tree, descriptor_node, enum_node):
+    """Recognize a known descriptor class still bound when the Enum is defined."""
+    if getattr(descriptor_node, "lineno", 0) >= getattr(enum_node, "lineno", 0):
+        return False
+    if not any(
+        isinstance(method, ast.FunctionDef)
+        and method.name in {"__get__", "__set__", "__delete__"}
+        for method in descriptor_node.body
+    ):
+        return False
+    return not _enum_descriptor_was_rebound(tree, descriptor_node, enum_node)
+
+
+def _enum_descriptor_classes_before(tree, class_nodes, enum_node):
+    """Get local descriptor types that Enum excludes from member creation."""
+    return {
+        possible.name
+        for possible in class_nodes
+        if _enum_descriptor_is_active(tree, possible, enum_node)
+    }
+
+
+def _collect_enum_member_targets(tree):
+    """Return member names of direct and locally derived Enum definitions."""
+    module_aliases, base_aliases, nonmember_aliases = _enum_import_aliases(tree)
+    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    enum_class_names = _local_enum_class_names(
+        class_nodes, module_aliases, base_aliases,
+    )
+    members = set()
     for node in class_nodes:
         if node.name not in enum_class_names:
             continue
-        # Instances of a locally proven descriptor do not become Enum members.
-        # Ignore a descriptor name that was rebound between its definition and use.
-        descriptor_classes = set()
-        for possible in class_nodes:
-            if getattr(possible, "lineno", 0) >= getattr(node, "lineno", 0):
-                continue
-            if not any(
-                isinstance(method, ast.FunctionDef)
-                and method.name in {"__get__", "__set__", "__delete__"}
-                for method in possible.body
-            ):
-                continue
-            if any(
-                possible.name == name
-                and getattr(stmt, "lineno", 0) > getattr(possible, "lineno", 0)
-                and getattr(stmt, "lineno", 0) < getattr(node, "lineno", 0)
-                for stmt in tree.body
-                for name, _value in _namespace_assignment_values(stmt)
-            ):
-                continue
-            descriptor_classes.add(possible.name)
+        descriptor_classes = _enum_descriptor_classes_before(
+            tree, class_nodes, node,
+        )
         members.update(
             (node.name, member_name)
             for member_name in _enum_member_names(
@@ -11400,6 +11430,90 @@ def _record_class_constructor_assignment_barriers(
                 class_methods.add((node.name, name))
 
 
+def _record_inherited_nested_constructors(
+    tree, methods, class_bases, class_methods, nested_constructor_pairs,
+):
+    """Include inner constructors inherited through a local class hierarchy."""
+    for outer in _iter_import_time_class_definitions(tree.body):
+        for inner in outer.body:
+            if isinstance(inner, ast.ClassDef) and _class_hierarchy_defines_method(
+                methods, class_bases, inner.name, "__init__", class_methods,
+            ):
+                nested_constructor_pairs.add((outer.name, inner.name))
+
+
+def _class_definition_line_events(tree):
+    """Track top-level class definitions in source order."""
+    definition_lines = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            definition_lines.setdefault(node.name, []).append(
+                getattr(node, "lineno", 0)
+            )
+    return definition_lines
+
+
+def _metaclass_bypass_binding_events(tree, class_bases):
+    """Track which locally defined metaclasses bypass construction."""
+    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    class_nodes_by_name = {node.name: node for node in class_nodes}
+    events = {}
+    for node, metaclass_name in _effective_metaclass_names(class_nodes):
+        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
+            metaclass_name, class_nodes_by_name, class_bases,
+        )
+        events.setdefault(node.name, []).append(
+            (getattr(node, "lineno", 0), bypass)
+        )
+    return events
+
+
+def _record_module_class_super_methods(
+    tree, class_bases, methods, class_methods, constructors,
+):
+    """Record mutating superclass dispatch for top-level classes."""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            _record_mutating_super_methods(
+                node, class_bases, methods, class_methods, constructors,
+            )
+
+
+def _nested_constructor_binding_pair(target, aliases, reference_line):
+    """Get a nested class attribute's canonical receiver, when statically known."""
+    if not isinstance(target, ast.Attribute):
+        return None
+    if not isinstance(target.value, ast.Name):
+        return None
+    outer = _class_name_alias_target(target.value.id, aliases, reference_line)
+    return (outer, target.attr)
+
+
+def _nested_constructor_rebinding_events(
+    tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
+):
+    """Track definite nested constructor replacements at module scope."""
+    events = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        line = getattr(node, "lineno", 0)
+        for target in targets:
+            pair = _nested_constructor_binding_pair(
+                target, class_name_aliases, line,
+            )
+            if pair not in nested_constructor_pairs:
+                continue
+            # A provably harmless lambda replaces the original constructor.
+            harmless = (
+                isinstance(node.value, ast.Lambda)
+                and not _lambda_mutates_workers(node.value, operator_bindings)
+            )
+            events.setdefault(pair, []).append((line, not harmless))
+    return events
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
@@ -11444,83 +11558,31 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
-    # Nested subclasses may inherit the mutating initializer of their base.
-    for outer in _iter_import_time_class_definitions(tree.body):
-        for inner in outer.body:
-            if isinstance(inner, ast.ClassDef) and _class_hierarchy_defines_method(
-                methods, class_bases, inner.name, "__init__", class_methods,
-            ):
-                nested_constructor_pairs.add((outer.name, inner.name))
+    _record_inherited_nested_constructors(
+        tree, methods, class_bases, class_methods, nested_constructor_pairs,
+    )
     class_name_aliases = _collect_class_name_aliases(tree, set(class_bases))
-    class_definition_lines = {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            class_definition_lines.setdefault(node.name, []).append(
-                getattr(node, "lineno", 0)
-            )
+    class_definition_lines = _class_definition_line_events(tree)
     _record_class_constructor_assignment_barriers(
         tree,
         operator_bindings,
         class_methods,
     )
-    class_nodes = [
-        node for node in tree.body if isinstance(node, ast.ClassDef)
-    ]
-    class_nodes_by_name = {node.name: node for node in class_nodes}
-    metaclass_bypass_events = {}
-    for node, metaclass_name in _effective_metaclass_names(class_nodes):
-        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
-            metaclass_name,
-            class_nodes_by_name,
-            class_bases,
-        )
-        metaclass_bypass_events.setdefault(node.name, []).append(
-            (getattr(node, "lineno", 0), bypass)
-        )
+    metaclass_bypass_events = _metaclass_bypass_binding_events(
+        tree, class_bases,
+    )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
             operator_bindings,
         )
     )
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        _record_mutating_super_methods(
-            node,
-            class_bases,
-            methods,
-            class_methods,
-            constructors,
-        )
-    # Track definite replacements of nested class constructors at module scope.
-    # An explicitly harmless lambda no longer constructs the original class.
-    nested_attribute_bindings = {}
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        value = node.value
-        line = getattr(node, "lineno", 0)
-        for target in targets:
-            if not (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-            ):
-                continue
-            original_outer = _class_name_alias_target(
-                target.value.id, class_name_aliases, line,
-            )
-            pair = (original_outer, target.attr)
-            if pair not in nested_constructor_pairs:
-                continue
-            harmless = (
-                isinstance(value, ast.Lambda)
-                and not _lambda_mutates_workers(value, operator_bindings)
-            )
-            nested_attribute_bindings.setdefault(pair, []).append(
-                (line, not harmless)
-            )
+    _record_module_class_super_methods(
+        tree, class_bases, methods, class_methods, constructors,
+    )
+    nested_attribute_bindings = _nested_constructor_rebinding_events(
+        tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
+    )
     return (
         constructors,
         methods,
