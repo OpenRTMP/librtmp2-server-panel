@@ -1509,6 +1509,25 @@ def _is_builtins_dict_update_attribute(
     )
 
 
+def _is_builtins_dict_setitem_attribute(
+    func,
+    builtins_aliases=None,
+    builtins_alias_events=None,
+    reference_line=0,
+):
+    """Return True for proven builtins-dict ``__setitem__`` attribute references."""
+    if not isinstance(func, ast.Attribute) or func.attr != "__setitem__":
+        return False
+    if _is_builtins_dict_subscript(func.value):
+        return True
+    return _is_builtins_dict_attribute(
+        func.value,
+        builtins_aliases,
+        builtins_alias_events,
+        reference_line or getattr(func, 'lineno', 0),
+    )
+
+
 
 def _is_dict_class_dict_update_subscript(
     node,
@@ -1652,6 +1671,63 @@ def _is_dict_type_update_callable(
         builtins_aliases=builtins_aliases,
         builtins_alias_events=builtins_alias_events,
         builtin_shadow_lines=builtin_shadow_lines,
+    )
+
+
+def _is_getattr_resolved_dict_setitem(
+    func,
+    *,
+    reference_line,
+    dict_shadow_line,
+    builtins_aliases,
+    builtins_alias_events,
+    builtin_shadow_lines,
+):
+    """Return True when ``getattr(...)('__setitem__')`` resolves to ``dict.__setitem__``."""
+    getattr_alias_events = {
+        "builtins_module_alias_events": builtins_alias_events or {}
+    }
+    if not _is_getattr_resolver_callee(
+        func.func if isinstance(func, ast.Call) else None,
+        alias_events=getattr_alias_events,
+        builtin_shadow_lines=builtin_shadow_lines,
+        reference_line=reference_line,
+    ):
+        return False
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and not _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
+        )
+    ):
+        return False
+    target = _getattr_target_for_method(
+        func,
+        "__setitem__",
+        getattr_alias_events,
+        reference_line,
+    )
+    if target is None:
+        return False
+    if isinstance(target, ast.Name) and target.id == "dict":
+        return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
+    return (
+        (
+            _name_is_unshadowed_builtin("type", reference_line, builtin_shadow_lines)
+            and _name_is_unshadowed_builtin("globals", reference_line, builtin_shadow_lines)
+            and _is_type_of_globals_call(target)
+        )
+        or _is_builtins_dict_subscript(target)
+        or _is_builtins_dict_attribute(
+            target,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        )
+        or _is_globals_class_dict_reference(target, builtin_shadow_lines)
     )
 
 
@@ -1829,6 +1905,8 @@ def _is_dict_type_setitem_callable(
     reference_line=0,
     dict_shadow_line=None,
     builtin_shadow_lines=None,
+    builtins_aliases=None,
+    builtins_alias_events=None,
 ):
     """Return True for builtin ``dict.__setitem__`` variants.
 
@@ -1838,15 +1916,22 @@ def _is_dict_type_setitem_callable(
     one unless the collected shadow state still shows the builtin.
     """
     func = _dunder_call_mutator_callee(func)
-    if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
-        return False
     if isinstance(func, ast.Attribute):
-        return (
+        if (
             func.attr == "__setitem__"
             and isinstance(func.value, ast.Name)
             and func.value.id == "dict"
-        )
-    return (
+        ):
+            return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
+        if _is_builtins_dict_setitem_attribute(
+            func,
+            builtins_aliases,
+            builtins_alias_events,
+            reference_line,
+        ):
+            return True
+        return False
+    if (
         isinstance(func, ast.Call)
         and _name_is_unshadowed_builtin(
             "getattr",
@@ -1860,6 +1945,15 @@ def _is_dict_type_setitem_callable(
         and func.args[0].id == "dict"
         and isinstance(func.args[1], ast.Constant)
         and func.args[1].value == "__setitem__"
+    ):
+        return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
+    return _is_getattr_resolved_dict_setitem(
+        func,
+        reference_line=reference_line,
+        dict_shadow_line=dict_shadow_line,
+        builtins_aliases=builtins_aliases,
+        builtins_alias_events=builtins_alias_events,
+        builtin_shadow_lines=builtin_shadow_lines,
     )
 
 
@@ -1868,15 +1962,33 @@ def _call_is_dict_type_setitem_on_module_namespace(
     call,
     namespace_aliases=None,
     dict_shadow_line=None,
+    operator_bindings=None,
 ):
     """Return True for ``dict.__setitem__(globals(), 'workers', ...)`` mutations."""
     if not isinstance(call, ast.Call) or len(call.args) < 2:
         return False
+    builtins_aliases = (
+        operator_bindings[8]
+        if operator_bindings and len(operator_bindings) > 8
+        else set()
+    )
+    builtins_alias_events = (
+        operator_bindings[30]
+        if operator_bindings and len(operator_bindings) > 30
+        else {}
+    )
+    builtin_shadow_lines = (
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
+    )
     if not _is_dict_type_setitem_callable(
         call.func,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
-        builtin_shadow_lines=getattr(namespace_aliases, "builtin_shadow_lines", None),
+        builtin_shadow_lines=builtin_shadow_lines,
+        builtins_aliases=builtins_aliases,
+        builtins_alias_events=builtins_alias_events,
     ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
@@ -2156,6 +2268,8 @@ def _operator_setitem_context_from_bindings(bindings):
         bindings[31] if len(bindings) > 31 else {},
         metadata.get("operator_setitem_alias_events", {}),
         metadata,
+        bindings[8] if len(bindings) > 8 else set(),
+        bindings[30] if len(bindings) > 30 else {},
     )
 
 
@@ -2163,7 +2277,7 @@ def _operator_setitem_callable_at_line(func, context):
     """Only recognize operator.setitem while its original import remains bound."""
     if context is None:
         return False
-    module_aliases, setitem_aliases, module_events, setitem_events, shadows = context
+    module_aliases, setitem_aliases, module_events, setitem_events, shadows = context[:5]
     line = getattr(func, "lineno", 0)
 
     def is_live_module(node):
@@ -2220,6 +2334,7 @@ def _partial_unbound_dict_namespace_method(
     dict_update_aliases,
     dict_ior_aliases,
     dict_shadow_line=None,
+    operator_context=None,
 ):
     """Return the dict mutator bound by ``partial(..., globals())``."""
     if partial_call is None or len(partial_call.args) < 2:
@@ -2227,11 +2342,17 @@ def _partial_unbound_dict_namespace_method(
     if not _is_module_namespace_mapping(partial_call.args[1], namespace_aliases):
         return None
     target = partial_call.args[0]
+    aliases = operator_context[5] if operator_context and len(operator_context) > 5 else set()
+    events = operator_context[6] if operator_context and len(operator_context) > 6 else {}
+    shadows = operator_context[4] if operator_context and len(operator_context) > 4 else {}
     if _is_dict_type_update_callable(
         target,
         dict_update_aliases,
         reference_line=getattr(partial_call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtins_aliases=aliases,
+        builtins_alias_events=events,
+        builtin_shadow_lines=shadows,
     ):
         return "update"
     if _is_dict_type_ior_callable(
@@ -2245,6 +2366,9 @@ def _partial_unbound_dict_namespace_method(
         target,
         reference_line=getattr(partial_call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtins_aliases=aliases,
+        builtins_alias_events=events,
+        builtin_shadow_lines=shadows,
     ):
         return "__setitem__"
     return None
@@ -2282,7 +2406,7 @@ def _partial_uses_unbound_dict_namespace_mutation(
         dict_ior_aliases = set()
     method = _partial_unbound_dict_namespace_method(
         partial_call, namespace_aliases, dict_update_aliases,
-        dict_ior_aliases, dict_shadow_line,
+        dict_ior_aliases, dict_shadow_line, operator_context,
     )
     if method is None:
         return False
@@ -3981,7 +4105,7 @@ def _partial_value_dict_namespace_method(
         return "__setitem__"
     return _partial_unbound_dict_namespace_method(
         partial_call, namespace_aliases, dict_update_aliases,
-        dict_ior_aliases, dict_shadow_line,
+        dict_ior_aliases, dict_shadow_line, operator_context,
     )
 
 
@@ -10488,18 +10612,27 @@ def _collect_metaclass_base_aliases(tree):
     return base_aliases, module_alias_events
 
 
+def _iter_import_time_class_definitions(statements):
+    """Include nested class bodies, but never definitions inside deferred functions."""
+    for node in statements:
+        if isinstance(node, ast.ClassDef):
+            yield node
+            yield from _iter_import_time_class_definitions(node.body)
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for block in _compound_statement_blocks(node):
+                yield from _iter_import_time_class_definitions(block)
+
+
 def _collect_metaclass_class_names(tree):
     """Return locally defined classes that are type or stdlib metaclass subclasses."""
-    class_nodes = [
-        node for node in tree.body if isinstance(node, ast.ClassDef)
-    ]
+    class_nodes = list(_iter_import_time_class_definitions(tree.body))
     local_names = {node.name for node in class_nodes}
     # Any locally defined class can be used as an explicit metaclass: Python
     # calls it with (name, bases, ns) even when it does not subclass ``type``
     # (for example ``class Meta(abc.ABC)``), so scan its hooks as well.
     explicit_metaclasses = {
         name
-        for node in _iter_class_definitions(tree.body)
+        for node in class_nodes
         if (name := _explicit_metaclass_name(node)) in local_names
     }
     base_aliases, module_alias_events = _collect_metaclass_base_aliases(tree)
@@ -10531,11 +10664,11 @@ def _collect_mutating_metaclass_hook_definitions(
     """Return mutating hook definitions owned by local metaclass classes."""
     return {
         (node.name, stmt.name)
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name in metaclass_names
+        for node in _iter_import_time_class_definitions(tree.body)
+        if node.name in metaclass_names
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
-        and stmt.name in {"__new__", "__init__", "__call__"}
+        and stmt.name in {"__new__", "__init__", "__call__", "__prepare__"}
         and _function_mutates_workers(stmt, operator_bindings)
     }
 
@@ -10598,11 +10731,17 @@ def _classes_with_mutating_effective_metaclass(
         operator_bindings,
         hook_names,
     )
+    class_names = {node.name for node in _iter_import_time_class_definitions(tree.body)}
+    aliases = _collect_class_name_aliases(tree, class_names)
     affected = set()
-    for node in _iter_class_definitions(tree.body):
+    for node in _iter_import_time_class_definitions(tree.body):
+        reference_line = getattr(node, 'lineno', 0)
         explicit = _explicit_metaclass_name(node)
+        if explicit is not None:
+            explicit = _class_name_alias_target(explicit, aliases, reference_line)
         inherited = any(
-            isinstance(base, ast.Name) and base.id in affected
+            isinstance(base, ast.Name)
+            and _class_name_alias_target(base.id, aliases, reference_line) in affected
             for base in node.bases
         )
         if explicit in mutating_metaclasses or inherited:
@@ -10615,7 +10754,7 @@ def _collect_metaclass_definition_mutators(tree, operator_bindings):
     return _classes_with_mutating_effective_metaclass(
         tree,
         operator_bindings,
-        {"__new__", "__init__"},
+        {"__new__", "__init__", "__prepare__"},
     )
 
 
@@ -10669,10 +10808,28 @@ def _class_has_worker_side_effect_target(
     constructors,
     methods,
     properties,
+    nested_constructor_pairs=None,
 ):
     """Record all risky hooks in one class and report whether any were found."""
     risky = False
     for stmt in class_node.body:
+        if isinstance(stmt, ast.ClassDef):
+            inner_risky = _class_has_worker_side_effect_target(
+                stmt,
+                operator_bindings,
+                constructors,
+                methods,
+                properties,
+                nested_constructor_pairs=nested_constructor_pairs,
+            )
+            if (
+                inner_risky
+                and nested_constructor_pairs is not None
+                and stmt.name in constructors
+            ):
+                nested_constructor_pairs.add((class_node.name, stmt.name))
+            risky = inner_risky or risky
+            continue
         if _record_class_side_effect_target(
             class_node.name,
             stmt,
@@ -10787,6 +10944,7 @@ def _scan_class_side_effect_bindings(
     *,
     descriptor_fields=None,
     conditional=False,
+    nested_constructor_pairs=None,
 ):
     """Populate source-ordered risky class bindings through compound blocks."""
     for node in statements:
@@ -10798,6 +10956,7 @@ def _scan_class_side_effect_bindings(
                 constructors,
                 methods,
                 properties,
+                nested_constructor_pairs=nested_constructor_pairs,
             )
             if descriptor_fields is not None:
                 risky = (
@@ -10832,6 +10991,7 @@ def _scan_class_side_effect_bindings(
                 binding_events,
                 descriptor_fields=descriptor_fields,
                 conditional=True,
+                nested_constructor_pairs=nested_constructor_pairs,
             )
 
 
@@ -10973,14 +11133,28 @@ def _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
     )
 
 
-def _enum_member_names(class_node, module_aliases, nonmember_aliases):
+def _enum_assignment_does_not_create_member(
+    value, module_aliases, nonmember_aliases, descriptor_classes,
+):
+    """Check values excluded from Enum membership by Python semantics."""
+    if isinstance(value, ast.Lambda):
+        return True
+    if _enum_value_is_nonmember(value, module_aliases, nonmember_aliases):
+        return True
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in descriptor_classes
+    )
+
+
+def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor_classes=None):
     """Yield public simple names that create true members in an enum body."""
+    descriptor_classes = descriptor_classes or set()
     for stmt in class_node.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        if isinstance(value, ast.Lambda) or _enum_value_is_nonmember(
-            value,
-            module_aliases,
-            nonmember_aliases,
+        if _enum_assignment_does_not_create_member(
+            value, module_aliases, nonmember_aliases, descriptor_classes,
         ):
             continue
         for target in _statement_simple_targets(stmt):
@@ -10988,21 +11162,79 @@ def _enum_member_names(class_node, module_aliases, nonmember_aliases):
                 yield target.id
 
 
+def _local_enum_class_names(class_nodes, module_aliases, base_aliases):
+    """Resolve local Enum subclasses, including subclasses of empty Enum bases."""
+    enum_class_names = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in class_nodes:
+            if node.name in enum_class_names:
+                continue
+            if _class_is_direct_enum(node, module_aliases, base_aliases) or any(
+                isinstance(base, ast.Name) and base.id in enum_class_names
+                for base in node.bases
+            ):
+                enum_class_names.add(node.name)
+                changed = True
+    return enum_class_names
+
+
+def _enum_descriptor_was_rebound(tree, descriptor_node, enum_node):
+    """Detect assignment to a descriptor name between its class and Enum."""
+    start = getattr(descriptor_node, "lineno", 0)
+    end = getattr(enum_node, "lineno", 0)
+    return any(
+        descriptor_node.name == name
+        and start < getattr(stmt, "lineno", 0) < end
+        for stmt in tree.body
+        for name, _value in _namespace_assignment_values(stmt)
+    )
+
+
+def _enum_descriptor_is_active(tree, descriptor_node, enum_node):
+    """Recognize a known descriptor class still bound when the Enum is defined."""
+    if getattr(descriptor_node, "lineno", 0) >= getattr(enum_node, "lineno", 0):
+        return False
+    if not any(
+        isinstance(method, ast.FunctionDef)
+        and method.name in {"__get__", "__set__", "__delete__"}
+        for method in descriptor_node.body
+    ):
+        return False
+    return not _enum_descriptor_was_rebound(tree, descriptor_node, enum_node)
+
+
+def _enum_descriptor_classes_before(tree, class_nodes, enum_node):
+    """Get local descriptor types that Enum excludes from member creation."""
+    return {
+        possible.name
+        for possible in class_nodes
+        if _enum_descriptor_is_active(tree, possible, enum_node)
+    }
+
+
 def _collect_enum_member_targets(tree):
-    """Return enum class/member pairs for direct enum definitions."""
+    """Return member names of direct and locally derived Enum definitions."""
     module_aliases, base_aliases, nonmember_aliases = _enum_import_aliases(tree)
+    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    enum_class_names = _local_enum_class_names(
+        class_nodes, module_aliases, base_aliases,
+    )
     members = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
+    for node in class_nodes:
+        if node.name not in enum_class_names:
             continue
-        if not _class_is_direct_enum(node, module_aliases, base_aliases):
-            continue
+        descriptor_classes = _enum_descriptor_classes_before(
+            tree, class_nodes, node,
+        )
         members.update(
             (node.name, member_name)
             for member_name in _enum_member_names(
                 node,
                 module_aliases,
                 nonmember_aliases,
+                descriptor_classes,
             )
         )
     return members
@@ -11034,7 +11266,7 @@ def _collect_class_definition_metadata(tree):
     class_bases = {}
     class_methods = set()
     class_attributes = set()
-    for node in _iter_class_definitions(tree.body):
+    for node in _iter_import_time_class_definitions(tree.body):
         class_bases[node.name] = tuple(
             base.id for base in node.bases if isinstance(base, ast.Name)
         )
@@ -11198,11 +11430,96 @@ def _record_class_constructor_assignment_barriers(
                 class_methods.add((node.name, name))
 
 
+def _record_inherited_nested_constructors(
+    tree, methods, class_bases, class_methods, nested_constructor_pairs,
+):
+    """Include inner constructors inherited through a local class hierarchy."""
+    for outer in _iter_import_time_class_definitions(tree.body):
+        for inner in outer.body:
+            if isinstance(inner, ast.ClassDef) and _class_hierarchy_defines_method(
+                methods, class_bases, inner.name, "__init__", class_methods,
+            ):
+                nested_constructor_pairs.add((outer.name, inner.name))
+
+
+def _class_definition_line_events(tree):
+    """Track top-level class definitions in source order."""
+    definition_lines = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            definition_lines.setdefault(node.name, []).append(
+                getattr(node, "lineno", 0)
+            )
+    return definition_lines
+
+
+def _metaclass_bypass_binding_events(tree, class_bases):
+    """Track which locally defined metaclasses bypass construction."""
+    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    class_nodes_by_name = {node.name: node for node in class_nodes}
+    events = {}
+    for node, metaclass_name in _effective_metaclass_names(class_nodes):
+        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
+            metaclass_name, class_nodes_by_name, class_bases,
+        )
+        events.setdefault(node.name, []).append(
+            (getattr(node, "lineno", 0), bypass)
+        )
+    return events
+
+
+def _record_module_class_super_methods(
+    tree, class_bases, methods, class_methods, constructors,
+):
+    """Record mutating superclass dispatch for top-level classes."""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            _record_mutating_super_methods(
+                node, class_bases, methods, class_methods, constructors,
+            )
+
+
+def _nested_constructor_binding_pair(target, aliases, reference_line):
+    """Get a nested class attribute's canonical receiver, when statically known."""
+    if not isinstance(target, ast.Attribute):
+        return None
+    if not isinstance(target.value, ast.Name):
+        return None
+    outer = _class_name_alias_target(target.value.id, aliases, reference_line)
+    return (outer, target.attr)
+
+
+def _nested_constructor_rebinding_events(
+    tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
+):
+    """Track definite nested constructor replacements at module scope."""
+    events = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        line = getattr(node, "lineno", 0)
+        for target in targets:
+            pair = _nested_constructor_binding_pair(
+                target, class_name_aliases, line,
+            )
+            if pair not in nested_constructor_pairs:
+                continue
+            # A provably harmless lambda replaces the original constructor.
+            harmless = (
+                isinstance(node.value, ast.Lambda)
+                and not _lambda_mutates_workers(node.value, operator_bindings)
+            )
+            events.setdefault(pair, []).append((line, not harmless))
+    return events
+
+
 def _collect_class_side_effect_targets(tree, operator_bindings):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
     properties = set()
+    nested_constructor_pairs = set()
     descriptor_fields = {"__get__": set(), "__set__": set(), "__delete__": set()}
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
@@ -11216,6 +11533,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         methods,
         properties,
         {},
+        nested_constructor_pairs=nested_constructor_pairs,
     )
 
     binding_events = {}
@@ -11227,6 +11545,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         properties,
         binding_events,
         descriptor_fields=descriptor_fields,
+        nested_constructor_pairs=nested_constructor_pairs,
     )
 
     enum_members = _collect_enum_member_targets(tree)
@@ -11239,48 +11558,31 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_bases, class_methods, class_attributes = (
         _collect_class_definition_metadata(tree)
     )
+    _record_inherited_nested_constructors(
+        tree, methods, class_bases, class_methods, nested_constructor_pairs,
+    )
     class_name_aliases = _collect_class_name_aliases(tree, set(class_bases))
-    class_definition_lines = {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            class_definition_lines.setdefault(node.name, []).append(
-                getattr(node, "lineno", 0)
-            )
+    class_definition_lines = _class_definition_line_events(tree)
     _record_class_constructor_assignment_barriers(
         tree,
         operator_bindings,
         class_methods,
     )
-    class_nodes = [
-        node for node in tree.body if isinstance(node, ast.ClassDef)
-    ]
-    class_nodes_by_name = {node.name: node for node in class_nodes}
-    metaclass_bypass_events = {}
-    for node, metaclass_name in _effective_metaclass_names(class_nodes):
-        bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
-            metaclass_name,
-            class_nodes_by_name,
-            class_bases,
-        )
-        metaclass_bypass_events.setdefault(node.name, []).append(
-            (getattr(node, "lineno", 0), bypass)
-        )
+    metaclass_bypass_events = _metaclass_bypass_binding_events(
+        tree, class_bases,
+    )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
             operator_bindings,
         )
     )
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        _record_mutating_super_methods(
-            node,
-            class_bases,
-            methods,
-            class_methods,
-            constructors,
-        )
+    _record_module_class_super_methods(
+        tree, class_bases, methods, class_methods, constructors,
+    )
+    nested_attribute_bindings = _nested_constructor_rebinding_events(
+        tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
+    )
     return (
         constructors,
         methods,
@@ -11297,6 +11599,8 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         metaclass_bypass_events,
         operator_bindings[32] if len(operator_bindings) > 32 else {},
         class_name_aliases,
+        nested_constructor_pairs,
+        nested_attribute_bindings,
     )
 
 
@@ -13110,6 +13414,26 @@ def _constructed_receiver_call_triggers_workers(
     )
 
 
+def _nested_class_attribute_call_triggers_workers(
+    outer_name,
+    inner_name,
+    class_targets,
+    reference_line,
+):
+    """Return True when ``Outer.Inner()`` constructs a tracked nested class."""
+    nested_pairs = class_targets[15] if len(class_targets) > 15 else set()
+    aliases = class_targets[14] if len(class_targets) > 14 else {}
+    original_outer = _class_name_alias_target(outer_name, aliases, reference_line)
+    if (original_outer, inner_name) not in nested_pairs:
+        return False
+    rebinding_events = class_targets[16] if len(class_targets) > 16 else {}
+    if _binding_state_at_line(
+        rebinding_events, (original_outer, inner_name), reference_line,
+    ) is False:
+        return False
+    return _class_binding_is_active(class_targets, original_outer, reference_line)
+
+
 def _enum_member_call_triggers_workers(
     receiver,
     method_name,
@@ -13317,6 +13641,13 @@ def _attribute_call_triggers_workers(
             class_targets,
         )
     if isinstance(receiver, ast.Name):
+        if _nested_class_attribute_call_triggers_workers(
+            receiver.id,
+            method_name,
+            class_targets,
+            reference_line,
+        ):
+            return True
         return _name_receiver_call_triggers_workers(
             receiver,
             method_name,
@@ -13471,9 +13802,15 @@ def _expression_triggers_class_workers_side_effect(
 
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     """Return True when defining the class itself mutates ``workers``."""
+    constructors = class_targets[0]
     methods = class_targets[1]
     metaclass_definitions = class_targets[3]
+    enum_members = class_targets[9] if len(class_targets) > 9 else set()
     if class_node.name in metaclass_definitions:
+        return True
+    if (class_node.name in constructors or (class_node.name, '__new__') in methods) and any(
+        member[0] == class_node.name for member in enum_members
+    ):
         return True
     class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     reference_line = getattr(class_node, "lineno", 0)
@@ -14297,7 +14634,12 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
         or _call_is_getattr_setdefault_workers(call, namespace_aliases)
         or _call_is_operator_setitem_workers(call, operator_bindings)
         or _call_is_getattr_setitem_workers(call)
-        or _call_is_dict_type_setitem_on_module_namespace(call, namespace_aliases, dict_shadow_line)
+        or _call_is_dict_type_setitem_on_module_namespace(
+            call,
+            namespace_aliases,
+            dict_shadow_line,
+            operator_bindings,
+        )
         or _call_is_dict_type_setitem_on_proven_frame_globals(call, operator_bindings)
         or _call_sets_workers_attribute(call, sys_aliases, importlib_aliases, importlib_module_aliases)
         or _call_is_dict_type_update_on_module_namespace(
@@ -16632,6 +16974,8 @@ def _call_is_dict_type_setitem_on_proven_frame_globals(
         builtin_shadow_lines=(
             operator_bindings[32] if len(operator_bindings) > 32 else None
         ),
+        builtins_aliases=operator_bindings[8] if len(operator_bindings) > 8 else set(),
+        builtins_alias_events=operator_bindings[30] if len(operator_bindings) > 30 else {},
     ):
         return False
     inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
@@ -18862,6 +19206,7 @@ def _collect_operator_setitem_bindings(tree):
     operator_context = (
         module_aliases, setitem_aliases, operator_module_alias_events,
         operator_setitem_alias_events, builtin_shadow_lines,
+        builtins_aliases, builtins_alias_events,
     )
     partial_workers_setter_aliases = _collect_partial_workers_setter_aliases(
         tree, namespace_aliases, partial_aliases, dict_update_aliases,
@@ -19712,9 +20057,9 @@ def _is_type_bound_hook_mutator_callable(
             func,
             reference_line=getattr(func, "lineno", 0),
             dict_shadow_line=dict_shadow_line,
-            builtin_shadow_lines=getattr(
-                namespace_aliases, "builtin_shadow_lines", None
-            ),
+            builtin_shadow_lines=(operator_bindings[32] if operator_bindings and len(operator_bindings) > 32 else None),
+            builtins_aliases=(operator_bindings[8] if operator_bindings and len(operator_bindings) > 8 else set()),
+            builtins_alias_events=(operator_bindings[30] if operator_bindings and len(operator_bindings) > 30 else {}),
         )
         or _operator_setitem_active_at_line(
             func,
@@ -19756,6 +20101,7 @@ def _partial_call_binds_hook_store_name(call, operator_bindings, namespace_alias
         dict_update_aliases,
         dict_ior_aliases,
         dict_shadow_line,
+        _operator_setitem_context_from_bindings(operator_bindings),
     )
     if method != "__setitem__" or len(call.args) <= start_index:
         return None
