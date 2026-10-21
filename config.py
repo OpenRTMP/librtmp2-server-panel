@@ -2277,7 +2277,7 @@ def _operator_setitem_callable_at_line(func, context):
     """Only recognize operator.setitem while its original import remains bound."""
     if context is None:
         return False
-    module_aliases, setitem_aliases, module_events, setitem_events, shadows = context
+    module_aliases, setitem_aliases, module_events, setitem_events, shadows = context[:5]
     line = getattr(func, "lineno", 0)
 
     def is_live_module(node):
@@ -2360,9 +2360,6 @@ def _partial_unbound_dict_namespace_method(
         aliases=dict_ior_aliases,
         reference_line=getattr(partial_call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
-        builtins_aliases=aliases,
-        builtins_alias_events=events,
-        builtin_shadow_lines=shadows,
     ):
         return "__ior__"
     if _is_dict_type_setitem_callable(
@@ -11239,7 +11236,7 @@ def _collect_class_definition_metadata(tree):
     class_bases = {}
     class_methods = set()
     class_attributes = set()
-    for node in _iter_class_definitions(tree.body):
+    for node in _iter_import_time_class_definitions(tree.body):
         class_bases[node.name] = tuple(
             base.id for base in node.bases if isinstance(base, ast.Name)
         )
