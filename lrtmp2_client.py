@@ -22,6 +22,13 @@ DELETE_STREAM_DRAIN_WAIT_SECONDS = 400
 # grows with the peer count, so a large cluster may need a larger value.
 ADMIN_REQUEST_TIMEOUT_SECONDS = 30
 
+# The dashboard polls the per-stream stats endpoint every 3s and aborts the
+# request after 10s (static/js/scripts.js). The upstream read has to finish
+# inside that window: a longer budget keeps the abandoned request - and the
+# Gunicorn worker thread it occupies - alive on the server side, so in-flight
+# upstream reads pile up until the worker's thread pool is exhausted.
+STATS_REQUEST_TIMEOUT_SECONDS = 8
+
 # Synchronous panel delete routes block for one admin DELETE (up to
 # ADMIN_REQUEST_TIMEOUT_SECONDS) plus polling through the drain window. Docker
 # Gunicorn --timeout must stay above this or workers are killed mid-poll.
@@ -246,7 +253,7 @@ class Lrtmp2Client:
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
             "stream_stats_by_id",
             headers=self._headers(),
-            timeout=self.admin_timeout,
+            timeout=min(self.admin_timeout, STATS_REQUEST_TIMEOUT_SECONDS),
         )
 
     def cluster_status(self):
