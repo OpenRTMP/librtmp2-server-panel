@@ -960,21 +960,91 @@ def _expression_is_namespace_update_reference(expr, namespace_aliases=None):
     return False
 
 
-def _simple_namespace_call_delegates_update(call, namespace_aliases=None):
-    """Return True when ``SimpleNamespace(update=globals().update)`` is constructed."""
+# Namespace attribute name -> the module namespace mutator it delegates.
+_DELEGATED_NAMESPACE_MUTATOR_METHODS = {
+    "update": "update",
+    "__setitem__": "__setitem__",
+    "setitem": "__setitem__",
+    "__ior__": "__ior__",
+    "ior": "__ior__",
+    "setdefault": "setdefault",
+}
+
+
+def _collect_simple_namespace_constructor_aliases(statements):
+    """Collect names bound to ``types.SimpleNamespace`` by a ``from`` import."""
+    aliases = set()
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module == "types":
+            for imported in node.names:
+                if imported.name == "SimpleNamespace":
+                    aliases.add(imported.asname or imported.name)
+        for block in _compound_statement_blocks(node):
+            aliases.update(_collect_simple_namespace_constructor_aliases(block))
+    return aliases
+
+
+def _is_simple_namespace_constructor(
+    func,
+    constructor_aliases=None,
+    module_aliases=None,
+):
+    """Return True when ``func`` names the ``types.SimpleNamespace`` constructor."""
+    if isinstance(func, ast.Name):
+        if func.id == "SimpleNamespace":
+            return True
+        return bool(constructor_aliases) and func.id in constructor_aliases
+    if isinstance(func, ast.Attribute) and func.attr == "SimpleNamespace":
+        return (
+            isinstance(func.value, ast.Name)
+            and bool(module_aliases)
+            and func.value.id in module_aliases
+        )
+    return False
+
+
+def _expression_is_namespace_mutator_reference(expr, method, namespace_aliases=None):
+    """Return True for expressions that reference a module namespace mutator."""
+    if not isinstance(expr, ast.Attribute) or expr.attr != method:
+        return False
+    return _is_module_namespace_mapping(expr.value, namespace_aliases)
+
+
+def _simple_namespace_call_delegates_update(
+    call,
+    namespace_aliases=None,
+    constructor_aliases=None,
+    module_aliases=None,
+):
+    """Return True when a ``SimpleNamespace`` delegates a module namespace mutator."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Name) or call.func.id != "SimpleNamespace":
+    if not _is_simple_namespace_constructor(
+        call.func,
+        constructor_aliases,
+        module_aliases,
+    ):
         return False
     return any(
-        keyword.arg == "update"
-        and _expression_is_namespace_update_reference(keyword.value, namespace_aliases)
+        keyword.arg in _DELEGATED_NAMESPACE_MUTATOR_METHODS
+        and _expression_is_namespace_mutator_reference(
+            keyword.value,
+            _DELEGATED_NAMESPACE_MUTATOR_METHODS[keyword.arg],
+            namespace_aliases,
+        )
         for keyword in call.keywords
     )
 
 
-def _collect_delegated_update_namespace_aliases(tree, namespace_aliases):
-    """Collect names ever bound to ``SimpleNamespace(update=globals().update)``."""
+def _collect_delegated_update_namespace_aliases(
+    tree,
+    namespace_aliases,
+    constructor_aliases=None,
+    module_aliases=None,
+):
+    """Collect names ever bound to a delegating ``SimpleNamespace``."""
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
     aliases = set()
@@ -983,6 +1053,8 @@ def _collect_delegated_update_namespace_aliases(tree, namespace_aliases):
             if value is not None and _simple_namespace_call_delegates_update(
                 value,
                 namespace_aliases,
+                constructor_aliases,
+                module_aliases,
             ):
                 aliases.add(name)
                 break
@@ -1034,7 +1106,12 @@ def _instance_binding_candidates_at_line(events, name, line):
     return [(event_line, class_name) for event_line, class_name in candidates if class_name]
 
 
-def _collect_delegated_update_alias_events(tree, namespace_aliases):
+def _collect_delegated_update_alias_events(
+    tree,
+    namespace_aliases,
+    constructor_aliases=None,
+    module_aliases=None,
+):
     """Track top-level delegated SimpleNamespace aliases by source position."""
     events = {}
     for node in tree.body:
@@ -1047,6 +1124,8 @@ def _collect_delegated_update_alias_events(tree, namespace_aliases):
                 and _simple_namespace_call_delegates_update(
                     value,
                     namespace_aliases,
+                    constructor_aliases,
+                    module_aliases,
                 )
             )
             events.setdefault(name, []).append((line, active))
@@ -1234,6 +1313,17 @@ def _call_is_chainmap_alias_maps_update(
     return False
 
 
+def _delegated_namespace_mutator_call_may_set_workers(method, call):
+    """Return True when a delegated namespace mutator call may bind workers."""
+    if method == "update":
+        return _update_payload_may_set_workers(call)
+    if method == "__ior__":
+        return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
+    if method in {"__setitem__", "setdefault"}:
+        return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
+    return False
+
+
 def _call_is_delegated_simplenamespace_update(
     call,
     delegated_update_aliases=None,
@@ -1242,7 +1332,10 @@ def _call_is_delegated_simplenamespace_update(
     """Return True for ``ns.update(...)`` when ``ns`` delegates to ``globals().update``."""
     if not isinstance(call, ast.Call):
         return False
-    if not isinstance(call.func, ast.Attribute) or call.func.attr != "update":
+    if not isinstance(call.func, ast.Attribute):
+        return False
+    method = _DELEGATED_NAMESPACE_MUTATOR_METHODS.get(call.func.attr)
+    if method is None:
         return False
     receiver = call.func.value
     if not isinstance(receiver, ast.Name):
@@ -1254,10 +1347,12 @@ def _call_is_delegated_simplenamespace_update(
             getattr(call, "lineno", 0),
         )
         if state is not None:
-            return state and _update_payload_may_set_workers(call)
+            return state and _delegated_namespace_mutator_call_may_set_workers(
+                method, call
+            )
     if receiver.id not in (delegated_update_aliases or set()):
         return False
-    return _update_payload_may_set_workers(call)
+    return _delegated_namespace_mutator_call_may_set_workers(method, call)
 
 
 
@@ -2374,6 +2469,20 @@ def _partial_unbound_dict_namespace_method(
     return None
 
 
+def _partial_bound_namespace_mutator_method(partial_call, namespace_aliases):
+    """Return the module namespace mutator bound by ``partial(globals().update)``."""
+    if partial_call is None or len(partial_call.args) != 1:
+        return None
+    target = partial_call.args[0]
+    if not isinstance(target, ast.Attribute):
+        return None
+    if target.attr not in _NAMESPACE_GETATTR_METHODS:
+        return None
+    if not _is_module_namespace_mapping(target.value, namespace_aliases):
+        return None
+    return target.attr
+
+
 def _call_payload_may_set_workers(method, call, start_index=0):
     """Inspect arguments supplied to a dict mutator invocation."""
     if method == "update":
@@ -2402,6 +2511,13 @@ def _partial_uses_unbound_dict_namespace_mutation(
         invocation_call, invocation_start_index,
     ):
         return True
+    bound_method = _partial_bound_namespace_mutator_method(
+        partial_call, namespace_aliases
+    )
+    if bound_method is not None:
+        return invocation_call is not None and _call_payload_may_set_workers(
+            bound_method, invocation_call, start_index=invocation_start_index,
+        )
     if dict_ior_aliases is None:
         dict_ior_aliases = set()
     method = _partial_unbound_dict_namespace_method(
@@ -4103,6 +4219,11 @@ def _partial_value_dict_namespace_method(
         )
     ):
         return "__setitem__"
+    bound_method = _partial_bound_namespace_mutator_method(
+        partial_call, namespace_aliases
+    )
+    if bound_method is not None:
+        return bound_method
     return _partial_unbound_dict_namespace_method(
         partial_call, namespace_aliases, dict_update_aliases,
         dict_ior_aliases, dict_shadow_line, operator_context,
@@ -4345,6 +4466,7 @@ def _call_mutates_lambda_param_namespace(call, param_name, dict_shadow_line=None
     return (
         _attribute_call_mutates_lambda_param(call, param_name)
         or _call_is_dict_setitem_on_name(call, param_name, dict_shadow_line)
+        or _call_is_dict_update_on_name(call, param_name, dict_shadow_line)
         or _invoked_lambda_param_namespace_mutation(call, param_name)
     )
 
@@ -4380,6 +4502,21 @@ def _call_is_dict_setitem_on_name(call, name, dict_shadow_line=None):
     ):
         return False
     return _key_may_be_workers(call.args[1])
+
+
+def _call_is_dict_update_on_name(call, name, dict_shadow_line=None):
+    """Return True for ``dict.update(name, {...})`` calls."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    if not isinstance(call.args[0], ast.Name) or call.args[0].id != name:
+        return False
+    if not _is_dict_type_update_callable(
+        call.func,
+        reference_line=getattr(call, "lineno", 0),
+        dict_shadow_line=dict_shadow_line,
+    ):
+        return False
+    return _update_payload_may_set_workers(call, start_index=1)
 
 
 def _is_operator_setitem_callable(func, setitem_aliases, module_aliases=None):
@@ -4525,20 +4662,20 @@ def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names
     if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
         return False
     callee = call.args[0]
-    if (
-        isinstance(callee, ast.Attribute)
-        and callee.attr == "update"
-        and _is_module_namespace_mapping(callee.value, namespace_aliases)
-    ):
+    namespace_mutator = _getattr_namespace_mutator_method(
+        callee,
+        namespace_aliases,
+        operator_bindings[32] if len(operator_bindings) > 32 else None,
+    )
+    if namespace_mutator == "update":
         return _update_payload_may_set_workers(call, start_index=1)
-    if (
-        isinstance(callee, ast.Attribute)
-        and callee.attr == "__setitem__"
-        and _is_module_namespace_mapping(callee.value, namespace_aliases)
-        and len(call.args) >= 2
-        and _key_may_be_workers(call.args[1])
-    ):
-        return True
+    if namespace_mutator == "__setitem__":
+        return len(call.args) >= 2 and _key_may_be_workers(call.args[1])
+    if namespace_mutator == "__ior__":
+        return (
+            len(call.args) >= 2
+            and _dict_merge_payload_may_set_workers(call.args[1])
+        )
     if (
         len(call.args) >= 3
         and _is_operator_setitem_callable(callee, setitem_aliases, module_aliases)
@@ -19217,9 +19354,22 @@ def _collect_operator_setitem_bindings(tree):
         dict_ior_aliases, dict_shadow_line, operator_context,
     )
     functools_aliases, reduce_aliases = _collect_functools_reduce_aliases(tree.body)
-    delegated_update_aliases = _collect_delegated_update_namespace_aliases(tree, namespace_aliases)
-    delegated_update_alias_events = _collect_delegated_update_alias_events(tree, namespace_aliases)
     types_module_aliases, functiontype_aliases = _collect_types_functiontype_aliases(tree.body)
+    simple_namespace_constructor_aliases = _collect_simple_namespace_constructor_aliases(
+        tree.body
+    )
+    delegated_update_aliases = _collect_delegated_update_namespace_aliases(
+        tree,
+        namespace_aliases,
+        simple_namespace_constructor_aliases,
+        types_module_aliases,
+    )
+    delegated_update_alias_events = _collect_delegated_update_alias_events(
+        tree,
+        namespace_aliases,
+        simple_namespace_constructor_aliases,
+        types_module_aliases,
+    )
     functiontype_namespace_aliases = _collect_functiontype_namespace_aliases(
         tree, namespace_aliases, types_module_aliases, functiontype_aliases
     )
