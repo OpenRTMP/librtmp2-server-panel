@@ -11126,7 +11126,7 @@ def _record_class_side_effect_target(
     if _function_is_property_method(stmt, operator_bindings):
         properties.add(target)
         return True
-    if stmt.name == "__get__":
+    if stmt.name in ("__get__", "__set_name__"):
         methods.add(target)
         return True
     # A plain instance method runs the mutation through an instance
@@ -14347,12 +14347,43 @@ def _expression_triggers_class_workers_side_effect(
 
 
 
+def _class_body_assigns_mutating_descriptor(class_node, class_targets):
+    """Return True when a class-body assignment runs a risky descriptor ``__set_name__``."""
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    reference_line = getattr(class_node, "lineno", 0)
+    for stmt in class_node.body:
+        if isinstance(stmt, ast.Assign):
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            value = stmt.value
+        else:
+            continue
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+            continue
+        descriptor_class = _class_name_alias_target(
+            value.func.id,
+            class_name_aliases,
+            reference_line,
+        )
+        if _class_hook_is_active(
+            class_targets,
+            descriptor_class,
+            "__set_name__",
+            methods,
+            reference_line,
+        ):
+            return True
+    return False
+
+
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     """Return True when defining the class itself mutates ``workers``."""
     constructors = class_targets[0]
     methods = class_targets[1]
     metaclass_definitions = class_targets[3]
     enum_members = class_targets[9] if len(class_targets) > 9 else set()
+    reference_line = getattr(class_node, "lineno", 0)
     if class_node.name in metaclass_definitions:
         return True
     if (class_node.name in constructors or (class_node.name, '__new__') in methods) and any(
@@ -14361,8 +14392,17 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
         return True
     if _classdef_runs_set_name_hook(class_node, class_targets):
         return True
+    if any(member[0] == class_node.name for member in enum_members) and _class_hook_is_active(
+        class_targets,
+        class_node.name,
+        "_generate_next_value_",
+        methods,
+        reference_line,
+    ):
+        return True
+    if _class_body_assigns_mutating_descriptor(class_node, class_targets):
+        return True
     class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
-    reference_line = getattr(class_node, "lineno", 0)
     return any(
         isinstance(base, ast.Name)
         and (
