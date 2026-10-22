@@ -90,6 +90,12 @@ import config
         "workers = 1\nfrom functools import partial\nfrom operator import methodcaller\npartial(methodcaller('update', {'workers': 4}), globals())()\n",
         "workers = 1\ngetattr(__builtins__['dict'], 'update')(globals(), {'workers': 4})\n",
         "workers = 1\nfrom functools import partial, reduce\npartial(reduce, lambda g,_: g.update({'workers':4}), [None], globals())()\n",
+        # Pre-bound payload forms: the key is already bound to the namespace
+        # mutator, so the invocation supplies only the value.
+        "workers = 1\nfrom functools import partial\npartial(globals().setdefault, 'workers')(4)\n",
+        # Pre-bound payload forms: the payload itself is bound to the mutator.
+        "workers = 1\nfrom functools import partial\npartial(globals().update, {'workers': 4})()\n",
+        "workers = 1\nfrom functools import partial\npartial(globals().__ior__, {'workers': 4})()\n",
     ],
 )
 def test_gunicorn_indirect_namespace_workers_mutations_are_dynamic(tmp_path, config_content):
