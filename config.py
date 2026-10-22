@@ -4710,6 +4710,59 @@ def _dict_subclass_uses_builtin_update(class_node, dict_shadow_line=None):
     return inherits_builtin_dict and not _class_overrides_update(class_node)
 
 
+def _type_call_namespace_overrides_update(namespace):
+    """Return whether a runtime class namespace binds its own ``update``."""
+    if not isinstance(namespace, ast.Dict):
+        # An unresolved namespace may bind its own ``update``.
+        return True
+    return any(
+        isinstance(key, ast.Constant) and key.value == "update"
+        for key in namespace.keys
+    )
+
+
+def _type_call_argument(call, name, position):
+    """Return one ``type(...)`` argument by position or keyword name."""
+    if len(call.args) > position:
+        return call.args[position]
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    return None
+
+
+def _type_call_creates_dict_subclass(
+    call,
+    dict_shadow_line=None,
+    builtin_shadow_lines=None,
+):
+    """Return whether a ``type(...)`` call creates a dict subclass."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not (isinstance(call.func, ast.Name) and call.func.id == "type"):
+        return False
+    line = getattr(call, "lineno", 0)
+    if not _name_is_unshadowed_builtin("type", line, builtin_shadow_lines):
+        return False
+    bases = _type_call_argument(call, "bases", 1)
+    namespace = _type_call_argument(call, "dict", 2)
+    if bases is None or namespace is None:
+        return False
+    if not isinstance(bases, (ast.Tuple, ast.List)):
+        return False
+    if not any(
+        isinstance(base, ast.Name)
+        and base.id == "dict"
+        and _dict_name_is_builtin_at_line(
+            getattr(base, "lineno", line),
+            dict_shadow_line,
+        )
+        for base in bases.elts
+    ):
+        return False
+    return not _type_call_namespace_overrides_update(namespace)
+
+
 def _deactivate_tracked_binding(events, name, line):
     """Record that a previously tracked binding is no longer active."""
     if name in events:
@@ -4740,12 +4793,31 @@ def _record_dict_subclass_definition(
         _deactivate_tracked_binding(events, class_node.name, line)
 
 
+def _record_runtime_dict_subclass_definitions(
+    node,
+    events,
+    dict_shadow_line,
+    builtin_shadow_lines=None,
+):
+    """Record dict subclasses created at runtime through ``type(...)``."""
+    for name, value in _namespace_assignment_values(node):
+        if not _type_call_creates_dict_subclass(
+            value,
+            dict_shadow_line,
+            builtin_shadow_lines,
+        ):
+            continue
+        line = getattr(node, "lineno", 0)
+        events.setdefault(name, []).append((line, True))
+
+
 def _scan_dict_subclass_bindings(
     statements,
     events,
     dict_shadow_line,
     *,
     conditional=False,
+    builtin_shadow_lines=None,
 ):
     """Populate source-ordered dict-subclass binding events."""
     for node in statements:
@@ -4760,19 +4832,31 @@ def _scan_dict_subclass_bindings(
             continue
         if not conditional:
             _invalidate_tracked_bindings_from_statement(node, events, line)
+        _record_runtime_dict_subclass_definitions(
+            node,
+            events,
+            dict_shadow_line,
+            builtin_shadow_lines,
+        )
         for nested in _compound_statement_blocks(node):
             _scan_dict_subclass_bindings(
                 nested,
                 events,
                 dict_shadow_line,
                 conditional=True,
+                builtin_shadow_lines=builtin_shadow_lines,
             )
 
 
-def _collect_dict_subclass_names(statements, dict_shadow_line=None):
+def _collect_dict_subclass_names(statements, dict_shadow_line=None, builtin_shadow_lines=None):
     """Track class names that inherit the unmodified builtin ``dict.update``."""
     events = {}
-    _scan_dict_subclass_bindings(statements, events, dict_shadow_line)
+    _scan_dict_subclass_bindings(
+        statements,
+        events,
+        dict_shadow_line,
+        builtin_shadow_lines=builtin_shadow_lines,
+    )
     return events
 
 
@@ -5985,6 +6069,15 @@ def _map_or_filter_lambda_mutates_when_consumed(call, operator_bindings):
         )
     if name != 'map':
         return False
+    # ``map`` is lazy too, so consuming it drains every iterable it consumes.
+    if any(
+        _expression_is_mutating_lazy_iterator(
+            iterable,
+            operator_bindings,
+        )
+        for iterable in call.args[1:]
+    ):
+        return True
     positional_params = (*lambda_node.args.posonlyargs, *lambda_node.args.args)
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if any(
@@ -6747,18 +6840,33 @@ def _thread_pool_rebound_names(node):
     return tuple(name for name, _value in _namespace_assignment_values(node))
 
 
-def _record_thread_pool_rebindings(node, class_events, module_events, line):
+def _record_thread_pool_rebindings(
+    node,
+    class_events,
+    module_events,
+    line,
+    *,
+    conditional=False,
+):
     """Deactivate tracked thread-pool aliases rebound by one statement."""
+    if conditional:
+        # A rebinding inside a branch may never run, so the alias stays a
+        # possible pool and the scan has to keep failing closed.
+        return
     for name in _thread_pool_rebound_names(node):
         _record_thread_pool_alias_event(class_events, name, None, line)
         _record_thread_pool_alias_event(module_events, name, None, line)
 
 
-def _collect_thread_pool_alias_events(tree):
+def _scan_thread_pool_alias_events(
+    statements,
+    class_events,
+    module_events,
+    *,
+    conditional=False,
+):
     """Track supported thread-pool imports without losing colliding aliases."""
-    class_events = {}
-    module_events = {}
-    for node in tree.body:
+    for node in statements:
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.ImportFrom):
             _record_thread_pool_direct_import_aliases(
@@ -6780,7 +6888,22 @@ def _collect_thread_pool_alias_events(tree):
                 class_events,
                 module_events,
                 line,
+                conditional=conditional,
             )
+        for nested in _compound_statement_blocks(node):
+            _scan_thread_pool_alias_events(
+                nested,
+                class_events,
+                module_events,
+                conditional=True,
+            )
+
+
+def _collect_thread_pool_alias_events(tree):
+    """Track supported thread-pool imports without losing colliding aliases."""
+    class_events = {}
+    module_events = {}
+    _scan_thread_pool_alias_events(tree.body, class_events, module_events)
     return class_events, module_events
 
 
@@ -7395,6 +7518,8 @@ def _record_future_constructor_assignment(
     value,
     class_events,
     module_events,
+    *,
+    conditional=False,
 ):
     """Record Future constructor/module aliases introduced by one assignment."""
     class_active = _future_reference_is_active(
@@ -7409,6 +7534,18 @@ def _record_future_constructor_assignment(
         value,
         module_events,
     )
+    if conditional:
+        # A rebinding inside a branch may never run, so the alias stays a
+        # possible Future and the scan has to keep failing closed.
+        if class_active:
+            class_events.setdefault(name, []).append(
+                _future_binding_event(node, True)
+            )
+        if module_active:
+            module_events.setdefault(name, []).append(
+                _future_binding_event(node, True)
+            )
+        return
     class_events.setdefault(name, []).append(
         _future_binding_event(node, class_active)
     )
@@ -7417,11 +7554,15 @@ def _record_future_constructor_assignment(
     )
 
 
-def _collect_future_constructor_alias_events(tree):
+def _scan_future_constructor_alias_events(
+    statements,
+    class_events,
+    module_events,
+    *,
+    conditional=False,
+):
     """Track Future constructors and futures-module aliases in source order."""
-    class_events = {}
-    module_events = {}
-    for node in tree.body:
+    for node in statements:
         handled_imports = _record_future_constructor_imports(
             node,
             class_events,
@@ -7434,17 +7575,36 @@ def _collect_future_constructor_alias_events(tree):
                 value,
                 class_events,
                 module_events,
+                conditional=conditional,
             )
         rebound_names = set(_import_bound_names(node)) - handled_imports
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             rebound_names.add(node.name)
         for name in rebound_names:
+            if conditional:
+                # A rebinding inside a branch may never run, so the alias
+                # stays a possible Future.
+                continue
             class_events.setdefault(name, []).append(
                 _future_binding_event(node, False)
             )
             module_events.setdefault(name, []).append(
                 _future_binding_event(node, False)
             )
+        for nested in _compound_statement_blocks(node):
+            _scan_future_constructor_alias_events(
+                nested,
+                class_events,
+                module_events,
+                conditional=True,
+            )
+
+
+def _collect_future_constructor_alias_events(tree):
+    """Track Future constructors and futures-module aliases in source order."""
+    class_events = {}
+    module_events = {}
+    _scan_future_constructor_alias_events(tree.body, class_events, module_events)
     return class_events, module_events
 
 
@@ -8882,12 +9042,15 @@ def _new_local_async_state(
             reference_line,
         ),
         "consumer_names": set(),
+        "task_factory_names": set(),
         "callback_mutators": set(),
         "bound_names": bound_names,
     }
 
 
 _ASYNCIO_AWAITABLE_CONSUMERS = frozenset({"gather", "shield", "wait_for"})
+
+_ASYNCIO_TASK_FACTORY_HELPERS = frozenset({"create_task", "ensure_future"})
 
 
 def _asyncio_consumer_reference_is_active(
@@ -9012,6 +9175,7 @@ def _asyncio_awaitable_mutates_workers(
             "asyncio_modules": set(),
             "to_thread_names": set(),
             "consumer_names": set(),
+            "task_factory_names": set(),
             "callback_mutators": set(),
             "bound_names": set(),
         }
@@ -9121,6 +9285,7 @@ def _clear_local_async_binding(name, local_state):
     local_state["bound_names"].add(name)
     local_state["to_thread_names"].discard(name)
     local_state["consumer_names"].discard(name)
+    local_state["task_factory_names"].discard(name)
     local_state["asyncio_modules"].discard(name)
     local_state["wrappers"].pop(name, None)
     local_state["awaitables"].discard(name)
@@ -9148,6 +9313,8 @@ def _record_local_asyncio_helper_imports(node, local_state):
             local_state["to_thread_names"].add(name)
         if imported.name in _ASYNCIO_AWAITABLE_CONSUMERS:
             local_state["consumer_names"].add(name)
+        if imported.name in _ASYNCIO_TASK_FACTORY_HELPERS:
+            local_state["task_factory_names"].add(name)
 
 
 def _record_local_asyncio_import(node, local_state):
@@ -9176,6 +9343,7 @@ def _record_local_async_definition(
         local_state["bound_names"].add(name)
         local_state["to_thread_names"].discard(name)
         local_state["consumer_names"].discard(name)
+        local_state["task_factory_names"].discard(name)
         local_state["asyncio_modules"].discard(name)
     if isinstance(node, ast.AsyncFunctionDef):
         candidates = frozenset({node})
@@ -9305,6 +9473,7 @@ def _record_local_async_bindings(
         local_state["bound_names"].add(name)
         local_state["asyncio_modules"].discard(name)
         local_state["consumer_names"].discard(name)
+        local_state["task_factory_names"].discard(name)
         _record_local_async_wrapper_assignment(
             name,
             value,
@@ -9327,6 +9496,30 @@ def _record_local_async_bindings(
     return False
 
 
+def _asyncio_task_factory_reference_is_active(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state=None,
+):
+    """Resolve create_task/ensure_future while honoring wrapper-local names."""
+    if (
+        local_state is not None
+        and isinstance(node, ast.Name)
+        and node.id in local_state["bound_names"]
+    ):
+        return node.id in local_state["task_factory_names"]
+    return any(
+        _asyncio_helper_active_at_line(
+            node,
+            helper_name,
+            operator_bindings,
+            reference_line,
+        )
+        for helper_name in _ASYNCIO_TASK_FACTORY_HELPERS
+    )
+
+
 def _asyncio_task_factory_call_mutates_workers(
     call,
     operator_bindings,
@@ -9338,15 +9531,11 @@ def _asyncio_task_factory_call_mutates_workers(
     """Return True when create_task/ensure_future schedules a mutating awaitable."""
     if not isinstance(call, ast.Call) or (not call.args and not call.keywords):
         return False
-    helper_names = ("create_task", "ensure_future")
-    if not any(
-        _asyncio_helper_active_at_line(
-            call.func,
-            helper_name,
-            operator_bindings,
-            reference_line,
-        )
-        for helper_name in helper_names
+    if not _asyncio_task_factory_reference_is_active(
+        call.func,
+        operator_bindings,
+        reference_line,
+        local_state,
     ):
         return False
     scheduled = _call_argument(
@@ -20724,7 +20913,11 @@ def _scan_gunicorn_config_worker_details(tree):
         thread_pool_instance_alias_events,
     )
     dict_shadow_line = operator_bindings[21] if len(operator_bindings) > 21 else None
-    dict_subclass_names = _collect_dict_subclass_names(tree.body, dict_shadow_line)
+    dict_subclass_names = _collect_dict_subclass_names(
+        tree.body,
+        dict_shadow_line,
+        operator_bindings[32],
+    )
     class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
     # Function bodies are scanned before the late inspect-analysis bundle exists.
     # Keep class targets in the existing metadata map, preserving tuple indices.
@@ -20739,6 +20932,38 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings = (
         *operator_bindings,
         import_time_workers_mutators,
+    )
+    # The lazy-iterator alias pass resolves a named callback through the
+    # import-time workers-mutator names, so it runs again now that they are
+    # collected. The yield-from and generator passes follow it so that they
+    # see the refreshed lazy-iterator aliases. The binding tuple indices are
+    # fixed, so the refreshed results replace slots 40, 41 and 42 in place.
+    lazy_iterator_alias_events = _collect_mutating_lazy_iterator_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings[:40],
+        lazy_iterator_alias_events,
+        *operator_bindings[41:],
+    )
+    mutating_yield_from_functions = _collect_mutating_yield_from_functions(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings[:41],
+        mutating_yield_from_functions,
+        *operator_bindings[42:],
+    )
+    mutating_generator_alias_events = _collect_mutating_generator_alias_events(
+        tree,
+        operator_bindings,
+    )
+    operator_bindings = (
+        *operator_bindings[:42],
+        mutating_generator_alias_events,
+        *operator_bindings[43:],
     )
     operator_bindings[32]["warnings_showwarning_mutation_events"] = (
         _collect_warnings_showwarning_mutation_events(
