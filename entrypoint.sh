@@ -25,4 +25,12 @@ cat <<'BANNER'
 BANNER
 printf '  librtmp2-server-panel %s\n\n' "$DISPLAY_VERSION"
 
+# The image's default command (kept in sync with the Dockerfile CMD). Without
+# this guard an empty argument list would exit 0 without ever starting
+# gunicorn, and a flag-first invocation would be consumed by the shell's own
+# exec builtin. Mirrors the guard in ../librtmp2-server/entrypoint.sh.
+if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
+    set -- gunicorn --bind 0.0.0.0:8000 --worker-class gthread --threads 4 --timeout 450 app:app "$@"
+fi
+
 exec "$@"
