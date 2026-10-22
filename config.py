@@ -978,16 +978,24 @@ _DELEGATED_NAMESPACE_MUTATOR_METHODS = {
 }
 
 
+def _simple_namespace_import_aliases(node):
+    """Return the names a single ``from types import SimpleNamespace`` binds."""
+    if not isinstance(node, ast.ImportFrom) or node.module != "types":
+        return set()
+    return {
+        imported.asname or imported.name
+        for imported in node.names
+        if imported.name == "SimpleNamespace"
+    }
+
+
 def _collect_simple_namespace_constructor_aliases(statements):
     """Collect names bound to ``types.SimpleNamespace`` by a ``from`` import."""
     aliases = set()
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(node, ast.ImportFrom) and node.module == "types":
-            for imported in node.names:
-                if imported.name == "SimpleNamespace":
-                    aliases.add(imported.asname or imported.name)
+        aliases.update(_simple_namespace_import_aliases(node))
         for block in _compound_statement_blocks(node):
             aliases.update(_collect_simple_namespace_constructor_aliases(block))
     return aliases
@@ -2476,9 +2484,14 @@ def _partial_unbound_dict_namespace_method(
     return None
 
 
-def _partial_bound_namespace_mutator_method(partial_call, namespace_aliases):
-    """Return the module namespace mutator bound by ``partial(globals().update)``."""
-    if partial_call is None or len(partial_call.args) != 1:
+def _partial_bound_namespace_mutator(partial_call, namespace_aliases):
+    """Return ``(method, bound_args)`` for ``partial(namespace_mutator, ...)``.
+
+    A partial can pre-bind part of the call: ``partial(ns.__setitem__, 'workers')``
+    already carries the key, while ``partial(ns.update, {'workers': 4})``
+    carries the payload itself.
+    """
+    if partial_call is None or not partial_call.args:
         return None
     target = partial_call.args[0]
     if not isinstance(target, ast.Attribute):
@@ -2487,7 +2500,48 @@ def _partial_bound_namespace_mutator_method(partial_call, namespace_aliases):
         return None
     if not _is_module_namespace_mapping(target.value, namespace_aliases):
         return None
-    return target.attr
+    return target.attr, list(partial_call.args[1:])
+
+
+def _partial_bound_namespace_mutator_method(partial_call, namespace_aliases):
+    """Return the module namespace mutator bound by ``partial(globals().update)``."""
+    bound = _partial_bound_namespace_mutator(partial_call, namespace_aliases)
+    return None if bound is None else bound[0]
+
+
+def _mutator_payload_expr_may_set_workers(method, payload):
+    """Return True when one payload expression may bind the ``workers`` key."""
+    if method == "update":
+        return not isinstance(payload, ast.Dict) or _dict_literal_sets_workers(payload)
+    if method == "__ior__":
+        return _dict_merge_payload_may_set_workers(payload)
+    return _key_may_be_workers(payload)
+
+
+def _partial_bound_mutation_may_set_workers(
+    method,
+    bound_args,
+    invocation_call,
+    invocation_start_index,
+):
+    """Return True when an invoked partial of a namespace mutator can bind workers.
+
+    The bound arguments are inspected first, because a partial can carry the
+    payload itself (``partial(ns.update, {'workers': 4})``) or the key
+    (``partial(ns.__setitem__, 'workers')``). For the keyed mutators a
+    pre-bound key ends the check: the invocation then supplies the value, not
+    the key, so its first argument must not be read as one.
+    """
+    if bound_args and _mutator_payload_expr_may_set_workers(method, bound_args[0]):
+        return True
+    if method in {"__setitem__", "setdefault"} and bound_args:
+        # The key is pre-bound and is provably not ``workers``.
+        return False
+    return invocation_call is not None and _call_payload_may_set_workers(
+        method,
+        invocation_call,
+        start_index=invocation_start_index,
+    )
 
 
 def _call_payload_may_set_workers(method, call, start_index=0):
@@ -2523,12 +2577,10 @@ def _partial_uses_unbound_dict_namespace_mutation(
         invocation_call, invocation_start_index,
     ):
         return True
-    bound_method = _partial_bound_namespace_mutator_method(
-        partial_call, namespace_aliases
-    )
-    if bound_method is not None:
-        return invocation_call is not None and _call_payload_may_set_workers(
-            bound_method, invocation_call, start_index=invocation_start_index,
+    bound = _partial_bound_namespace_mutator(partial_call, namespace_aliases)
+    if bound is not None:
+        return _partial_bound_mutation_may_set_workers(
+            bound[0], bound[1], invocation_call, invocation_start_index,
         )
     if dict_ior_aliases is None:
         dict_ior_aliases = set()
@@ -14098,6 +14150,100 @@ def _indirect_method_dispatch_target(expr, class_targets, operator_bindings=None
     return None
 
 
+def _plain_name_receiver_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when a plain-name receiver reaches a mutating method."""
+    if _nested_class_attribute_call_triggers_workers(
+        receiver.id,
+        method_name,
+        class_targets,
+        reference_line,
+    ):
+        return True
+    return _name_receiver_call_triggers_workers(
+        receiver,
+        method_name,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _type_call_receiver_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True for ``type(obj).method(...)`` when ``type`` is the builtin."""
+    if not (isinstance(receiver.func, ast.Name) and receiver.func.id == "type"):
+        return False
+    if not receiver.args:
+        return False
+    # ``type(obj).method`` resolves the method on obj's class.
+    shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+    if not _name_is_unshadowed_builtin(
+        "type", getattr(receiver, "lineno", 0), shadow_lines
+    ):
+        return False
+    return _receiver_method_call_triggers_workers(
+        receiver.args[0],
+        method_name,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _enum_attribute_receiver_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    reference_line,
+):
+    """Return True for ``Enum.MEMBER.method(...)`` receivers."""
+    return _enum_member_call_triggers_workers(
+        _enum_member_class_name(receiver.value.id, class_targets, reference_line),
+        receiver.attr,
+        method_name,
+        methods,
+        class_targets,
+        reference_line,
+    )
+
+
+def _subscript_receiver_triggers_workers(
+    receiver,
+    method_name,
+    methods,
+    class_targets,
+    reference_line,
+):
+    """Return True for ``Enum['MEMBER'].method(...)`` receivers."""
+    member_name = _enum_member_subscript_name(receiver)
+    if member_name is None:
+        return False
+    return _enum_member_call_triggers_workers(
+        _enum_member_class_name(receiver.value.id, class_targets, reference_line),
+        member_name,
+        method_name,
+        methods,
+        class_targets,
+        reference_line,
+    )
+
+
 def _receiver_method_call_triggers_workers(
     receiver,
     method_name,
@@ -14108,14 +14254,7 @@ def _receiver_method_call_triggers_workers(
 ):
     """Return True when a resolved receiver reaches a mutating method."""
     if isinstance(receiver, ast.Name):
-        if _nested_class_attribute_call_triggers_workers(
-            receiver.id,
-            method_name,
-            class_targets,
-            reference_line,
-        ):
-            return True
-        return _name_receiver_call_triggers_workers(
+        return _plain_name_receiver_triggers_workers(
             receiver,
             method_name,
             methods,
@@ -14124,20 +14263,15 @@ def _receiver_method_call_triggers_workers(
             reference_line,
         )
     if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
-        if receiver.func.id == "type" and receiver.args:
-            # ``type(obj).method`` resolves the method on obj's class.
-            shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
-            if _name_is_unshadowed_builtin(
-                "type", getattr(receiver, "lineno", 0), shadow_lines
-            ):
-                return _receiver_method_call_triggers_workers(
-                    receiver.args[0],
-                    method_name,
-                    methods,
-                    class_targets,
-                    instance_events,
-                    reference_line,
-                )
+        if _type_call_receiver_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        ):
+            return True
         return _constructed_receiver_call_triggers_workers(
             receiver,
             method_name,
@@ -14146,21 +14280,16 @@ def _receiver_method_call_triggers_workers(
             reference_line,
         )
     if isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name):
-        return _enum_member_call_triggers_workers(
-            _enum_member_class_name(receiver.value.id, class_targets, reference_line),
-            receiver.attr,
+        return _enum_attribute_receiver_triggers_workers(
+            receiver,
             method_name,
             methods,
             class_targets,
             reference_line,
         )
     if isinstance(receiver, ast.Subscript) and isinstance(receiver.value, ast.Name):
-        member_name = _enum_member_subscript_name(receiver)
-        if member_name is None:
-            return False
-        return _enum_member_call_triggers_workers(
-            _enum_member_class_name(receiver.value.id, class_targets, reference_line),
-            member_name,
+        return _subscript_receiver_triggers_workers(
+            receiver,
             method_name,
             methods,
             class_targets,
