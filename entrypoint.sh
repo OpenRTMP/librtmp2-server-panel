@@ -7,9 +7,9 @@ if [ -r "$VERSION_FILE" ]; then
     VERSION="$(cat "$VERSION_FILE")"
 fi
 
-if printf '%s\n' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]'; then
+if printf '%s\n' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+'; then
     DISPLAY_VERSION="$VERSION"
-elif printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]'; then
+elif printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+'; then
     DISPLAY_VERSION="v$VERSION"
 else
     DISPLAY_VERSION="$VERSION"
@@ -25,12 +25,47 @@ cat <<'BANNER'
 BANNER
 printf '  librtmp2-server-panel %s\n\n' "$DISPLAY_VERSION"
 
+# Return 0 when the arguments carry a WSGI application target, i.e. a
+# "module:callable" pair or a path to a python file. A host:port value (for
+# example the "0.0.0.0:8000" of --bind) is not an application target.
+app_target_supplied() {
+    for arg in "$@"; do
+        case "$arg" in
+            -*) continue ;;
+        esac
+        case "$arg" in
+            *.py) return 0 ;;
+        esac
+        case "$arg" in
+            *:*) ;;
+            *) continue ;;
+        esac
+        module="${arg%%:*}"
+        callable="${arg#*:}"
+        case "$module" in
+            ''|[0-9]*|*[!A-Za-z0-9_.]*) continue ;;
+        esac
+        case "$callable" in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        return 0
+    done
+    return 1
+}
+
 # The image's default command (kept in sync with the Dockerfile CMD). Without
 # this guard an empty argument list would exit 0 without ever starting
 # gunicorn, and a flag-first invocation would be consumed by the shell's own
 # exec builtin. Mirrors the guard in ../librtmp2-server/entrypoint.sh.
 if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
-    set -- gunicorn --bind 0.0.0.0:8000 --worker-class gthread --threads 4 --timeout 450 app:app "$@"
+    if app_target_supplied "$@"; then
+        # Gunicorn serves the first positional argument, so an application
+        # target supplied by the operator must not be preceded by the
+        # image's default one.
+        set -- gunicorn --bind 0.0.0.0:8000 --worker-class gthread --threads 4 --timeout 450 "$@"
+    else
+        set -- gunicorn --bind 0.0.0.0:8000 --worker-class gthread --threads 4 --timeout 450 app:app "$@"
+    fi
 fi
 
 exec "$@"
