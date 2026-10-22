@@ -353,6 +353,13 @@ def _emit_config_error(message: str) -> None:
     sys.stderr.write("\n")
 
 
+def _emit_config_warning(message: str) -> None:
+    """Emit a startup config warning without interpolating sensitive env values."""
+    sys.stderr.write("CONFIG WARNING: ")
+    sys.stderr.write(message)
+    sys.stderr.write("\n")
+
+
 def _parse_worker_count(value):
     """Return an integer-looking worker count, or None.
 
@@ -21633,6 +21640,24 @@ def _gunicorn_launch_directory_is_known() -> bool:
         return False
 
 
+def _gunicorn_launch_directory_differs_from_cwd() -> bool:
+    """Return True when an inherited PWD names a directory other than the cwd.
+
+    Gunicorn resolves the implicit ``gunicorn.conf.py`` against its launch
+    directory and only afterwards applies the config's own ``chdir``, so the
+    current working directory can differ from the launch directory. An
+    inherited ``PWD`` pointing at another directory is the only evidence that
+    such a ``chdir`` happened: without it there is nothing to fail closed on.
+    """
+    inherited_pwd = os.environ.get("PWD", "").strip()
+    if not inherited_pwd:
+        return False
+    try:
+        return Path(inherited_pwd).resolve() != Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _gunicorn_pwd_config_candidate(relative, directories, cwd_config):
     """Resolve the PWD config candidate and whether it adds a distinct file."""
     if len(directories) <= 1:
@@ -21795,12 +21820,26 @@ def _detect_worker_settings() -> tuple[int, bool]:
                 # the larger environment count and force the dynamic flag.
                 count = max(count, env_count)
                 runtime_dynamic = True
+        elif _gunicorn_launch_directory_differs_from_cwd():
+            # No implicit config was found and the inherited PWD names a
+            # directory other than the current one: Gunicorn may have loaded
+            # a config that chdir'd away from the current directory and set
+            # several workers. Fail closed instead of assuming a single
+            # static worker.
+            runtime_dynamic = True
         elif not _gunicorn_launch_directory_is_known():
             # No implicit config was found and the launch directory cannot be
-            # reconstructed: Gunicorn may have loaded a config that chdir'd
-            # away from the current directory and set several workers. Fail
-            # closed instead of assuming a single static worker.
-            runtime_dynamic = True
+            # reconstructed, but nothing indicates that a config chdir'd away
+            # from the current directory. Keep the single-worker verdict so an
+            # ordinary deployment still starts, and warn that the worker count
+            # stayed unverified.
+            _emit_config_warning(
+                "The Gunicorn worker count could not be verified: no implicit "
+                "gunicorn.conf.py was found and the launch directory is unknown "
+                "(no inherited PWD). Assuming a single worker; set "
+                "WEB_CONCURRENCY or use a shared rate-limit backend such as "
+                "redis://redis:6379/0 when running multiple workers."
+            )
 
     cmd_override = _worker_count_override_from_tokens(cmd_tokens)
     if cmd_override is not None:
@@ -21833,13 +21872,16 @@ def _ratelimit_storage_error():
     if ratelimit_uri == RATELIMIT_MEMORY_URI:
         if dynamic_workers_config:
             return (
-                "The Gunicorn config file sets workers using a dynamic or conditional "
-                "assignment (for example workers = multiprocessing.cpu_count() or "
-                "workers = N inside an if/for block). Startup cannot verify a "
-                f"single-worker deployment, so {RATELIMIT_MEMORY_URI} would bypass "
-                "login rate limits across worker processes. Set a single static "
-                "top-level workers = N in the config file, configure WEB_CONCURRENCY, "
-                "or use a shared backend such as redis://redis:6379/0."
+                "The Gunicorn worker count could not be verified: the config file "
+                "sets workers using a dynamic or conditional assignment (for "
+                "example workers = multiprocessing.cpu_count() or workers = N "
+                "inside an if/for block), or the config changed the launch "
+                "directory so no config file could be located. Startup cannot "
+                f"verify a single-worker deployment, so {RATELIMIT_MEMORY_URI} "
+                "would bypass login rate limits across worker processes. Set a "
+                "single static top-level workers = N in the config file, "
+                "configure WEB_CONCURRENCY, or use a shared backend such as "
+                "redis://redis:6379/0."
             )
         return (
             f"RATELIMIT_STORAGE_URI={RATELIMIT_MEMORY_URI} is per worker process and "

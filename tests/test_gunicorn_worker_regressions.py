@@ -85,15 +85,31 @@ def test_environment_does_not_let_gunicorn_workers_mask_web_concurrency(
     monkeypatch, tmp_path, config_module
 ):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path / "launch"))
     monkeypatch.setenv("WEB_CONCURRENCY", "4")
     monkeypatch.setenv("GUNICORN_WORKERS", "1")
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
     # WEB_CONCURRENCY still wins over GUNICORN_WORKERS, but the implicit
-    # gunicorn.conf.py cannot be located and the launch directory is unknown
-    # (PWD does not name the current directory), so the deployment has to
+    # gunicorn.conf.py cannot be located and the inherited PWD names a
+    # directory other than the current one, so the deployment has to
     # stay dynamic instead of pretending to run a single static worker.
     assert config_module._detect_worker_settings() == (4, True)
+
+
+def test_missing_pwd_keeps_a_single_worker_deployment_startable(
+    monkeypatch, tmp_path, config_module
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PWD", raising=False)
+    monkeypatch.setenv("RATELIMIT_STORAGE_URI", "memory://")
+    monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
+
+    # Without an inherited PWD there is no evidence that a Gunicorn config
+    # chdir'd away from the current directory, so an ordinary single-worker
+    # deployment must keep starting instead of refusing the memory limiter.
+    assert config_module._detect_worker_settings() == (1, False)
+    assert config_module._ratelimit_storage_error() is None
 
 
 def test_direct_builtins_exec_alias_fails_closed(config_module):

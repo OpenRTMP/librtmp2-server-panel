@@ -27,7 +27,11 @@ ADMIN_REQUEST_TIMEOUT_SECONDS = 30
 # inside that window: a longer budget keeps the abandoned request - and the
 # Gunicorn worker thread it occupies - alive on the server side, so in-flight
 # upstream reads pile up until the worker's thread pool is exhausted.
-STATS_REQUEST_TIMEOUT_SECONDS = 8
+# The upstream server spends up to 8s on a cluster round trip to a remote
+# stream owner before it falls back to the local stats
+# (src/cluster/network.rs), so the budget needs headroom above that or the
+# panel gives up while the server is still waiting for the owner.
+STATS_REQUEST_TIMEOUT_SECONDS = 9
 
 # Synchronous panel delete routes block for one admin DELETE (up to
 # ADMIN_REQUEST_TIMEOUT_SECONDS) plus polling through the drain window. Docker
