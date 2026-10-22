@@ -2483,7 +2483,7 @@ def _partial_bound_namespace_mutator_method(partial_call, namespace_aliases):
     target = partial_call.args[0]
     if not isinstance(target, ast.Attribute):
         return None
-    if target.attr not in _NAMESPACE_GETATTR_METHODS:
+    if target.attr not in (_NAMESPACE_GETATTR_METHODS | {"setdefault"}):
         return None
     if not _is_module_namespace_mapping(target.value, namespace_aliases):
         return None
@@ -2500,6 +2500,11 @@ def _call_payload_may_set_workers(method, call, start_index=0):
             and _dict_merge_payload_may_set_workers(call.args[start_index])
         )
     if method == "__setitem__":
+        return (
+            len(call.args) > start_index
+            and _key_may_be_workers(call.args[start_index])
+        )
+    if method == "setdefault":
         return (
             len(call.args) > start_index
             and _key_may_be_workers(call.args[start_index])
@@ -4513,7 +4518,7 @@ def _call_is_dict_setitem_on_name(call, name, dict_shadow_line=None):
 
 def _call_is_dict_update_on_name(call, name, dict_shadow_line=None):
     """Return True for ``dict.update(name, {...})`` calls."""
-    if not isinstance(call, ast.Call) or len(call.args) < 2:
+    if not isinstance(call, ast.Call) or not call.args:
         return False
     if not isinstance(call.args[0], ast.Name) or call.args[0].id != name:
         return False
@@ -4720,8 +4725,9 @@ def _dict_subclass_uses_builtin_update(class_node, dict_shadow_line=None):
 def _type_call_namespace_overrides_update(namespace):
     """Return whether a runtime class namespace binds its own ``update``."""
     if not isinstance(namespace, ast.Dict):
-        # An unresolved namespace may bind its own ``update``.
-        return True
+        # An unresolved namespace cannot prove an ``update`` override, so
+        # keep tracking the class and fail closed.
+        return False
     return any(
         isinstance(key, ast.Constant) and key.value == "update"
         for key in namespace.keys
