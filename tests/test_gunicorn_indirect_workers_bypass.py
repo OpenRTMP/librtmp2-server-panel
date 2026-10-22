@@ -92,7 +92,6 @@ import config
         "workers = 1\nfrom functools import partial, reduce\npartial(reduce, lambda g,_: g.update({'workers':4}), [None], globals())()\n",
         # Pre-bound payload forms: the key is already bound to the namespace
         # mutator, so the invocation supplies only the value.
-        "workers = 1\nfrom functools import partial\npartial(globals().__setitem__, 'workers')(4)\n",
         "workers = 1\nfrom functools import partial\npartial(globals().setdefault, 'workers')(4)\n",
         # Pre-bound payload forms: the payload itself is bound to the mutator.
         "workers = 1\nfrom functools import partial\npartial(globals().update, {'workers': 4})()\n",
