@@ -4636,3 +4636,49 @@ def test_codex_review_oct21_indirect_workers_regressions(
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (
         1, expected_dynamic
     )
+
+
+# Security review 2026-10-22: descriptor __set_name__ and Enum _generate_next_value_.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "class Descriptor:\n"
+            "    def __set_name__(self, owner, name):\n"
+            "        global workers\n"
+            "        workers = 4\n"
+            "class C:\n"
+            "    field = Descriptor()\n"
+        ),
+        (
+            "workers = 1\n"
+            "class Descriptor:\n"
+            "    def __set_name__(self, owner, name):\n"
+            "        global workers\n"
+            "        workers = 4\n"
+            "Alias = Descriptor\n"
+            "class C:\n"
+            "    field = Alias()\n"
+        ),
+        (
+            "workers = 1\n"
+            "from enum import Enum, auto\n"
+            "class E(Enum):\n"
+            "    def _generate_next_value_(name, start, count, last_values):\n"
+            "        global workers\n"
+            "        workers = 4\n"
+            "        return start\n"
+            "    A = auto()\n"
+        ),
+    ],
+    ids=[
+        "descriptor-set-name",
+        "descriptor-set-name-alias",
+        "enum-generate-next-value",
+    ],
+)
+def test_security_review_oct22_worker_scan_gaps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
