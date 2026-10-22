@@ -29,9 +29,19 @@ ADMIN_REQUEST_TIMEOUT_SECONDS = 30
 # upstream reads pile up until the worker's thread pool is exhausted.
 # The upstream server spends up to 8s on a cluster round trip to a remote
 # stream owner before it falls back to the local stats
-# (src/cluster/network.rs), so the budget needs headroom above that or the
+# (src/cluster/network.rs), so the read budget needs headroom above that or the
 # panel gives up while the server is still waiting for the owner.
-STATS_REQUEST_TIMEOUT_SECONDS = 9
+# ``requests`` applies a scalar timeout separately to the connect phase and
+# to the read inactivity, so a scalar budget does not cap the total request
+# duration: it can still outlive the browser's abort. The budget is split
+# into an explicit per-phase pair instead - a short connect budget plus a
+# read budget that still covers the cluster round trip - so the total stays
+# below the abort.
+STATS_REQUEST_CONNECT_TIMEOUT_SECONDS = 1
+STATS_REQUEST_READ_TIMEOUT_SECONDS = 8.5
+STATS_REQUEST_TIMEOUT_SECONDS = (
+    STATS_REQUEST_CONNECT_TIMEOUT_SECONDS + STATS_REQUEST_READ_TIMEOUT_SECONDS
+)
 
 # Synchronous panel delete routes block for one admin DELETE (up to
 # ADMIN_REQUEST_TIMEOUT_SECONDS) plus polling through the drain window. Docker
@@ -251,13 +261,28 @@ class Lrtmp2Client:
             params={"key": stats_key},
         )
 
+    def _stats_request_timeout(self):
+        """Return the per-phase ``(connect, read)`` timeout of a stats request.
+
+        The phases are budgeted separately so the total request duration
+        stays inside the browser's abort window, while the read phase still
+        covers the upstream cluster round trip. An explicitly shorter
+        admin_timeout still wins.
+        """
+        total = min(self.admin_timeout, STATS_REQUEST_TIMEOUT_SECONDS)
+        connect = min(STATS_REQUEST_CONNECT_TIMEOUT_SECONDS, total)
+        read = total - connect
+        if read <= 0:
+            return (total, total)
+        return (connect, read)
+
     def stream_stats_by_id(self, stream_id):
         return self._request_json(
             requests.get,
             f"{self.base_url}/api/v1/streams/{quote(stream_id, safe='')}/stats",
             "stream_stats_by_id",
             headers=self._headers(),
-            timeout=min(self.admin_timeout, STATS_REQUEST_TIMEOUT_SECONDS),
+            timeout=self._stats_request_timeout(),
         )
 
     def cluster_status(self):
