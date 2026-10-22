@@ -11,6 +11,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project has no fixed version; semantic-versioning guarantees
 only begin at a future `1.0.0`.
 
+## [Unreleased]
+
+### Fixed
+- Closed further Gunicorn worker-detection gaps so a memory-backed rate limit
+  and a per-process session store are refused whenever a config can raise the
+  worker count at import time. The gate now also covers a delegating
+  `SimpleNamespace` (including aliased constructors and the `__setitem__`,
+  `__ior__` and `setdefault` delegations), a bound `partial(globals().update)`,
+  the unbound `dict.update` form, a `map`/`filter` consumer whose callback
+  mutates the namespace, guarded `ThreadPool`/`Future` imports, a
+  function-local asyncio task factory, a named mutating callback, a
+  `type(...)`-created dict subclass, a metaclass that explicitly runs the
+  initializer, a descriptor `__set_name__` hook, the enum member shapes
+  (tuple targets, module-level aliases and subscripted access), the indirect
+  dispatch forms (`getattr`, `__getattribute__`, `operator.methodcaller`,
+  `operator.attrgetter`, `type(obj).m(obj)` and `Cls.__dict__['m'](obj)`), an
+  unresolvable callee that receives the module namespace, and a Gunicorn
+  launch whose configuration file and working directory cannot be
+  determined.
+- The upstream per-stream stats read now uses a timeout that fits the
+  browser's abort window, so an abandoned request no longer keeps an
+  upstream read (and a worker thread) alive.
+- The player list no longer offers a delete action for the stream's default
+  play key, which the server deliberately protects.
+- The container entrypoint now starts the default command when it is called
+  without arguments and handles a flag-first invocation.
+
 ## [0.1.13] — 2026-10-21
 
 ### Security
