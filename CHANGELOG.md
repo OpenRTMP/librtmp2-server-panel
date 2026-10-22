@@ -28,8 +28,8 @@ only begin at a future `1.0.0`.
   dispatch forms (`getattr`, `__getattribute__`, `operator.methodcaller`,
   `operator.attrgetter`, `type(obj).m(obj)` and `Cls.__dict__['m'](obj)`), an
   unresolvable callee that receives the module namespace, and a Gunicorn
-  launch whose configuration file and working directory cannot be
-  determined.
+  launch whose configuration file cannot be located while the inherited
+  working directory shows that the config changed the launch directory.
 - The upstream per-stream stats read now uses a timeout that fits the
   browser's abort window, so an abandoned request no longer keeps an
   upstream read (and a worker thread) alive.
