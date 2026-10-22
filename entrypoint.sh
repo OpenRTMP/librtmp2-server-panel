@@ -25,30 +25,97 @@ cat <<'BANNER'
 BANNER
 printf '  librtmp2-server-panel %s\n\n' "$DISPLAY_VERSION"
 
-# Return 0 when the arguments carry a WSGI application target, i.e. a
-# "module:callable" pair or a path to a python file. A host:port value (for
-# example the "0.0.0.0:8000" of --bind) is not an application target.
+# Return 0 when the given Gunicorn option takes its value as the next
+# argument. Without this the value of an option such as --config or --chdir
+# would be mistaken for the WSGI application target.
+option_takes_value() {
+    case "$1" in
+        -b|--bind|-w|--workers|-k|--worker-class|-t|--timeout|-c|--config|\
+        --chdir|-n|--name|-u|--user|-g|--group|-m|--umask|-p|--pid|-e|--env|\
+        --threads|--worker-connections|--graceful-timeout|--keep-alive|\
+        --max-requests|--max-requests-jitter|--backlog|--worker-tmp-dir|\
+        --log-level|--log-file|--access-logfile|--error-logfile|\
+        --access-logformat|--logger-class|--certfile|--keyfile|--ca-certs|\
+        --ssl-version|--ciphers|--forwarded-allow-ips|--proxy-allow-from|\
+        --statsd-host|--dogstatsd|--paste|--pythonpath|--reload-engine|\
+        --reload-extra-file|--limit-request-line|--limit-request-fields|\
+        --limit-request-field-size|--sendfile|--raw-passthrough|--spec|\
+        --wsgi-app)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+# Return 0 when the value looks like a WSGI application target: a
+# "module:callable" pair (optionally written "module:callable()"), a path to a
+# python file, or a dotted module name. A host:port value (for example the
+# "0.0.0.0:8000" of --bind) is not an application target.
+is_app_target() {
+    case "$1" in
+        *'()')
+            # "module:create_app()" - the trailing call is not part of the name.
+            is_app_target "${1%()}"
+            return $? ;;
+        *)
+            ;;
+    esac
+    case "$1" in
+        *.py)
+            return 0 ;;
+        *)
+            ;;
+    esac
+    case "$1" in
+        *:*)
+            ;;
+        *)
+            case "$1" in
+                ''|[0-9]*|*[!A-Za-z0-9_.]*)
+                    return 1 ;;
+                *)
+                    return 0 ;;
+            esac ;;
+    esac
+    module="${1%%:*}"
+    callable="${1#*:}"
+    case "$module" in
+        ''|[0-9]*|*[!A-Za-z0-9_.]*)
+            return 1 ;;
+        *)
+            ;;
+    esac
+    case "$callable" in
+        ''|*[!A-Za-z0-9_]*)
+            return 1 ;;
+        *)
+            return 0 ;;
+    esac
+}
+
+# Return 0 when the arguments carry a WSGI application target. Option values
+# are skipped, so "--config gunicorn.conf.py" is not read as an application.
 app_target_supplied() {
+    expect_value=0
     for arg in "$@"; do
+        if [ "$expect_value" -eq 1 ]; then
+            expect_value=0
+            continue
+        fi
         case "$arg" in
-            -*) continue ;;
+            --*=*)
+                continue ;;
+            -*)
+                if option_takes_value "$arg"; then
+                    expect_value=1
+                fi
+                continue ;;
+            *)
+                ;;
         esac
-        case "$arg" in
-            *.py) return 0 ;;
-        esac
-        case "$arg" in
-            *:*) ;;
-            *) continue ;;
-        esac
-        module="${arg%%:*}"
-        callable="${arg#*:}"
-        case "$module" in
-            ''|[0-9]*|*[!A-Za-z0-9_.]*) continue ;;
-        esac
-        case "$callable" in
-            ''|*[!A-Za-z0-9_]*) continue ;;
-        esac
-        return 0
+        if is_app_target "$arg"; then
+            return 0
+        fi
     done
     return 1
 }
@@ -59,7 +126,10 @@ app_target_supplied() {
 bind_option_supplied() {
     for arg in "$@"; do
         case "$arg" in
-            -b|-b*|--bind|--bind=*) return 0 ;;
+            -b|-b*|--bind|--bind=*)
+                return 0 ;;
+            *)
+                ;;
         esac
     done
     return 1
