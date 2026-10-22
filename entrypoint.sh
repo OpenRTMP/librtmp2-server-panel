@@ -135,6 +135,43 @@ bind_option_supplied() {
     return 1
 }
 
+# Return 0 when the arguments name a Gunicorn config file that provides the
+# application itself (``wsgi_app``). Gunicorn serves the first positional
+# argument in preference to ``wsgi_app``, so the image's default application
+# must not be added when the operator's config already supplies one.
+config_supplies_app() {
+    expect_value=0
+    config_path=
+    for arg in "$@"; do
+        if [ "$expect_value" -eq 1 ]; then
+            config_path="$arg"
+            expect_value=0
+            continue
+        fi
+        case "$arg" in
+            --config=*)
+                config_path="${arg#--config=}" ;;
+            -c|--config)
+                expect_value=1 ;;
+            -c*)
+                config_path="${arg#-c}" ;;
+            *)
+                ;;
+        esac
+    done
+    case "$config_path" in
+        ''|python:*)
+            # An empty value or a module reference cannot be inspected here.
+            return 1 ;;
+        file:*)
+            config_path="${config_path#file:}" ;;
+        *)
+            ;;
+    esac
+    [ -r "$config_path" ] || return 1
+    grep -qE '^[[:space:]]*wsgi_app[[:space:]]*=' "$config_path"
+}
+
 # The image's default command (kept in sync with the Dockerfile CMD). Without
 # this guard an empty argument list would exit 0 without ever starting
 # gunicorn, and a flag-first invocation would be consumed by the shell's own
@@ -149,10 +186,10 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
     else
         default_bind="--bind 0.0.0.0:8000"
     fi
-    if app_target_supplied "$@"; then
+    if app_target_supplied "$@" || config_supplies_app "$@"; then
         # Gunicorn serves the first positional argument, so an application
-        # target supplied by the operator must not be preceded by the
-        # image's default one.
+        # target supplied by the operator (or by its config) must not be
+        # preceded by the image's default one.
         set -- gunicorn $default_bind --worker-class gthread --threads 4 --timeout 450 "$@"
     else
         set -- gunicorn $default_bind --worker-class gthread --threads 4 --timeout 450 app:app "$@"
