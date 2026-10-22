@@ -14799,7 +14799,11 @@ def _call_passes_namespace_to_unknown_callee(call, operator_bindings):
         return False
     root = _call_callee_root_name(call.func)
     if root is None:
-        return False
+        # The callee cannot be reduced to a name (a conditional expression, a
+        # boolean operator, ...), so it cannot be matched against the
+        # recognized safe forms above. An outsider reached that way can still
+        # assign ``workers`` in the namespace, so the scan fails closed.
+        return True
     if _call_root_is_recognized_namespace_consumer(
         root,
         call,
