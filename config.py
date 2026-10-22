@@ -11474,6 +11474,15 @@ def _enum_assignment_does_not_create_member(
     )
 
 
+def _enum_member_target_names(target):
+    """Yield the simple names one enum assignment target binds."""
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            yield from _enum_member_target_names(element)
+
+
 def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor_classes=None):
     """Yield public simple names that create true members in an enum body."""
     descriptor_classes = descriptor_classes or set()
@@ -11484,8 +11493,9 @@ def _enum_member_names(class_node, module_aliases, nonmember_aliases, descriptor
         ):
             continue
         for target in _statement_simple_targets(stmt):
-            if isinstance(target, ast.Name) and not target.id.startswith("_"):
-                yield target.id
+            for name in _enum_member_target_names(target):
+                if not name.startswith("_"):
+                    yield name
 
 
 def _local_enum_class_names(class_nodes, module_aliases, base_aliases):
@@ -11846,7 +11856,12 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     methods = set()
     properties = set()
     nested_constructor_pairs = set()
-    descriptor_fields = {"__get__": set(), "__set__": set(), "__delete__": set()}
+    descriptor_fields = {
+        "__get__": set(),
+        "__set__": set(),
+        "__delete__": set(),
+        "__set_name__": set(),
+    }
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
@@ -12043,6 +12058,22 @@ def _effective_metaclass_names(class_nodes):
     return resolved
 
 
+def _function_invokes_class_initializer(func_node):
+    """Return True when a function body calls an ``__init__`` attribute.
+
+    A metaclass ``__call__`` that runs ``cls.__init__(obj, ...)`` invokes the
+    class initializer explicitly, so the inherited constructor is not bypassed
+    even though ``type.__call__`` is never reached.
+    """
+    for child in ast.walk(func_node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Attribute) and func.attr == "__init__":
+            return True
+    return False
+
+
 def _metaclass_call_bypasses_initializer(
     metaclass_name,
     class_nodes_by_name,
@@ -12055,6 +12086,10 @@ def _metaclass_call_bypasses_initializer(
             continue
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef) and stmt.name == "__call__":
+                if _function_invokes_class_initializer(stmt):
+                    # The initializer runs explicitly, so the inherited
+                    # constructor is reached after all.
+                    return False
                 return not _function_delegates_type_call(stmt)
     return False
 
@@ -13760,18 +13795,32 @@ def _nested_class_attribute_call_triggers_workers(
     return _class_binding_is_active(class_targets, original_outer, reference_line)
 
 
+def _enum_member_class_name(name, class_targets, reference_line):
+    """Resolve an enum class name through the recorded class-name aliases."""
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    return _class_name_alias_target(name, class_name_aliases, reference_line)
+
+
+def _enum_member_subscript_name(receiver):
+    """Return the member name an enum subscript selects."""
+    index = receiver.slice
+    if isinstance(index, ast.Constant) and isinstance(index.value, str):
+        return index.value
+    return None
+
+
 def _enum_member_call_triggers_workers(
-    receiver,
+    class_name,
+    member_name,
     method_name,
     methods,
     class_targets,
     reference_line,
 ):
     """Return True when EnumClass.MEMBER.method() reaches a risky hook."""
-    class_name = receiver.value.id
     enum_members = class_targets[9] if len(class_targets) > 9 else set()
     return (
-        (class_name, receiver.attr) in enum_members
+        (class_name, member_name) in enum_members
         and _class_hook_is_active(
             class_targets,
             class_name,
@@ -13943,29 +13992,108 @@ def _getattr_super_descriptor_read_triggers_workers(expr, class_targets):
     ))
 
 
-def _attribute_call_triggers_workers(
-    expr,
+def _constant_string_value(node):
+    """Return a literal string value, or None when the value is not literal."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _indirect_getattr_target(call, class_targets):
+    """Return the dispatch target of a ``getattr(obj, 'method')`` call."""
+    if not (isinstance(call.func, ast.Name) and call.func.id == "getattr"):
+        return None
+    if len(call.args) < 2:
+        return None
+    shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+    if not _name_is_unshadowed_builtin(
+        "getattr", getattr(call, "lineno", 0), shadow_lines
+    ):
+        return None
+    method_name = _constant_string_value(call.args[1])
+    if method_name is None:
+        return None
+    return method_name, call.args[0]
+
+
+def _indirect_getattribute_target(call):
+    """Return the dispatch target of an ``obj.__getattribute__('method')`` call."""
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "__getattribute__"):
+        return None
+    if not call.args:
+        return None
+    method_name = _constant_string_value(call.args[0])
+    if method_name is None:
+        return None
+    return method_name, func.value
+
+
+def _indirect_operator_target(expr, operator_bindings):
+    """Return the target of an ``operator.methodcaller``/``attrgetter`` call."""
+    factory = expr.func
+    if not isinstance(factory, ast.Call):
+        return None
+    # ``operator.methodcaller('m')(obj)`` calls the factory directly.
+    resolved = _resolve_operator_methodcaller_factory(expr, operator_bindings)
+    if resolved is not None:
+        method_name = _methodcaller_method_name(resolved)
+        if method_name is not None and expr.args:
+            return method_name, expr.args[0]
+    # ``operator.attrgetter('m')(obj)()`` calls the factory's result.
+    inner = factory.func
+    if not isinstance(inner, ast.Call):
+        return None
+    if not _is_operator_attrgetter_factory(inner, operator_bindings):
+        return None
+    method_name = _operator_attrgetter_method_name(inner, operator_bindings)
+    if method_name is None or not factory.args:
+        return None
+    return method_name, factory.args[0]
+
+
+def _class_dict_subscript_target(sub):
+    """Return the dispatch target of a ``Cls.__dict__['method']`` subscript."""
+    if not isinstance(sub, ast.Subscript):
+        return None
+    value = sub.value
+    if not (isinstance(value, ast.Attribute) and value.attr == "__dict__"):
+        return None
+    if not isinstance(value.value, ast.Name):
+        return None
+    method_name = _constant_string_value(sub.slice)
+    if method_name is None:
+        return None
+    return method_name, value.value
+
+
+def _indirect_method_dispatch_target(expr, class_targets, operator_bindings=None):
+    """Return ``(method name, receiver)`` for an indirect method dispatch."""
+    func = expr.func
+    if isinstance(func, ast.Call):
+        target = _indirect_getattr_target(func, class_targets)
+        if target is not None:
+            return target
+        target = _indirect_getattribute_target(func)
+        if target is not None:
+            return target
+        if operator_bindings is not None:
+            return _indirect_operator_target(expr, operator_bindings)
+        return None
+    if isinstance(func, ast.Subscript):
+        return _class_dict_subscript_target(func)
+    return None
+
+
+def _receiver_method_call_triggers_workers(
+    receiver,
+    method_name,
     methods,
     class_targets,
     instance_events,
     reference_line,
 ):
-    """Return True for calls that reach proven mutating class hooks."""
-    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)):
-        return False
-    method_name = expr.func.attr
-    receiver = expr.func.value
-    if (
-        isinstance(receiver, ast.Call)
-        and isinstance(receiver.func, ast.Name)
-        and receiver.func.id == "super"
-    ):
-        return _super_method_call_triggers_workers(
-            receiver,
-            method_name,
-            methods,
-            class_targets,
-        )
+    """Return True when a resolved receiver reaches a mutating method."""
     if isinstance(receiver, ast.Name):
         if _nested_class_attribute_call_triggers_workers(
             receiver.id,
@@ -13983,6 +14111,20 @@ def _attribute_call_triggers_workers(
             reference_line,
         )
     if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+        if receiver.func.id == "type" and receiver.args:
+            # ``type(obj).method`` resolves the method on obj's class.
+            shadow_lines = class_targets[13] if len(class_targets) > 13 else {}
+            if _name_is_unshadowed_builtin(
+                "type", getattr(receiver, "lineno", 0), shadow_lines
+            ):
+                return _receiver_method_call_triggers_workers(
+                    receiver.args[0],
+                    method_name,
+                    methods,
+                    class_targets,
+                    instance_events,
+                    reference_line,
+                )
         return _constructed_receiver_call_triggers_workers(
             receiver,
             method_name,
@@ -13992,13 +14134,78 @@ def _attribute_call_triggers_workers(
         )
     if isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name):
         return _enum_member_call_triggers_workers(
-            receiver,
+            _enum_member_class_name(receiver.value.id, class_targets, reference_line),
+            receiver.attr,
+            method_name,
+            methods,
+            class_targets,
+            reference_line,
+        )
+    if isinstance(receiver, ast.Subscript) and isinstance(receiver.value, ast.Name):
+        member_name = _enum_member_subscript_name(receiver)
+        if member_name is None:
+            return False
+        return _enum_member_call_triggers_workers(
+            _enum_member_class_name(receiver.value.id, class_targets, reference_line),
+            member_name,
             method_name,
             methods,
             class_targets,
             reference_line,
         )
     return False
+
+
+def _attribute_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings=None,
+):
+    """Return True for calls that reach proven mutating class hooks."""
+    if not isinstance(expr, ast.Call):
+        return False
+    if not isinstance(expr.func, ast.Attribute):
+        # ``getattr(obj, 'm')()``, ``operator.methodcaller('m')(obj)`` and
+        # ``Cls.__dict__['m'](obj)`` dispatch a method without an attribute
+        # access on the receiver.
+        target = _indirect_method_dispatch_target(
+            expr, class_targets, operator_bindings
+        )
+        if target is None:
+            return False
+        method_name, receiver = target
+        return _receiver_method_call_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
+    method_name = expr.func.attr
+    receiver = expr.func.value
+    if (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Name)
+        and receiver.func.id == "super"
+    ):
+        return _super_method_call_triggers_workers(
+            receiver,
+            method_name,
+            methods,
+            class_targets,
+        )
+    return _receiver_method_call_triggers_workers(
+        receiver,
+        method_name,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
 
 
 def _attribute_access_triggers_workers(
@@ -14107,6 +14314,7 @@ def _expression_triggers_class_workers_side_effect(
             class_targets,
             instance_events,
             reference_line,
+            operator_bindings,
         )
         or _getattr_super_method_call_triggers_workers(
             expr,
@@ -14138,6 +14346,8 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
         member[0] == class_node.name for member in enum_members
     ):
         return True
+    if _classdef_runs_set_name_hook(class_node, class_targets):
+        return True
     class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     reference_line = getattr(class_node, "lineno", 0)
     return any(
@@ -14149,6 +14359,18 @@ def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
         in methods
         for base in class_node.bases
     )
+
+
+def _classdef_runs_set_name_hook(class_node, class_targets):
+    """Return True when class creation calls a mutating ``__set_name__``.
+
+    CPython invokes ``__set_name__`` on every descriptor while the class body
+    is executed, so a descriptor whose hook mutates ``workers`` already runs
+    at import time.
+    """
+    descriptor_fields = class_targets[5] if len(class_targets) > 5 else {}
+    set_name_fields = descriptor_fields.get("__set_name__", set())
+    return any(owner == class_node.name for owner, _field in set_name_fields)
 
 
 
@@ -21389,6 +21611,24 @@ def _gunicorn_config_chdir_matches(config_path: Path, cwd: Path) -> bool:
     return _gunicorn_config_chdir_status(config_path, cwd) is True
 
 
+def _gunicorn_launch_directory_is_known() -> bool:
+    """Return True when the Gunicorn launch directory can be reconstructed.
+
+    Gunicorn resolves the implicit ``gunicorn.conf.py`` against its launch
+    directory and only afterwards applies the config's own ``chdir``, so the
+    current working directory can differ from the launch directory. ``PWD``
+    is the only remaining source for it, so the launch directory is only
+    known when ``PWD`` still names the current working directory.
+    """
+    inherited_pwd = os.environ.get("PWD", "").strip()
+    if not inherited_pwd:
+        return False
+    try:
+        return Path(inherited_pwd).resolve() == Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _gunicorn_pwd_config_candidate(relative, directories, cwd_config):
     """Resolve the PWD config candidate and whether it adds a distinct file."""
     if len(directories) <= 1:
@@ -21551,6 +21791,12 @@ def _detect_worker_settings() -> tuple[int, bool]:
                 # the larger environment count and force the dynamic flag.
                 count = max(count, env_count)
                 runtime_dynamic = True
+        elif not _gunicorn_launch_directory_is_known():
+            # No implicit config was found and the launch directory cannot be
+            # reconstructed: Gunicorn may have loaded a config that chdir'd
+            # away from the current directory and set several workers. Fail
+            # closed instead of assuming a single static worker.
+            runtime_dynamic = True
 
     cmd_override = _worker_count_override_from_tokens(cmd_tokens)
     if cmd_override is not None:

@@ -89,7 +89,11 @@ def test_environment_does_not_let_gunicorn_workers_mask_web_concurrency(
     monkeypatch.setenv("GUNICORN_WORKERS", "1")
     monkeypatch.setattr(sys, "argv", ["gunicorn", "app:app"])
 
-    assert config_module._detect_worker_settings() == (4, False)
+    # WEB_CONCURRENCY still wins over GUNICORN_WORKERS, but the implicit
+    # gunicorn.conf.py cannot be located and the launch directory is unknown
+    # (PWD does not name the current directory), so the deployment has to
+    # stay dynamic instead of pretending to run a single static worker.
+    assert config_module._detect_worker_settings() == (4, True)
 
 
 def test_direct_builtins_exec_alias_fails_closed(config_module):
