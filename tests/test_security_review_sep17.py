@@ -36,6 +36,24 @@ import config
             "    d = D()\n"
             "X().d\n"
         ),
+        (
+            "workers = 1\n"
+            "class R:\n"
+            "    def __getitem__(self, i):\n"
+            "        globals()['workers'] = 4\n"
+            "        return object\n"
+            "R()[0]\n"
+        ),
+        (
+            "workers = 1\n"
+            "class R(type):\n"
+            "    def __getitem__(cls, i):\n"
+            "        globals()['workers'] = 4\n"
+            "        return object\n"
+            "class X(metaclass=R):\n"
+            "    pass\n"
+            "X[0]\n"
+        ),
     ],
 )
 def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):

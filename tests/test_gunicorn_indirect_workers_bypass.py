@@ -80,6 +80,7 @@ import config
         "workers = 1\ndef dec(f):\n    globals()['workers'] = 4\n    return f\n@dec\ndef f(): pass\n",
         "workers = 1\nimport sys\nsys.modules['builtins'].exec('workers=4')\n",
         "workers = 1\nimport operator\noperator.call(globals().update, {'workers': 4})\n",
+        "workers = 1\nimport operator\nfrom functools import partial\noperator.call(partial(globals().update, {'workers': 4}))\n",
         "workers = 1\nfrom functools import partial\npartial(dict.__setitem__, globals(), 'workers')(4)\n",
         "workers = 1\nimport types\nc=compile('workers=4','','exec')\ngetattr(types, 'FunctionType')(c, globals())()\n",
         "workers = 1\nfrom functools import reduce\nreduce(lambda g, _: dict.__setitem__(g, 'workers', 4), [None], globals())\n",

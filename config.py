@@ -4750,6 +4750,23 @@ def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names
     return False
 
 
+def _call_is_operator_call_bound_partial_invocation(
+    call, operator_bindings, bound_names=None
+):
+    """Return True when ``operator.call(partial(...))`` runs a bound partial."""
+    if not isinstance(call, ast.Call) or not call.args or call.args[1:] or call.keywords:
+        return False
+    if not _is_operator_call_factory(call.func, operator_bindings, bound_names):
+        return False
+    synthetic = ast.Call(
+        func=call.args[0],
+        args=[],
+        keywords=[],
+        lineno=getattr(call, "lineno", 0),
+    )
+    return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
+
+
 def _class_overrides_update(class_node):
     """Return True when a class body binds its own ``update`` member."""
     for stmt in class_node.body:
@@ -11989,6 +12006,12 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     nested_attribute_bindings = _nested_constructor_rebinding_events(
         tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
     )
+    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    class_metaclass_names = {
+        node.name: metaclass_name
+        for node, metaclass_name in _effective_metaclass_names(class_nodes)
+        if metaclass_name is not None
+    }
     return (
         constructors,
         methods,
@@ -12007,6 +12030,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_name_aliases,
         nested_constructor_pairs,
         nested_attribute_bindings,
+        class_metaclass_names,
     )
 
 
@@ -13813,6 +13837,33 @@ def _name_receiver_call_triggers_workers(
     )
 
 
+def _instance_subscript_triggers_workers(sub, methods, class_targets, reference_line):
+    """Return True when ``ClassName()[index]`` reaches a mutating ``__getitem__``."""
+    if not isinstance(sub, ast.Subscript):
+        return False
+    value = sub.value
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and not value.args
+        and not value.keywords
+    ):
+        return False
+    class_name = value.func.id
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    class_methods = class_targets[8] if len(class_targets) > 8 else None
+    return (
+        _class_hierarchy_defines_method(
+            methods,
+            class_bases,
+            class_name,
+            "__getitem__",
+            class_methods,
+        )
+        and _class_binding_is_active(class_targets, class_name, reference_line)
+    )
+
+
 def _constructed_receiver_call_triggers_workers(
     receiver,
     method_name,
@@ -14422,11 +14473,23 @@ def _class_subscript_triggers_workers(expr, class_targets):
     methods = class_targets[1]
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
-    return _class_hierarchy_defines_method(
+    if _class_hierarchy_defines_method(
         methods,
         class_bases,
         class_name,
         "__class_getitem__",
+        class_methods,
+    ):
+        return True
+    class_metaclass_names = class_targets[17] if len(class_targets) > 17 else {}
+    metaclass_name = class_metaclass_names.get(class_name)
+    if metaclass_name is None:
+        return False
+    return _class_hierarchy_defines_method(
+        methods,
+        class_bases,
+        metaclass_name,
+        "__getitem__",
         class_methods,
     )
 
@@ -14447,6 +14510,12 @@ def _expression_triggers_class_workers_side_effect(
                 operator_bindings,
                 class_targets=class_targets,
             )
+        )
+        or _instance_subscript_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            reference_line,
         )
         or _class_subscript_triggers_workers(expr, class_targets)
         or _class_call_triggers_workers(expr, constructors, class_targets, reference_line)
@@ -15057,6 +15126,9 @@ def _call_has_secondary_worker_mutation(
         )
         or _call_is_delegated_simplenamespace_update(expr, delegated_update_aliases, delegated_update_alias_events)
         or _call_is_operator_call_namespace_update(expr, operator_bindings, bound_names)
+        or _call_is_operator_call_bound_partial_invocation(
+            expr, operator_bindings, bound_names
+        )
         or _call_has_mutating_lambda_argument(expr, operator_bindings, bound_names)
         or _call_is_type_constructor_side_effect(expr, operator_bindings)
         or _call_is_partial_reduce_namespace_mutation(expr, operator_bindings)
