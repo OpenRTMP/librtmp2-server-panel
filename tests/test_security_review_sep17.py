@@ -87,23 +87,24 @@ def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):
 
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
 
+
 @pytest.mark.parametrize(
     "config_content",
     [
         (
-            "workers = 1\\n"
-            "from functools import partial\\n"
-            "import types\\n"
-            "bound = partial(globals().update, {'workers': 4})\\n"
-            "types.MethodType(partial.__repr__, bound)()\\n"
+            "workers = 1\n"
+            "from functools import partial\n"
+            "import types\n"
+            "bound = partial(globals().update, {'workers': 4})\n"
+            "types.MethodType(partial.__repr__, bound)()\n"
         ),
         (
-            "workers = 1\\n"
-            "from functools import partial\\n"
-            "from operator import call\\n"
-            "def register(call):\\n"
-            "    (call := call)(partial(globals().update, {'workers': 4}))\\n"
-            "register(lambda callback: None)\\n"
+            "workers = 1\n"
+            "from functools import partial\n"
+            "from operator import call\n"
+            "def register(call):\n"
+            "    (call := call)(partial(globals().update, {'workers': 4}))\n"
+            "register(lambda callback: None)\n"
         ),
     ],
 )
