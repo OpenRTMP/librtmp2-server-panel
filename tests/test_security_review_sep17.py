@@ -80,11 +80,11 @@ import config
             "types.MethodType(partial.__call__, bound)()\n"
         ),
         (
-            "workers = 1\\n"
-            "from functools import partial\\n"
-            "from operator import call\\n"
+            "workers = 1\n"
+            "from functools import partial\n"
+            "from operator import call\n"
             "(invoke := call)(partial(globals().update, {'workers': 4})); "
-            "call = lambda callback: None\\n"
+            "call = lambda callback: None\n"
         ),
     ],
 )
@@ -114,19 +114,19 @@ def test_security_review_worker_scan_gaps_are_dynamic(tmp_path, config_content):
             "register(lambda callback: None)\n"
         ),
         (
-            "workers = 1\\n"
-            "from functools import partial\\n"
-            "p = partial(globals().update, {'workers': 4})\\n"
-            "def register(p):\\n"
-            "    getattr(p, '__call__')()\\n"
-            "register(lambda: None)\\n"
+            "workers = 1\n"
+            "from functools import partial\n"
+            "p = partial(globals().update, {'workers': 4})\n"
+            "def register(p):\n"
+            "    getattr(p, '__call__')()\n"
+            "register(lambda: None)\n"
         ),
         (
-            "workers = 1\\n"
-            "from functools import partial\\n"
-            "from operator import call\\n"
+            "workers = 1\n"
+            "from functools import partial\n"
+            "from operator import call\n"
             "call = lambda callback: None; "
-            "(invoke := call)(partial(globals().update, {'workers': 4}))\\n"
+            "(invoke := call)(partial(globals().update, {'workers': 4}))\n"
         ),
     ],
 )
