@@ -4495,6 +4495,17 @@ def _call_is_invoked_types_methodtype_partial(call, operator_bindings):
         return False
     if len(inner.args) < 2:
         return False
+    # Only partial.__call__ invokes the bound partial. Other descriptors,
+    # such as partial.__repr__, must not count as worker mutations.
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    descriptor = inner.args[0]
+    if not (
+        isinstance(descriptor, ast.Attribute)
+        and descriptor.attr == "__call__"
+        and isinstance(descriptor.value, ast.Name)
+        and descriptor.value.id in partial_aliases
+    ):
+        return False
     synthetic = ast.Call(
         func=inner.args[1],
         args=[],
@@ -4862,6 +4873,9 @@ def _operator_call_factory_for_invocation(call, operator_bindings, bound_names=N
             if len(operator_bindings) > 32
             else {}
         )
+        # A locally bound name shadows a module-level operator.call alias.
+        if bound_names and call_factory.value.id in bound_names:
+            return False
         if _binding_state_at_line(
             call_alias_events,
             call_factory.value.id,
