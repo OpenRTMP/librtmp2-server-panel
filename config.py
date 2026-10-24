@@ -4409,7 +4409,7 @@ def _named_partial_workers_mutation(
     return _call_payload_may_set_workers(saved_method, call)
 
 
-def _call_is_getattr_saved_partial_invocation(call, operator_bindings):
+def _call_is_getattr_saved_partial_invocation(call, operator_bindings, bound_names=None):
     """Return True for ``getattr(saved_partial, '__call__')()`` invocations."""
     if not isinstance(call, ast.Call):
         return False
@@ -4432,6 +4432,8 @@ def _call_is_getattr_saved_partial_invocation(call, operator_bindings):
         operator_bindings[27] if len(operator_bindings) > 27 else {}
     )
     name = func.args[0].id
+    if bound_names and name in bound_names:
+        return False
     if name in saved_aliases:
         return True
     saved_method = _binding_state_at_line(
@@ -4515,11 +4517,11 @@ def _call_is_invoked_types_methodtype_partial(call, operator_bindings):
     return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
 
 
-def _call_is_partial_bound_workers_setitem(call, operator_bindings):
+def _call_is_partial_bound_workers_setitem(call, operator_bindings, bound_names=None):
     """Return True for direct or saved partial workers setters."""
     if not isinstance(call, ast.Call):
         return False
-    if _call_is_getattr_saved_partial_invocation(call, operator_bindings):
+    if _call_is_getattr_saved_partial_invocation(call, operator_bindings, bound_names):
         return True
     if _call_is_object_getattribute_partial_invocation(call, operator_bindings):
         return True
@@ -4864,24 +4866,22 @@ def _call_is_operator_call_namespace_update(call, operator_bindings, bound_names
 def _operator_call_factory_for_invocation(call, operator_bindings, bound_names=None):
     """Resolve ``operator.call`` for plain and walrus-bound invocations."""
     call_factory = call.func
-    reference_line = getattr(call, "lineno", 0)
     if isinstance(call_factory, ast.NamedExpr) and isinstance(
         call_factory.value, ast.Name
     ):
-        call_alias_events = (
-            operator_bindings[32].get(_OPERATOR_CALL_ALIAS_EVENTS_KEY, {})
-            if len(operator_bindings) > 32
-            else {}
-        )
         # A locally bound name shadows a module-level operator.call alias.
         if bound_names and call_factory.value.id in bound_names:
             return False
-        if _binding_state_at_line(
-            call_alias_events,
-            call_factory.value.id,
-            reference_line - 1 if reference_line else 0,
-        ):
-            return True
+        ordered_events = (
+            operator_bindings[32].get("operator_call_ordered_events", {})
+            if len(operator_bindings) > 32
+            else {}
+        )
+        state = _ordered_binding_state_at_position(
+            ordered_events, call_factory.value.id, call_factory.value
+        )
+        if state is not None:
+            return bool(state)
     return _is_operator_call_factory(
         call_factory, operator_bindings, bound_names
     )
@@ -4903,7 +4903,7 @@ def _call_is_operator_call_bound_partial_invocation(
         keywords=[],
         lineno=getattr(call, "lineno", 0),
     )
-    return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
+    return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings, bound_names)
 
 
 def _class_overrides_update(class_node):
@@ -14997,7 +14997,7 @@ def _call_is_known_reduce_lambda_mutation(call, operator_bindings):
     )
 
 
-def _call_has_primary_worker_mutation(expr, operator_bindings):
+def _call_has_primary_worker_mutation(expr, operator_bindings, bound_names=None):
     """Check the core exec/operator/namespace worker mutation forms."""
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     mutator_aliases = operator_bindings[5] if len(operator_bindings) > 5 else {}
@@ -15039,7 +15039,7 @@ def _call_has_primary_worker_mutation(expr, operator_bindings):
             expr,
             operator_bindings,
         )
-        or _call_is_partial_bound_workers_setitem(expr, operator_bindings)
+        or _call_is_partial_bound_workers_setitem(expr, operator_bindings, bound_names)
         or _call_is_known_reduce_lambda_mutation(expr, operator_bindings)
     )
 
@@ -15324,6 +15324,7 @@ def _call_expression_mutates_workers(
         or _call_has_primary_worker_mutation(
             expr,
             operator_bindings,
+            bound_names,
         )
         or _call_has_secondary_worker_mutation(
             expr,
@@ -19697,7 +19698,7 @@ def _record_imported_name_alias_propagation(
                 events.setdefault(name, []).append((line, True))
 
 
-def _collect_imported_name_alias_events(tree, module_name, imported_names):
+def _collect_imported_name_alias_events(tree, module_name, imported_names, *, ordered_events=None):
     """Track import-time aliases in module and compound statement bodies."""
     events = {}
     active = set()
@@ -19707,6 +19708,10 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names):
         if not isinstance(node, ast.stmt):
             continue
         line = getattr(node, "lineno", 0)
+        prior_counts = (
+            {name: len(items) for name, items in events.items()}
+            if ordered_events is not None else {}
+        )
         _record_imported_module_aliases(
             node,
             module_name,
@@ -19737,6 +19742,12 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names):
             module_events,
             line,
         )
+        if ordered_events is not None:
+            for name, items in events.items():
+                for event in items[prior_counts.get(name, 0):]:
+                    ordered_events.setdefault(name, []).append(
+                        (event[0], getattr(node, "col_offset", 0), event[1])
+                    )
     return events
 
 
@@ -21409,14 +21420,17 @@ def _scan_gunicorn_config_worker_details(tree):
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(
         tree, namespace_aliases, operator_bindings
     )
+    operator_call_ordered_events = {}
     operator_call_alias_events = _collect_imported_name_alias_events(
         tree,
         "operator",
         {"call"},
+        ordered_events=operator_call_ordered_events,
     )
     operator_bindings[32][_OPERATOR_CALL_ALIAS_EVENTS_KEY] = (
         operator_call_alias_events
     )
+    operator_bindings[32]["operator_call_ordered_events"] = operator_call_ordered_events
     (
         callback_alias_events,
         callback_container_events,
