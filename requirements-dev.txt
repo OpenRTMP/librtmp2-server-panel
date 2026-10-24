@@ -619,7 +619,7 @@ wrapt==2.5.1 \
     --hash=sha256:fcccaa1484f7dd1091602970988ab741491f9f974013c844f70e45ac1196b80d \
     --hash=sha256:fd3f878a4aac3c262447ddf43c5f4c18fc67dfc3ba69c4fb1c7a4c4af96abe7e
     # via deprecated
-WTForms==3.3.0 \
-    --hash=sha256:eaf2f7649bedbee0bad74bb068dca8bfec8b00d04fd44c1735682c1fe33acfa7 \
-    --hash=sha256:efbc626b0b68d3bcb77822e0eceb995f56c5e9d0aeb4220b9dc2fc9f03e7e1ed
+WTForms==3.3.1 \
+    --hash=sha256:2f4728ef3f67173c22590e60e845937598af7455474330fdb84354a609d67ec1 \
+    --hash=sha256:9d10ccb5740290c9ae6673522d87bcae3b669cf0cb4e4584aee229b4694af10c
     # via flask-wtf
