@@ -19698,6 +19698,18 @@ def _record_imported_name_alias_propagation(
                 events.setdefault(name, []).append((line, True))
 
 
+def _imported_alias_event_column(node, name):
+    """Place a walrus rebinding after evaluating its source value."""
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.NamedExpr)
+            and isinstance(child.target, ast.Name)
+            and child.target.id == name
+        ):
+            return getattr(child, "end_col_offset", getattr(node, "col_offset", 0))
+    return getattr(node, "col_offset", 0)
+
+
 def _collect_imported_name_alias_events(tree, module_name, imported_names, *, ordered_events=None):
     """Track import-time aliases in module and compound statement bodies."""
     events = {}
@@ -19746,7 +19758,7 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names, *, or
             for name, items in events.items():
                 for event in items[prior_counts.get(name, 0):]:
                     ordered_events.setdefault(name, []).append(
-                        (event[0], getattr(node, "col_offset", 0), event[1])
+                        (event[0], _imported_alias_event_column(node, name), event[1])
                     )
     return events
 
