@@ -4689,3 +4689,37 @@ def test_security_review_oct22_worker_scan_gaps_are_dynamic(tmp_path, config_con
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+# Security review 2026-10-25: weakref.finalize named-function callback gap.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import weakref\n"
+            "class C:\n"
+            "    pass\n"
+            "def cb(w):\n"
+            "    global workers\n"
+            "    workers = 4\n"
+            "weakref.finalize(C(), cb, C())\n"
+        ),
+        (
+            "workers = 1\n"
+            "from weakref import finalize\n"
+            "class C:\n"
+            "    pass\n"
+            "def bump(_ignored):\n"
+            "    globals()['workers'] = 4\n"
+            "finalize(C(), bump, C())\n"
+        ),
+    ],
+    ids=["weakref-finalize-named-global", "weakref-finalize-import-alias"],
+)
+def test_security_review_oct25_weakref_finalize_named_callback_is_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
