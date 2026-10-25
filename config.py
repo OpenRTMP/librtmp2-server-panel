@@ -5664,8 +5664,8 @@ def _call_is_weakref_finalize_mutation(call, operator_bindings, bound_names=None
     ):
         return False
     callback = call.args[1]
-    if isinstance(callback, ast.Lambda):
-        return _lambda_mutates_workers(callback, operator_bindings)
+    if _thread_pool_callback_mutates_workers(callback, operator_bindings):
+        return True
     return _expression_mutates_workers(
         callback,
         operator_bindings,
