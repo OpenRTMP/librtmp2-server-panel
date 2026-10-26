@@ -11800,20 +11800,29 @@ def _collect_enum_member_targets(tree):
 def _class_body_plain_attribute_names(class_node):
     """Return names bound to provably plain values in one class body.
 
-    Only values that cannot implement the descriptor protocol (constants and
-    literal containers) qualify, so the barrier can never hide a descriptor
-    assigned through a name or a factory call.
+    Literal values are plain assignment barriers. Trivial entry-hook lambdas
+    returning one of their parameters are also proven harmless overrides;
+    arbitrary callables or descriptors are never treated as safe.
     """
     names = set()
     for stmt in class_node.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        if not isinstance(
+        harmless_entry_lambda = (
+            isinstance(value, ast.Lambda)
+            and isinstance(value.body, ast.Name)
+            and value.body.id in {arg.arg for arg in value.args.args}
+            and not value.args.defaults
+            and not value.args.kw_defaults
+        )
+        if not harmless_entry_lambda and not isinstance(
             value,
             (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.JoinedStr),
         ):
             continue
         for target in _statement_simple_targets(stmt):
-            if isinstance(target, ast.Name):
+            if isinstance(target, ast.Name) and (
+                not harmless_entry_lambda or target.id in ("__enter__", "__aenter__")
+            ):
                 names.add(target.id)
     return names
 
@@ -12159,6 +12168,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         for stmt in node.body
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aenter__"
+        and not stmt.decorator_list
         and _function_mutates_workers(stmt, operator_bindings)
     }
     return (
@@ -16360,6 +16370,7 @@ def _statement_has_class_workers_side_effect(
                 if metaclass and _class_hierarchy_defines_method(
                     methods, class_bases, metaclass, enter_attr,
                     class_targets[8] if len(class_targets) > 8 else None,
+                    class_attributes=class_targets[10] if len(class_targets) > 10 else None,
                 ):
                     return True
                 continue
