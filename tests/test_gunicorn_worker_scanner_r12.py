@@ -77,6 +77,47 @@ _CONTEXT_MANAGER_CASES = [
         "    pass\n",
         (1, False),
     ),
+    (
+        "unawaited async entry hook does not mutate workers",
+        "workers = 1\n"
+        "class CM:\n"
+        "    async def __aenter__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "    async def __aexit__(self, *a):\n"
+        "        pass\n"
+        "pending = CM().__aenter__()\n"
+        "pending.close()\n",
+        (1, False),
+    ),
+    (
+        "class context uses harmless metaclass entry not mutating instance hook",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __enter__(cls):\n"
+        "        return cls\n"
+        "    def __exit__(cls, *a):\n"
+        "        pass\n"
+        "class CM(metaclass=Meta):\n"
+        "    def __enter__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "with CM:\n"
+        "    pass\n",
+        (1, False),
+    ),
+    (
+        "class context detects mutating metaclass entry",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __enter__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "    def __exit__(cls, *a):\n"
+        "        pass\n"
+        "class CM(metaclass=Meta):\n"
+        "    pass\n"
+        "with CM:\n"
+        "    pass\n",
+        (1, True),
+    ),
 ]
 
 
