@@ -11314,10 +11314,7 @@ def _record_class_side_effect_target(
     properties,
 ):
     """Record one class method that mutates ``workers`` when invoked."""
-    if not (
-        isinstance(stmt, ast.FunctionDef)
-        or (isinstance(stmt, ast.AsyncFunctionDef) and stmt.name == "__aenter__")
-    ):
+    if not isinstance(stmt, ast.FunctionDef):
         return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
@@ -12154,6 +12151,16 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         for node, metaclass_name in _effective_metaclass_names(class_nodes)
         if metaclass_name is not None
     }
+    # Async entry hooks execute only when awaited by async-with. Keep them
+    # separate from ordinary method calls, which merely create coroutines.
+    async_entry_methods = {
+        (node.name, stmt.name)
+        for node in _iter_import_time_class_definitions(tree.body)
+        for stmt in node.body
+        if isinstance(stmt, ast.AsyncFunctionDef)
+        and stmt.name == "__aenter__"
+        and _function_mutates_workers(stmt, operator_bindings)
+    }
     return (
         constructors,
         methods,
@@ -12173,6 +12180,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         nested_constructor_pairs,
         nested_attribute_bindings,
         class_metaclass_names,
+        async_entry_methods,
     )
 
 
@@ -16322,7 +16330,10 @@ def _statement_has_class_workers_side_effect(
     if _statement_hook_write_triggers_workers(node, class_targets):
         return True
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        methods = class_targets[1] if len(class_targets) > 1 else set()
+        methods = (
+            class_targets[18] if isinstance(node, ast.AsyncWith) and len(class_targets) > 18
+            else class_targets[1] if len(class_targets) > 1 else set()
+        )
         instance_events = class_targets[6] if len(class_targets) > 6 else {}
         reference_line = getattr(node, "lineno", 0)
         enter_attr = (
@@ -16335,6 +16346,23 @@ def _statement_has_class_workers_side_effect(
                 operator_bindings=operator_bindings,
             ):
                 return True
+            # A class object enters via its metaclass, not via the class's
+            # instance-level __enter__ method.
+            class_name = (
+                item.context_expr.id if isinstance(item.context_expr, ast.Name) else None
+            )
+            class_bases = class_targets[7] if len(class_targets) > 7 else {}
+            if class_name in class_bases and _class_binding_is_active(
+                class_targets, class_name, reference_line
+            ):
+                metaclasses = class_targets[17] if len(class_targets) > 17 else {}
+                metaclass = metaclasses.get(class_name)
+                if metaclass and _class_hierarchy_defines_method(
+                    methods, class_bases, metaclass, enter_attr,
+                    class_targets[8] if len(class_targets) > 8 else None,
+                ):
+                    return True
+                continue
             enter_call = ast.Call(
                 func=ast.Attribute(
                     value=item.context_expr,
