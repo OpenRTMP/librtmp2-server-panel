@@ -16319,12 +16319,38 @@ def _statement_has_class_workers_side_effect(
     if _statement_hook_write_triggers_workers(node, class_targets):
         return True
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        return any(
-            _expression_has_class_workers_side_effect(
-                item.context_expr, class_targets, operator_bindings=operator_bindings
-            )
-            for item in node.items
+        methods = class_targets[1] if len(class_targets) > 1 else set()
+        instance_events = class_targets[6] if len(class_targets) > 6 else {}
+        reference_line = getattr(node, "lineno", 0)
+        enter_attr = (
+            "__aenter__" if isinstance(node, ast.AsyncWith) else "__enter__"
         )
+        for item in node.items:
+            if _expression_has_class_workers_side_effect(
+                item.context_expr,
+                class_targets,
+                operator_bindings=operator_bindings,
+            ):
+                return True
+            enter_call = ast.Call(
+                func=ast.Attribute(
+                    value=item.context_expr,
+                    attr=enter_attr,
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[],
+            )
+            if _attribute_call_triggers_workers(
+                enter_call,
+                methods,
+                class_targets,
+                instance_events,
+                reference_line,
+                operator_bindings,
+            ):
+                return True
+        return False
     return any(
         isinstance(child, ast.expr)
         and _expression_has_class_workers_side_effect(
