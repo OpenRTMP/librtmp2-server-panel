@@ -120,38 +120,38 @@ _CONTEXT_MANAGER_CASES = [
     ),
     (
         "metaclass lambda overrides inherited mutating entry",
-        "workers = 1\\n"
-        "class Base(type):\\n"
-        "    def __enter__(cls):\\n"
-        "        globals()['workers'] = 4\\n"
-        "    def __exit__(cls, *a):\\n"
-        "        pass\\n"
-        "class Meta(Base):\\n"
-        "    __enter__ = lambda cls: cls\\n"
-        "class CM(metaclass=Meta):\\n"
-        "    pass\\n"
-        "with CM:\\n"
-        "    pass\\n",
+        "workers = 1\n"
+        "class Base(type):\n"
+        "    def __enter__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "    def __exit__(cls, *a):\n"
+        "        pass\n"
+        "class Meta(Base):\n"
+        "    __enter__ = lambda cls: cls\n"
+        "class CM(metaclass=Meta):\n"
+        "    pass\n"
+        "with CM:\n"
+        "    pass\n",
         (1, False),
     ),
     (
         "decorated async entry replacement is harmless",
-        "workers = 1\\n"
-        "import asyncio\\n"
-        "def replace(fn):\\n"
-        "    async def harmless(self):\\n"
-        "        return self\\n"
-        "    return harmless\\n"
-        "class CM:\\n"
-        "    @replace\\n"
-        "    async def __aenter__(self):\\n"
-        "        globals()['workers'] = 4\\n"
-        "    async def __aexit__(self, *a):\\n"
-        "        pass\\n"
-        "async def boot():\\n"
-        "    async with CM():\\n"
-        "        pass\\n"
-        "asyncio.run(boot())\\n",
+        "workers = 1\n"
+        "import asyncio\n"
+        "def replace(fn):\n"
+        "    async def harmless(self):\n"
+        "        return self\n"
+        "    return harmless\n"
+        "class CM:\n"
+        "    @replace\n"
+        "    async def __aenter__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "    async def __aexit__(self, *a):\n"
+        "        pass\n"
+        "async def boot():\n"
+        "    async with CM():\n"
+        "        pass\n"
+        "asyncio.run(boot())\n",
         (1, False),
     ),
 ]
