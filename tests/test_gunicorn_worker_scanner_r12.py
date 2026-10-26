@@ -154,6 +154,39 @@ _CONTEXT_MANAGER_CASES = [
         "asyncio.run(boot())\n",
         (1, False),
     ),
+    (
+        "function-local class alias uses harmless entry",
+        "workers = 1\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "    def __exit__(self, *a):\n"
+        "        pass\n"
+        "class Safe:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *a):\n"
+        "        pass\n"
+        "def boot():\n"
+        "    CM = Safe\n"
+        "    with CM():\n"
+        "        pass\n"
+        "boot()\n",
+        (1, False),
+    ),
+    (
+        "generator entry creates iterator without running body",
+        "workers = 1\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        yield self\n"
+        "    def __exit__(self, *a):\n"
+        "        pass\n"
+        "with CM():\n"
+        "    pass\n",
+        (1, False),
+    ),
 ]
 
 
