@@ -11316,6 +11316,13 @@ def _record_class_side_effect_target(
     """Record one class method that mutates ``workers`` when invoked."""
     if not isinstance(stmt, ast.FunctionDef):
         return False
+    # A generator __enter__ creates an iterator; its body is not executed
+    # by implicit context entry.
+    if stmt.name == "__enter__" and any(
+        isinstance(node, (ast.Yield, ast.YieldFrom))
+        for node in _function_runtime_nodes(stmt)
+    ):
+        return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
     if stmt.name == "__class_getitem__":
@@ -11800,20 +11807,29 @@ def _collect_enum_member_targets(tree):
 def _class_body_plain_attribute_names(class_node):
     """Return names bound to provably plain values in one class body.
 
-    Only values that cannot implement the descriptor protocol (constants and
-    literal containers) qualify, so the barrier can never hide a descriptor
-    assigned through a name or a factory call.
+    Literal values are plain assignment barriers. Trivial entry-hook lambdas
+    returning one of their parameters are also proven harmless overrides;
+    arbitrary callables or descriptors are never treated as safe.
     """
     names = set()
     for stmt in class_node.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        if not isinstance(
+        harmless_entry_lambda = (
+            isinstance(value, ast.Lambda)
+            and isinstance(value.body, ast.Name)
+            and value.body.id in {arg.arg for arg in value.args.args}
+            and not value.args.defaults
+            and not value.args.kw_defaults
+        )
+        if not harmless_entry_lambda and not isinstance(
             value,
             (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.JoinedStr),
         ):
             continue
         for target in _statement_simple_targets(stmt):
-            if isinstance(target, ast.Name):
+            if isinstance(target, ast.Name) and (
+                not harmless_entry_lambda or target.id in ("__enter__", "__aenter__")
+            ):
                 names.add(target.id)
     return names
 
@@ -12151,6 +12167,17 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         for node, metaclass_name in _effective_metaclass_names(class_nodes)
         if metaclass_name is not None
     }
+    # Async entry hooks execute only when awaited by async-with. Keep them
+    # separate from ordinary method calls, which merely create coroutines.
+    async_entry_methods = {
+        (node.name, stmt.name)
+        for node in _iter_import_time_class_definitions(tree.body)
+        for stmt in node.body
+        if isinstance(stmt, ast.AsyncFunctionDef)
+        and stmt.name == "__aenter__"
+        and not stmt.decorator_list
+        and _function_mutates_workers(stmt, operator_bindings)
+    }
     return (
         constructors,
         methods,
@@ -12170,6 +12197,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         nested_constructor_pairs,
         nested_attribute_bindings,
         class_metaclass_names,
+        async_entry_methods,
     )
 
 
@@ -16310,20 +16338,136 @@ def _statement_hook_write_triggers_workers(node, class_targets):
     )
 
 
-def _statement_has_class_workers_side_effect(
-    node, class_targets, operator_bindings=None
+def _resolve_local_class_context(expr, local_class_aliases, reference_line):
+    """Resolve a proven single-assignment function-local class alias."""
+    target = expr.func if isinstance(expr, ast.Call) else expr
+    if not isinstance(target, ast.Name):
+        return expr
+    binding = (local_class_aliases or {}).get(target.id)
+    if not binding or binding[0] >= reference_line:
+        return expr
+    resolved = ast.copy_location(ast.Name(id=binding[1], ctx=ast.Load()), target)
+    if isinstance(expr, ast.Call):
+        return ast.copy_location(
+            ast.Call(func=resolved, args=expr.args, keywords=expr.keywords), expr
+        )
+    return resolved
+
+
+def _context_manager_entry_methods(node, class_targets):
+    """Return methods and hook name used by this kind of context manager."""
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    if isinstance(node, ast.AsyncWith):
+        if len(class_targets) > 18:
+            methods = class_targets[18]
+        return methods, "__aenter__"
+    return methods, "__enter__"
+
+
+def _context_metaclass_entry_mutates_workers(
+    class_name, enter_attr, methods, class_targets
 ):
-    """Return True when an evaluated statement expression invokes a risky class hook."""
-    if not class_targets or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    """Check the metaclass hook for a context entered as a class object."""
+    metaclasses = class_targets[17] if len(class_targets) > 17 else {}
+    metaclass = metaclasses.get(class_name)
+    if not metaclass:
+        return False
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    return _class_hierarchy_defines_method(
+        methods,
+        class_bases,
+        metaclass,
+        enter_attr,
+        class_targets[8] if len(class_targets) > 8 else None,
+        class_attributes=class_targets[10] if len(class_targets) > 10 else None,
+    )
+
+
+def _context_manager_item_mutates_workers(
+    item,
+    reference_line,
+    enter_attr,
+    methods,
+    class_targets,
+    instance_events,
+    operator_bindings,
+    local_class_aliases,
+):
+    """Check a context expression and the entry hook that it invokes."""
+    context_expr = _resolve_local_class_context(
+        item.context_expr, local_class_aliases, reference_line
+    )
+    if _expression_has_class_workers_side_effect(
+        context_expr,
+        class_targets,
+        operator_bindings=operator_bindings,
+    ):
+        return True
+
+    # A class object enters via its metaclass, not via an instance hook.
+    class_name = context_expr.id if isinstance(context_expr, ast.Name) else None
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    if class_name in class_bases and _class_binding_is_active(
+        class_targets, class_name, reference_line
+    ):
+        return _context_metaclass_entry_mutates_workers(
+            class_name, enter_attr, methods, class_targets
+        )
+
+    enter_call = ast.Call(
+        func=ast.Attribute(
+            value=context_expr,
+            attr=enter_attr,
+            ctx=ast.Load(),
+        ),
+        args=[],
+        keywords=[],
+    )
+    return _attribute_call_triggers_workers(
+        enter_call,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+        operator_bindings,
+    )
+
+
+def _context_manager_entry_mutates_workers(
+    node, class_targets, operator_bindings, local_class_aliases
+):
+    """Account for implicit __enter__ or __aenter__ calls at import time."""
+    methods, enter_attr = _context_manager_entry_methods(node, class_targets)
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    reference_line = getattr(node, "lineno", 0)
+    return any(
+        _context_manager_item_mutates_workers(
+            item,
+            reference_line,
+            enter_attr,
+            methods,
+            class_targets,
+            instance_events,
+            operator_bindings,
+            local_class_aliases,
+        )
+        for item in node.items
+    )
+
+
+def _statement_has_class_workers_side_effect(
+    node, class_targets, operator_bindings=None, local_class_aliases=None
+):
+    """Return True when an evaluated statement invokes a risky class hook."""
+    if not class_targets or isinstance(
+        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
         return False
     if _statement_hook_write_triggers_workers(node, class_targets):
         return True
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        return any(
-            _expression_has_class_workers_side_effect(
-                item.context_expr, class_targets, operator_bindings=operator_bindings
-            )
-            for item in node.items
+        return _context_manager_entry_mutates_workers(
+            node, class_targets, operator_bindings, local_class_aliases
         )
     return any(
         isinstance(child, ast.expr)
@@ -16361,6 +16505,7 @@ def _statement_mutates_workers(
     dict_subclass_names=None,
     bound_names=None,
     defer_annotations=False,
+    local_class_aliases=None,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
@@ -16386,7 +16531,7 @@ def _statement_mutates_workers(
             defer_annotations,
         )
     if _statement_has_class_workers_side_effect(
-        node, class_targets, operator_bindings
+        node, class_targets, operator_bindings, local_class_aliases
     ):
         return True
     if _is_dynamic_workers_mutation(
@@ -16429,6 +16574,7 @@ def _statement_mutates_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
             defer_annotations=defer_annotations,
+            local_class_aliases=local_class_aliases,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -16445,6 +16591,7 @@ def _statements_mutate_workers(
     dict_subclass_names=None,
     bound_names=None,
     defer_annotations=False,
+    local_class_aliases=None,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -16459,6 +16606,7 @@ def _statements_mutate_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
             defer_annotations=defer_annotations,
+            local_class_aliases=local_class_aliases,
         )
         for node in statements
     )
@@ -16524,6 +16672,44 @@ def _function_local_bound_names(func_node):
     return names - module_names
 
 
+def _record_simple_class_aliases(
+    stmt, known_classes, local_names, parameters, writes, aliases
+):
+    """Record proven, unshadowed, single-write aliases from one assignment."""
+    if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Name):
+        return
+    source = stmt.value.id
+    if source not in known_classes or source in local_names:
+        return
+    for target in stmt.targets:
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id not in local_names or target.id in parameters:
+            continue
+        if writes.get(target.id) != 1:
+            continue
+        aliases[target.id] = (stmt.lineno, source)
+
+
+def _function_simple_class_aliases(func_node, class_targets):
+    """Track direct local aliases of module classes when no rebinding is possible."""
+    if not class_targets or len(class_targets) <= 7:
+        return {}
+    known_classes = set(class_targets[7])
+    local_names = _function_local_bound_names(func_node)
+    parameters = _function_argument_bound_names(func_node)
+    writes = {}
+    for node in _function_runtime_nodes(func_node):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            writes[node.id] = writes.get(node.id, 0) + 1
+    aliases = {}
+    for stmt in func_node.body:
+        _record_simple_class_aliases(
+            stmt, known_classes, local_names, parameters, writes, aliases
+        )
+    return aliases
+
+
 def _function_mutates_workers(
     func_node,
     operator_bindings,
@@ -16554,6 +16740,7 @@ def _function_mutates_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=_function_local_bound_names(func_node),
             defer_annotations=defer_annotations,
+            local_class_aliases=_function_simple_class_aliases(func_node, class_targets),
         )
 
 
