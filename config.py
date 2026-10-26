@@ -11314,7 +11314,10 @@ def _record_class_side_effect_target(
     properties,
 ):
     """Record one class method that mutates ``workers`` when invoked."""
-    if not isinstance(stmt, ast.FunctionDef):
+    if not (
+        isinstance(stmt, ast.FunctionDef)
+        or (isinstance(stmt, ast.AsyncFunctionDef) and stmt.name == "__aenter__")
+    ):
         return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
