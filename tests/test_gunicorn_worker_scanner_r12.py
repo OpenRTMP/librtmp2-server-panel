@@ -54,7 +54,7 @@ _CONTEXT_MANAGER_CASES = [
         (1, True),
     ),
     (
-        "with body assignment without enter hook stays static",
+        "with body assignment changes workers dynamically",
         "workers = 1\n"
         "class CM:\n"
         "    def __enter__(self):\n"
@@ -63,6 +63,18 @@ _CONTEXT_MANAGER_CASES = [
         "        pass\n"
         "with CM():\n"
         "    workers = 4\n",
+        (1, True),
+    ),
+    (
+        "with no mutating enter hook or body stays static",
+        "workers = 1\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *a):\n"
+        "        pass\n"
+        "with CM():\n"
+        "    pass\n",
         (1, False),
     ),
 ]
