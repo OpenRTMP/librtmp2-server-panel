@@ -11316,6 +11316,13 @@ def _record_class_side_effect_target(
     """Record one class method that mutates ``workers`` when invoked."""
     if not isinstance(stmt, ast.FunctionDef):
         return False
+    # A generator __enter__ creates an iterator; its body is not executed
+    # by implicit context entry.
+    if stmt.name == "__enter__" and any(
+        isinstance(node, (ast.Yield, ast.YieldFrom))
+        for node in _function_runtime_nodes(stmt)
+    ):
+        return False
     if not _function_mutates_workers(stmt, operator_bindings):
         return False
     if stmt.name == "__class_getitem__":
@@ -16331,8 +16338,24 @@ def _statement_hook_write_triggers_workers(node, class_targets):
     )
 
 
+def _resolve_local_class_context(expr, local_class_aliases, reference_line):
+    """Resolve a proven single-assignment function-local class alias."""
+    target = expr.func if isinstance(expr, ast.Call) else expr
+    if not isinstance(target, ast.Name):
+        return expr
+    binding = (local_class_aliases or {}).get(target.id)
+    if not binding or binding[0] >= reference_line:
+        return expr
+    resolved = ast.copy_location(ast.Name(id=binding[1], ctx=ast.Load()), target)
+    if isinstance(expr, ast.Call):
+        return ast.copy_location(
+            ast.Call(func=resolved, args=expr.args, keywords=expr.keywords), expr
+        )
+    return resolved
+
+
 def _statement_has_class_workers_side_effect(
-    node, class_targets, operator_bindings=None
+    node, class_targets, operator_bindings=None, local_class_aliases=None
 ):
     """Return True when an evaluated statement expression invokes a risky class hook."""
     if not class_targets or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -16350,8 +16373,11 @@ def _statement_has_class_workers_side_effect(
             "__aenter__" if isinstance(node, ast.AsyncWith) else "__enter__"
         )
         for item in node.items:
+            context_expr = _resolve_local_class_context(
+                item.context_expr, local_class_aliases, reference_line
+            )
             if _expression_has_class_workers_side_effect(
-                item.context_expr,
+                context_expr,
                 class_targets,
                 operator_bindings=operator_bindings,
             ):
@@ -16359,7 +16385,7 @@ def _statement_has_class_workers_side_effect(
             # A class object enters via its metaclass, not via the class's
             # instance-level __enter__ method.
             class_name = (
-                item.context_expr.id if isinstance(item.context_expr, ast.Name) else None
+                context_expr.id if isinstance(context_expr, ast.Name) else None
             )
             class_bases = class_targets[7] if len(class_targets) > 7 else {}
             if class_name in class_bases and _class_binding_is_active(
@@ -16376,7 +16402,7 @@ def _statement_has_class_workers_side_effect(
                 continue
             enter_call = ast.Call(
                 func=ast.Attribute(
-                    value=item.context_expr,
+                    value=context_expr,
                     attr=enter_attr,
                     ctx=ast.Load(),
                 ),
@@ -16429,6 +16455,7 @@ def _statement_mutates_workers(
     dict_subclass_names=None,
     bound_names=None,
     defer_annotations=False,
+    local_class_aliases=None,
 ):
     """Return True when one statement may mutate the module ``workers`` binding."""
     if _statement_invokes_function(node, mutator_names):
@@ -16454,7 +16481,7 @@ def _statement_mutates_workers(
             defer_annotations,
         )
     if _statement_has_class_workers_side_effect(
-        node, class_targets, operator_bindings
+        node, class_targets, operator_bindings, local_class_aliases
     ):
         return True
     if _is_dynamic_workers_mutation(
@@ -16497,6 +16524,7 @@ def _statement_mutates_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
             defer_annotations=defer_annotations,
+            local_class_aliases=local_class_aliases,
         )
         for block in _compound_statement_blocks(node)
     )
@@ -16513,6 +16541,7 @@ def _statements_mutate_workers(
     dict_subclass_names=None,
     bound_names=None,
     defer_annotations=False,
+    local_class_aliases=None,
 ):
     """Return True when statements may mutate the module ``workers`` binding."""
     if mutator_names is None:
@@ -16527,6 +16556,7 @@ def _statements_mutate_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=bound_names,
             defer_annotations=defer_annotations,
+            local_class_aliases=local_class_aliases,
         )
         for node in statements
     )
@@ -16592,6 +16622,35 @@ def _function_local_bound_names(func_node):
     return names - module_names
 
 
+def _function_simple_class_aliases(func_node, class_targets):
+    """Track direct local aliases of module classes when no rebinding is possible."""
+    if not class_targets or len(class_targets) <= 7:
+        return {}
+    known_classes = set(class_targets[7])
+    local_names = _function_local_bound_names(func_node)
+    parameters = _function_argument_bound_names(func_node)
+    writes = {}
+    for node in _function_runtime_nodes(func_node):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            writes[node.id] = writes.get(node.id, 0) + 1
+    aliases = {}
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Name):
+            continue
+        source = stmt.value.id
+        if source not in known_classes or source in local_names:
+            continue
+        for target in stmt.targets:
+            if (
+                isinstance(target, ast.Name)
+                and target.id in local_names
+                and target.id not in parameters
+                and writes.get(target.id) == 1
+            ):
+                aliases[target.id] = (stmt.lineno, source)
+    return aliases
+
+
 def _function_mutates_workers(
     func_node,
     operator_bindings,
@@ -16622,6 +16681,7 @@ def _function_mutates_workers(
             dict_subclass_names=dict_subclass_names,
             bound_names=_function_local_bound_names(func_node),
             defer_annotations=defer_annotations,
+            local_class_aliases=_function_simple_class_aliases(func_node, class_targets),
         )
 
 
