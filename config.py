@@ -12178,6 +12178,15 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         and not stmt.decorator_list
         and _function_mutates_workers(stmt, operator_bindings)
     }
+    async_exit_methods = {
+        (node.name, stmt.name)
+        for node in _iter_import_time_class_definitions(tree.body)
+        for stmt in node.body
+        if isinstance(stmt, ast.AsyncFunctionDef)
+        and stmt.name == "__aexit__"
+        and not stmt.decorator_list
+        and _function_mutates_workers(stmt, operator_bindings)
+    }
     return (
         constructors,
         methods,
@@ -12198,6 +12207,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         nested_attribute_bindings,
         class_metaclass_names,
         async_entry_methods,
+        async_exit_methods,
     )
 
 
@@ -16364,6 +16374,16 @@ def _context_manager_entry_methods(node, class_targets):
     return methods, "__enter__"
 
 
+def _context_manager_exit_methods(node, class_targets):
+    """Return methods and hook name used when a context manager exits."""
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    if isinstance(node, ast.AsyncWith):
+        if len(class_targets) > 19:
+            methods = class_targets[19]
+        return methods, "__aexit__"
+    return methods, "__exit__"
+
+
 def _context_metaclass_entry_mutates_workers(
     class_name, enter_attr, methods, class_targets
 ):
@@ -16383,17 +16403,39 @@ def _context_metaclass_entry_mutates_workers(
     )
 
 
+def _context_metaclass_exit_mutates_workers(
+    class_name, exit_attr, methods, class_targets
+):
+    """Check the metaclass hook for a context exited as a class object."""
+    metaclasses = class_targets[17] if len(class_targets) > 17 else {}
+    metaclass = metaclasses.get(class_name)
+    if not metaclass:
+        return False
+    class_bases = class_targets[7] if len(class_targets) > 7 else {}
+    return _class_hierarchy_defines_method(
+        methods,
+        class_bases,
+        metaclass,
+        exit_attr,
+        class_targets[8] if len(class_targets) > 8 else None,
+        class_attributes=class_targets[10] if len(class_targets) > 10 else None,
+    )
+
+
 def _context_manager_item_mutates_workers(
     item,
+    with_node,
     reference_line,
-    enter_attr,
-    methods,
     class_targets,
     instance_events,
     operator_bindings,
     local_class_aliases,
 ):
-    """Check a context expression and the entry hook that it invokes."""
+    """Check a context expression and the entry/exit hooks that it invokes."""
+    methods, enter_attr = _context_manager_entry_methods(with_node, class_targets)
+    exit_methods, exit_attr = _context_manager_exit_methods(
+        with_node, class_targets
+    )
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
@@ -16407,25 +16449,52 @@ def _context_manager_item_mutates_workers(
     # A class object enters via its metaclass, not via an instance hook.
     class_name = context_expr.id if isinstance(context_expr, ast.Name) else None
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
-    if class_name in class_bases and _class_binding_is_active(
-        class_targets, class_name, reference_line
-    ):
-        return _context_metaclass_entry_mutates_workers(
+    is_class_context = (
+        class_name in class_bases
+        and _class_binding_is_active(class_targets, class_name, reference_line)
+    )
+    if is_class_context:
+        if _context_metaclass_entry_mutates_workers(
             class_name, enter_attr, methods, class_targets
+        ):
+            return True
+    else:
+        enter_call = ast.Call(
+            func=ast.Attribute(
+                value=context_expr,
+                attr=enter_attr,
+                ctx=ast.Load(),
+            ),
+            args=[],
+            keywords=[],
+        )
+        if _attribute_call_triggers_workers(
+            enter_call,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+        ):
+            return True
+
+    if is_class_context:
+        return _context_metaclass_exit_mutates_workers(
+            class_name, exit_attr, exit_methods, class_targets
         )
 
-    enter_call = ast.Call(
+    exit_call = ast.Call(
         func=ast.Attribute(
             value=context_expr,
-            attr=enter_attr,
+            attr=exit_attr,
             ctx=ast.Load(),
         ),
-        args=[],
+        args=[ast.Constant(value=None), ast.Constant(value=None), ast.Constant(value=None)],
         keywords=[],
     )
     return _attribute_call_triggers_workers(
-        enter_call,
-        methods,
+        exit_call,
+        exit_methods,
         class_targets,
         instance_events,
         reference_line,
@@ -16436,16 +16505,14 @@ def _context_manager_item_mutates_workers(
 def _context_manager_entry_mutates_workers(
     node, class_targets, operator_bindings, local_class_aliases
 ):
-    """Account for implicit __enter__ or __aenter__ calls at import time."""
-    methods, enter_attr = _context_manager_entry_methods(node, class_targets)
+    """Account for implicit context entry/exit hooks at import time."""
     instance_events = class_targets[6] if len(class_targets) > 6 else {}
     reference_line = getattr(node, "lineno", 0)
     return any(
         _context_manager_item_mutates_workers(
             item,
+            node,
             reference_line,
-            enter_attr,
-            methods,
             class_targets,
             instance_events,
             operator_bindings,

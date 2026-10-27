@@ -187,6 +187,47 @@ _CONTEXT_MANAGER_CASES = [
         "    pass\n",
         (1, False),
     ),
+    (
+        "top-level with __exit__ rebinding workers is dynamic",
+        "workers = 1\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *a):\n"
+        "        globals()['workers'] = 4\n"
+        "with CM():\n"
+        "    pass\n",
+        (1, True),
+    ),
+    (
+        "async with __aexit__ rebinding workers is dynamic",
+        "workers = 1\n"
+        "import asyncio\n"
+        "class CM:\n"
+        "    async def __aenter__(self):\n"
+        "        return self\n"
+        "    async def __aexit__(self, *a):\n"
+        "        globals()['workers'] = 4\n"
+        "async def boot():\n"
+        "    async with CM():\n"
+        "        pass\n"
+        "asyncio.run(boot())\n",
+        (1, True),
+    ),
+    (
+        "class context detects mutating metaclass exit",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __enter__(cls):\n"
+        "        return cls\n"
+        "    def __exit__(cls, *a):\n"
+        "        globals()['workers'] = 4\n"
+        "class CM(metaclass=Meta):\n"
+        "    pass\n"
+        "with CM:\n"
+        "    pass\n",
+        (1, True),
+    ),
 ]
 
 
