@@ -292,11 +292,15 @@ def client_ip_for_rate_limit(
     """
     if not trusted_proxy_count:
         return forwarded_addr
-    if direct_addr and ip_in_trusted_proxy_networks(direct_addr, trusted_networks):
+    if not direct_addr:
+        # The direct peer is the only address we can verify against the
+        # trusted-proxy allowlist. If the WSGI environment did not provide it,
+        # fail closed instead of honoring a possibly spoofed forwarded header:
+        # bucket all such requests together so they cannot rotate identities.
+        return "unknown"
+    if ip_in_trusted_proxy_networks(direct_addr, trusted_networks):
         return forwarded_addr
-    if direct_addr:
-        return direct_addr
-    return forwarded_addr
+    return direct_addr
 
 
 def _session_cookie_secure_default():

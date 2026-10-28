@@ -16,6 +16,17 @@ def test_client_ip_for_rate_limit_ignores_spoofed_xff_from_untrusted_direct_clie
     assert client_ip == "10.0.0.5"
 
 
+def test_client_ip_for_rate_limit_fails_closed_when_direct_peer_is_missing():
+    networks = [ipaddress.ip_network("10.0.0.0/8")]
+    client_ip = config.client_ip_for_rate_limit(
+        direct_addr="",
+        forwarded_addr="198.51.100.25",
+        trusted_proxy_count=1,
+        trusted_networks=networks,
+    )
+    assert client_ip == "unknown"
+
+
 def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
     networks = [ipaddress.ip_network("10.0.0.0/8")]
     client_ip = config.client_ip_for_rate_limit(
