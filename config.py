@@ -5583,6 +5583,14 @@ def _scan_exit_stack_alias_events(statements, events, operator_bindings, *, cond
                     operator_bindings,
                     conditional=conditional,
                 )
+        if isinstance(node, ast.Assign):
+            line = getattr(node, "lineno", 0)
+            if _contextlib_exit_stack_constructor(node.value, operator_bindings):
+                for target in node.targets:
+                    for name in _loop_target_names(target):
+                        events.setdefault(name, []).append((line, True))
+                        if conditional:
+                            break
         for block in _compound_statement_blocks(node):
             _scan_exit_stack_alias_events(
                 block,
@@ -6185,15 +6193,8 @@ def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings
     return False
 
 
-def _call_is_exit_stack_callback_mutation(call, operator_bindings):
-    """Return True for ``stack.callback(mutating)`` on a tracked ExitStack."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-        return False
-    if call.func.attr != "callback" or len(call.args) != 1:
-        return False
-    if not _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
-        return False
-    receiver = call.func.value
+def _exit_stack_instance_is_active(receiver, operator_bindings, reference_line):
+    """Return True when a name refers to a tracked ExitStack instance."""
     if not isinstance(receiver, ast.Name):
         return False
     exit_stack_events = {}
@@ -6205,7 +6206,54 @@ def _call_is_exit_stack_callback_mutation(call, operator_bindings):
     return _imported_alias_is_active(
         exit_stack_events,
         receiver.id,
+        reference_line,
+    )
+
+
+def _call_is_exit_stack_callback_mutation(call, operator_bindings):
+    """Return True for ``stack.callback(mutating)`` on a tracked ExitStack."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "callback" or len(call.args) != 1:
+        return False
+    if not _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
+        return False
+    return _exit_stack_instance_is_active(
+        call.func.value,
+        operator_bindings,
         getattr(call, "lineno", 0),
+    )
+
+
+def _call_is_exit_stack_enter_context_mutation(
+    call,
+    operator_bindings,
+    class_targets,
+    local_class_aliases=None,
+):
+    """Return True for ``stack.enter_context(...)`` on a tracked ExitStack."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "enter_context" or not call.args:
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _exit_stack_instance_is_active(
+        call.func.value,
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    with_node = ast.With(items=[ast.withitem(context_expr=call.args[0])], body=[])
+    ast.copy_location(with_node, call)
+    return _context_manager_item_mutates_workers(
+        with_node.items[0],
+        with_node,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases or {},
     )
 
 
@@ -11037,6 +11085,44 @@ def _function_is_property_method(func_node, operator_bindings=None):
     )
 
 
+def _decorator_resolves_to_contextlib_name(decorator, name, operator_bindings=None):
+    """Return True when a decorator resolves to a contextlib import."""
+    reference_line = getattr(decorator, 'lineno', 0)
+    binding_store = (
+        operator_bindings[32]
+        if operator_bindings and len(operator_bindings) > 32
+        else {}
+    )
+    imported_events = binding_store.get(_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY, {})
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    if isinstance(decorator, ast.Name):
+        return _imported_alias_is_active(
+            imported_events,
+            decorator.id,
+            reference_line,
+        )
+    if not (isinstance(decorator, ast.Attribute) and decorator.attr == name):
+        return False
+    return _module_alias_active_at_line(
+        decorator.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _function_uses_contextmanager_decorator(func_node, operator_bindings=None):
+    """Return True for a proven ``contextlib.contextmanager`` decorator."""
+    return any(
+        _decorator_resolves_to_contextlib_name(
+            decorator,
+            "contextmanager",
+            operator_bindings,
+        )
+        for decorator in func_node.decorator_list
+    )
+
+
 
 def _super_invocation_method_name(func):
     """Return the method name for direct and getattr super() invocations."""
@@ -11353,6 +11439,12 @@ def _record_class_side_effect_target(
     # (``Helper.bump(Helper())``). A decorator can replace the function with a
     # wrapper that never runs its body, so only undecorated methods are proven.
     if stmt.decorator_list:
+        if (
+            _function_uses_contextmanager_decorator(stmt, operator_bindings)
+            and _function_mutates_workers(stmt, operator_bindings)
+        ):
+            methods.add(target)
+            return True
         return False
     methods.add(target)
     return True
@@ -16172,6 +16264,18 @@ def _expression_has_class_workers_side_effect(
     """Recursively inspect evaluated expressions without entering lambda scopes."""
     if isinstance(expr, ast.Lambda):
         return False
+    if (
+        isinstance(expr, ast.Call)
+        and operator_bindings
+        and class_targets
+        and _call_is_exit_stack_enter_context_mutation(
+            expr,
+            operator_bindings,
+            class_targets,
+            bound_class_aliases,
+        )
+    ):
+        return True
     if _comprehension_hook_write_triggers_workers(expr, class_targets):
         return True
     shadowed_call = (
@@ -21718,7 +21822,9 @@ def _scan_gunicorn_config_worker_details(tree):
         _collect_imported_module_alias_events(tree, "contextlib")
     )
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+        _collect_imported_name_alias_events(
+            tree, "contextlib", {"ExitStack", "contextmanager"}
+        )
     )
     operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
         _collect_exit_stack_alias_events(tree, operator_bindings)
@@ -21893,7 +21999,9 @@ def _scan_gunicorn_config_worker_details(tree):
         _collect_imported_module_alias_events(tree, "contextlib")
     )
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+        _collect_imported_name_alias_events(
+            tree, "contextlib", {"ExitStack", "contextmanager"}
+        )
     )
     operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
         _collect_exit_stack_alias_events(tree, operator_bindings)
