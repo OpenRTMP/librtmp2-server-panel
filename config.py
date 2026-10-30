@@ -16314,6 +16314,57 @@ def _statement_invokes_function(node, func_names):
     )
 
 
+def _expression_enters_deferred_contextmanager(expr, operator_bindings):
+    """Recognize entering an already constructed contextmanager instance."""
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "__enter__"
+        and isinstance(expr.func.value, ast.Name)
+        and operator_bindings
+    ):
+        return False
+    return _contextmanager_factory_binding_is_active(
+        expr.func.value.id, getattr(expr, "lineno", 0), operator_bindings
+    )
+
+
+def _expression_enters_exit_stack_context(
+    expr, class_targets, operator_bindings, bound_class_aliases
+):
+    """Recognize mutating context entry through a tracked ExitStack."""
+    return bool(
+        isinstance(expr, ast.Call)
+        and operator_bindings
+        and class_targets
+        and _call_is_exit_stack_enter_context_mutation(
+            expr, operator_bindings, class_targets, bound_class_aliases
+        )
+    )
+
+
+def _shadowed_class_call_triggers_workers(expr, class_targets, bound_class_aliases):
+    """Resolve a shadowed local class alias before inspecting its constructor."""
+    actual_name = (bound_class_aliases or {}).get(expr.func.id)
+    if not actual_name:
+        return False
+    reference_line = getattr(expr, "lineno", 0)
+    if _class_mro_hook_triggers_workers(
+        actual_name, "__new__", class_targets, reference_line
+    ):
+        return True
+    return _class_call_triggers_workers(
+        ast.Call(
+            func=ast.Name(id=actual_name, ctx=ast.Load()),
+            args=expr.args,
+            keywords=expr.keywords,
+        ),
+        class_targets[0],
+        class_targets,
+        reference_line,
+    )
+
+
 def _expression_has_class_workers_side_effect(
     expr,
     class_targets,
@@ -16324,27 +16375,10 @@ def _expression_has_class_workers_side_effect(
     """Recursively inspect evaluated expressions without entering lambda scopes."""
     if isinstance(expr, ast.Lambda):
         return False
-    if (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Attribute)
-        and expr.func.attr == "__enter__"
-        and isinstance(expr.func.value, ast.Name)
-        and operator_bindings
-        and _contextmanager_factory_binding_is_active(
-            expr.func.value.id, getattr(expr, "lineno", 0), operator_bindings
-        )
-    ):
-        return True
-    if (
-        isinstance(expr, ast.Call)
-        and operator_bindings
-        and class_targets
-        and _call_is_exit_stack_enter_context_mutation(
-            expr,
-            operator_bindings,
-            class_targets,
-            bound_class_aliases,
-        )
+    if _expression_enters_deferred_contextmanager(
+        expr, operator_bindings
+    ) or _expression_enters_exit_stack_context(
+        expr, class_targets, operator_bindings, bound_class_aliases
     ):
         return True
     if _comprehension_hook_write_triggers_workers(expr, class_targets):
@@ -16356,23 +16390,8 @@ def _expression_has_class_workers_side_effect(
         and expr.func.id in bound_names
     )
     if shadowed_call:
-        actual_name = (bound_class_aliases or {}).get(expr.func.id)
-        if actual_name and _class_mro_hook_triggers_workers(
-            actual_name,
-            "__new__",
-            class_targets,
-            getattr(expr, "lineno", 0),
-        ):
-            return True
-        if actual_name and _class_call_triggers_workers(
-            ast.Call(
-                func=ast.Name(id=actual_name, ctx=ast.Load()),
-                args=expr.args,
-                keywords=expr.keywords,
-            ),
-            class_targets[0],
-            class_targets,
-            getattr(expr, "lineno", 0),
+        if _shadowed_class_call_triggers_workers(
+            expr, class_targets, bound_class_aliases
         ):
             return True
     elif _expression_triggers_class_workers_side_effect(
@@ -16390,7 +16409,6 @@ def _expression_has_class_workers_side_effect(
         for child in ast.iter_child_nodes(expr)
         if isinstance(child, ast.AST)
     )
-
 
 def _attribute_hook_write_triggers_workers(
     expr,
