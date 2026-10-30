@@ -235,8 +235,8 @@ def test_deferred_contextmanager_and_exitstack_hooks(config_module, source, expe
     ("source", "is_dynamic"),
     [
         (_REGRESSION_CASES[0][1], False),
-        (_REGRESSION_CASES[3][1], False),
-        (_REGRESSION_CASES[4][1], True),
+        (_REGRESSION_CASES[6][1], False),
+        (_REGRESSION_CASES[7][1], True),
     ],
 )
 def test_memory_storage_allowed_when_deferred_hooks_are_not_run(
