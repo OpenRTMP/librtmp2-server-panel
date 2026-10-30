@@ -6225,6 +6225,45 @@ def _call_is_exit_stack_callback_mutation(call, operator_bindings):
     )
 
 
+def _collect_exit_stack_close_events(tree, operator_bindings):
+    """Track import-time ExitStack exits, not merely registrations."""
+    events = {}
+    for node in _module_scope_ast_nodes(tree):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                if (
+                    isinstance(item.optional_vars, ast.Name)
+                    and _contextlib_exit_stack_constructor(
+                        item.context_expr, operator_bindings
+                    )
+                ):
+                    events.setdefault(item.optional_vars.id, []).append(
+                        (node.lineno, node.end_lineno)
+                    )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"close", "__exit__"}
+            and isinstance(node.func.value, ast.Name)
+            and _exit_stack_instance_is_active(
+                node.func.value, operator_bindings, node.lineno
+            )
+        ):
+            events.setdefault(node.func.value.id, []).append((node.lineno, None))
+    return events
+
+
+def _exit_stack_closes_after_enter(name, reference_line, operator_bindings):
+    """Check whether a tracked stack closes after the context was entered."""
+    store = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    for start, end in store.get("exit_stack_close_events", {}).get(name, ()):
+        if end is None and start > reference_line:
+            return True
+        if end is not None and start <= reference_line <= end:
+            return True
+    return False
+
+
 def _call_is_exit_stack_enter_context_mutation(
     call,
     operator_bindings,
@@ -6254,6 +6293,9 @@ def _call_is_exit_stack_enter_context_mutation(
         instance_events,
         operator_bindings,
         local_class_aliases or {},
+        include_exit=_exit_stack_closes_after_enter(
+            call.func.value.id, reference_line, operator_bindings
+        ),
     )
 
 
@@ -11093,7 +11135,7 @@ def _decorator_resolves_to_contextlib_name(decorator, name, operator_bindings=No
         if operator_bindings and len(operator_bindings) > 32
         else {}
     )
-    imported_events = binding_store.get(_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY, {})
+    imported_events = binding_store.get("contextmanager_alias_events", {})
     module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
     if isinstance(decorator, ast.Name):
         return _imported_alias_is_active(
@@ -11439,12 +11481,8 @@ def _record_class_side_effect_target(
     # (``Helper.bump(Helper())``). A decorator can replace the function with a
     # wrapper that never runs its body, so only undecorated methods are proven.
     if stmt.decorator_list:
-        if (
-            _function_uses_contextmanager_decorator(stmt, operator_bindings)
-            and _function_mutates_workers(stmt, operator_bindings)
-        ):
-            methods.add(target)
-            return True
+        # @contextmanager returns a lazy manager; its generator body runs
+        # on context entry, not when the decorated method is called.
         return False
     methods.add(target)
     return True
@@ -12283,6 +12321,16 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         and not stmt.decorator_list
         and _function_mutates_workers(stmt, operator_bindings)
     }
+    # Generator-based contextmanager methods only run their bodies upon
+    # __enter__/__exit__, so do not add them to ordinary mutating methods.
+    contextmanager_methods = {
+        (node.name, stmt.name)
+        for node in _iter_import_time_class_definitions(tree.body)
+        for stmt in node.body
+        if isinstance(stmt, ast.FunctionDef)
+        and _function_uses_contextmanager_decorator(stmt, operator_bindings)
+        and _function_mutates_workers(stmt, operator_bindings)
+    }
     return (
         constructors,
         methods,
@@ -12304,6 +12352,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_metaclass_names,
         async_entry_methods,
         async_exit_methods,
+        contextmanager_methods,
     )
 
 
@@ -16538,8 +16587,10 @@ def _context_manager_item_mutates_workers(
     instance_events,
     operator_bindings,
     local_class_aliases,
+    *,
+    include_exit=True,
 ):
-    """Check a context expression and the entry/exit hooks that it invokes."""
+    """Check entry hooks and optionally exit hooks for a context expression."""
     methods, enter_attr = _context_manager_entry_methods(with_node, class_targets)
     exit_methods, exit_attr = _context_manager_exit_methods(
         with_node, class_targets
@@ -16552,6 +16603,22 @@ def _context_manager_item_mutates_workers(
         class_targets,
         operator_bindings=operator_bindings,
     ):
+        return True
+    if (
+        isinstance(with_node, ast.With)
+        and isinstance(context_expr, ast.Call)
+        and len(class_targets) > 20
+        and _attribute_call_triggers_workers(
+            context_expr,
+            class_targets[20],
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+        )
+    ):
+        # Calling @contextmanager merely creates a wrapper; entering it
+        # advances the generator and may mutate workers.
         return True
 
     # A class object enters via its metaclass, not via an instance hook.
@@ -16586,6 +16653,8 @@ def _context_manager_item_mutates_workers(
         ):
             return True
 
+    if not include_exit:
+        return False
     if is_class_context:
         return _context_metaclass_exit_mutates_workers(
             class_name, exit_attr, exit_methods, class_targets
@@ -21822,12 +21891,16 @@ def _scan_gunicorn_config_worker_details(tree):
         _collect_imported_module_alias_events(tree, "contextlib")
     )
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(
-            tree, "contextlib", {"ExitStack", "contextmanager"}
-        )
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    operator_bindings[32]["contextmanager_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
     )
     operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
         _collect_exit_stack_alias_events(tree, operator_bindings)
+    )
+    operator_bindings[32]["exit_stack_close_events"] = (
+        _collect_exit_stack_close_events(tree, operator_bindings)
     )
     operator_bindings[32]["weakref_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "weakref")
@@ -21999,12 +22072,16 @@ def _scan_gunicorn_config_worker_details(tree):
         _collect_imported_module_alias_events(tree, "contextlib")
     )
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(
-            tree, "contextlib", {"ExitStack", "contextmanager"}
-        )
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    operator_bindings[32]["contextmanager_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
     )
     operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
         _collect_exit_stack_alias_events(tree, operator_bindings)
+    )
+    operator_bindings[32]["exit_stack_close_events"] = (
+        _collect_exit_stack_close_events(tree, operator_bindings)
     )
     asyncio_module_alias_events = _collect_imported_module_alias_events(
         tree,
