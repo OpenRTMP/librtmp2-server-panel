@@ -16315,6 +16315,17 @@ def _expression_has_class_workers_side_effect(
         return False
     if (
         isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "__enter__"
+        and isinstance(expr.func.value, ast.Name)
+        and operator_bindings
+        and _contextmanager_factory_binding_is_active(
+            expr.func.value.id, getattr(expr, "lineno", 0), operator_bindings
+        )
+    ):
+        return True
+    if (
+        isinstance(expr, ast.Call)
         and operator_bindings
         and class_targets
         and _call_is_exit_stack_enter_context_mutation(
@@ -16521,6 +16532,46 @@ def _resolve_local_class_context(expr, local_class_aliases, reference_line):
     return resolved
 
 
+def _contextmanager_method_factory_mutates_workers(expr, class_targets, operator_bindings):
+    """Check a generator-based contextmanager factory without executing it."""
+    if not isinstance(expr, ast.Call) or len(class_targets) <= 20:
+        return False
+    return _attribute_call_triggers_workers(
+        expr,
+        class_targets[20],
+        class_targets,
+        class_targets[6],
+        getattr(expr, "lineno", 0),
+        operator_bindings,
+    )
+
+
+def _collect_contextmanager_factory_events(tree, class_targets, operator_bindings):
+    """Track source-ordered names bound to deferred mutating context managers."""
+    events = {}
+    for node in _module_scope_ast_nodes(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        mutating = _contextmanager_method_factory_mutates_workers(
+            value, class_targets, operator_bindings
+        )
+        for name in _simple_assignment_names(node):
+            if mutating or name in events:
+                events.setdefault(name, []).append((node.lineno, mutating))
+    return events
+
+
+def _contextmanager_factory_binding_is_active(name, reference_line, operator_bindings):
+    """Check whether a deferred factory result still owns this variable."""
+    store = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    return _imported_alias_is_active(
+        store.get("contextmanager_factory_events", {}),
+        name,
+        reference_line,
+    )
+
+
 def _context_manager_entry_methods(node, class_targets):
     """Return methods and hook name used by this kind of context manager."""
     methods = class_targets[1] if len(class_targets) > 1 else set()
@@ -16604,21 +16655,19 @@ def _context_manager_item_mutates_workers(
         operator_bindings=operator_bindings,
     ):
         return True
-    if (
-        isinstance(with_node, ast.With)
-        and isinstance(context_expr, ast.Call)
-        and len(class_targets) > 20
-        and _attribute_call_triggers_workers(
-            context_expr,
-            class_targets[20],
-            class_targets,
-            instance_events,
-            reference_line,
-            operator_bindings,
+    if isinstance(with_node, ast.With) and (
+        _contextmanager_method_factory_mutates_workers(
+            context_expr, class_targets, operator_bindings
+        )
+        or (
+            isinstance(context_expr, ast.Name)
+            and _contextmanager_factory_binding_is_active(
+                context_expr.id, reference_line, operator_bindings
+            )
         )
     ):
-        # Calling @contextmanager merely creates a wrapper; entering it
-        # advances the generator and may mutate workers.
+        # The factory call alone is inert; entering its returned manager
+        # advances the decorated generator.
         return True
 
     # A class object enters via its metaclass, not via an instance hook.
@@ -22005,6 +22054,9 @@ def _scan_gunicorn_config_worker_details(tree):
     # Function bodies are scanned before the late inspect-analysis bundle exists.
     # Keep class targets in the existing metadata map, preserving tuple indices.
     operator_bindings[32]["class_targets"] = class_targets
+    operator_bindings[32]["contextmanager_factory_events"] = (
+        _collect_contextmanager_factory_events(tree, class_targets, operator_bindings)
+    )
     operator_bindings[32]["dict_subclass_names"] = dict_subclass_names
     import_time_workers_mutators = _collect_import_time_workers_mutators(
         tree,
