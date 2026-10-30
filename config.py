@@ -5570,6 +5570,22 @@ def _record_exit_stack_with_alias(item, events, line, operator_bindings, *, cond
             return
 
 
+def _record_exit_stack_assignment_aliases(
+    node, events, operator_bindings, *, conditional
+):
+    """Record aliases for assignment-bound ExitStack instances."""
+    if not isinstance(node, ast.Assign) or not _contextlib_exit_stack_constructor(
+        node.value, operator_bindings
+    ):
+        return
+    line = getattr(node, "lineno", 0)
+    for target in node.targets:
+        for name in _loop_target_names(target):
+            events.setdefault(name, []).append((line, True))
+            if conditional:
+                break
+
+
 def _scan_exit_stack_alias_events(statements, events, operator_bindings, *, conditional=False):
     """Track aliases bound from ``with contextlib.ExitStack()`` blocks."""
     for node in statements:
@@ -5583,14 +5599,9 @@ def _scan_exit_stack_alias_events(statements, events, operator_bindings, *, cond
                     operator_bindings,
                     conditional=conditional,
                 )
-        if isinstance(node, ast.Assign):
-            line = getattr(node, "lineno", 0)
-            if _contextlib_exit_stack_constructor(node.value, operator_bindings):
-                for target in node.targets:
-                    for name in _loop_target_names(target):
-                        events.setdefault(name, []).append((line, True))
-                        if conditional:
-                            break
+        _record_exit_stack_assignment_aliases(
+            node, events, operator_bindings, conditional=conditional
+        )
         for block in _compound_statement_blocks(node):
             _scan_exit_stack_alias_events(
                 block,
