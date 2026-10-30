@@ -16659,6 +16659,61 @@ def _context_metaclass_exit_mutates_workers(
     )
 
 
+def _deferred_contextmanager_entry_mutates_workers(
+    context_expr, class_targets, operator_bindings, reference_line
+):
+    """Check generator bodies when a deferred contextmanager is entered."""
+    if _contextmanager_method_factory_mutates_workers(
+        context_expr, class_targets, operator_bindings
+    ):
+        return True
+    return isinstance(context_expr, ast.Name) and (
+        _contextmanager_factory_binding_is_active(
+            context_expr.id, reference_line, operator_bindings
+        )
+    )
+
+
+def _context_manager_hook_mutates_workers(
+    context_expr,
+    hook_name,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings,
+    *,
+    is_class_context,
+    exiting,
+):
+    """Dispatch a context entry/exit hook to a class or instance."""
+    if is_class_context:
+        check_metaclass = (
+            _context_metaclass_exit_mutates_workers
+            if exiting else _context_metaclass_entry_mutates_workers
+        )
+        return check_metaclass(context_expr.id, hook_name, methods, class_targets)
+
+    hook_args = [ast.Constant(value=None) for _ in range(3)] if exiting else []
+    hook_call = ast.Call(
+        func=ast.Attribute(
+            value=context_expr,
+            attr=hook_name,
+            ctx=ast.Load(),
+        ),
+        args=hook_args,
+        keywords=[],
+    )
+    return _attribute_call_triggers_workers(
+        hook_call,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+        operator_bindings,
+    )
+
+
 def _context_manager_item_mutates_workers(
     item,
     with_node,
@@ -16670,11 +16725,7 @@ def _context_manager_item_mutates_workers(
     *,
     include_exit=True,
 ):
-    """Check entry hooks and optionally exit hooks for a context expression."""
-    methods, enter_attr = _context_manager_entry_methods(with_node, class_targets)
-    exit_methods, exit_attr = _context_manager_exit_methods(
-        with_node, class_targets
-    )
+    """Check context entry immediately, and exit only when it executes."""
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
@@ -16684,19 +16735,9 @@ def _context_manager_item_mutates_workers(
         operator_bindings=operator_bindings,
     ):
         return True
-    if isinstance(with_node, ast.With) and (
-        _contextmanager_method_factory_mutates_workers(
-            context_expr, class_targets, operator_bindings
-        )
-        or (
-            isinstance(context_expr, ast.Name)
-            and _contextmanager_factory_binding_is_active(
-                context_expr.id, reference_line, operator_bindings
-            )
-        )
+    if isinstance(with_node, ast.With) and _deferred_contextmanager_entry_mutates_workers(
+        context_expr, class_targets, operator_bindings, reference_line
     ):
-        # The factory call alone is inert; entering its returned manager
-        # advances the decorated generator.
         return True
 
     # A class object enters via its metaclass, not via an instance hook.
@@ -16706,56 +16747,38 @@ def _context_manager_item_mutates_workers(
         class_name in class_bases
         and _class_binding_is_active(class_targets, class_name, reference_line)
     )
-    if is_class_context:
-        if _context_metaclass_entry_mutates_workers(
-            class_name, enter_attr, methods, class_targets
-        ):
-            return True
-    else:
-        enter_call = ast.Call(
-            func=ast.Attribute(
-                value=context_expr,
-                attr=enter_attr,
-                ctx=ast.Load(),
-            ),
-            args=[],
-            keywords=[],
-        )
-        if _attribute_call_triggers_workers(
-            enter_call,
-            methods,
-            class_targets,
-            instance_events,
-            reference_line,
-            operator_bindings,
-        ):
-            return True
-
+    entry_methods, enter_attr = _context_manager_entry_methods(
+        with_node, class_targets
+    )
+    if _context_manager_hook_mutates_workers(
+        context_expr,
+        enter_attr,
+        entry_methods,
+        class_targets,
+        instance_events,
+        reference_line,
+        operator_bindings,
+        is_class_context=is_class_context,
+        exiting=False,
+    ):
+        return True
     if not include_exit:
         return False
-    if is_class_context:
-        return _context_metaclass_exit_mutates_workers(
-            class_name, exit_attr, exit_methods, class_targets
-        )
 
-    exit_call = ast.Call(
-        func=ast.Attribute(
-            value=context_expr,
-            attr=exit_attr,
-            ctx=ast.Load(),
-        ),
-        args=[ast.Constant(value=None), ast.Constant(value=None), ast.Constant(value=None)],
-        keywords=[],
+    exit_methods, exit_attr = _context_manager_exit_methods(
+        with_node, class_targets
     )
-    return _attribute_call_triggers_workers(
-        exit_call,
+    return _context_manager_hook_mutates_workers(
+        context_expr,
+        exit_attr,
         exit_methods,
         class_targets,
         instance_events,
         reference_line,
         operator_bindings,
+        is_class_context=is_class_context,
+        exiting=True,
     )
-
 
 def _context_manager_entry_mutates_workers(
     node, class_targets, operator_bindings, local_class_aliases
