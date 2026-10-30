@@ -126,6 +126,47 @@ _REGRESSION_CASES = [
         (1, True),
     ),
     (
+        "entering a stored contextmanager executes its body",
+        "workers = 1\n"
+        "from contextlib import contextmanager\n"
+        "class C:\n"
+        "    @contextmanager\n"
+        "    def cm(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        yield\n"
+        "pending = C().cm()\n"
+        "with pending:\n"
+        "    pass\n",
+        (1, True),
+    ),
+    (
+        "entering a stored contextmanager through ExitStack executes it",
+        "workers = 1\n"
+        "from contextlib import ExitStack, contextmanager\n"
+        "class C:\n"
+        "    @contextmanager\n"
+        "    def cm(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        yield\n"
+        "pending = C().cm()\n"
+        "stack = ExitStack()\n"
+        "stack.enter_context(pending)\n",
+        (1, True),
+    ),
+    (
+        "rebinding a stored contextmanager removes its deferred effect",
+        "workers = 1\n"
+        "from contextlib import contextmanager\n"
+        "class C:\n"
+        "    @contextmanager\n"
+        "    def cm(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        yield\n"
+        "pending = C().cm()\n"
+        "pending = None\n",
+        (1, False),
+    ),
+    (
         "unclosed ExitStack does not run context exit hook",
         "workers = 1\n"
         "from contextlib import ExitStack\n"
