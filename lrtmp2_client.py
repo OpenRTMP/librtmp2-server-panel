@@ -136,9 +136,12 @@ class Lrtmp2Client:
             ) from exc
         elapsed_ms = (time.perf_counter() - started) * 1000
         status = getattr(resp, "status_code", None)
-        # 404 is expected only where the caller treats it as success (the
-        # idempotent stream/player deletes); everywhere else it is a failure.
-        expected = getattr(resp, "ok", True) or (ok_404 and status == 404)
+        # Only 2xx is expected (requests' resp.ok also accepts a final 3xx),
+        # plus 404 where the caller treats it as success (the idempotent
+        # stream/player deletes).
+        expected = (isinstance(status, int) and 200 <= status < 300) or (
+            ok_404 and status == 404
+        )
         logger.log(
             logging.DEBUG if expected else logging.WARNING,
             "librtmp2-server API: %s -> HTTP %s in %.0f ms",

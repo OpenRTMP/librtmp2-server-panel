@@ -136,3 +136,18 @@ def test_api_url_for_log_drops_userinfo_and_survives_bad_ports(url, expected):
     import app as app_module
 
     assert app_module._api_url_for_log(url) == expected
+
+
+def test_final_3xx_response_logs_at_warning(caplog):
+    client = Lrtmp2Client("http://example.test", "tok")
+    # requests' resp.ok is True for 3xx; the API log must still warn.
+    resp = type("Resp", (), {"ok": True, "status_code": 304, "json": lambda self: {}})()
+    with patch("lrtmp2_client.requests.get", return_value=resp), caplog.at_level(
+        logging.DEBUG, logger="lrtmp2_client"
+    ):
+        try:
+            client.health()
+        except Lrtmp2ApiError:
+            pass
+    levels = [r.levelno for r in caplog.records if "HTTP 304" in r.getMessage()]
+    assert levels == [logging.WARNING]
