@@ -5198,6 +5198,7 @@ _OPERATOR_CALL_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
 _EXIT_STACK_ALIAS_EVENTS_KEY = object()
 _CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY = object()
+_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY = object()
 _EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
@@ -6307,6 +6308,124 @@ def _call_is_exit_stack_enter_context_mutation(
         include_exit=_exit_stack_closes_after_enter(
             call.func.value.id, reference_line, operator_bindings
         ),
+    )
+
+
+def _contextlib_imported_name_constructor(value, class_name, operator_bindings):
+    """Return True when ``value`` constructs a named ``contextlib`` helper."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    reference_line = getattr(value, "lineno", 0)
+    binding_store = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    class_events = binding_store.get(
+        _CONTEXTLIB_NAME_ALIAS_EVENTS_KEY,
+        {},
+    ).get(class_name, {})
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            class_events,
+            func.id,
+            reference_line,
+        )
+    if not (isinstance(func, ast.Attribute) and func.attr == class_name):
+        return False
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _contextlib_closing_constructor(value, operator_bindings):
+    """Return True when ``value`` constructs ``contextlib.closing(...)``."""
+    return _contextlib_imported_name_constructor(
+        value,
+        "closing",
+        operator_bindings,
+    )
+
+
+def _contextlib_closing_close_mutates_workers(
+    item,
+    reference_line,
+    class_targets,
+    instance_events,
+    operator_bindings,
+    local_class_aliases,
+):
+    """Return True when ``with closing(obj):`` runs a mutating ``obj.close()``."""
+    if not _contextlib_closing_constructor(
+        item.context_expr,
+        operator_bindings,
+    ):
+        return False
+    if not item.context_expr.args:
+        return False
+    wrapped = _resolve_local_class_context(
+        item.context_expr.args[0],
+        local_class_aliases,
+        reference_line,
+    )
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    close_call = ast.Call(
+        func=ast.Attribute(
+            value=wrapped,
+            attr="close",
+            ctx=ast.Load(),
+        ),
+        args=[],
+        keywords=[],
+    )
+    return _attribute_call_triggers_workers(
+        close_call,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+        operator_bindings,
+    )
+
+
+def _call_is_async_context_enter_mutation(
+    call,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings,
+    local_class_aliases=None,
+):
+    """Return True for direct ``__aenter__`` or ``enter_async_context`` calls."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr == "__aenter__":
+        context_expr = call.func.value
+    elif call.func.attr == "enter_async_context" and call.args:
+        context_expr = call.args[0]
+    else:
+        return False
+    context_expr = _resolve_local_class_context(
+        context_expr,
+        local_class_aliases or {},
+        reference_line,
+    )
+    async_with = ast.AsyncWith(
+        items=[ast.withitem(context_expr=context_expr)],
+        body=[],
+    )
+    ast.copy_location(async_with, call)
+    return _context_manager_item_mutates_workers(
+        async_with.items[0],
+        async_with,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases or {},
     )
 
 
@@ -9494,6 +9613,17 @@ def _asyncio_awaitable_mutates_workers(
     """Return True when awaiting an expression can mutate module workers."""
     if not isinstance(expr, ast.Call):
         return False
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if class_targets:
+        instance_events = class_targets[6] if len(class_targets) > 6 else {}
+        if _call_is_async_context_enter_mutation(
+            expr,
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+        ):
+            return True
     if local_state is None:
         local_state = {
             "wrappers": {},
@@ -16729,6 +16859,15 @@ def _context_manager_item_mutates_workers(
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
+    if isinstance(with_node, ast.With) and _contextlib_closing_close_mutates_workers(
+        item,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases,
+    ):
+        return True
     if _expression_has_class_workers_side_effect(
         context_expr,
         class_targets,
@@ -21991,6 +22130,13 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
         _collect_imported_module_alias_events(tree, "contextlib")
     )
+    operator_bindings[32][_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
+        "closing": _collect_imported_name_alias_events(
+            tree,
+            "contextlib",
+            {"closing"},
+        ),
+    }
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
     )
@@ -22175,6 +22321,13 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
         _collect_imported_module_alias_events(tree, "contextlib")
     )
+    operator_bindings[32][_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
+        "closing": _collect_imported_name_alias_events(
+            tree,
+            "contextlib",
+            {"closing"},
+        ),
+    }
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
     )
