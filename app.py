@@ -644,7 +644,7 @@ class _PanelRuntime:
             pass_ok = hmac.compare_digest(
                 password.encode("utf-8"), str(self.app.config["PASSWORD"]).encode("utf-8")
             )
-            client_ip = _log_safe_ip(request.remote_addr)
+            client_ip = _log_safe_ip(self._rate_limit_remote_addr())
             if user_ok and pass_ok:
                 return self._complete_login(client_ip)
             self.app.logger.warning("Login failed (invalid credentials) from %s", client_ip)
@@ -710,7 +710,7 @@ class _PanelRuntime:
             )
             return redirect(url_for("index"))
         session.clear()
-        self.app.logger.info("Logout from %s", _log_safe_ip(request.remote_addr))
+        self.app.logger.info("Logout from %s", _log_safe_ip(self._rate_limit_remote_addr()))
         return redirect(url_for("login"))
 
     def _validate_logout_session(self):

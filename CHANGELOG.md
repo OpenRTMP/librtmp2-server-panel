@@ -16,10 +16,10 @@ only begin at a future `1.0.0`.
 ## [0.1.14] — 2026-11-01
 
 ### Security
-- The rate-limit client key fails closed when the WSGI environment carries no
-  direct peer address: such requests share one `unknown` bucket instead of
-  trusting a forwarded header that could not be checked against
-  `TRUSTED_PROXY_IPS`.
+- With `TRUSTED_PROXY_COUNT` set, the rate-limit client key fails closed when
+  the WSGI environment carries no direct peer address: such requests share one
+  `unknown` bucket instead of trusting a forwarded header that could not be
+  checked against `TRUSTED_PROXY_IPS`.
 
 ### Added
 - `LOG_LEVEL` (`0`-`3` like librtmp2-server, or a level name; default info)
@@ -27,7 +27,9 @@ only begin at a future `1.0.0`.
   log lines were never printed before, because only Gunicorn's loggers were
   configured.
 - Startup line with the API URL (userinfo dropped), login mode and log level.
-- Logins (success and failure, with the client IP), logouts and stream,
+- Logins (success and failure, with the client IP as resolved for rate
+  limiting, so a spoofed `X-Forwarded-For` from an untrusted peer is not
+  logged), logouts and stream,
   player and cluster-node changes are logged at info. Stream ids appear as
   the existing keyed `stream_tag`.
 - Failed librtmp2-server API calls (timeout, unreachable, non-2xx status)
