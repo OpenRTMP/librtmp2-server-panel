@@ -10043,6 +10043,84 @@ def _record_local_awaitable_assignment(
         local_state["awaitables"].discard(name)
 
 
+
+def _record_local_async_with_stack_bindings(node, operator_bindings, local_state):
+    """Record local AsyncExitStack names introduced by an async with."""
+    if not isinstance(node, ast.AsyncWith):
+        return
+    for item in node.items:
+        if not isinstance(item.optional_vars, ast.Name):
+            continue
+        if not _contextlib_async_exit_stack_constructor(
+            item.context_expr, operator_bindings
+        ):
+            continue
+        name = item.optional_vars.id
+        local_state["async_exit_stack_names"].add(name)
+        local_state["async_exit_stack_with_names"].add(name)
+
+
+def _record_local_async_stack_assignment(
+    name, value, operator_bindings, local_state, *, conditional
+):
+    """Track stack aliases while preserving conditional binding semantics."""
+    stack_names = local_state["async_exit_stack_names"]
+    with_names = local_state["async_exit_stack_with_names"]
+    alias_name = value.id if isinstance(value, ast.Name) else None
+    is_stack = (
+        _contextlib_async_exit_stack_constructor(value, operator_bindings)
+        or alias_name in stack_names
+    )
+    is_with_stack = alias_name in with_names
+    if is_stack:
+        stack_names.add(name)
+    elif not conditional:
+        stack_names.discard(name)
+    if is_with_stack:
+        with_names.add(name)
+    elif not conditional:
+        with_names.discard(name)
+
+
+def _record_local_async_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Update source-ordered local async bindings for one assignment."""
+    _record_local_async_stack_assignment(
+        name, value, operator_bindings, local_state, conditional=conditional
+    )
+    local_state["bound_names"].add(name)
+    local_state["asyncio_modules"].discard(name)
+    local_state["consumer_names"].discard(name)
+    local_state["task_factory_names"].discard(name)
+    _record_local_async_wrapper_assignment(
+        name,
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+        conditional=conditional,
+    )
+    _record_local_awaitable_assignment(
+        name,
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+        conditional=conditional,
+    )
+    if not conditional:
+        local_state["callback_mutators"].discard(name)
+
+
 def _record_local_async_bindings(
     node,
     operator_bindings,
@@ -10053,19 +10131,7 @@ def _record_local_async_bindings(
     conditional,
 ):
     """Update local imports, wrappers, callbacks, and stored awaitables."""
-    if isinstance(node, ast.AsyncWith):
-        for item in node.items:
-            if (
-                isinstance(item.optional_vars, ast.Name)
-                and _contextlib_async_exit_stack_constructor(
-                    item.context_expr,
-                    operator_bindings,
-                )
-            ):
-                local_state["async_exit_stack_names"].add(item.optional_vars.id)
-                local_state["async_exit_stack_with_names"].add(
-                    item.optional_vars.id
-                )
+    _record_local_async_with_stack_bindings(node, operator_bindings, local_state)
     if _record_local_asyncio_import(node, local_state):
         return isinstance(node, (ast.Import, ast.ImportFrom))
     if _record_local_async_definition(
@@ -10075,37 +10141,8 @@ def _record_local_async_bindings(
         conditional=conditional,
     ):
         return True
-
     for name, value in _namespace_assignment_values(node):
-        stack_names = local_state["async_exit_stack_names"]
-        with_names = local_state["async_exit_stack_with_names"]
-        alias_name = value.id if isinstance(value, ast.Name) else None
-        is_stack = (
-            _contextlib_async_exit_stack_constructor(value, operator_bindings)
-            or alias_name in stack_names
-        )
-        is_with_stack = alias_name in with_names
-        if is_stack:
-            stack_names.add(name)
-        elif not conditional:
-            stack_names.discard(name)
-        if is_with_stack:
-            with_names.add(name)
-        elif not conditional:
-            with_names.discard(name)
-        local_state["bound_names"].add(name)
-        local_state["asyncio_modules"].discard(name)
-        local_state["consumer_names"].discard(name)
-        local_state["task_factory_names"].discard(name)
-        _record_local_async_wrapper_assignment(
-            name,
-            value,
-            operator_bindings,
-            reference_line,
-            local_state,
-            conditional=conditional,
-        )
-        _record_local_awaitable_assignment(
+        _record_local_async_assignment(
             name,
             value,
             operator_bindings,
@@ -10114,10 +10151,7 @@ def _record_local_async_bindings(
             seen,
             conditional=conditional,
         )
-        if not conditional:
-            local_state["callback_mutators"].discard(name)
     return False
-
 
 def _asyncio_task_factory_reference_is_active(
     node,
@@ -10197,6 +10231,77 @@ def _statement_schedules_mutating_asyncio_task(
     )
 
 
+
+def _async_statement_has_mutating_awaitable(
+    node, operator_bindings, reference_line, local_state, seen
+):
+    """Detect directly awaited, scheduled, or registered worker mutations."""
+    return (
+        _statement_awaits_mutating_asyncio(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+        or _statement_schedules_mutating_asyncio_task(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+        or _statement_async_exit_stack_push_mutates_workers(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+    )
+
+
+def _end_local_async_with_scope(node, local_state):
+    """Stop tracking automatic exits after the containing async with block."""
+    if not isinstance(node, ast.AsyncWith):
+        return
+    for item in node.items:
+        if isinstance(item.optional_vars, ast.Name):
+            local_state["async_exit_stack_with_names"].discard(
+                item.optional_vars.id
+            )
+
+
+def _async_statement_mutates_workers_via_asyncio(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Analyze one statement and recursively visit its executable blocks."""
+    if _record_local_async_bindings(
+        node,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+        conditional=conditional,
+    ):
+        return False
+    if _async_statement_has_mutating_awaitable(
+        node, operator_bindings, reference_line, local_state, seen
+    ):
+        return True
+    # With-bodies execute after successful entry; their assignments replace
+    # existing local bindings. Other compound branches remain conditional.
+    block_conditional = (
+        conditional if isinstance(node, (ast.With, ast.AsyncWith)) else True
+    )
+    for block in _compound_statement_blocks(node):
+        if _async_statements_mutate_workers_via_asyncio(
+            block,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+            conditional=block_conditional,
+        ):
+            return True
+    _end_local_async_with_scope(node, local_state)
+    return False
+
+
 def _async_statements_mutate_workers_via_asyncio(
     statements,
     operator_bindings,
@@ -10208,7 +10313,7 @@ def _async_statements_mutate_workers_via_asyncio(
 ):
     """Scan async statements while excluding uninvoked nested function bodies."""
     for node in statements:
-        if _record_local_async_bindings(
+        if _async_statement_mutates_workers_via_asyncio(
             node,
             operator_bindings,
             reference_line,
@@ -10216,54 +10321,8 @@ def _async_statements_mutate_workers_via_asyncio(
             seen,
             conditional=conditional,
         ):
-            continue
-        if _statement_awaits_mutating_asyncio(
-            node,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        ):
             return True
-        if _statement_schedules_mutating_asyncio_task(
-            node,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        ):
-            return True
-        if _statement_async_exit_stack_push_mutates_workers(
-            node,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        ):
-            return True
-        for block in _compound_statement_blocks(node):
-            if _async_statements_mutate_workers_via_asyncio(
-                block,
-                operator_bindings,
-                reference_line,
-                local_state,
-                seen,
-                # A with-body runs when entry succeeds; assignments there
-                # supersede earlier local bindings in source order.
-                conditional=conditional if isinstance(
-                    node, (ast.With, ast.AsyncWith)
-                ) else True,
-            ):
-                return True
-        if isinstance(node, ast.AsyncWith):
-            # An instance may survive the block, but automatic exit does not.
-            for item in node.items:
-                if isinstance(item.optional_vars, ast.Name):
-                    local_state["async_exit_stack_with_names"].discard(
-                        item.optional_vars.id
-                    )
     return False
-
 
 def _async_function_mutates_workers_via_asyncio(
     func_node,
