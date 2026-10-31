@@ -13,6 +13,29 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-11-01
+
+### Security
+- With `TRUSTED_PROXY_COUNT` set, the rate-limit client key fails closed when
+  the WSGI environment carries no direct peer address: such requests share one
+  `unknown` bucket instead of trusting a forwarded header that could not be
+  checked against `TRUSTED_PROXY_IPS`.
+
+### Added
+- `LOG_LEVEL` (`0`-`3` like librtmp2-server, or a level name; default info)
+  and a stderr log format with timestamps. Under Gunicorn the panel's own
+  log lines were never printed before, because only Gunicorn's loggers were
+  configured.
+- Startup line with the API URL (userinfo dropped), login mode and log level.
+- Logins (success and failure, with the client IP as resolved for rate
+  limiting, so a spoofed `X-Forwarded-For` from an untrusted peer is not
+  logged), logouts and stream,
+  player and cluster-node changes are logged at info. Stream ids appear as
+  the existing keyed `stream_tag`.
+- Failed librtmp2-server API calls (timeout, unreachable, non-2xx status)
+  are logged with the operation and duration, and every call is logged at
+  debug. URLs are never logged, since stats URLs embed the stats key.
+
 ### Fixed
 - Closed further Gunicorn worker-detection gaps so a memory-backed rate limit
   and a per-process session store are refused whenever a config can raise the
@@ -30,6 +53,16 @@ only begin at a future `1.0.0`.
   unresolvable callee that receives the module namespace, and a Gunicorn
   launch whose configuration file cannot be located while the inherited
   working directory shows that the config changed the launch directory.
+- The Gunicorn worker scan also catches workers mutations hidden in
+  `builtins.dict.__setitem__`, a metaclass `__prepare__` or `__getitem__`,
+  Enum member `__init__` and `_generate_next_value_`, nested `Outer.Inner()`
+  constructors, instance subscript side effects, `operator.call(partial(...))`
+  (also walrus-bound, via `getattr`, `object.__getattribute__` or
+  `types.MethodType`), named `weakref.finalize` callbacks, context-manager
+  entry and exit hooks (`__enter__`/`__exit__`, `__aenter__`/`__aexit__`,
+  including a direct `asyncio.run(obj.__aenter__())`), `@contextmanager`
+  methods, `ExitStack.enter_context`, `enter_async_context` and
+  `contextlib.closing()`.
 - The upstream per-stream stats read now uses a timeout that fits the
   browser's abort window, so an abandoned request no longer keeps an
   upstream read (and a worker thread) alive.
@@ -37,6 +70,12 @@ only begin at a future `1.0.0`.
   play key, which the server deliberately protects.
 - The container entrypoint now starts the default command when it is called
   without arguments and handles a flag-first invocation.
+
+### Changed
+- Dependency updates: WTForms 3.3.1, certifi 2026.10.23, Deprecated 3.0.1,
+  wrapt 2.5.2.
+- CI: the reusable Docker workflow declares only the Quay credentials it
+  needs; docker/login-action v4.7.0 and a newer setup-python pin.
 
 ## [0.1.13] — 2026-10-21
 
@@ -454,7 +493,9 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.13...v0.1.14
+[0.1.13]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...v0.1.10

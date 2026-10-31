@@ -1,7 +1,10 @@
+import logging
 import time
 from urllib.parse import quote
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class Lrtmp2ApiError(Exception):
@@ -97,24 +100,56 @@ class Lrtmp2Client:
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _request(self, request_func, url, operation, timeout=None, **kwargs):
+    def _request(
+        self, request_func, url, operation, timeout=None, ok_404=False, **kwargs
+    ):
         """Perform an HTTP request, translating network-level failures (connection
         refused, DNS failure, timeout, ...) into Lrtmp2ApiError so callers only ever
         need to catch one exception type instead of the request crashing the panel."""
+        # Log the operation name, never the URL: stats URLs embed the stats key.
+        # perf_counter, not monotonic: the delete drain deadline uses
+        # monotonic, and request timing must not interleave with it.
+        started = time.perf_counter()
         try:
-            return request_func(
+            resp = request_func(
                 url,
                 timeout=self.timeout if timeout is None else timeout,
                 **kwargs,
             )
         except requests.exceptions.Timeout as exc:
+            logger.warning(
+                "librtmp2-server API: %s timed out after %.1fs",
+                operation,
+                time.perf_counter() - started,
+            )
             raise Lrtmp2ApiError(
                 f"{operation} failed: librtmp2-server did not respond in time"
             ) from exc
         except requests.exceptions.RequestException as exc:
+            logger.warning(
+                "librtmp2-server API: %s could not reach the server: %s",
+                operation,
+                type(exc).__name__,
+            )
             raise Lrtmp2ApiError(
                 f"{operation} failed: could not reach librtmp2-server"
             ) from exc
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        status = getattr(resp, "status_code", None)
+        # Only 2xx is expected (requests' resp.ok also accepts a final 3xx),
+        # plus 404 where the caller treats it as success (the idempotent
+        # stream/player deletes).
+        expected = (isinstance(status, int) and 200 <= status < 300) or (
+            ok_404 and status == 404
+        )
+        logger.log(
+            logging.DEBUG if expected else logging.WARNING,
+            "librtmp2-server API: %s -> HTTP %s in %.0f ms",
+            operation,
+            status,
+            elapsed_ms,
+        )
+        return resp
 
     def _request_json(self, request_func, url, operation, **kwargs):
         """_request + the raise-on-error/parse-JSON sequence shared by every
@@ -205,6 +240,7 @@ class Lrtmp2Client:
             "delete_stream",
             headers=self._headers(),
             timeout=self.admin_timeout,
+            ok_404=True,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_stream")
@@ -249,6 +285,7 @@ class Lrtmp2Client:
             "delete_player",
             headers=self._headers(),
             timeout=self.admin_timeout,
+            ok_404=True,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_player")

@@ -1,12 +1,13 @@
 import hashlib
 import hmac
 import ipaddress
+import logging
 import math
 import re
 import secrets
 import threading
 from functools import wraps
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from flask_limiter import Limiter
@@ -231,6 +232,63 @@ def _normalize_cluster_metrics(cluster):
 def _append_api_error(current, error):
     text = str(error)
     return text if current is None else f"{current}; {text}"
+
+
+# Loggers that follow LOG_LEVEL down to DEBUG; everything else stays at INFO+.
+_PANEL_LOGGERS = ("lrtmp2_client", "session_store")
+
+
+def _configure_logging(app):
+    """Send panel, client and session-store logs to stderr at LOG_LEVEL.
+
+    Gunicorn configures only its own loggers, so without this the panel's
+    INFO lines (logins, stream changes) were never printed.
+    """
+    level = getattr(logging, app.config["LOG_LEVEL"])
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)-7s %(name)s: %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            )
+        )
+        root.addHandler(handler)
+    # DEBUG goes to the panel's own loggers only: third-party loggers such
+    # as urllib3 log full request URLs at debug, and stats URLs carry the
+    # stats key.
+    root.setLevel(max(level, logging.INFO))
+    for name in _PANEL_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+    app.logger.setLevel(level)
+    if not app.config["LOG_LEVEL_VALID"]:
+        app.logger.warning("Ignoring invalid LOG_LEVEL; using INFO (expected 0-3 or a level name)")
+
+
+def _api_url_for_log(url):
+    """Drop any userinfo from the API URL before it is logged."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        # A malformed port must not stop the panel from starting; the API
+        # calls will report the bad URL themselves.
+        port = None
+    if port:
+        host = f"{host}:{port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def _log_safe_ip(addr):
+    """Normalize a client address for logging; anything unparsable is masked."""
+    try:
+        return str(ipaddress.ip_address(addr))
+    except (TypeError, ValueError):
+        return "unknown"
 
 
 def _configure_proxy(app):
@@ -586,18 +644,21 @@ class _PanelRuntime:
             pass_ok = hmac.compare_digest(
                 password.encode("utf-8"), str(self.app.config["PASSWORD"]).encode("utf-8")
             )
+            client_ip = _log_safe_ip(self._rate_limit_remote_addr())
             if user_ok and pass_ok:
-                return self._complete_login()
+                return self._complete_login(client_ip)
+            self.app.logger.warning("Login failed (invalid credentials) from %s", client_ip)
             error = "Invalid credentials"
         return render_template(LOGIN_HTML, error=error)
 
-    def _complete_login(self):
+    def _complete_login(self, client_ip):
         try:
             self._establish_logged_in_session()
         except SessionBackendUnavailable:
             self.app.logger.exception("Session backend unavailable during login")
             error = "Authentication service temporarily unavailable. Please try again."
             return render_template(LOGIN_HTML, error=error), 503
+        self.app.logger.info("Login succeeded from %s", client_ip)
         return redirect(url_for("index"))
 
     def handle_csrf_error(self, error):
@@ -649,6 +710,7 @@ class _PanelRuntime:
             )
             return redirect(url_for("index"))
         session.clear()
+        self.app.logger.info("Logout from %s", _log_safe_ip(self._rate_limit_remote_addr()))
         return redirect(url_for("login"))
 
     def _validate_logout_session(self):
@@ -958,6 +1020,7 @@ class _PanelRuntime:
                 session["flash_error"] = "Unknown cluster action"
             else:
                 handler(parsed_id)
+                self.app.logger.info("Cluster node %d: %s requested", parsed_id, action)
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("cluster_overview"))
@@ -1060,7 +1123,9 @@ class _PanelRuntime:
             return None, str(exc)
         created_id = result.get("id") if isinstance(result, dict) else None
         if not created_id:
+            self.app.logger.warning("Create stream: server returned an invalid response")
             return None, "Server returned an invalid create-stream response."
+        self.app.logger.info("Stream created (stream_tag=%s)", self._stream_tag(str(created_id)))
         return created_id, None
 
     def stream_created(self):
@@ -1095,6 +1160,7 @@ class _PanelRuntime:
             return redirect(url_for("index"))
         try:
             self.client.create_player(stream_id, name=name, play_key=play_key)
+            self.app.logger.info("Player added (stream_tag=%s)", self._stream_tag(stream_id))
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
@@ -1116,6 +1182,7 @@ class _PanelRuntime:
             return redirect(url_for("index"))
         try:
             self.client.delete_player(stream_id, player_id)
+            self.app.logger.info("Player deleted (stream_tag=%s)", self._stream_tag(stream_id))
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
         return redirect(url_for("index"))
@@ -1133,23 +1200,26 @@ class _PanelRuntime:
                 return redirect(url_for("index"))
             try:
                 self.client.delete_stream(stream_id)
+                self.app.logger.info("Stream deleted (stream_tag=%s)", self._stream_tag(stream_id))
             finally:
                 _stream_delete_drain_slots.release()
         except Lrtmp2ApiError as exc:
             self._handle_delete_stream_error(stream_id, exc)
         return redirect(url_for("index"))
 
-    def _handle_delete_stream_error(self, stream_id, exc):
+    def _stream_tag(self, stream_id):
         # Log a keyed correlation tag instead of the raw user-controlled
         # stream_id (SonarCloud pythonsecurity:S5145).
-        stream_tag = hmac.new(
+        return hmac.new(
             self.app.config["SECRET_KEY"].encode(),
             stream_id.encode(),
             hashlib.sha256,
         ).hexdigest()[:12]
+
+    def _handle_delete_stream_error(self, stream_id, exc):
         self.app.logger.warning(
             "Delete stream failed (stream_tag=%s): %s",
-            stream_tag,
+            self._stream_tag(stream_id),
             exc,
         )
         session["flash_error"] = str(exc)
@@ -1253,6 +1323,13 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+    _configure_logging(app)
+    app.logger.info(
+        "librtmp2-server-panel starting: API %s, login %s, log level %s",
+        _api_url_for_log(app.config["LRTMP2_API_URL"]),
+        "required" if app.config["REQUIRE_LOGIN"] else "DISABLED",
+        app.config["LOG_LEVEL"],
+    )
     _configure_proxy(app)
     _configure_security_defaults(app)
     # index.html skips the forms whose upstream id cannot fill a URL rule.
