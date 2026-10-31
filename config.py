@@ -6291,6 +6291,10 @@ def _async_exit_stack_callback_mutates_workers(
             for candidate in candidates
         ):
             return True
+        # A local callback shadows any same-named mutator found in the global
+        # scan; falling back to that old name would resurrect stale bindings.
+        if callback.id in local_state.get("bound_names", set()):
+            return False
     return _thread_pool_callback_mutates_workers(callback, operator_bindings)
 
 
@@ -10244,7 +10248,11 @@ def _async_statements_mutate_workers_via_asyncio(
                 reference_line,
                 local_state,
                 seen,
-                conditional=True,
+                # A with-body runs when entry succeeds; assignments there
+                # supersede earlier local bindings in source order.
+                conditional=conditional if isinstance(
+                    node, (ast.With, ast.AsyncWith)
+                ) else True,
             ):
                 return True
         if isinstance(node, ast.AsyncWith):
