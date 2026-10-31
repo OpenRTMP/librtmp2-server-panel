@@ -66,3 +66,19 @@ def test_api_error_status_is_logged_without_url(caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert any("stream_stats -> HTTP 500" in m for m in messages)
     assert not any("secret-stats-key" in m for m in messages)
+
+
+def test_debug_level_does_not_enable_third_party_url_logging(monkeypatch):
+    import app as app_module
+
+    application = app_module.create_app()
+    application.config["LOG_LEVEL"] = "DEBUG"
+    app_module._configure_logging(application)
+    try:
+        assert logging.getLogger("lrtmp2_client").isEnabledFor(logging.DEBUG)
+        assert application.logger.isEnabledFor(logging.DEBUG)
+        # urllib3 logs "GET /stats?key=..." at debug.
+        assert not logging.getLogger("urllib3.connectionpool").isEnabledFor(logging.DEBUG)
+    finally:
+        application.config["LOG_LEVEL"] = "INFO"
+        app_module._configure_logging(application)

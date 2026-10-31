@@ -234,6 +234,10 @@ def _append_api_error(current, error):
     return text if current is None else f"{current}; {text}"
 
 
+# Loggers that follow LOG_LEVEL down to DEBUG; everything else stays at INFO+.
+_PANEL_LOGGERS = ("lrtmp2_client", "session_store")
+
+
 def _configure_logging(app):
     """Send panel, client and session-store logs to stderr at LOG_LEVEL.
 
@@ -251,7 +255,12 @@ def _configure_logging(app):
             )
         )
         root.addHandler(handler)
-    root.setLevel(level)
+    # DEBUG goes to the panel's own loggers only: third-party loggers such
+    # as urllib3 log full request URLs at debug, and stats URLs carry the
+    # stats key.
+    root.setLevel(max(level, logging.INFO))
+    for name in _PANEL_LOGGERS:
+        logging.getLogger(name).setLevel(level)
     app.logger.setLevel(level)
     if not app.config["LOG_LEVEL_VALID"]:
         app.logger.warning("Ignoring invalid LOG_LEVEL; using INFO (expected 0-3 or a level name)")
