@@ -45,6 +45,19 @@ _CASES = [
         "asyncio.run(main())\n",
         (1, True),
     ),
+    (
+        "AsyncExitStack push_async_callback rebinding workers is dynamic",
+        "workers = 1\n"
+        "from contextlib import AsyncExitStack\n"
+        "import asyncio\n"
+        "async def main():\n"
+        "    async with AsyncExitStack() as s:\n"
+        "        async def cb():\n"
+        "            globals().__setitem__('workers', 4)\n"
+        "        s.push_async_callback(cb)\n"
+        "asyncio.run(main())\n",
+        (1, True),
+    ),
 ]
 
 

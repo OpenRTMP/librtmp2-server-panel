@@ -5200,6 +5200,7 @@ _EXIT_STACK_ALIAS_EVENTS_KEY = object()
 _CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY = object()
 _CONTEXTLIB_NAME_ALIAS_EVENTS_KEY = object()
 _EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
+_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
 
@@ -5546,6 +5547,36 @@ def _contextlib_exit_stack_constructor(value, operator_bindings):
             reference_line,
         )
     if not (isinstance(func, ast.Attribute) and func.attr == "ExitStack"):
+        return False
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _contextlib_async_exit_stack_constructor(value, operator_bindings):
+    """Return True when ``value`` constructs a contextlib.AsyncExitStack."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    reference_line = getattr(value, "lineno", 0)
+    binding_store = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    async_exit_stack_class_events = binding_store.get(
+        _ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY,
+        {},
+    )
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            async_exit_stack_class_events,
+            func.id,
+            reference_line,
+        )
+    if not (isinstance(func, ast.Attribute) and func.attr == "AsyncExitStack"):
         return False
     module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
     return _module_alias_active_at_line(
@@ -6234,6 +6265,76 @@ def _call_is_exit_stack_callback_mutation(call, operator_bindings):
         call.func.value,
         operator_bindings,
         getattr(call, "lineno", 0),
+    )
+
+
+def _async_exit_stack_callback_mutates_workers(
+    callback,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Return True when an AsyncExitStack callback can mutate module workers."""
+    if isinstance(callback, ast.Name):
+        async_def = local_state.get("async_defs", {}).get(callback.id)
+        if async_def is not None and _async_function_mutates_workers_via_asyncio(
+            async_def,
+            operator_bindings,
+            reference_line,
+            seen=seen,
+        ):
+            return True
+        if async_def is not None and _function_mutates_workers(
+            async_def,
+            operator_bindings,
+        ):
+            return True
+    return _thread_pool_callback_mutates_workers(callback, operator_bindings)
+
+
+def _call_is_async_exit_stack_push_async_callback_mutation(
+    call,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen=None,
+):
+    """Return True for ``stack.push_async_callback(...)`` on a tracked AsyncExitStack."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "push_async_callback" or not call.args:
+        return False
+    if not isinstance(call.func.value, ast.Name):
+        return False
+    if call.func.value.id not in local_state.get("async_exit_stack_names", set()):
+        return False
+    return _async_exit_stack_callback_mutates_workers(
+        call.args[0],
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+    )
+
+
+def _statement_async_exit_stack_push_mutates_workers(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Return True when a statement registers a mutating AsyncExitStack callback."""
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call):
+        return False
+    return _call_is_async_exit_stack_push_async_callback_mutation(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
     )
 
 
@@ -9490,6 +9591,8 @@ def _new_local_async_state(
         "task_factory_names": set(),
         "callback_mutators": set(),
         "bound_names": bound_names,
+        "async_exit_stack_names": set(),
+        "async_defs": {},
     }
 
 
@@ -9809,6 +9912,7 @@ def _record_local_async_definition(
                 frozenset(),
             )
         local_state["wrappers"][node.name] = candidates
+        local_state["async_defs"][node.name] = node
         return True
     if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
         return False
@@ -9915,6 +10019,17 @@ def _record_local_async_bindings(
     conditional,
 ):
     """Update local imports, wrappers, callbacks, and stored awaitables."""
+    if isinstance(node, ast.AsyncWith):
+        line = getattr(node, "lineno", 0)
+        for item in node.items:
+            if (
+                isinstance(item.optional_vars, ast.Name)
+                and _contextlib_async_exit_stack_constructor(
+                    item.context_expr,
+                    operator_bindings,
+                )
+            ):
+                local_state["async_exit_stack_names"].add(item.optional_vars.id)
     if _record_local_asyncio_import(node, local_state):
         return isinstance(node, (ast.Import, ast.ImportFrom))
     if _record_local_async_definition(
@@ -10059,6 +10174,14 @@ def _async_statements_mutate_workers_via_asyncio(
         ):
             return True
         if _statement_schedules_mutating_asyncio_task(
+            node,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+        ):
+            return True
+        if _statement_async_exit_stack_push_mutates_workers(
             node,
             operator_bindings,
             reference_line,
@@ -22140,6 +22263,9 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
     )
+    operator_bindings[32][_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
+    )
     operator_bindings[32]["contextmanager_alias_events"] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
     )
@@ -22330,6 +22456,9 @@ def _scan_gunicorn_config_worker_details(tree):
     }
     operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    operator_bindings[32][_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
     )
     operator_bindings[32]["contextmanager_alias_events"] = (
         _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
