@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 from unittest.mock import patch
@@ -116,10 +117,9 @@ def test_404_is_quiet_only_for_the_idempotent_deletes(caplog, call, ok_404_expec
     with patch("lrtmp2_client.requests.get", return_value=resp), patch(
         "lrtmp2_client.requests.delete", return_value=resp
     ), caplog.at_level(logging.DEBUG, logger="lrtmp2_client"):
-        try:
+        # Only the log level matters here; a raised API error is expected.
+        with contextlib.suppress(Lrtmp2ApiError):
             call(client)
-        except Lrtmp2ApiError:
-            pass
     levels = [r.levelno for r in caplog.records if "HTTP 404" in r.getMessage()]
     assert levels == [logging.DEBUG if ok_404_expected else logging.WARNING]
 
@@ -145,9 +145,8 @@ def test_final_3xx_response_logs_at_warning(caplog):
     with patch("lrtmp2_client.requests.get", return_value=resp), caplog.at_level(
         logging.DEBUG, logger="lrtmp2_client"
     ):
-        try:
+        # Only the log level matters here; a raised API error is expected.
+        with contextlib.suppress(Lrtmp2ApiError):
             client.health()
-        except Lrtmp2ApiError:
-            pass
     levels = [r.levelno for r in caplog.records if "HTTP 304" in r.getMessage()]
     assert levels == [logging.WARNING]
