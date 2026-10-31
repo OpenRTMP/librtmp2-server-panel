@@ -5198,7 +5198,9 @@ _OPERATOR_CALL_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_ALIAS_EVENTS_KEY = object()
 _EXIT_STACK_ALIAS_EVENTS_KEY = object()
 _CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY = object()
+_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY = object()
 _EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
+_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY = object()
 _MUTATING_CALLBACK_CONTAINER_EVENTS_KEY = object()
 
 
@@ -5545,6 +5547,36 @@ def _contextlib_exit_stack_constructor(value, operator_bindings):
             reference_line,
         )
     if not (isinstance(func, ast.Attribute) and func.attr == "ExitStack"):
+        return False
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _contextlib_async_exit_stack_constructor(value, operator_bindings):
+    """Return True when ``value`` constructs a contextlib.AsyncExitStack."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    reference_line = getattr(value, "lineno", 0)
+    binding_store = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    async_exit_stack_class_events = binding_store.get(
+        _ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY,
+        {},
+    )
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            async_exit_stack_class_events,
+            func.id,
+            reference_line,
+        )
+    if not (isinstance(func, ast.Attribute) and func.attr == "AsyncExitStack"):
         return False
     module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
     return _module_alias_active_at_line(
@@ -6236,6 +6268,81 @@ def _call_is_exit_stack_callback_mutation(call, operator_bindings):
     )
 
 
+def _async_exit_stack_callback_mutates_workers(
+    callback,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Check current async callback bindings, including aliases and rebinding."""
+    if isinstance(callback, ast.Name):
+        candidates = local_state.get("wrappers", {}).get(
+            callback.id, frozenset()
+        )
+        if any(
+            _async_function_mutates_workers_via_asyncio(
+                candidate,
+                operator_bindings,
+                reference_line,
+                seen=seen,
+            )
+            or _function_mutates_workers(candidate, operator_bindings)
+            for candidate in candidates
+        ):
+            return True
+        # A local callback shadows any same-named mutator found in the global
+        # scan; falling back to that old name would resurrect stale bindings.
+        if callback.id in local_state.get("bound_names", set()):
+            return False
+    return _thread_pool_callback_mutates_workers(callback, operator_bindings)
+
+
+def _call_is_async_exit_stack_push_async_callback_mutation(
+    call,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen=None,
+):
+    """Return True for ``stack.push_async_callback(...)`` on a tracked AsyncExitStack."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "push_async_callback" or not call.args:
+        return False
+    if not isinstance(call.func.value, ast.Name):
+        return False
+    if call.func.value.id not in local_state.get("async_exit_stack_names", set()):
+        return False
+    return _async_exit_stack_callback_mutates_workers(
+        call.args[0],
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+    )
+
+
+def _statement_async_exit_stack_push_mutates_workers(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+):
+    """Return True when a statement registers a mutating AsyncExitStack callback."""
+    expr = _statement_value_expression(node)
+    if not isinstance(expr, ast.Call):
+        return False
+    return _call_is_async_exit_stack_push_async_callback_mutation(
+        expr,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+    )
+
+
 def _collect_exit_stack_close_events(tree, operator_bindings):
     """Track import-time ExitStack exits, not merely registrations."""
     events = {}
@@ -6307,6 +6414,149 @@ def _call_is_exit_stack_enter_context_mutation(
         include_exit=_exit_stack_closes_after_enter(
             call.func.value.id, reference_line, operator_bindings
         ),
+    )
+
+
+def _contextlib_imported_name_constructor(value, class_name, operator_bindings):
+    """Return True when ``value`` constructs a named ``contextlib`` helper."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    reference_line = getattr(value, "lineno", 0)
+    binding_store = (
+        operator_bindings[32] if len(operator_bindings) > 32 else {}
+    )
+    class_events = binding_store.get(
+        _CONTEXTLIB_NAME_ALIAS_EVENTS_KEY,
+        {},
+    ).get(class_name, {})
+    if isinstance(func, ast.Name):
+        return _imported_alias_is_active(
+            class_events,
+            func.id,
+            reference_line,
+        )
+    if not (isinstance(func, ast.Attribute) and func.attr == class_name):
+        return False
+    module_events = binding_store.get(_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY, {})
+    return _module_alias_active_at_line(
+        func.value,
+        set(),
+        module_events,
+        reference_line,
+    )
+
+
+def _contextlib_closing_constructor(value, operator_bindings):
+    """Return True when ``value`` constructs ``contextlib.closing(...)``."""
+    return _contextlib_imported_name_constructor(
+        value,
+        "closing",
+        operator_bindings,
+    )
+
+
+def _contextlib_closing_close_mutates_workers(
+    item,
+    reference_line,
+    class_targets,
+    instance_events,
+    operator_bindings,
+    local_class_aliases,
+):
+    """Return True when ``with closing(obj):`` runs a mutating ``obj.close()``."""
+    if not _contextlib_closing_constructor(
+        item.context_expr,
+        operator_bindings,
+    ):
+        return False
+    if not item.context_expr.args:
+        return False
+    wrapped = _resolve_local_class_context(
+        item.context_expr.args[0],
+        local_class_aliases,
+        reference_line,
+    )
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    close_call = ast.Call(
+        func=ast.Attribute(
+            value=wrapped,
+            attr="close",
+            ctx=ast.Load(),
+        ),
+        args=[],
+        keywords=[],
+    )
+    return _attribute_call_triggers_workers(
+        close_call,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+        operator_bindings,
+    )
+
+
+def _async_exit_stack_receiver_is_tracked(receiver, operator_bindings, local_state):
+    """Accept a real AsyncExitStack constructor or a tracked local instance."""
+    if _contextlib_async_exit_stack_constructor(receiver, operator_bindings):
+        return True
+    return (
+        isinstance(receiver, ast.Name)
+        and receiver.id in (local_state or {}).get("async_exit_stack_names", set())
+    )
+
+
+def _call_is_async_context_enter_mutation(
+    call,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings,
+    local_class_aliases=None,
+    local_state=None,
+):
+    """Detect async context entry without inventing exits or stack receivers."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr == "__aenter__":
+        context_expr = call.func.value
+        include_exit = False
+    elif call.func.attr == "enter_async_context" and call.args:
+        receiver = call.func.value
+        if not _async_exit_stack_receiver_is_tracked(
+            receiver, operator_bindings, local_state
+        ):
+            return False
+        context_expr = call.args[0]
+        # Only the surrounding async-with guarantees a subsequent stack exit.
+        include_exit = (
+            isinstance(receiver, ast.Name)
+            and receiver.id in (local_state or {}).get(
+                "async_exit_stack_with_names", set()
+            )
+        )
+    else:
+        return False
+    context_expr = _resolve_local_class_context(
+        context_expr,
+        local_class_aliases or {},
+        reference_line,
+    )
+    async_with = ast.AsyncWith(
+        items=[ast.withitem(context_expr=context_expr)],
+        body=[],
+    )
+    ast.copy_location(async_with, call)
+    return _context_manager_item_mutates_workers(
+        async_with.items[0],
+        async_with,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases or {},
+        include_exit=include_exit,
     )
 
 
@@ -9371,6 +9621,8 @@ def _new_local_async_state(
         "task_factory_names": set(),
         "callback_mutators": set(),
         "bound_names": bound_names,
+        "async_exit_stack_names": set(),
+        "async_exit_stack_with_names": set(),
     }
 
 
@@ -9494,6 +9746,18 @@ def _asyncio_awaitable_mutates_workers(
     """Return True when awaiting an expression can mutate module workers."""
     if not isinstance(expr, ast.Call):
         return False
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if class_targets:
+        instance_events = class_targets[6] if len(class_targets) > 6 else {}
+        if _call_is_async_context_enter_mutation(
+            expr,
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+            local_state=local_state,
+        ):
+            return True
     if local_state is None:
         local_state = {
             "wrappers": {},
@@ -9616,6 +9880,8 @@ def _clear_local_async_binding(name, local_state):
     local_state["wrappers"].pop(name, None)
     local_state["awaitables"].discard(name)
     local_state["callback_mutators"].discard(name)
+    local_state["async_exit_stack_names"].discard(name)
+    local_state["async_exit_stack_with_names"].discard(name)
 
 
 def _record_local_asyncio_module_imports(node, local_state):
@@ -9671,6 +9937,8 @@ def _record_local_async_definition(
         local_state["consumer_names"].discard(name)
         local_state["task_factory_names"].discard(name)
         local_state["asyncio_modules"].discard(name)
+        local_state["async_exit_stack_names"].discard(name)
+        local_state["async_exit_stack_with_names"].discard(name)
     if isinstance(node, ast.AsyncFunctionDef):
         candidates = frozenset({node})
         if conditional:
@@ -9775,6 +10043,83 @@ def _record_local_awaitable_assignment(
         local_state["awaitables"].discard(name)
 
 
+def _record_local_async_with_stack_bindings(node, operator_bindings, local_state):
+    """Record local AsyncExitStack names introduced by an async with."""
+    if not isinstance(node, ast.AsyncWith):
+        return
+    for item in node.items:
+        if not isinstance(item.optional_vars, ast.Name):
+            continue
+        if not _contextlib_async_exit_stack_constructor(
+            item.context_expr, operator_bindings
+        ):
+            continue
+        name = item.optional_vars.id
+        local_state["async_exit_stack_names"].add(name)
+        local_state["async_exit_stack_with_names"].add(name)
+
+
+def _record_local_async_stack_assignment(
+    name, value, operator_bindings, local_state, *, conditional
+):
+    """Track stack aliases while preserving conditional binding semantics."""
+    stack_names = local_state["async_exit_stack_names"]
+    with_names = local_state["async_exit_stack_with_names"]
+    alias_name = value.id if isinstance(value, ast.Name) else None
+    is_stack = (
+        _contextlib_async_exit_stack_constructor(value, operator_bindings)
+        or alias_name in stack_names
+    )
+    is_with_stack = alias_name in with_names
+    if is_stack:
+        stack_names.add(name)
+    elif not conditional:
+        stack_names.discard(name)
+    if is_with_stack:
+        with_names.add(name)
+    elif not conditional:
+        with_names.discard(name)
+
+
+def _record_local_async_assignment(
+    name,
+    value,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Update source-ordered local async bindings for one assignment."""
+    _record_local_async_stack_assignment(
+        name, value, operator_bindings, local_state, conditional=conditional
+    )
+    local_state["bound_names"].add(name)
+    local_state["asyncio_modules"].discard(name)
+    local_state["consumer_names"].discard(name)
+    local_state["task_factory_names"].discard(name)
+    _record_local_async_wrapper_assignment(
+        name,
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+        conditional=conditional,
+    )
+    _record_local_awaitable_assignment(
+        name,
+        value,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+        conditional=conditional,
+    )
+    if not conditional:
+        local_state["callback_mutators"].discard(name)
+
+
 def _record_local_async_bindings(
     node,
     operator_bindings,
@@ -9785,6 +10130,7 @@ def _record_local_async_bindings(
     conditional,
 ):
     """Update local imports, wrappers, callbacks, and stored awaitables."""
+    _record_local_async_with_stack_bindings(node, operator_bindings, local_state)
     if _record_local_asyncio_import(node, local_state):
         return isinstance(node, (ast.Import, ast.ImportFrom))
     if _record_local_async_definition(
@@ -9794,21 +10140,8 @@ def _record_local_async_bindings(
         conditional=conditional,
     ):
         return True
-
     for name, value in _namespace_assignment_values(node):
-        local_state["bound_names"].add(name)
-        local_state["asyncio_modules"].discard(name)
-        local_state["consumer_names"].discard(name)
-        local_state["task_factory_names"].discard(name)
-        _record_local_async_wrapper_assignment(
-            name,
-            value,
-            operator_bindings,
-            reference_line,
-            local_state,
-            conditional=conditional,
-        )
-        _record_local_awaitable_assignment(
+        _record_local_async_assignment(
             name,
             value,
             operator_bindings,
@@ -9817,8 +10150,6 @@ def _record_local_async_bindings(
             seen,
             conditional=conditional,
         )
-        if not conditional:
-            local_state["callback_mutators"].discard(name)
     return False
 
 
@@ -9900,6 +10231,76 @@ def _statement_schedules_mutating_asyncio_task(
     )
 
 
+def _async_statement_has_mutating_awaitable(
+    node, operator_bindings, reference_line, local_state, seen
+):
+    """Detect directly awaited, scheduled, or registered worker mutations."""
+    return (
+        _statement_awaits_mutating_asyncio(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+        or _statement_schedules_mutating_asyncio_task(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+        or _statement_async_exit_stack_push_mutates_workers(
+            node, operator_bindings, reference_line, local_state, seen
+        )
+    )
+
+
+def _end_local_async_with_scope(node, local_state):
+    """Stop tracking automatic exits after the containing async with block."""
+    if not isinstance(node, ast.AsyncWith):
+        return
+    for item in node.items:
+        if isinstance(item.optional_vars, ast.Name):
+            local_state["async_exit_stack_with_names"].discard(
+                item.optional_vars.id
+            )
+
+
+def _async_statement_mutates_workers_via_asyncio(
+    node,
+    operator_bindings,
+    reference_line,
+    local_state,
+    seen,
+    *,
+    conditional,
+):
+    """Analyze one statement and recursively visit its executable blocks."""
+    if _record_local_async_bindings(
+        node,
+        operator_bindings,
+        reference_line,
+        local_state,
+        seen,
+        conditional=conditional,
+    ):
+        return False
+    if _async_statement_has_mutating_awaitable(
+        node, operator_bindings, reference_line, local_state, seen
+    ):
+        return True
+    # With-bodies execute after successful entry; their assignments replace
+    # existing local bindings. Other compound branches remain conditional.
+    block_conditional = (
+        conditional if isinstance(node, (ast.With, ast.AsyncWith)) else True
+    )
+    for block in _compound_statement_blocks(node):
+        if _async_statements_mutate_workers_via_asyncio(
+            block,
+            operator_bindings,
+            reference_line,
+            local_state,
+            seen,
+            conditional=block_conditional,
+        ):
+            return True
+    _end_local_async_with_scope(node, local_state)
+    return False
+
+
 def _async_statements_mutate_workers_via_asyncio(
     statements,
     operator_bindings,
@@ -9911,7 +10312,7 @@ def _async_statements_mutate_workers_via_asyncio(
 ):
     """Scan async statements while excluding uninvoked nested function bodies."""
     for node in statements:
-        if _record_local_async_bindings(
+        if _async_statement_mutates_workers_via_asyncio(
             node,
             operator_bindings,
             reference_line,
@@ -9919,33 +10320,7 @@ def _async_statements_mutate_workers_via_asyncio(
             seen,
             conditional=conditional,
         ):
-            continue
-        if _statement_awaits_mutating_asyncio(
-            node,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        ):
             return True
-        if _statement_schedules_mutating_asyncio_task(
-            node,
-            operator_bindings,
-            reference_line,
-            local_state,
-            seen,
-        ):
-            return True
-        for block in _compound_statement_blocks(node):
-            if _async_statements_mutate_workers_via_asyncio(
-                block,
-                operator_bindings,
-                reference_line,
-                local_state,
-                seen,
-                conditional=True,
-            ):
-                return True
     return False
 
 
@@ -16729,6 +17104,15 @@ def _context_manager_item_mutates_workers(
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
+    if isinstance(with_node, ast.With) and _contextlib_closing_close_mutates_workers(
+        item,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases,
+    ):
+        return True
     if _expression_has_class_workers_side_effect(
         context_expr,
         class_targets,
@@ -21950,6 +22334,36 @@ def _gunicorn_config_has_runtime_hooks(
     return False
 
 
+def _record_contextlib_alias_events(tree, operator_bindings):
+    """Refresh contextlib alias events for the current worker-scan pass."""
+    alias_store = operator_bindings[32]
+    alias_store[_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
+        _collect_imported_module_alias_events(tree, "contextlib")
+    )
+    alias_store[_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
+        "closing": _collect_imported_name_alias_events(
+            tree,
+            "contextlib",
+            {"closing"},
+        ),
+    }
+    alias_store[_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    alias_store[_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
+    )
+    alias_store["contextmanager_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
+    )
+    alias_store[_EXIT_STACK_ALIAS_EVENTS_KEY] = (
+        _collect_exit_stack_alias_events(tree, operator_bindings)
+    )
+    alias_store["exit_stack_close_events"] = (
+        _collect_exit_stack_close_events(tree, operator_bindings)
+    )
+
+
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
@@ -21988,21 +22402,7 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
     )
-    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
-        _collect_imported_module_alias_events(tree, "contextlib")
-    )
-    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
-    )
-    operator_bindings[32]["contextmanager_alias_events"] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
-    )
-    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
-        _collect_exit_stack_alias_events(tree, operator_bindings)
-    )
-    operator_bindings[32]["exit_stack_close_events"] = (
-        _collect_exit_stack_close_events(tree, operator_bindings)
-    )
+    _record_contextlib_alias_events(tree, operator_bindings)
     operator_bindings[32]["weakref_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "weakref")
     )
@@ -22172,21 +22572,7 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
     )
-    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
-        _collect_imported_module_alias_events(tree, "contextlib")
-    )
-    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
-    )
-    operator_bindings[32]["contextmanager_alias_events"] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
-    )
-    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
-        _collect_exit_stack_alias_events(tree, operator_bindings)
-    )
-    operator_bindings[32]["exit_stack_close_events"] = (
-        _collect_exit_stack_close_events(tree, operator_bindings)
-    )
+    _record_contextlib_alias_events(tree, operator_bindings)
     asyncio_module_alias_events = _collect_imported_module_alias_events(
         tree,
         "asyncio",
