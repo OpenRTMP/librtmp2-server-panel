@@ -91,6 +91,7 @@ Copy `.env.example` to `.env` for a manual setup and adjust:
 | `USERNAME` / `PASSWORD` | Panel administrator credentials | When login is enabled |
 | `SECRET_KEY` | Flask session secret | Yes |
 | `RATELIMIT_STORAGE_URI` | Shared Flask-Limiter backend; quickstart uses Redis | No |
+| `LOG_LEVEL` | `0`=error `1`=warn `2`=info `3`=debug (same scale as librtmp2-server) or a level name; default `2`. Info logs logins, logouts and stream/player/cluster changes; debug adds every librtmp2-server API call with its status and duration | No |
 | `PANEL_PUBLIC_URL` | Public panel URL, used for secure-cookie detection | No |
 | `SESSION_COOKIE_SECURE` | Force secure cookies when served over HTTPS | No |
 | `TRUSTED_PROXY_COUNT` | Trusted value count used independently for `X-Forwarded-For` and `X-Forwarded-Proto`; default `0` ignores both | No |

@@ -23315,8 +23315,37 @@ def _validate_config():
 _validate_config()
 
 
+_LOG_LEVEL_NAMES = {
+    # Same numeric scale as librtmp2-server's LOG_LEVEL.
+    "0": "ERROR",
+    "1": "WARNING",
+    "2": "INFO",
+    "3": "DEBUG",
+    "ERROR": "ERROR",
+    "WARN": "WARNING",
+    "WARNING": "WARNING",
+    "INFO": "INFO",
+    "DEBUG": "DEBUG",
+}
+
+
+def _parse_log_level(raw):
+    """Parse LOG_LEVEL (0-3 like librtmp2-server, or a level name).
+
+    Returns ``(level_name, valid)``; blank/unset or unknown values fall back
+    to INFO so a typo never stops the panel from starting.
+    """
+    if raw is None or not raw.strip():
+        return "INFO", True
+    name = _LOG_LEVEL_NAMES.get(raw.strip().upper())
+    if name is None:
+        return "INFO", False
+    return name, True
+
+
 class Config:
     SECRET_KEY = os.environ["SECRET_KEY"]
+    LOG_LEVEL, LOG_LEVEL_VALID = _parse_log_level(os.environ.get("LOG_LEVEL"))
 
     REQUIRE_LOGIN = _parse_require_login(os.environ.get("REQUIRE_LOGIN"), True)
     USERNAME = os.environ.get("USERNAME", "admin")

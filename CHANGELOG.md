@@ -13,6 +13,19 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- `LOG_LEVEL` (`0`-`3` like librtmp2-server, or a level name; default info)
+  and a stderr log format with timestamps. Under Gunicorn the panel's own
+  log lines were never printed before, because only Gunicorn's loggers were
+  configured.
+- Startup line with the API URL (userinfo dropped), login mode and log level.
+- Logins (success and failure, with the client IP), logouts and stream,
+  player and cluster-node changes are logged at info. Stream ids appear as
+  the existing keyed `stream_tag`.
+- Failed librtmp2-server API calls (timeout, unreachable, non-2xx status)
+  are logged with the operation and duration, and every call is logged at
+  debug. URLs are never logged, since stats URLs embed the stats key.
+
 ### Fixed
 - Closed further Gunicorn worker-detection gaps so a memory-backed rate limit
   and a per-process session store are refused whenever a config can raise the
