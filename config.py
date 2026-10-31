@@ -10020,7 +10020,6 @@ def _record_local_async_bindings(
 ):
     """Update local imports, wrappers, callbacks, and stored awaitables."""
     if isinstance(node, ast.AsyncWith):
-        line = getattr(node, "lineno", 0)
         for item in node.items:
             if (
                 isinstance(item.optional_vars, ast.Name)
@@ -22212,6 +22211,36 @@ def _gunicorn_config_has_runtime_hooks(
     return False
 
 
+def _record_contextlib_alias_events(tree, operator_bindings):
+    """Refresh contextlib alias events for the current worker-scan pass."""
+    alias_store = operator_bindings[32]
+    alias_store[_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
+        _collect_imported_module_alias_events(tree, "contextlib")
+    )
+    alias_store[_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
+        "closing": _collect_imported_name_alias_events(
+            tree,
+            "contextlib",
+            {"closing"},
+        ),
+    }
+    alias_store[_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
+    )
+    alias_store[_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
+    )
+    alias_store["contextmanager_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
+    )
+    alias_store[_EXIT_STACK_ALIAS_EVENTS_KEY] = (
+        _collect_exit_stack_alias_events(tree, operator_bindings)
+    )
+    alias_store["exit_stack_close_events"] = (
+        _collect_exit_stack_close_events(tree, operator_bindings)
+    )
+
+
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
@@ -22250,31 +22279,7 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
     )
-    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
-        _collect_imported_module_alias_events(tree, "contextlib")
-    )
-    operator_bindings[32][_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
-        "closing": _collect_imported_name_alias_events(
-            tree,
-            "contextlib",
-            {"closing"},
-        ),
-    }
-    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
-    )
-    operator_bindings[32][_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
-    )
-    operator_bindings[32]["contextmanager_alias_events"] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
-    )
-    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
-        _collect_exit_stack_alias_events(tree, operator_bindings)
-    )
-    operator_bindings[32]["exit_stack_close_events"] = (
-        _collect_exit_stack_close_events(tree, operator_bindings)
-    )
+    _record_contextlib_alias_events(tree, operator_bindings)
     operator_bindings[32]["weakref_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "weakref")
     )
@@ -22444,31 +22449,7 @@ def _scan_gunicorn_config_worker_details(tree):
     operator_bindings[32][_MUTATING_CALLBACK_CONTAINER_EVENTS_KEY] = (
         callback_container_events
     )
-    operator_bindings[32][_CONTEXTLIB_MODULE_ALIAS_EVENTS_KEY] = (
-        _collect_imported_module_alias_events(tree, "contextlib")
-    )
-    operator_bindings[32][_CONTEXTLIB_NAME_ALIAS_EVENTS_KEY] = {
-        "closing": _collect_imported_name_alias_events(
-            tree,
-            "contextlib",
-            {"closing"},
-        ),
-    }
-    operator_bindings[32][_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"ExitStack"})
-    )
-    operator_bindings[32][_ASYNC_EXIT_STACK_CLASS_ALIAS_EVENTS_KEY] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"AsyncExitStack"})
-    )
-    operator_bindings[32]["contextmanager_alias_events"] = (
-        _collect_imported_name_alias_events(tree, "contextlib", {"contextmanager"})
-    )
-    operator_bindings[32][_EXIT_STACK_ALIAS_EVENTS_KEY] = (
-        _collect_exit_stack_alias_events(tree, operator_bindings)
-    )
-    operator_bindings[32]["exit_stack_close_events"] = (
-        _collect_exit_stack_close_events(tree, operator_bindings)
-    )
+    _record_contextlib_alias_events(tree, operator_bindings)
     asyncio_module_alias_events = _collect_imported_module_alias_events(
         tree,
         "asyncio",
