@@ -6275,19 +6275,20 @@ def _async_exit_stack_callback_mutates_workers(
     local_state,
     seen,
 ):
-    """Return True when an AsyncExitStack callback can mutate module workers."""
+    """Check current async callback bindings, including aliases and rebinding."""
     if isinstance(callback, ast.Name):
-        async_def = local_state.get("async_defs", {}).get(callback.id)
-        if async_def is not None and _async_function_mutates_workers_via_asyncio(
-            async_def,
-            operator_bindings,
-            reference_line,
-            seen=seen,
-        ):
-            return True
-        if async_def is not None and _function_mutates_workers(
-            async_def,
-            operator_bindings,
+        candidates = local_state.get("wrappers", {}).get(
+            callback.id, frozenset()
+        )
+        if any(
+            _async_function_mutates_workers_via_asyncio(
+                candidate,
+                operator_bindings,
+                reference_line,
+                seen=seen,
+            )
+            or _function_mutates_workers(candidate, operator_bindings)
+            for candidate in candidates
         ):
             return True
     return _thread_pool_callback_mutates_workers(callback, operator_bindings)
@@ -6492,6 +6493,16 @@ def _contextlib_closing_close_mutates_workers(
     )
 
 
+def _async_exit_stack_receiver_is_tracked(receiver, operator_bindings, local_state):
+    """Accept a real AsyncExitStack constructor or a tracked local instance."""
+    if _contextlib_async_exit_stack_constructor(receiver, operator_bindings):
+        return True
+    return (
+        isinstance(receiver, ast.Name)
+        and receiver.id in (local_state or {}).get("async_exit_stack_names", set())
+    )
+
+
 def _call_is_async_context_enter_mutation(
     call,
     class_targets,
@@ -6499,14 +6510,28 @@ def _call_is_async_context_enter_mutation(
     reference_line,
     operator_bindings,
     local_class_aliases=None,
+    local_state=None,
 ):
-    """Return True for direct ``__aenter__`` or ``enter_async_context`` calls."""
+    """Detect async context entry without inventing exits or stack receivers."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
     if call.func.attr == "__aenter__":
         context_expr = call.func.value
+        include_exit = False
     elif call.func.attr == "enter_async_context" and call.args:
+        receiver = call.func.value
+        if not _async_exit_stack_receiver_is_tracked(
+            receiver, operator_bindings, local_state
+        ):
+            return False
         context_expr = call.args[0]
+        # Only the surrounding async-with guarantees a subsequent stack exit.
+        include_exit = (
+            isinstance(receiver, ast.Name)
+            and receiver.id in (local_state or {}).get(
+                "async_exit_stack_with_names", set()
+            )
+        )
     else:
         return False
     context_expr = _resolve_local_class_context(
@@ -6527,6 +6552,7 @@ def _call_is_async_context_enter_mutation(
         instance_events,
         operator_bindings,
         local_class_aliases or {},
+        include_exit=include_exit,
     )
 
 
@@ -9592,7 +9618,7 @@ def _new_local_async_state(
         "callback_mutators": set(),
         "bound_names": bound_names,
         "async_exit_stack_names": set(),
-        "async_defs": {},
+        "async_exit_stack_with_names": set(),
     }
 
 
@@ -9725,6 +9751,7 @@ def _asyncio_awaitable_mutates_workers(
             instance_events,
             reference_line,
             operator_bindings,
+            local_state=local_state,
         ):
             return True
     if local_state is None:
@@ -9849,6 +9876,8 @@ def _clear_local_async_binding(name, local_state):
     local_state["wrappers"].pop(name, None)
     local_state["awaitables"].discard(name)
     local_state["callback_mutators"].discard(name)
+    local_state["async_exit_stack_names"].discard(name)
+    local_state["async_exit_stack_with_names"].discard(name)
 
 
 def _record_local_asyncio_module_imports(node, local_state):
@@ -9904,6 +9933,8 @@ def _record_local_async_definition(
         local_state["consumer_names"].discard(name)
         local_state["task_factory_names"].discard(name)
         local_state["asyncio_modules"].discard(name)
+        local_state["async_exit_stack_names"].discard(name)
+        local_state["async_exit_stack_with_names"].discard(name)
     if isinstance(node, ast.AsyncFunctionDef):
         candidates = frozenset({node})
         if conditional:
@@ -9912,7 +9943,6 @@ def _record_local_async_definition(
                 frozenset(),
             )
         local_state["wrappers"][node.name] = candidates
-        local_state["async_defs"][node.name] = node
         return True
     if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
         return False
@@ -10029,6 +10059,9 @@ def _record_local_async_bindings(
                 )
             ):
                 local_state["async_exit_stack_names"].add(item.optional_vars.id)
+                local_state["async_exit_stack_with_names"].add(
+                    item.optional_vars.id
+                )
     if _record_local_asyncio_import(node, local_state):
         return isinstance(node, (ast.Import, ast.ImportFrom))
     if _record_local_async_definition(
@@ -10040,6 +10073,22 @@ def _record_local_async_bindings(
         return True
 
     for name, value in _namespace_assignment_values(node):
+        stack_names = local_state["async_exit_stack_names"]
+        with_names = local_state["async_exit_stack_with_names"]
+        alias_name = value.id if isinstance(value, ast.Name) else None
+        is_stack = (
+            _contextlib_async_exit_stack_constructor(value, operator_bindings)
+            or alias_name in stack_names
+        )
+        is_with_stack = alias_name in with_names
+        if is_stack:
+            stack_names.add(name)
+        elif not conditional:
+            stack_names.discard(name)
+        if is_with_stack:
+            with_names.add(name)
+        elif not conditional:
+            with_names.discard(name)
         local_state["bound_names"].add(name)
         local_state["asyncio_modules"].discard(name)
         local_state["consumer_names"].discard(name)
@@ -10198,6 +10247,13 @@ def _async_statements_mutate_workers_via_asyncio(
                 conditional=True,
             ):
                 return True
+        if isinstance(node, ast.AsyncWith):
+            # An instance may survive the block, but automatic exit does not.
+            for item in node.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    local_state["async_exit_stack_with_names"].discard(
+                        item.optional_vars.id
+                    )
     return False
 
 
