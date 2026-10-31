@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-11-01
+
 ### Added
 - `LOG_LEVEL` (`0`-`3` like librtmp2-server, or a level name; default info)
   and a stderr log format with timestamps. Under Gunicorn the panel's own
@@ -467,7 +469,9 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.13...v0.1.14
+[0.1.13]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.9...v0.1.10
