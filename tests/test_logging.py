@@ -82,3 +82,57 @@ def test_debug_level_does_not_enable_third_party_url_logging(monkeypatch):
     finally:
         application.config["LOG_LEVEL"] = "INFO"
         app_module._configure_logging(application)
+
+
+def test_login_is_not_logged_as_succeeded_when_the_session_backend_fails(caplog):
+    from session_store import SessionBackendUnavailable
+
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch("app.create_session_store"):
+        mock_client_cls.return_value.health.return_value = {"rtmps_enabled": False}
+        client = _app().test_client()
+        with patch(
+            "app._PanelRuntime._establish_logged_in_session",
+            side_effect=SessionBackendUnavailable("down"),
+        ), caplog.at_level(logging.INFO):
+            resp = client.post(
+                "/login",
+                data={"username": "admin", "password": os.environ["PASSWORD"]},
+            )
+    assert resp.status_code == 503
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(m.startswith("Login succeeded from ") for m in messages)
+
+
+@pytest.mark.parametrize(
+    ("call", "ok_404_expected"),
+    [
+        (lambda c: c.delete_player("s1", "p1"), True),
+        (lambda c: c.health(), False),
+    ],
+)
+def test_404_is_quiet_only_for_the_idempotent_deletes(caplog, call, ok_404_expected):
+    client = Lrtmp2Client("http://example.test", "tok")
+    resp = type("Resp", (), {"ok": False, "status_code": 404, "json": lambda self: {}})()
+    with patch("lrtmp2_client.requests.get", return_value=resp), patch(
+        "lrtmp2_client.requests.delete", return_value=resp
+    ), caplog.at_level(logging.DEBUG, logger="lrtmp2_client"):
+        try:
+            call(client)
+        except Lrtmp2ApiError:
+            pass
+    levels = [r.levelno for r in caplog.records if "HTTP 404" in r.getMessage()]
+    assert levels == [logging.DEBUG if ok_404_expected else logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://user:pw@api.test:8080/base", "http://api.test:8080/base"),
+        ("http://[::1]:8080", "http://[::1]:8080"),
+        ("http://api.test:99999", "http://api.test"),
+    ],
+)
+def test_api_url_for_log_drops_userinfo_and_survives_bad_ports(url, expected):
+    import app as app_module
+
+    assert app_module._api_url_for_log(url) == expected

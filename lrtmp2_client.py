@@ -100,7 +100,9 @@ class Lrtmp2Client:
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _request(self, request_func, url, operation, timeout=None, **kwargs):
+    def _request(
+        self, request_func, url, operation, timeout=None, ok_404=False, **kwargs
+    ):
         """Perform an HTTP request, translating network-level failures (connection
         refused, DNS failure, timeout, ...) into Lrtmp2ApiError so callers only ever
         need to catch one exception type instead of the request crashing the panel."""
@@ -134,8 +136,9 @@ class Lrtmp2Client:
             ) from exc
         elapsed_ms = (time.perf_counter() - started) * 1000
         status = getattr(resp, "status_code", None)
-        # 404 is an expected answer for the idempotent deletes.
-        expected = getattr(resp, "ok", True) or status == 404
+        # 404 is expected only where the caller treats it as success (the
+        # idempotent stream/player deletes); everywhere else it is a failure.
+        expected = getattr(resp, "ok", True) or (ok_404 and status == 404)
         logger.log(
             logging.DEBUG if expected else logging.WARNING,
             "librtmp2-server API: %s -> HTTP %s in %.0f ms",
@@ -234,6 +237,7 @@ class Lrtmp2Client:
             "delete_stream",
             headers=self._headers(),
             timeout=self.admin_timeout,
+            ok_404=True,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_stream")
@@ -278,6 +282,7 @@ class Lrtmp2Client:
             "delete_player",
             headers=self._headers(),
             timeout=self.admin_timeout,
+            ok_404=True,
         )
         if not resp.ok and resp.status_code != 404:
             raise _api_error(resp, "delete_player")

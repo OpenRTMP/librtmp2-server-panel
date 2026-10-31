@@ -270,8 +270,16 @@ def _api_url_for_log(url):
     """Drop any userinfo from the API URL before it is logged."""
     parts = urlsplit(url)
     host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        # A malformed port must not stop the panel from starting; the API
+        # calls will report the bad URL themselves.
+        port = None
+    if port:
+        host = f"{host}:{port}"
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
@@ -638,19 +646,19 @@ class _PanelRuntime:
             )
             client_ip = _log_safe_ip(request.remote_addr)
             if user_ok and pass_ok:
-                self.app.logger.info("Login succeeded from %s", client_ip)
-                return self._complete_login()
+                return self._complete_login(client_ip)
             self.app.logger.warning("Login failed (invalid credentials) from %s", client_ip)
             error = "Invalid credentials"
         return render_template(LOGIN_HTML, error=error)
 
-    def _complete_login(self):
+    def _complete_login(self, client_ip):
         try:
             self._establish_logged_in_session()
         except SessionBackendUnavailable:
             self.app.logger.exception("Session backend unavailable during login")
             error = "Authentication service temporarily unavailable. Please try again."
             return render_template(LOGIN_HTML, error=error), 503
+        self.app.logger.info("Login succeeded from %s", client_ip)
         return redirect(url_for("index"))
 
     def handle_csrf_error(self, error):
