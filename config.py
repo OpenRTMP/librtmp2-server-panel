@@ -10043,7 +10043,6 @@ def _record_local_awaitable_assignment(
         local_state["awaitables"].discard(name)
 
 
-
 def _record_local_async_with_stack_bindings(node, operator_bindings, local_state):
     """Record local AsyncExitStack names introduced by an async with."""
     if not isinstance(node, ast.AsyncWith):
@@ -10153,6 +10152,7 @@ def _record_local_async_bindings(
         )
     return False
 
+
 def _asyncio_task_factory_reference_is_active(
     node,
     operator_bindings,
@@ -10229,7 +10229,6 @@ def _statement_schedules_mutating_asyncio_task(
         local_state=local_state,
         seen=seen,
     )
-
 
 
 def _async_statement_has_mutating_awaitable(
@@ -10323,6 +10322,7 @@ def _async_statements_mutate_workers_via_asyncio(
         ):
             return True
     return False
+
 
 def _async_function_mutates_workers_via_asyncio(
     func_node,
