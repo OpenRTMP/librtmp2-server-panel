@@ -2986,24 +2986,30 @@ def _comprehension_target_namespace_values(node):
     return pairs
 
 
+def _namespace_assignment_values_for_node(node):
+    """Yield every module-namespace assignment carried by one statement."""
+    for name, value in _namespace_assignment_values(node):
+        yield name, value
+    for name, value in _compound_test_namespace_assignment_values(node):
+        yield name, value
+    for name, value in _match_namespace_capture_assignments(node):
+        yield name, value
+    for name, value in _unpacked_namespace_assignment_values(node):
+        yield name, value
+    for name, value in _for_target_namespace_values(node):
+        yield name, value
+    for name, value in _with_target_namespace_values(node):
+        yield name, value
+    for name, value in _comprehension_target_namespace_values(node):
+        yield name, value
+
+
 def _record_module_namespace_assignments(statements, assignments):
     """Collect module-level assignments, including compound statement bodies."""
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        for name, value in _namespace_assignment_values(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _compound_test_namespace_assignment_values(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _match_namespace_capture_assignments(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _unpacked_namespace_assignment_values(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _for_target_namespace_values(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _with_target_namespace_values(node):
-            assignments.setdefault(name, []).append(value)
-        for name, value in _comprehension_target_namespace_values(node):
+        for name, value in _namespace_assignment_values_for_node(node):
             assignments.setdefault(name, []).append(value)
         for block in _compound_statement_blocks(node):
             _record_module_namespace_assignments(block, assignments)
@@ -6289,17 +6295,24 @@ def _warnings_showwarning_value_mutates(
     return _expression_mutates_workers(value, operator_bindings)
 
 
+def _class_attribute_assignment(stmt):
+    """Return ``(targets, value)`` for a class-body binding, else ``None``."""
+    if isinstance(stmt, ast.Assign):
+        return stmt.targets, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        return [stmt.target], stmt.value
+    return None
+
+
 def _collect_class_attribute_value_expressions(tree):
     """Map ``(class, attribute)`` to its class-body values in source order."""
     values = {}
     for node in _iter_import_time_class_definitions(tree.body):
         for stmt in node.body:
-            if isinstance(stmt, ast.Assign):
-                targets, value = stmt.targets, stmt.value
-            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-                targets, value = [stmt.target], stmt.value
-            else:
+            assignment = _class_attribute_assignment(stmt)
+            if assignment is None:
                 continue
+            targets, value = assignment
             line = getattr(stmt, "lineno", 0)
             for target in targets:
                 if isinstance(target, ast.Name):
@@ -6343,6 +6356,65 @@ def _class_body_bound_names(statements):
     return names
 
 
+def _scan_warnings_class_body(
+    node,
+    operator_bindings,
+    mutator_names,
+    events,
+    *,
+    definite,
+    shadowed,
+    class_attribute_values,
+):
+    """Scan a class body statement by statement with evolving shadowing."""
+    class_shadowed = set(shadowed)
+    for statement in node.body:
+        _scan_warnings_showwarning_mutation_events(
+            [statement],
+            operator_bindings,
+            mutator_names,
+            events,
+            definite=definite,
+            shadowed=frozenset(class_shadowed),
+            class_attribute_values=class_attribute_values,
+        )
+        class_shadowed.update(_class_body_bound_names([statement]))
+
+
+def _record_warnings_showwarning_replacement(
+    node,
+    operator_bindings,
+    mutator_names,
+    events,
+    *,
+    definite,
+    shadowed,
+    class_attribute_values,
+):
+    """Append one replacement event unless the receiver is shadowed."""
+    replacement = _warnings_showwarning_statement_replacement(
+        node,
+        operator_bindings,
+    )
+    if replacement is None:
+        return
+    receiver, value = replacement
+    if isinstance(receiver, ast.Name) and receiver.id in shadowed:
+        return
+    events.append(
+        (
+            getattr(node, "lineno", 0),
+            _warnings_showwarning_value_mutates(
+                value,
+                operator_bindings,
+                mutator_names,
+                class_attribute_values,
+            ),
+            definite,
+        )
+    )
+
+
 def _scan_warnings_showwarning_mutation_events(
     statements,
     operator_bindings,
@@ -6369,40 +6441,25 @@ def _scan_warnings_showwarning_mutation_events(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if isinstance(node, ast.ClassDef):
-            class_shadowed = set(shadowed)
-            for statement in node.body:
-                _scan_warnings_showwarning_mutation_events(
-                    [statement],
-                    operator_bindings,
-                    mutator_names,
-                    events,
-                    definite=definite,
-                    shadowed=frozenset(class_shadowed),
-                    class_attribute_values=class_attribute_values,
-                )
-                class_shadowed.update(_class_body_bound_names([statement]))
+            _scan_warnings_class_body(
+                node,
+                operator_bindings,
+                mutator_names,
+                events,
+                definite=definite,
+                shadowed=shadowed,
+                class_attribute_values=class_attribute_values,
+            )
             continue
-        replacement = _warnings_showwarning_statement_replacement(
+        _record_warnings_showwarning_replacement(
             node,
             operator_bindings,
+            mutator_names,
+            events,
+            definite=definite,
+            shadowed=shadowed,
+            class_attribute_values=class_attribute_values,
         )
-        if replacement is not None:
-            receiver, value = replacement
-            if not (
-                isinstance(receiver, ast.Name) and receiver.id in shadowed
-            ):
-                events.append(
-                    (
-                        getattr(node, "lineno", 0),
-                        _warnings_showwarning_value_mutates(
-                            value,
-                            operator_bindings,
-                            mutator_names,
-                            class_attribute_values,
-                        ),
-                        definite,
-                    )
-                )
         for block in _compound_statement_blocks(node):
             _scan_warnings_showwarning_mutation_events(
                 block,
@@ -11542,49 +11599,57 @@ def _heapq_positional_key_mutates_workers(call, operator_bindings):
     return _named_callback_mutates_workers(key, operator_bindings)
 
 
+def _heapq_call_targets_module(call, operator_bindings, reference_line):
+    """True when the call resolves to the heapq module."""
+    if isinstance(call.func, ast.Attribute):
+        if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
+            return False
+        return _heapq_receiver_may_be_module(
+            call.func.value,
+            _heapq_module_alias_events(operator_bindings),
+            reference_line,
+        )
+    if not isinstance(call.func, ast.Name):
+        return False
+    name_alias_events = _heapq_ordered_callback_alias_events(operator_bindings)
+    return bool(
+        name_alias_events
+        and _module_alias_active_at_line(
+            call.func,
+            set(),
+            name_alias_events,
+            reference_line,
+        )
+    )
+
+
+def _heapq_arguments_mutate_workers(call, operator_bindings):
+    """True when a heapq key/iterable argument can mutate workers."""
+    if len(call.args) < 2:
+        return False
+    if (
+        _key_lambda_mutates_workers(call, operator_bindings)
+        or _heapq_positional_key_mutates_workers(call, operator_bindings)
+        or _key_lambda_invokes_mutating_callback_container(call, operator_bindings)
+    ):
+        return True
+    iterable = call.args[1]
+    return _iterable_holds_mutating_callbacks(
+        iterable, operator_bindings
+    ) or _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
+
+
 def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
     """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
     if not isinstance(call, ast.Call):
         return False
-    reference_line = getattr(call, "lineno", 0)
-    if isinstance(call.func, ast.Attribute):
-        if call.func.attr not in _HEAPQ_ORDERED_CALLBACK_METHODS:
-            return False
-        if not _heapq_receiver_may_be_module(
-            call.func.value,
-            _heapq_module_alias_events(operator_bindings),
-            reference_line,
-        ):
-            return False
-    elif isinstance(call.func, ast.Name):
-        name_alias_events = _heapq_ordered_callback_alias_events(
-            operator_bindings
-        )
-        if not (
-            name_alias_events
-            and _module_alias_active_at_line(
-                call.func,
-                set(),
-                name_alias_events,
-                reference_line,
-            )
-        ):
-            return False
-    else:
+    if not _heapq_call_targets_module(
+        call,
+        operator_bindings,
+        getattr(call, "lineno", 0),
+    ):
         return False
-    if len(call.args) < 2:
-        return False
-    if _key_lambda_mutates_workers(call, operator_bindings):
-        return True
-    if _heapq_positional_key_mutates_workers(call, operator_bindings):
-        return True
-    if _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
-        return True
-    iterable = call.args[1]
-    return (
-        _iterable_holds_mutating_callbacks(iterable, operator_bindings)
-        or _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
-    )
+    return _heapq_arguments_mutate_workers(call, operator_bindings)
 
 
 def _itertools_starmap_alias_events(operator_bindings):
@@ -12620,6 +12685,50 @@ def _property_hook_decorator_name(stmt):
     return None
 
 
+def _descriptor_field_assignment(stmt, class_name_aliases, reference_line):
+    """Return ``(targets, descriptor class name)`` for a field binding."""
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+        value = stmt.value
+    elif isinstance(stmt, ast.AnnAssign):
+        # An annotated field (``field: Desc = Desc()``) binds the value
+        # exactly like the plain assignment spelling.
+        targets = [stmt.target]
+        value = stmt.value
+    else:
+        return None
+    if value is None or not isinstance(value, ast.Call):
+        return None
+    if not isinstance(value.func, ast.Name):
+        return None
+    descriptor_class = _class_name_alias_target(
+        value.func.id,
+        class_name_aliases or {},
+        reference_line,
+    )
+    return targets, descriptor_class
+
+
+def _record_descriptor_method_hook(
+    stmt,
+    class_name,
+    methods,
+    descriptor_fields,
+    operator_bindings,
+    mutator_names,
+):
+    """Record a mutating property hook method, returning whether one matched."""
+    hook = _property_hook_decorator_name(stmt)
+    if hook is None or not _function_mutates_workers(
+        stmt,
+        operator_bindings,
+        mutator_names,
+    ):
+        return False
+    descriptor_fields[hook].add((class_name, stmt.name))
+    return True
+
+
 def _record_descriptor_field_assignments(
     class_node,
     methods,
@@ -12633,34 +12742,24 @@ def _record_descriptor_field_assignments(
     reference_line = getattr(class_node, "lineno", 0)
     for stmt in class_node.body:
         if isinstance(stmt, ast.FunctionDef):
-            hook = _property_hook_decorator_name(stmt)
-            if hook is not None and _function_mutates_workers(
-                stmt,
-                operator_bindings,
-                mutator_names,
-            ):
-                descriptor_fields[hook].add((class_node.name, stmt.name))
-                found = True
+            found = (
+                _record_descriptor_method_hook(
+                    stmt,
+                    class_node.name,
+                    methods,
+                    descriptor_fields,
+                    operator_bindings,
+                    mutator_names,
+                )
+                or found
+            )
             continue
-        if isinstance(stmt, ast.Assign):
-            targets = stmt.targets
-            value = stmt.value
-        elif isinstance(stmt, ast.AnnAssign):
-            # An annotated field (``field: Desc = Desc()``) binds the value
-            # exactly like the plain assignment spelling.
-            targets = [stmt.target]
-            value = stmt.value
-        else:
-            continue
-        if value is None or not isinstance(value, ast.Call):
-            continue
-        if not isinstance(value.func, ast.Name):
-            continue
-        descriptor_class = _class_name_alias_target(
-            value.func.id,
-            class_name_aliases or {},
-            reference_line,
+        assignment = _descriptor_field_assignment(
+            stmt, class_name_aliases, reference_line
         )
+        if assignment is None:
+            continue
+        targets, descriptor_class = assignment
         found = (
             _record_descriptor_targets(
                 class_node.name,
@@ -12794,40 +12893,50 @@ def _single_literal_iterable_element(iterator):
     return iterator.elts[0]
 
 
+def _for_instance_bindings(node):
+    """Bindings introduced by a ``for`` over one literal constructor call."""
+    element = _single_literal_iterable_element(node.iter)
+    if not (isinstance(element, ast.Call) and isinstance(element.func, ast.Name)):
+        return []
+    target_names = _loop_target_names(node.target)
+    if len(target_names) != 1:
+        return []
+    return [(next(iter(target_names)), element.func.id)]
+
+
+def _with_instance_bindings(node):
+    """Bindings introduced by ``with Ctx() as name`` items."""
+    bindings = []
+    for item in node.items:
+        if not (isinstance(item.optional_vars, ast.Name) and isinstance(
+            item.context_expr, ast.Call
+        ) and isinstance(item.context_expr.func, ast.Name)):
+            continue
+        bindings.append((item.optional_vars.id, item.context_expr.func.id))
+    return bindings
+
+
+def _except_instance_bindings(node):
+    """Binding introduced by ``except Error as name``."""
+    if node.name and isinstance(node.type, ast.Name):
+        return [(node.name, node.type.id)]
+    return []
+
+
 def _statement_instance_bindings(node):
-    """Return ``(name, class name)`` pairs for non-assignment instance binds.
+    """Return a list of ``(name, class name)`` non-assignment instance binds.
 
     ``for h in (Dangerous(),)``, ``with Ctx() as h`` and ``except Error as h``
     all bind an instance to the target name without an assignment statement, so
     a tracked receiver has to follow them instead of keeping the stale class.
     """
     if isinstance(node, (ast.For, ast.AsyncFor)):
-        element = _single_literal_iterable_element(node.iter)
-        if not (
-            isinstance(element, ast.Call)
-            and isinstance(element.func, ast.Name)
-        ):
-            return ()
-        target_names = _loop_target_names(node.target)
-        if len(target_names) != 1:
-            return ()
-        return ((next(iter(target_names)), element.func.id),)
+        return _for_instance_bindings(node)
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        bindings = []
-        for item in node.items:
-            if not isinstance(item.optional_vars, ast.Name):
-                continue
-            if not (
-                isinstance(item.context_expr, ast.Call)
-                and isinstance(item.context_expr.func, ast.Name)
-            ):
-                continue
-            bindings.append((item.optional_vars.id, item.context_expr.func.id))
-        return tuple(bindings)
+        return _with_instance_bindings(node)
     if isinstance(node, ast.ExceptHandler):
-        if node.name and isinstance(node.type, ast.Name):
-            return ((node.name, node.type.id),)
-    return ()
+        return _except_instance_bindings(node)
+    return []
 
 
 def _record_class_instance_statement(node, line, events, conditional, enum_members=None):
@@ -21685,6 +21794,66 @@ def _imported_alias_event_column(node, name):
     return getattr(node, "col_offset", 0)
 
 
+def _process_imported_alias_node(
+    node,
+    module_name,
+    imported_names,
+    active,
+    events,
+    module_aliases,
+    module_events,
+    line,
+    *,
+    top_level,
+):
+    """Fold one module-scope statement into the imported-alias state."""
+    _record_imported_module_aliases(
+        node,
+        module_name,
+        module_aliases,
+        module_events,
+        line,
+    )
+    _record_imported_name_aliases(
+        node,
+        module_name,
+        imported_names,
+        active,
+        events,
+        line,
+    )
+    if top_level:
+        _invalidate_imported_module_aliases(node, active, events, line)
+    _record_imported_name_alias_propagation(
+        node,
+        module_aliases,
+        imported_names,
+        active,
+        events,
+        line,
+    )
+    if top_level:
+        _invalidate_imported_module_aliases(
+            node,
+            module_aliases,
+            module_events,
+            line,
+        )
+
+
+def _flush_ordered_alias_events(node, events, prior_counts, ordered_events):
+    """Append the events added by the current statement in source order."""
+    for name, items in events.items():
+        for event in items[prior_counts.get(name, 0):]:
+            ordered_events.setdefault(name, []).append(
+                (
+                    event[0],
+                    _imported_alias_event_column(node, name),
+                    event[1],
+                )
+            )
+
+
 def _collect_imported_name_alias_events(tree, module_name, imported_names, *, ordered_events=None):
     """Track import-time aliases in module and compound statement bodies.
 
@@ -21704,46 +21873,24 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names, *, or
         line = getattr(node, "lineno", 0)
         prior_counts = (
             {name: len(items) for name, items in events.items()}
-            if ordered_events is not None else {}
+            if ordered_events is not None
+            else {}
         )
-        _record_imported_module_aliases(
+        _process_imported_alias_node(
             node,
             module_name,
+            imported_names,
+            active,
+            events,
             module_aliases,
             module_events,
             line,
+            top_level=id(node) in top_level_nodes,
         )
-        _record_imported_name_aliases(
-            node,
-            module_name,
-            imported_names,
-            active,
-            events,
-            line,
-        )
-        if id(node) in top_level_nodes:
-            _invalidate_imported_module_aliases(node, active, events, line)
-        _record_imported_name_alias_propagation(
-            node,
-            module_aliases,
-            imported_names,
-            active,
-            events,
-            line,
-        )
-        if id(node) in top_level_nodes:
-            _invalidate_imported_module_aliases(
-                node,
-                module_aliases,
-                module_events,
-                line,
-            )
         if ordered_events is not None:
-            for name, items in events.items():
-                for event in items[prior_counts.get(name, 0):]:
-                    ordered_events.setdefault(name, []).append(
-                        (event[0], _imported_alias_event_column(node, name), event[1])
-                    )
+            _flush_ordered_alias_events(
+                node, events, prior_counts, ordered_events
+            )
     return events
 
 
