@@ -12712,7 +12712,6 @@ def _descriptor_field_assignment(stmt, class_name_aliases, reference_line):
 def _record_descriptor_method_hook(
     stmt,
     class_name,
-    methods,
     descriptor_fields,
     operator_bindings,
     mutator_names,
@@ -12746,7 +12745,6 @@ def _record_descriptor_field_assignments(
                 _record_descriptor_method_hook(
                     stmt,
                     class_node.name,
-                    methods,
                     descriptor_fields,
                     operator_bindings,
                     mutator_names,
