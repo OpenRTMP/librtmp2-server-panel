@@ -40,7 +40,11 @@ option_takes_value() {
         --statsd-host|--dogstatsd|--paste|--pythonpath|--reload-engine|\
         --reload-extra-file|--limit-request-line|--limit-request-fields|\
         --limit-request-field-size|--sendfile|--raw-passthrough|--spec|\
-        --wsgi-app)
+        --wsgi-app|--protocol|--log-config|--log-config-json|--header-map|\
+        --forwarder-headers|--root-path|--statsd-prefix|--dogstatsd-tags|\
+        --log-syslog-to|--log-syslog-facility|--log-syslog-prefix|\
+        --cert-reqs|--http-protocols|--http-parser|--control-socket|\
+        --paste-global|--paster|--uwsgi-allow-from|--asgi-*|--dirty-*)
             return 0 ;;
         *)
             return 1 ;;
@@ -120,11 +124,11 @@ app_target_supplied() {
     return 1
 }
 
-# Return 0 when the arguments carry a Gunicorn bind option, i.e. "-b",
-# "--bind" or "--bind=ADDRESS". A host:port value (for example the
-# "0.0.0.0:8000" of the default --bind) is not a bind option.
+# Return 0 when the arguments (or GUNICORN_CMD_ARGS) carry a Gunicorn bind
+# option, i.e. "-b", "--bind" or "--bind=ADDRESS". A host:port value (for
+# example the "0.0.0.0:8000" of the default --bind) is not a bind option.
 bind_option_supplied() {
-    for arg in "$@"; do
+    for arg in "$@" ${GUNICORN_CMD_ARGS:-}; do
         case "$arg" in
             -b|-b*|--bind|--bind=*)
                 return 0 ;;
@@ -135,11 +139,10 @@ bind_option_supplied() {
     return 1
 }
 
-# Return 0 when the arguments name a Gunicorn config file that provides the
-# application itself (``wsgi_app``). Gunicorn serves the first positional
-# argument in preference to ``wsgi_app``, so the image's default application
-# must not be added when the operator's config already supplies one.
-config_supplies_app() {
+# Print the Gunicorn config file named by the arguments, or nothing when the
+# arguments name none that can be inspected here. A "python:MODULE" reference
+# and a missing -c value cannot be read from the shell.
+config_file_from_args() {
     expect_value=0
     config_path=
     for arg in "$@"; do
@@ -161,15 +164,33 @@ config_supplies_app() {
     done
     case "$config_path" in
         ''|python:*)
-            # An empty value or a module reference cannot be inspected here.
             return 1 ;;
         file:*)
             config_path="${config_path#file:}" ;;
         *)
             ;;
     esac
+    printf '%s\n' "$config_path"
+}
+
+# Return 0 when the arguments name a Gunicorn config file that provides the
+# application itself (``wsgi_app``). Gunicorn serves the first positional
+# argument in preference to ``wsgi_app``, so the image's default application
+# must not be added when the operator's config already supplies one.
+config_supplies_app() {
+    config_path="$(config_file_from_args "$@")" || return 1
     [ -r "$config_path" ] || return 1
     grep -qE '^[[:space:]]*wsgi_app[[:space:]]*=' "$config_path"
+}
+
+# Return 0 when the arguments name a Gunicorn config file that sets ``bind``.
+# The image's default --bind has to stay out of the way then: --bind is
+# append-valued and an argv value replaces the config's list, so injecting the
+# default would silently move the service back to 0.0.0.0.
+config_supplies_bind() {
+    config_path="$(config_file_from_args "$@")" || return 1
+    [ -r "$config_path" ] || return 1
+    grep -qE '^[[:space:]]*bind[[:space:]]*=' "$config_path"
 }
 
 # The image's default command (kept in sync with the Dockerfile CMD). Without
@@ -181,7 +202,7 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
     # by the operator has to replace the image's default one instead of
     # being appended to it: otherwise the service keeps listening on
     # 0.0.0.0:8000 and the operator's restriction is defeated.
-    if bind_option_supplied "$@"; then
+    if bind_option_supplied "$@" || config_supplies_bind "$@"; then
         default_bind=
     else
         default_bind="--bind 0.0.0.0:8000"

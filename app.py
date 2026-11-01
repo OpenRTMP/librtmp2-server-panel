@@ -88,7 +88,13 @@ def _is_valid_display_name(value):
         return False
     if len(value) > DISPLAY_NAME_MAX_LEN:
         return False
-    return all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
+    # Reject the whole Unicode ``Cc`` category (C0 controls, DEL and the C1
+    # block U+0080-U+009F), matching librtmp2-server's ``char::is_control``
+    # check so a pasted C1 character is caught locally instead of upstream.
+    return all(
+        32 <= ord(ch) and not 127 <= ord(ch) <= 159
+        for ch in value
+    )
 
 
 def _is_valid_access_key(value):
@@ -115,6 +121,18 @@ def _is_usable_id(value):
     cannot address a stream. Same id set the cluster lookups accept.
     """
     return isinstance(value, CLUSTER_KEY_TYPES)
+
+
+def _stream_id_matches(upstream_id, requested_id):
+    """Return True when an upstream id denotes the requested stream id.
+
+    The query string always yields a ``str`` while the panel deliberately keeps
+    non-string scalar upstream ids usable, so a plain ``==`` comparison would
+    report a created and listed stream as missing.
+    """
+    if upstream_id == requested_id:
+        return True
+    return _is_usable_id(upstream_id) and str(upstream_id) == str(requested_id)
 
 
 def _optional_form_value(raw):
@@ -730,12 +748,13 @@ class _PanelRuntime:
                 "is temporarily unavailable. Your session is still active; "
                 "please try again."
             )
+            rtmps_on, _rtmps_port = self.rtmps_health()
             return render_template(
                 INDEX_HTML,
                 streams=[],
                 api_error=None,
                 flash_error=error,
-                rtmps_enabled=False,
+                rtmps_enabled=rtmps_on,
             ), 503
         return None
 
@@ -800,15 +819,19 @@ class _PanelRuntime:
 
     def _render_index_api_failure(self, flash_error, exc):
         # Resolve cluster via health so confirmed standalone does not keep a
-        # Cluster nav link. Health failure stays "unknown" (nav stays).
-        cluster_on, _, detect_error = self.detect_cluster()
+        # Cluster nav link. Health failure stays "unknown" (nav stays). The same
+        # payload decides the RTMPS badge: /health is config-only, so a
+        # streams-endpoint failure can coexist with a healthy TLS state and the
+        # page must not claim RTMPS is disabled.
+        cluster_on, health, detect_error = self.detect_cluster()
         cluster_status_unknown = bool(detect_error)
+        rtmps_on, _rtmps_port = self.rtmps_from_health(health)
         return render_template(
             INDEX_HTML,
             streams=[],
             api_error=str(exc),
             flash_error=flash_error,
-            rtmps_enabled=False,
+            rtmps_enabled=rtmps_on,
             cluster_enabled=cluster_on,
             cluster_status_unknown=cluster_status_unknown,
             show_cluster_nav=cluster_on or cluster_status_unknown,
@@ -1137,7 +1160,14 @@ class _PanelRuntime:
         except Lrtmp2ApiError as exc:
             session["flash_error"] = str(exc)
             return redirect(url_for("index"))
-        stream = next((item for item in streams if item.get("id") == stream_id), None)
+        stream = next(
+            (
+                item
+                for item in streams
+                if _stream_id_matches(item.get("id"), stream_id)
+            ),
+            None,
+        )
         if not stream:
             session["flash_error"] = (
                 f"Stream '{stream_id}' was created but is not listed yet. "

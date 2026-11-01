@@ -511,14 +511,36 @@ def _subscript_base_node(node):
     return value
 
 
+def _is_empty_container_literal(node):
+    """Return True for an empty tuple/list/set/dict literal."""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return not node.elts
+    return isinstance(node, ast.Dict) and not node.keys
+
+
+def _call_passes_no_arguments(call):
+    """Return True when a call passes no arguments, including empty splats.
+
+    ``globals(*())`` / ``globals(**{})`` are runtime-identical to ``globals()``
+    because an empty literal splat contributes nothing, so such a call still
+    names the argument-less builtin.
+    """
+    return all(
+        isinstance(arg, ast.Starred) and _is_empty_container_literal(arg.value)
+        for arg in call.args
+    ) and all(
+        keyword.arg is None and _is_empty_container_literal(keyword.value)
+        for keyword in call.keywords
+    )
+
+
 def _is_globals_call(node):
     """Return True for a direct ``globals()`` call."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "globals"
-        and not node.args
-        and not node.keywords
+        and _call_passes_no_arguments(node)
     )
 
 
@@ -675,6 +697,7 @@ class _ModuleNamespaceAliases(set):
         sys_aliases=None,
         importlib_aliases=None,
         importlib_module_aliases=None,
+        binding_events=None,
     ):
         super().__init__(values)
         self.sys_aliases = (
@@ -690,6 +713,10 @@ class _ModuleNamespaceAliases(set):
             if importlib_module_aliases is None
             else set(importlib_module_aliases)
         )
+        # Source-ordered top-level rebindings: a name that is ``globals()`` at
+        # the line of a mutation but rebound later must still count as the
+        # namespace there, and the reverse order must not.
+        self.binding_events = {} if binding_events is None else binding_events
 
     def __eq__(self, other):
         """Compare alias members and the module-reference metadata."""
@@ -853,6 +880,17 @@ def _is_module_namespace_mapping(node, namespace_aliases=None):
     if namespace_aliases is None:
         namespace_aliases = set()
     if isinstance(node, ast.Name) and node.id in namespace_aliases:
+        binding_events = getattr(namespace_aliases, "binding_events", None)
+        if binding_events:
+            state = _binding_state_at_line(
+                binding_events,
+                node.id,
+                getattr(node, "lineno", 0),
+            )
+            if state is False:
+                # The name was definitely rebound to a plain value before this
+                # reference, so it no longer names the module namespace.
+                return False
         return True
     if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
         return _is_module_namespace_mapping(node.value, namespace_aliases)
@@ -932,8 +970,7 @@ def _is_namespace_accessor_call(node):
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in {"locals", "vars"}
-        and not node.args
-        and not node.keywords
+        and _call_passes_no_arguments(node)
     )
 
 
@@ -1178,6 +1215,25 @@ def _chainmap_callee_is_collections_chainmap(func, alias_events=None):
     return False
 
 
+def _expand_starred_literal_arguments(arguments):
+    """Expand literal ``*[...]`` / ``*(...)`` call arguments into elements.
+
+    A single starred literal is the only way a caller can spell the same
+    argument list without listing the values inline, so the elements can be
+    inspected individually. Any other starred argument is kept as-is because
+    its contents cannot be resolved statically.
+    """
+    expanded = []
+    for argument in arguments:
+        if isinstance(argument, ast.Starred) and isinstance(
+            argument.value, (ast.List, ast.Tuple)
+        ):
+            expanded.extend(argument.value.elts)
+            continue
+        expanded.append(argument)
+    return expanded
+
+
 def _chainmap_call_includes_namespace(
     chainmap_call,
     namespace_aliases=None,
@@ -1192,7 +1248,8 @@ def _chainmap_call_includes_namespace(
     ):
         return False
     return any(
-        _is_module_namespace_mapping(arg, namespace_aliases) for arg in chainmap_call.args
+        _is_module_namespace_mapping(arg, namespace_aliases)
+        for arg in _expand_starred_literal_arguments(chainmap_call.args)
     )
 
 
@@ -2116,6 +2173,7 @@ def _is_dict_type_ior_callable(
     aliases=None,
     reference_line=0,
     dict_shadow_line=None,
+    builtin_shadow_lines=None,
 ):
     """Return True for builtin ``dict.__ior__`` variants or proven aliases."""
     if aliases is None:
@@ -2133,6 +2191,14 @@ def _is_dict_type_ior_callable(
         )
     return (
         isinstance(func, ast.Call)
+        # ``getattr(dict, '__ior__')`` only fetches the builtin mutator while
+        # ``getattr`` still names the builtin, like the sibling setitem and
+        # dict-update resolvers already require.
+        and _name_is_unshadowed_builtin(
+            "getattr",
+            reference_line,
+            builtin_shadow_lines,
+        )
         and isinstance(func.func, ast.Name)
         and func.func.id == "getattr"
         and len(func.args) >= 2
@@ -2187,6 +2253,7 @@ def _call_is_dict_type_ior_on_module_namespace(
     namespace_aliases=None,
     dict_shadow_line=None,
     ior_aliases=None,
+    builtin_shadow_lines=None,
 ):
     """Return True for builtin ``dict.__ior__(globals(), ...)`` mutations."""
     if not isinstance(call, ast.Call) or len(call.args) < 2:
@@ -2196,6 +2263,7 @@ def _call_is_dict_type_ior_on_module_namespace(
         aliases=ior_aliases,
         reference_line=getattr(call, "lineno", 0),
         dict_shadow_line=dict_shadow_line,
+        builtin_shadow_lines=builtin_shadow_lines,
     ):
         return False
     if not _is_module_namespace_mapping(call.args[0], namespace_aliases):
@@ -2667,7 +2735,11 @@ def _resolve_operator_methodcaller_factory(call, operator_bindings):
     getattr_call = factory.func
     if not isinstance(getattr_call, ast.Call):
         return None
-    if _getattr_operator_method_name(getattr_call, module_aliases) != "methodcaller":
+    if _getattr_operator_method_name(
+        getattr_call,
+        module_aliases,
+        operator_bindings[32] if len(operator_bindings) > 32 else None,
+    ) != "methodcaller":
         return None
     if len(factory.args) < 1:
         return None
@@ -2758,8 +2830,14 @@ def _match_namespace_capture_assignments(node):
     return captures
 
 
-def _namespace_assignment_values(node):
-    """Return simple name assignments relevant to namespace alias tracking."""
+def _namespace_assignment_values(node, *, include_bare_annotations=False):
+    """Return simple name assignments relevant to namespace alias tracking.
+
+    A value-less ``name: T`` annotation is not an assignment: it only updates
+    ``__annotations__`` and leaves the existing binding untouched. Callers that
+    enumerate compile-time scope bindings instead of runtime rebindings pass
+    ``include_bare_annotations=True``.
+    """
     if isinstance(node, ast.Assign):
         values = [
             (target.id, node.value)
@@ -2769,6 +2847,8 @@ def _namespace_assignment_values(node):
         values.extend(_namedexpr_assignment_values(node.value))
         return values
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        if node.value is None and not include_bare_annotations:
+            return list(_namedexpr_assignment_values(node.annotation))
         values = [(node.target.id, node.value)]
         if node.value is not None:
             values.extend(_namedexpr_assignment_values(node.value))
@@ -2778,6 +2858,132 @@ def _namespace_assignment_values(node):
     if isinstance(node, ast.Expr):
         return _namedexpr_assignment_values(node.value)
     return []
+
+
+def _literal_single_element_values(iterator):
+    """Return the elements of a one-element literal iterable, if any."""
+    if isinstance(iterator, (ast.Tuple, ast.List)) and len(iterator.elts) == 1:
+        return iterator.elts
+    return None
+
+
+def _nullcontext_call_is_active(call):
+    """Return True for ``contextlib.nullcontext(...)`` / ``nullcontext(...)``."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id == "nullcontext"
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "nullcontext"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "contextlib"
+    )
+
+
+def _context_manager_namespace_value(expr):
+    """Return the module-namespace value a ``with`` expression yields, if any.
+
+    ``contextlib.nullcontext(x)`` returns ``x`` from ``__enter__``, so the
+    target of ``with nullcontext(globals()) as ns`` names the module namespace
+    exactly like a plain ``ns = globals()``.
+    """
+    if _is_module_namespace_mapping(expr, set()):
+        return expr
+    if (
+        isinstance(expr, ast.Call)
+        and not expr.keywords
+        and len(expr.args) == 1
+        and _nullcontext_call_is_active(expr)
+    ):
+        return expr.args[0]
+    return None
+
+
+def _unpacked_namespace_assignment_values(node):
+    """Return ``(name, element)`` pairs bound by tuple/list unpacking."""
+    if not isinstance(node, ast.Assign):
+        return []
+    if not isinstance(node.value, (ast.Tuple, ast.List)):
+        return []
+    pairs = []
+    for target in node.targets:
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            continue
+        if len(target.elts) != len(node.value.elts):
+            continue
+        for element_target, element_value in zip(target.elts, node.value.elts):
+            if isinstance(element_target, ast.Name):
+                pairs.append((element_target.id, element_value))
+    return pairs
+
+
+def _for_target_namespace_values(node):
+    """Return ``(name, value)`` pairs a for-loop target binds provably.
+
+    ``for ns in (globals(),):`` binds the module namespace to ``ns`` on the
+    first (and only) iteration, exactly like the simple assignment spelling.
+    """
+    if not isinstance(node, (ast.For, ast.AsyncFor)):
+        return []
+    values = _literal_single_element_values(node.iter)
+    if values is None or not isinstance(node.target, ast.Name):
+        return []
+    if not _is_module_namespace_mapping(values[0], set()):
+        return []
+    return [(node.target.id, values[0])]
+
+
+def _with_target_namespace_values(node):
+    """Return ``(name, value)`` pairs a ``with ... as name`` binds provably."""
+    if not isinstance(node, (ast.With, ast.AsyncWith)):
+        return []
+    pairs = []
+    for item in node.items:
+        if not isinstance(item.optional_vars, ast.Name):
+            continue
+        value = _context_manager_namespace_value(item.context_expr)
+        if value is not None and _is_module_namespace_mapping(value, set()):
+            pairs.append((item.optional_vars.id, value))
+    return pairs
+
+
+def _iter_evaluated_expression_nodes(node):
+    """Yield expression nodes without entering deferred function scopes."""
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        current = stack.pop()
+        if isinstance(
+            current,
+            (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            continue
+        yield current
+        stack.extend(ast.iter_child_nodes(current))
+
+
+_COMPREHENSION_NODE_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _comprehension_target_namespace_values(node):
+    """Return ``(name, value)`` pairs bound by comprehension loop targets.
+
+    A comprehension target is its own binding, so ``[ns.update(...) for ns in
+    (globals(),)]`` mutates the module namespace through ``ns`` exactly like a
+    module-level alias would.
+    """
+    pairs = []
+    for child in _iter_evaluated_expression_nodes(node):
+        if not isinstance(child, _COMPREHENSION_NODE_TYPES):
+            continue
+        for generator in child.generators:
+            if not isinstance(generator.target, ast.Name):
+                continue
+            values = _literal_single_element_values(generator.iter)
+            if values is None:
+                continue
+            if _is_module_namespace_mapping(values[0], set()):
+                pairs.append((generator.target.id, values[0]))
+    return pairs
 
 
 def _record_module_namespace_assignments(statements, assignments):
@@ -2791,14 +2997,28 @@ def _record_module_namespace_assignments(statements, assignments):
             assignments.setdefault(name, []).append(value)
         for name, value in _match_namespace_capture_assignments(node):
             assignments.setdefault(name, []).append(value)
+        for name, value in _unpacked_namespace_assignment_values(node):
+            assignments.setdefault(name, []).append(value)
+        for name, value in _for_target_namespace_values(node):
+            assignments.setdefault(name, []).append(value)
+        for name, value in _with_target_namespace_values(node):
+            assignments.setdefault(name, []).append(value)
+        for name, value in _comprehension_target_namespace_values(node):
+            assignments.setdefault(name, []).append(value)
         for block in _compound_statement_blocks(node):
             _record_module_namespace_assignments(block, assignments)
 
 
 def _values_are_module_namespace_aliases(values, aliases):
-    """Return True when every assignment resolves to the module namespace."""
+    """Return True when any assignment resolves to the module namespace.
+
+    A name rebound to a plain dict somewhere else is still the namespace at the
+    line of the mutation; ``_collect_module_namespace_alias_events`` carries the
+    source order that decides each reference. Conditional rebindings must not
+    drop the alias, matching the module-alias collector's fail-closed rule.
+    """
     resolved_values = [value for value in values if value is not None]
-    return bool(resolved_values) and all(
+    return any(
         _is_module_namespace_mapping(value, aliases) for value in resolved_values
     )
 
@@ -2835,6 +3055,29 @@ def _resolve_module_namespace_aliases(
     return aliases
 
 
+def _collect_module_namespace_alias_events(tree, assignments, aliases):
+    """Record source-ordered top-level rebindings of each namespace alias.
+
+    Only top-level assignments are definite, so only those can deactivate an
+    alias. A conditional rebinding may not run, and keeping the name as a
+    possible namespace is the fail-closed direction.
+    """
+    events = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        line = getattr(node, "lineno", 0)
+        for name, value in _namespace_assignment_values(node):
+            if name not in assignments or value is None:
+                # An augmented assign or other unresolvable value does not
+                # prove the name stopped naming the module namespace.
+                continue
+            events.setdefault(name, []).append(
+                (line, bool(_is_module_namespace_mapping(value, aliases)))
+            )
+    return events
+
+
 def _collect_module_namespace_aliases(
     tree,
     *,
@@ -2846,13 +3089,19 @@ def _collect_module_namespace_aliases(
     """Collect names that are always assigned a module namespace mapping."""
     assignments = {}
     _record_module_namespace_assignments(tree.body, assignments)
-    return _resolve_module_namespace_aliases(
+    aliases = _resolve_module_namespace_aliases(
         assignments,
         sys_aliases=sys_aliases,
         importlib_aliases=importlib_aliases,
         importlib_module_aliases=importlib_module_aliases,
         builtin_shadow_lines=builtin_shadow_lines,
     )
+    aliases.binding_events = _collect_module_namespace_alias_events(
+        tree,
+        assignments,
+        aliases,
+    )
+    return aliases
 
 
 def _constant_is_workers(node):
@@ -2914,7 +3163,7 @@ def _call_is_operator_setitem_workers(call, operator_bindings):
     )
 
 
-def _call_is_getattr_setitem_workers(call):
+def _call_is_getattr_setitem_workers(call, builtin_shadow_lines=None):
     """Return True for ``getattr(globals(), '__setitem__')('workers', ...)``."""
     if not isinstance(call, ast.Call) or not call.args:
         return False
@@ -2922,6 +3171,12 @@ def _call_is_getattr_setitem_workers(call):
     if not isinstance(func, ast.Call) or len(func.args) < 2:
         return False
     if not isinstance(func.func, ast.Name) or func.func.id != "getattr":
+        return False
+    if not _name_is_unshadowed_builtin(
+        "getattr",
+        getattr(call, "lineno", 0),
+        builtin_shadow_lines,
+    ):
         return False
     if not _is_globals_call(func.args[0]):
         return False
@@ -2931,11 +3186,17 @@ def _call_is_getattr_setitem_workers(call):
     return _constant_is_workers(call.args[0])
 
 
-def _getattr_operator_method_name(getattr_call, module_aliases):
+def _getattr_operator_method_name(getattr_call, module_aliases, builtin_shadow_lines=None):
     """Return a recognized operator method name from ``getattr(operator, ...)``."""
     if not isinstance(getattr_call, ast.Call):
         return None
     if not isinstance(getattr_call.func, ast.Name) or getattr_call.func.id != "getattr":
+        return None
+    if not _name_is_unshadowed_builtin(
+        "getattr",
+        getattr(getattr_call, "lineno", 0),
+        builtin_shadow_lines,
+    ):
         return None
     if len(getattr_call.args) < 2:
         return None
@@ -2970,7 +3231,11 @@ def _call_is_getattr_operator_namespace_mutation(call, operator_bindings):
         return False
     module_aliases = operator_bindings[0] if operator_bindings else set()
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
-    method = _getattr_operator_method_name(call.func, module_aliases)
+    method = _getattr_operator_method_name(
+        call.func,
+        module_aliases,
+        operator_bindings[32] if len(operator_bindings) > 32 else None,
+    )
     if method is None:
         return (
             _getattr_operator_method_is_dynamic(call.func, module_aliases)
@@ -3139,7 +3404,9 @@ def _call_is_operator_attrgetter_on_proven_frame_globals(call, operator_bindings
     return _namespace_mutator_call_may_set_workers(call.func.attr, call)
 
 
-_NAMESPACE_GETATTR_METHODS = frozenset({"update", "__ior__", "__setitem__"})
+_NAMESPACE_GETATTR_METHODS = frozenset(
+    {"update", "__ior__", "__setitem__", "setdefault"}
+)
 _DYNAMIC_EXEC_EVAL_NAMES = frozenset({"exec", "eval"})
 _BUILTINS_SHADOW_MARKER = "__builtins_shadowed__"
 
@@ -4065,7 +4332,12 @@ def _namespace_mutator_call_may_set_workers(method, call):
     if method == "__ior__":
         return bool(call.args) and _dict_merge_payload_may_set_workers(call.args[0])
     if method == "__setitem__":
-        return len(call.args) >= 2 and _constant_is_workers(call.args[0])
+        # A computed key cannot be proven different from ``workers``, so this
+        # follows the fail-closed rule the direct ``globals().__setitem__``
+        # paths already use.
+        return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
+    if method == "setdefault":
+        return len(call.args) >= 2 and _key_may_be_workers(call.args[0])
     return False
 
 
@@ -4451,8 +4723,17 @@ def _call_is_getattr_saved_partial_invocation(call, operator_bindings, bound_nam
 
 
 def _call_is_object_getattribute_partial_invocation(call, operator_bindings):
-    """Return True for ``object.__getattribute__(partial, '__call__')(bound)()``."""
-    if not isinstance(call, ast.Call) or not call.args:
+    """Return True for ``object.__getattribute__(partial, '__call__')(...)``.
+
+    Two shapes reach the same bound partial: the unbound form passes the bound
+    partial as the invocation argument
+    (``object.__getattribute__(partial, '__call__')(p)``), and the instance form
+    reads ``__call__`` off a saved partial and invokes it with the payload
+    (``object.__getattribute__(p, '__call__')({...})``). The invocation
+    arguments are the partial's own payload in both cases, so they have to be
+    carried into the synthetic call instead of being dropped.
+    """
+    if not isinstance(call, ast.Call):
         return False
     _, _, _, _, partial_aliases = _unpack_operator_bindings(operator_bindings)
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
@@ -4469,16 +4750,36 @@ def _call_is_object_getattribute_partial_invocation(call, operator_bindings):
     if len(inner.args) < 2:
         return False
     if not (
-        isinstance(inner.args[0], ast.Name)
-        and inner.args[0].id in partial_aliases
-        and isinstance(inner.args[1], ast.Constant)
+        isinstance(inner.args[1], ast.Constant)
         and inner.args[1].value == "__call__"
     ):
         return False
+    bound = inner.args[0]
+    if isinstance(bound, ast.Name) and bound.id in partial_aliases:
+        if not call.args:
+            return False
+        synthetic = ast.Call(
+            func=call.args[0],
+            args=list(call.args[1:]),
+            keywords=list(call.keywords),
+            lineno=reference_line,
+        )
+        return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
+    if not isinstance(bound, ast.Name):
+        return False
+    partial_mutator_alias_events = (
+        operator_bindings[27] if len(operator_bindings) > 27 else {}
+    )
+    if _binding_state_at_line(
+        partial_mutator_alias_events,
+        bound.id,
+        reference_line,
+    ) is None:
+        return False
     synthetic = ast.Call(
-        func=call.args[0],
-        args=[],
-        keywords=[],
+        func=ast.Name(id=bound.id, ctx=ast.Load(), lineno=reference_line),
+        args=list(call.args),
+        keywords=list(call.keywords),
         lineno=reference_line,
     )
     return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
@@ -4514,8 +4815,11 @@ def _call_is_invoked_types_methodtype_partial(call, operator_bindings):
         return False
     synthetic = ast.Call(
         func=inner.args[1],
-        args=[],
-        keywords=[],
+        # The invocation arguments are the bound partial's payload: without
+        # them ``MethodType(partial.__call__, bound)({'workers': 4})`` looks
+        # like a call with no payload and the mutation is missed.
+        args=list(call.args),
+        keywords=list(call.keywords),
         lineno=getattr(call, "lineno", 0),
     )
     return _call_is_partial_bound_workers_setitem(synthetic, operator_bindings)
@@ -4921,8 +5225,16 @@ def _class_overrides_update(class_node):
 
 
 
-def _dict_subclass_uses_builtin_update(class_node, dict_shadow_line=None):
-    """Return whether a class inherits the unmodified builtin dict.update."""
+def _dict_subclass_uses_builtin_update(
+    class_node,
+    dict_shadow_line=None,
+    dict_subclass_bases=None,
+):
+    """Return whether a class inherits the unmodified builtin dict.update.
+
+    ``class E(D)`` inherits ``D.update`` unchanged, so a subclass of an already
+    tracked dict subclass reaches the same builtin mutator.
+    """
     line = getattr(class_node, 'lineno', 0)
     inherits_builtin_dict = (
         _dict_name_is_builtin_at_line(line, dict_shadow_line)
@@ -4930,6 +5242,9 @@ def _dict_subclass_uses_builtin_update(class_node, dict_shadow_line=None):
             isinstance(base, ast.Name) and base.id == 'dict'
             for base in class_node.bases
         )
+    ) or any(
+        isinstance(base, ast.Name) and base.id in (dict_subclass_bases or ())
+        for base in class_node.bases
     )
     return inherits_builtin_dict and not _class_overrides_update(class_node)
 
@@ -4994,11 +5309,34 @@ def _deactivate_tracked_binding(events, name, line):
         events[name].append((line, False))
 
 
+def _statement_rebound_names(node):
+    """Return names a non-assignment statement definitely rebinds.
+
+    ``for`` / ``with ... as`` / ``except ... as`` targets and import bindings
+    replace an existing module binding exactly like an assignment does, so a
+    stale tracked binding has to be invalidated for them too.
+    """
+    names = set()
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        names.update(_loop_target_names(node.target))
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                names.update(_loop_target_names(item.optional_vars))
+    elif isinstance(node, ast.ExceptHandler):
+        if node.name:
+            names.add(node.name)
+    names.update(_import_bound_names(node))
+    return names
+
+
 def _invalidate_tracked_bindings_from_statement(node, events, line):
     """Deactivate tracked names rebound by a non-class statement."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         _deactivate_tracked_binding(events, node.name, line)
     for name, _value in _namespace_assignment_values(node):
+        _deactivate_tracked_binding(events, name, line)
+    for name in _statement_rebound_names(node):
         _deactivate_tracked_binding(events, name, line)
 
 
@@ -5011,11 +5349,25 @@ def _record_dict_subclass_definition(
 ):
     """Record one dict-subclass definition while preserving branch uncertainty."""
     line = getattr(class_node, 'lineno', 0)
-    if _dict_subclass_uses_builtin_update(class_node, dict_shadow_line):
+    active_bases = _active_dict_subclass_names(events, line)
+    if _dict_subclass_uses_builtin_update(
+        class_node,
+        dict_shadow_line,
+        active_bases,
+    ):
         events.setdefault(class_node.name, []).append((line, True))
         return
     if not conditional:
         _deactivate_tracked_binding(events, class_node.name, line)
+
+
+def _active_dict_subclass_names(events, reference_line):
+    """Return dict subclasses still bound at ``reference_line``."""
+    return {
+        name
+        for name in events
+        if _dict_subclass_binding_is_active(events, name, reference_line)
+    }
 
 
 def _record_runtime_dict_subclass_definitions(
@@ -5728,11 +6080,12 @@ def _call_is_weakref_finalize_mutation(call, operator_bindings, bound_names=None
     )
 
 
-def _warnings_showwarning_target_is_active(target, operator_bindings, reference_line):
-    """Return True when target is an active warnings.showwarning assignment."""
-    if not isinstance(target, ast.Attribute) or target.attr != "showwarning":
-        return False
-    receiver = target.value
+def _warnings_showwarning_receiver_is_active(
+    receiver,
+    operator_bindings,
+    reference_line,
+):
+    """Return True when the receiver name still names the warnings module."""
     if not isinstance(receiver, ast.Name):
         return False
     return _imported_alias_is_active(
@@ -5742,17 +6095,169 @@ def _warnings_showwarning_target_is_active(target, operator_bindings, reference_
     )
 
 
+def _warnings_showwarning_target_is_active(target, operator_bindings, reference_line):
+    """Return True when target is an active warnings.showwarning assignment."""
+    if not isinstance(target, ast.Attribute) or target.attr != "showwarning":
+        return False
+    return _warnings_showwarning_receiver_is_active(
+        target.value,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _warnings_showwarning_subscript_target_is_active(
+    target,
+    operator_bindings,
+    reference_line,
+):
+    """Return True for ``warnings.__dict__['showwarning'] = ...`` targets."""
+    if not isinstance(target, ast.Subscript):
+        return False
+    index = target.slice
+    if not (isinstance(index, ast.Constant) and index.value == "showwarning"):
+        return False
+    receiver = target.value
+    if not (isinstance(receiver, ast.Attribute) and receiver.attr == "__dict__"):
+        return False
+    return _warnings_showwarning_receiver_is_active(
+        receiver.value,
+        operator_bindings,
+        reference_line,
+    )
+
+
+def _warnings_showwarning_setattr_replacement(
+    node,
+    operator_bindings,
+):
+    """Return ``(receiver, value)`` for ``setattr(warnings, 'showwarning', v)``."""
+    call = node.value if isinstance(node, ast.Expr) else None
+    if not isinstance(call, ast.Call):
+        return None
+    if not (isinstance(call.func, ast.Name) and call.func.id == "setattr"):
+        return None
+    if len(call.args) < 3:
+        return None
+    if not (
+        isinstance(call.args[1], ast.Constant)
+        and call.args[1].value == "showwarning"
+    ):
+        return None
+    if not _warnings_showwarning_receiver_is_active(
+        call.args[0],
+        operator_bindings,
+        getattr(node, "lineno", 0),
+    ):
+        return None
+    return call.args[0], call.args[2]
+
+
+def _warnings_showwarning_statement_replacement(node, operator_bindings):
+    """Return ``(receiver, value)`` for a statement that installs showwarning."""
+    line = getattr(node, "lineno", 0)
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if _warnings_showwarning_target_is_active(
+                target,
+                operator_bindings,
+                line,
+            ):
+                return target.value, node.value
+            if _warnings_showwarning_subscript_target_is_active(
+                target,
+                operator_bindings,
+                line,
+            ):
+                return target.value.value, node.value
+        return None
+    return _warnings_showwarning_setattr_replacement(node, operator_bindings)
+
+
+def _class_attribute_value_expression(class_attribute_values, expr):
+    """Resolve a ``Class.attribute`` reference to the class-body value."""
+    if not class_attribute_values:
+        return None
+    if not (isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name)):
+        return None
+    return class_attribute_values.get((expr.value.id, expr.attr))
+
+
 def _warnings_showwarning_value_mutates(
     value,
     operator_bindings,
     mutator_names,
+    class_attribute_values=None,
 ):
-    """Return True when a showwarning replacement can mutate workers."""
+    """Return True when a showwarning replacement can mutate workers.
+
+    ``_expression_mutates_workers`` only inspects definition-time expressions,
+    so a replacement wrapped in a conditional, an ``or`` chain or a class
+    attribute reference would otherwise be reported as safe even though the
+    selected callable mutates ``workers``.
+    """
     if isinstance(value, ast.Name):
         return value.id in mutator_names
     if isinstance(value, ast.Lambda):
         return _lambda_mutates_workers(value, operator_bindings)
+    if isinstance(value, ast.IfExp):
+        return _warnings_showwarning_value_mutates(
+            value.body,
+            operator_bindings,
+            mutator_names,
+            class_attribute_values,
+        ) or _warnings_showwarning_value_mutates(
+            value.orelse,
+            operator_bindings,
+            mutator_names,
+            class_attribute_values,
+        )
+    if isinstance(value, ast.BoolOp):
+        return any(
+            _warnings_showwarning_value_mutates(
+                operand,
+                operator_bindings,
+                mutator_names,
+                class_attribute_values,
+            )
+            for operand in value.values
+        )
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.args:
+        # ``staticmethod(fn)`` / ``classmethod(fn)`` / ``functools.wraps``-style
+        # wrappers keep the wrapped callable as their first argument.
+        if value.func.id in {"staticmethod", "classmethod"}:
+            return _warnings_showwarning_value_mutates(
+                value.args[0],
+                operator_bindings,
+                mutator_names,
+                class_attribute_values,
+            )
+    assigned = _class_attribute_value_expression(class_attribute_values, value)
+    if assigned is not None:
+        return _warnings_showwarning_value_mutates(
+            assigned,
+            operator_bindings,
+            mutator_names,
+            class_attribute_values,
+        )
     return _expression_mutates_workers(value, operator_bindings)
+
+
+def _collect_class_attribute_value_expressions(tree):
+    """Map ``(class, attribute)`` to the value its class body binds."""
+    values = {}
+    for node in _iter_import_time_class_definitions(tree.body):
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                targets, value = stmt.targets, stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                targets, value = [stmt.target], stmt.value
+            else:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    values[(node.name, target.id)] = value
+    return values
 
 
 def _collect_warnings_showwarning_mutation_events(
@@ -5770,6 +6275,7 @@ def _collect_warnings_showwarning_mutation_events(
         mutator_names,
         events,
         definite=True,
+        class_attribute_values=_collect_class_attribute_value_expressions(tree),
     )
     return events
 
@@ -5796,50 +6302,54 @@ def _scan_warnings_showwarning_mutation_events(
     *,
     definite,
     shadowed=frozenset(),
+    class_attribute_values=None,
 ):
     """Record showwarning replacements, flagging straight-line module ones.
 
     Only a definitely executed (straight-line, unconditional) safe assignment
     clears an earlier mutating replacement; a safe assignment inside a compound
-    statement or class body may be skipped at runtime, so it must not hide the
-    mutating hook. A mutating replacement anywhere still fails closed. Inside a
-    class body that locally rebinds the receiver name, ``receiver.showwarning``
-    targets that local name instead of the imported module and is ignored.
+    statement may be skipped at runtime, so it must not hide the mutating hook.
+    A module-level class body always runs at import, so its assignments keep the
+    enclosing statement's definiteness. A mutating replacement anywhere still
+    fails closed. Inside a class body, only a receiver name bound *before* the
+    replacement shadows the imported module: a later ``warnings = ...`` in the
+    same class body has not run yet, so the earlier target still resolves to
+    the module through LOAD_NAME.
     """
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if isinstance(node, ast.ClassDef):
-            _scan_warnings_showwarning_mutation_events(
-                node.body,
-                operator_bindings,
-                mutator_names,
-                events,
-                definite=False,
-                shadowed=_class_body_bound_names(node.body),
-            )
-            continue
-        if isinstance(node, ast.Assign):
-            line = getattr(node, "lineno", 0)
-            if any(
-                _warnings_showwarning_target_is_active(
-                    target,
+            class_shadowed = set(shadowed)
+            for statement in node.body:
+                _scan_warnings_showwarning_mutation_events(
+                    [statement],
                     operator_bindings,
-                    line,
+                    mutator_names,
+                    events,
+                    definite=definite,
+                    shadowed=frozenset(class_shadowed),
+                    class_attribute_values=class_attribute_values,
                 )
-                and not (
-                    isinstance(target.value, ast.Name)
-                    and target.value.id in shadowed
-                )
-                for target in node.targets
+                class_shadowed.update(_class_body_bound_names([statement]))
+            continue
+        replacement = _warnings_showwarning_statement_replacement(
+            node,
+            operator_bindings,
+        )
+        if replacement is not None:
+            receiver, value = replacement
+            if not (
+                isinstance(receiver, ast.Name) and receiver.id in shadowed
             ):
                 events.append(
                     (
-                        line,
+                        getattr(node, "lineno", 0),
                         _warnings_showwarning_value_mutates(
-                            node.value,
+                            value,
                             operator_bindings,
                             mutator_names,
+                            class_attribute_values,
                         ),
                         definite,
                     )
@@ -5852,6 +6362,7 @@ def _scan_warnings_showwarning_mutation_events(
                 events,
                 definite=False,
                 shadowed=shadowed,
+                class_attribute_values=class_attribute_values,
             )
 
 
@@ -6139,10 +6650,35 @@ def _sys_meta_path_mutated_before_node(operator_bindings, node):
     )
 
 
+def _importlib_import_module_after_meta_path_mutation(node, operator_bindings):
+    """Return True for an ``import_module`` call after a meta_path mutation."""
+    call = _statement_value_expression(node)
+    if not isinstance(call, ast.Call):
+        return False
+    importlib_aliases = (
+        operator_bindings[16] if len(operator_bindings) > 16 else set()
+    )
+    importlib_module_aliases = (
+        operator_bindings[24] if len(operator_bindings) > 24 else set()
+    )
+    if not _importlib_import_module_call(
+        call,
+        importlib_aliases,
+        importlib_module_aliases,
+    ):
+        return False
+    return _sys_meta_path_mutated_before_node(operator_bindings, node)
+
+
 def _import_statement_after_sys_meta_path_mutation(node, operator_bindings):
     """Return True when an import may invoke a custom sys.meta_path hook."""
-    return isinstance(node, (ast.Import, ast.ImportFrom)) and (
-        _sys_meta_path_mutated_before_node(operator_bindings, node)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return _sys_meta_path_mutated_before_node(operator_bindings, node)
+    # ``importlib.import_module('x')`` runs the same finders an import
+    # statement does, so an installed meta_path hook fires there too.
+    return _importlib_import_module_after_meta_path_mutation(
+        node,
+        operator_bindings,
     )
 
 
@@ -6206,19 +6742,27 @@ def _class_uses_dataclass_decorator(class_node, operator_bindings):
     return False
 
 
-def _dataclass_default_factory_mutates(field_call, operator_bindings):
+def _dataclass_default_factory_mutates(field_call, operator_bindings, mutator_names=None):
     """Return True when a dataclass field default_factory mutates ``workers``."""
     for keyword in field_call.keywords:
         if keyword.arg != "default_factory":
             continue
         factory = keyword.value
+        if (
+            isinstance(factory, ast.Name)
+            and mutator_names
+            and factory.id in mutator_names
+        ):
+            return True
         if isinstance(factory, ast.Lambda):
             return _lambda_mutates_workers(factory, operator_bindings)
         return _expression_mutates_workers(factory, operator_bindings)
     return False
 
 
-def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings):
+def _class_dataclass_field_default_factory_mutates(
+    class_node, operator_bindings, mutator_names=None
+):
     """Return True when a dataclass field default_factory mutates ``workers``."""
     if not _class_uses_dataclass_decorator(class_node, operator_bindings):
         return False
@@ -6231,7 +6775,11 @@ def _class_dataclass_field_default_factory_mutates(class_node, operator_bindings
             value,
             operator_bindings,
             line,
-        ) and _dataclass_default_factory_mutates(value, operator_bindings):
+        ) and _dataclass_default_factory_mutates(
+            value,
+            operator_bindings,
+            mutator_names,
+        ):
             return True
     return False
 
@@ -6257,7 +6805,10 @@ def _call_is_exit_stack_callback_mutation(call, operator_bindings):
     """Return True for ``stack.callback(mutating)`` on a tracked ExitStack."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
-    if call.func.attr != "callback" or len(call.args) != 1:
+    # ``ExitStack.callback(callback, /, *args, **kwds)`` passes the trailing
+    # arguments to the callback when the stack unwinds, so any arity registers
+    # the same import-time mutation as the bare ``stack.callback(cb)`` form.
+    if call.func.attr != "callback" or not call.args:
         return False
     if not _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
         return False
@@ -6835,16 +7386,25 @@ def _function_yields_sys_getframe(func_def, operator_bindings):
 
 def _function_yields_proven_live_frame(func_def, inspect_analysis):
     """Return True when a generator yields a proven live frame object."""
-    active_frame_names = set()
+    frame_alias_events = inspect_analysis.get("frame_alias_events", {})
     for node in _function_runtime_nodes(func_def):
         if not isinstance(node, ast.Yield) or node.value is None:
             continue
+        reference_line = getattr(node.value, "lineno", 0)
         if _sys_getframe_call_is_active(node.value, inspect_analysis):
             return True
         if _node_is_proven_live_frame(
             node.value,
             inspect_analysis,
-            active_frame_names,
+            _active_frame_names_at_line(inspect_analysis, reference_line),
+        ):
+            return True
+        # ``yield frame`` where ``frame`` is a module-level alias of a proven
+        # live frame yields that same frame object.
+        if isinstance(node.value, ast.Name) and _imported_alias_is_active(
+            frame_alias_events,
+            node.value.id,
+            reference_line,
         ):
             return True
     return False
@@ -6896,13 +7456,7 @@ def _record_mutating_generator_definition(
     ):
         return False
     line = getattr(node, "lineno", 0)
-    inspect_analysis = (
-        operator_bindings[-1]
-        if operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-        else {}
-    )
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
         _function_has_mutating_yield_from(node, operator_bindings)
         or _function_yields_sys_getframe(node, operator_bindings)
@@ -7346,6 +7900,12 @@ _THREAD_POOL_DIRECT_IMPORT_KINDS = {
     ("multiprocessing.pool", "ThreadPool"): "pool",
     (_CONCURRENT_FUTURES_MODULE, "ThreadPoolExecutor"): "executor",
 }
+# ``from concurrent import futures`` / ``from multiprocessing import pool``
+# bind a module object, so the constructor is reached through an attribute.
+_THREAD_POOL_FROM_IMPORT_MODULE_KINDS = {
+    ("concurrent", "futures"): "executor",
+    ("multiprocessing", "pool"): "pool",
+}
 _THREAD_POOL_MODULE_IMPORT_KINDS = {
     "multiprocessing.pool": "pool",
     _CONCURRENT_FUTURES_MODULE: "executor",
@@ -7366,14 +7926,17 @@ def _record_thread_pool_direct_import_aliases(
     module_events,
     line,
 ):
-    """Record direct ThreadPool and ThreadPoolExecutor imports."""
+    """Record direct ThreadPool/ThreadPoolExecutor and module imports."""
     for imported in node.names:
         name = imported.asname or imported.name
         kind = _THREAD_POOL_DIRECT_IMPORT_KINDS.get(
             (node.module, imported.name)
         )
         _record_thread_pool_alias_event(class_events, name, kind, line)
-        _record_thread_pool_alias_event(module_events, name, None, line)
+        module_kind = _THREAD_POOL_FROM_IMPORT_MODULE_KINDS.get(
+            (node.module, imported.name)
+        )
+        _record_thread_pool_alias_event(module_events, name, module_kind, line)
 
 
 def _record_thread_pool_module_import_aliases(
@@ -8293,7 +8856,18 @@ def _scan_future_instance_alias_events(
             events,
             conditional=conditional,
         )
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            # A class body runs at import, and the completion pass already
+            # walks it, so a Future created there has to be tracked too.
+            _scan_future_instance_alias_events(
+                node.body,
+                operator_bindings,
+                analysis,
+                events,
+                conditional=conditional,
+            )
             continue
         for block in _compound_statement_blocks(node):
             _scan_future_instance_alias_events(
@@ -10904,6 +11478,21 @@ def _heapq_receiver_may_be_module(receiver, events, reference_line):
     return _module_alias_active_at_line(receiver, set(), events, reference_line)
 
 
+def _heapq_positional_key_mutates_workers(call, operator_bindings):
+    """Return True when the positional ``key`` argument mutates workers.
+
+    ``heapq.nsmallest(n, iterable, key=None)`` / ``nlargest`` take the callback
+    as the third positional parameter, so a positional spelling runs the same
+    mutating key the keyword form does.
+    """
+    if len(call.args) < 3:
+        return False
+    key = call.args[2]
+    if isinstance(key, ast.Lambda):
+        return _lambda_mutates_workers(key, operator_bindings)
+    return _named_callback_mutates_workers(key, operator_bindings)
+
+
 def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
     """Return True when heapq.nsmallest/nlargest executes mutating callbacks."""
     if not isinstance(call, ast.Call):
@@ -10937,6 +11526,8 @@ def _call_is_heapq_ordered_callback_mutation(call, operator_bindings):
     if len(call.args) < 2:
         return False
     if _key_lambda_mutates_workers(call, operator_bindings):
+        return True
+    if _heapq_positional_key_mutates_workers(call, operator_bindings):
         return True
     if _key_lambda_invokes_mutating_callback_container(call, operator_bindings):
         return True
@@ -11021,14 +11612,19 @@ def _starmap_iterables_are_mutating(iterables, operator_bindings):
 
 def _call_is_itertools_starmap_mutation(call, operator_bindings):
     """Return True when itertools.starmap executes workers-mutating callbacks."""
-    if not isinstance(call, ast.Call) or len(call.args) < 2:
+    if not isinstance(call, ast.Call):
+        return False
+    # ``starmap(*(func, iterable))`` passes the same argument list as the
+    # inline spelling, so the literal splat is expanded before the arity gate.
+    arguments = _expand_starred_literal_arguments(call.args)
+    if len(arguments) < 2:
         return False
     if not _starmap_callee_is_itertools(call, operator_bindings):
         return False
-    callback = call.args[0]
+    callback = arguments[0]
     if _thread_pool_callback_mutates_workers(callback, operator_bindings):
         return True
-    iterables = call.args[1:]
+    iterables = arguments[1:]
     if _starmap_callback_first_param_feeds_loop_callback(callback):
         return _starmap_iterables_hold_mutating_callbacks(
             iterables,
@@ -11725,6 +12321,7 @@ def _collect_mutating_metaclass_hook_definitions(
     tree,
     operator_bindings,
     metaclass_names,
+    mutator_names=None,
 ):
     """Return mutating hook definitions owned by local metaclass classes."""
     return {
@@ -11734,22 +12331,29 @@ def _collect_mutating_metaclass_hook_definitions(
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
         and stmt.name in {"__new__", "__init__", "__call__", "__prepare__"}
-        and _function_mutates_workers(stmt, operator_bindings)
+        and _function_mutates_workers(stmt, operator_bindings, mutator_names)
     }
 
 
-def _mutating_metaclass_names_for_hooks(tree, operator_bindings, hook_names):
+def _mutating_metaclass_names_for_hooks(
+    tree,
+    operator_bindings,
+    hook_names,
+    mutator_names=None,
+    class_name_aliases=None,
+):
     """Return metaclasses whose effective MRO hook mutates workers."""
     metaclass_names = _collect_metaclass_class_names(tree)
     if not metaclass_names:
         return set()
     class_bases, class_methods, _class_attributes = (
-        _collect_class_definition_metadata(tree)
+        _collect_class_definition_metadata(tree, class_name_aliases)
     )
     mutating_hooks = _collect_mutating_metaclass_hook_definitions(
         tree,
         operator_bindings,
         metaclass_names,
+        mutator_names,
     )
     return {
         name
@@ -11789,15 +12393,20 @@ def _classes_with_mutating_effective_metaclass(
     tree,
     operator_bindings,
     hook_names,
+    mutator_names=None,
 ):
     """Return classes whose effective metaclass runs a mutating hook."""
+    class_names = {
+        node.name for node in _iter_import_time_class_definitions(tree.body)
+    }
+    aliases = _collect_class_name_aliases(tree, class_names)
     mutating_metaclasses = _mutating_metaclass_names_for_hooks(
         tree,
         operator_bindings,
         hook_names,
+        mutator_names,
+        aliases,
     )
-    class_names = {node.name for node in _iter_import_time_class_definitions(tree.body)}
-    aliases = _collect_class_name_aliases(tree, class_names)
     affected = set()
     for node in _iter_import_time_class_definitions(tree.body):
         reference_line = getattr(node, 'lineno', 0)
@@ -11814,12 +12423,13 @@ def _classes_with_mutating_effective_metaclass(
     return affected
 
 
-def _collect_metaclass_definition_mutators(tree, operator_bindings):
+def _collect_metaclass_definition_mutators(tree, operator_bindings, mutator_names=None):
     """Return classes whose definition runs mutating metaclass new/init hooks."""
     return _classes_with_mutating_effective_metaclass(
         tree,
         operator_bindings,
         {"__new__", "__init__", "__prepare__"},
+        mutator_names,
     )
 
 
@@ -11830,6 +12440,7 @@ def _record_class_side_effect_target(
     constructors,
     methods,
     properties,
+    mutator_names=None,
 ):
     """Record one class method that mutates ``workers`` when invoked."""
     if not isinstance(stmt, ast.FunctionDef):
@@ -11841,7 +12452,7 @@ def _record_class_side_effect_target(
         for node in _function_runtime_nodes(stmt)
     ):
         return False
-    if not _function_mutates_workers(stmt, operator_bindings):
+    if not _function_mutates_workers(stmt, operator_bindings, mutator_names):
         return False
     if stmt.name == "__class_getitem__":
         methods.add((class_name, stmt.name))
@@ -11883,6 +12494,7 @@ def _class_has_worker_side_effect_target(
     methods,
     properties,
     nested_constructor_pairs=None,
+    mutator_names=None,
 ):
     """Record all risky hooks in one class and report whether any were found."""
     risky = False
@@ -11895,6 +12507,7 @@ def _class_has_worker_side_effect_target(
                 methods,
                 properties,
                 nested_constructor_pairs=nested_constructor_pairs,
+                mutator_names=mutator_names,
             )
             if (
                 inner_risky
@@ -11911,11 +12524,13 @@ def _class_has_worker_side_effect_target(
             constructors,
             methods,
             properties,
+            mutator_names,
         ):
             risky = True
     if _class_dataclass_field_default_factory_mutates(
         class_node,
         operator_bindings,
+        mutator_names,
     ):
         constructors.add(class_node.name)
         risky = True
@@ -11961,29 +12576,48 @@ def _record_descriptor_field_assignments(
     methods,
     descriptor_fields,
     operator_bindings,
+    mutator_names=None,
+    class_name_aliases=None,
 ):
     """Record descriptor fields keyed by the hook an access kind invokes."""
     found = False
+    reference_line = getattr(class_node, "lineno", 0)
     for stmt in class_node.body:
         if isinstance(stmt, ast.FunctionDef):
             hook = _property_hook_decorator_name(stmt)
             if hook is not None and _function_mutates_workers(
                 stmt,
                 operator_bindings,
+                mutator_names,
             ):
                 descriptor_fields[hook].add((class_node.name, stmt.name))
                 found = True
             continue
-        if not isinstance(stmt, ast.Assign):
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            # An annotated field (``field: Desc = Desc()``) binds the value
+            # exactly like the plain assignment spelling.
+            targets = [stmt.target]
+            value = stmt.value
+        else:
             continue
-        if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
+        if value is None or not isinstance(value, ast.Call):
             continue
+        if not isinstance(value.func, ast.Name):
+            continue
+        descriptor_class = _class_name_alias_target(
+            value.func.id,
+            class_name_aliases or {},
+            reference_line,
+        )
         found = (
             _record_descriptor_targets(
                 class_node.name,
-                stmt.targets,
+                targets,
                 _descriptor_hooks_for_class(
-                    stmt.value.func.id, methods, descriptor_fields
+                    descriptor_class, methods, descriptor_fields
                 ),
                 descriptor_fields,
             )
@@ -12019,6 +12653,8 @@ def _scan_class_side_effect_bindings(
     descriptor_fields=None,
     conditional=False,
     nested_constructor_pairs=None,
+    mutator_names=None,
+    class_name_aliases=None,
 ):
     """Populate source-ordered risky class bindings through compound blocks."""
     for node in statements:
@@ -12031,6 +12667,7 @@ def _scan_class_side_effect_bindings(
                 methods,
                 properties,
                 nested_constructor_pairs=nested_constructor_pairs,
+                mutator_names=mutator_names,
             )
             if descriptor_fields is not None:
                 risky = (
@@ -12039,6 +12676,8 @@ def _scan_class_side_effect_bindings(
                         methods,
                         descriptor_fields,
                         operator_bindings,
+                        mutator_names,
+                        class_name_aliases,
                     )
                     or risky
                 )
@@ -12066,6 +12705,8 @@ def _scan_class_side_effect_bindings(
                 descriptor_fields=descriptor_fields,
                 conditional=True,
                 nested_constructor_pairs=nested_constructor_pairs,
+                mutator_names=mutator_names,
+                class_name_aliases=class_name_aliases,
             )
 
 
@@ -12097,9 +12738,54 @@ def _class_instance_assignment_bindings(node, enum_members=None):
     )
 
 
+def _single_literal_iterable_element(iterator):
+    """Return the only element of a one-element literal iterable, if any."""
+    if not isinstance(iterator, (ast.Tuple, ast.List)) or len(iterator.elts) != 1:
+        return None
+    return iterator.elts[0]
+
+
+def _statement_instance_bindings(node):
+    """Return ``(name, class name)`` pairs for non-assignment instance binds.
+
+    ``for h in (Dangerous(),)``, ``with Ctx() as h`` and ``except Error as h``
+    all bind an instance to the target name without an assignment statement, so
+    a tracked receiver has to follow them instead of keeping the stale class.
+    """
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        element = _single_literal_iterable_element(node.iter)
+        if not (
+            isinstance(element, ast.Call)
+            and isinstance(element.func, ast.Name)
+        ):
+            return ()
+        target_names = _loop_target_names(node.target)
+        if len(target_names) != 1:
+            return ()
+        return ((next(iter(target_names)), element.func.id),)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        bindings = []
+        for item in node.items:
+            if not isinstance(item.optional_vars, ast.Name):
+                continue
+            if not (
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+            ):
+                continue
+            bindings.append((item.optional_vars.id, item.context_expr.func.id))
+        return tuple(bindings)
+    if isinstance(node, ast.ExceptHandler):
+        if node.name and isinstance(node.type, ast.Name):
+            return ((node.name, node.type.id),)
+    return ()
+
+
 def _record_class_instance_statement(node, line, events, conditional, enum_members=None):
     """Record or invalidate one statement's class-instance bindings."""
     bindings = _class_instance_assignment_bindings(node, enum_members)
+    if not bindings:
+        bindings = _statement_instance_bindings(node)
     if bindings:
         for name, class_name in bindings:
             events.setdefault(name, []).append(
@@ -12354,14 +13040,123 @@ def _class_body_plain_attribute_names(class_node):
     return names
 
 
-def _collect_class_definition_metadata(tree):
+def _class_base_expression_name(base, reference_line, class_name_aliases=None):
+    """Resolve one base expression to a locally defined class name.
+
+    ``class Child(Alias)``, ``class Child(Base[int])`` (with a passthrough
+    ``__class_getitem__``), ``class Child(globals()['Base'])`` and
+    ``class Child(*bases)`` all name a real base at runtime. Recording the base
+    keeps the subclass relationship instead of collapsing the MRO.
+    """
+    if isinstance(base, ast.Name):
+        return _class_name_alias_target(
+            base.id,
+            class_name_aliases or {},
+            reference_line,
+        )
+    if isinstance(base, ast.Subscript):
+        # ``Base[int]`` re-enters the class's ``__mro_entries__`` /
+        # ``__class_getitem__`` path; a locally defined class still names the
+        # base for MRO purposes.
+        return _class_base_expression_name(
+            base.value,
+            reference_line,
+            class_name_aliases,
+        )
+    if isinstance(base, ast.Call):
+        function = base.func
+        if (
+            isinstance(function, ast.Name)
+            and function.id == "getattr"
+            and len(base.args) >= 2
+            and isinstance(base.args[0], ast.Name)
+            and base.args[0].id in {"globals", "locals", "vars"}
+            and isinstance(base.args[1], ast.Constant)
+            and isinstance(base.args[1].value, str)
+        ):
+            # ``globals()['Base']`` - only the literal key is resolvable.
+            return _class_name_alias_target(
+                base.args[1].value,
+                class_name_aliases,
+                reference_line,
+            )
+    if isinstance(base, ast.Starred) and isinstance(base.value, ast.Name):
+        # ``*bases`` cannot be resolved without evaluating the config, so the
+        # relationship is left unknown instead of being reported as "no base".
+        return None
+    return None
+
+
+def _module_literal_base_names(tree):
+    """Map module-level names to the literal class names a tuple holds.
+
+    ``bases = (Base,)`` followed by ``class Child(*bases)`` names the same base
+    the inline spelling does, so the literal container is expanded instead of
+    dropping the subclass relationship.
+    """
+    values = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            continue
+        names = tuple(
+            element.id for element in value.elts if isinstance(element, ast.Name)
+        )
+        if len(names) != len(value.elts):
+            # A non-name element cannot be resolved, so the tuple is not a
+            # provable base list.
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                values[target.id] = names
+    return values
+
+
+def _iter_class_base_names(
+    node,
+    reference_line,
+    class_name_aliases,
+    literal_bases,
+):
+    """Yield the resolvable base class names of one class definition."""
+    for base in node.bases:
+        if isinstance(base, ast.Starred) and isinstance(base.value, ast.Name):
+            for base_name in literal_bases.get(base.value.id, ()):
+                yield _class_name_alias_target(
+                    base_name,
+                    class_name_aliases or {},
+                    reference_line,
+                )
+            continue
+        name = _class_base_expression_name(
+            base,
+            reference_line,
+            class_name_aliases,
+        )
+        if name is not None:
+            yield name
+
+
+def _collect_class_definition_metadata(tree, class_name_aliases=None):
     """Collect class bases, defined methods, and plain class attributes."""
     class_bases = {}
     class_methods = set()
     class_attributes = set()
+    literal_bases = _module_literal_base_names(tree)
     for node in _iter_import_time_class_definitions(tree.body):
+        reference_line = getattr(node, "lineno", 0)
         class_bases[node.name] = tuple(
-            base.id for base in node.bases if isinstance(base, ast.Name)
+            _iter_class_base_names(
+                node,
+                reference_line,
+                class_name_aliases,
+                literal_bases,
+            )
         )
         class_methods.update(
             (node.name, stmt.name)
@@ -12426,12 +13221,15 @@ def _class_name_alias_target(name, class_name_aliases, reference_line=0):
     return target
 
 
-def _collect_metaclass_call_constructor_names(tree, operator_bindings):
+def _collect_metaclass_call_constructor_names(
+    tree, operator_bindings, mutator_names=None
+):
     """Return classes whose construction runs a mutating metaclass __call__."""
     return _classes_with_mutating_effective_metaclass(
         tree,
         operator_bindings,
         {"__call__"},
+        mutator_names,
     )
 
 
@@ -12529,29 +13327,51 @@ def _record_inherited_nested_constructors(
     """Include inner constructors inherited through a local class hierarchy."""
     for outer in _iter_import_time_class_definitions(tree.body):
         for inner in outer.body:
-            if isinstance(inner, ast.ClassDef) and _class_hierarchy_defines_method(
-                methods, class_bases, inner.name, "__init__", class_methods,
+            if isinstance(inner, ast.ClassDef) and any(
+                _class_hierarchy_defines_method(
+                    methods,
+                    class_bases,
+                    inner.name,
+                    hook_name,
+                    class_methods,
+                )
+                for hook_name in ("__new__", "__init__")
             ):
                 nested_constructor_pairs.add((outer.name, inner.name))
 
 
 def _class_definition_line_events(tree):
-    """Track top-level class definitions in source order."""
+    """Track class definitions in source order, including compound blocks.
+
+    A class defined inside ``if``/``try``/``with`` still runs at import when its
+    block does, so omitting it would silently disable the base-rebinding guard
+    that compares a subclass's definition line with the base's binding events.
+    """
     definition_lines = {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            definition_lines.setdefault(node.name, []).append(
-                getattr(node, "lineno", 0)
-            )
+
+    def record(statements):
+        for node in statements:
+            if isinstance(node, ast.ClassDef):
+                definition_lines.setdefault(node.name, []).append(
+                    getattr(node, "lineno", 0)
+                )
+                continue
+            for block in _compound_statement_blocks(node):
+                record(block)
+
+    record(tree.body)
     return definition_lines
 
 
-def _metaclass_bypass_binding_events(tree, class_bases):
+def _metaclass_bypass_binding_events(tree, class_bases, class_name_aliases=None):
     """Track which locally defined metaclasses bypass construction."""
     class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     class_nodes_by_name = {node.name: node for node in class_nodes}
     events = {}
-    for node, metaclass_name in _effective_metaclass_names(class_nodes):
+    for node, metaclass_name in _effective_metaclass_names(
+        class_nodes,
+        class_name_aliases,
+    ):
         bypass = metaclass_name is not None and _metaclass_call_bypasses_initializer(
             metaclass_name, class_nodes_by_name, class_bases,
         )
@@ -12607,7 +13427,7 @@ def _nested_constructor_rebinding_events(
     return events
 
 
-def _collect_class_side_effect_targets(tree, operator_bindings):
+def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=None):
     """Collect risky class hooks plus source-ordered class bindings."""
     constructors = set()
     methods = set()
@@ -12622,6 +13442,17 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     metaclass_definitions = _collect_metaclass_definition_mutators(
         tree,
         operator_bindings,
+        mutator_names,
+    )
+    # The class-alias map only needs the definition names, so resolve it before
+    # the hook scan: a descriptor factory spelled through an alias is resolved
+    # the same way the constructor path already resolves one.
+    class_name_aliases = _collect_class_name_aliases(
+        tree,
+        {
+            node.name
+            for node in _iter_import_time_class_definitions(tree.body)
+        },
     )
 
     _scan_class_side_effect_bindings(
@@ -12632,6 +13463,8 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         properties,
         {},
         nested_constructor_pairs=nested_constructor_pairs,
+        mutator_names=mutator_names,
+        class_name_aliases=class_name_aliases,
     )
 
     binding_events = {}
@@ -12644,6 +13477,8 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         binding_events,
         descriptor_fields=descriptor_fields,
         nested_constructor_pairs=nested_constructor_pairs,
+        mutator_names=mutator_names,
+        class_name_aliases=class_name_aliases,
     )
 
     enum_members = _collect_enum_member_targets(tree)
@@ -12654,12 +13489,11 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         enum_members=enum_members,
     )
     class_bases, class_methods, class_attributes = (
-        _collect_class_definition_metadata(tree)
+        _collect_class_definition_metadata(tree, class_name_aliases)
     )
     _record_inherited_nested_constructors(
         tree, methods, class_bases, class_methods, nested_constructor_pairs,
     )
-    class_name_aliases = _collect_class_name_aliases(tree, set(class_bases))
     class_definition_lines = _class_definition_line_events(tree)
     _record_class_constructor_assignment_barriers(
         tree,
@@ -12667,12 +13501,13 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         class_methods,
     )
     metaclass_bypass_events = _metaclass_bypass_binding_events(
-        tree, class_bases,
+        tree, class_bases, class_name_aliases,
     )
     constructors.update(
         _collect_metaclass_call_constructor_names(
             tree,
             operator_bindings,
+            mutator_names,
         )
     )
     _record_module_class_super_methods(
@@ -12684,7 +13519,10 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
     class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     class_metaclass_names = {
         node.name: metaclass_name
-        for node, metaclass_name in _effective_metaclass_names(class_nodes)
+        for node, metaclass_name in _effective_metaclass_names(
+            class_nodes,
+            class_name_aliases,
+        )
         if metaclass_name is not None
     }
     # Async entry hooks execute only when awaited by async-with. Keep them
@@ -12696,7 +13534,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aenter__"
         and not stmt.decorator_list
-        and _function_mutates_workers(stmt, operator_bindings)
+        and _function_mutates_workers(stmt, operator_bindings, mutator_names)
     }
     async_exit_methods = {
         (node.name, stmt.name)
@@ -12705,7 +13543,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aexit__"
         and not stmt.decorator_list
-        and _function_mutates_workers(stmt, operator_bindings)
+        and _function_mutates_workers(stmt, operator_bindings, mutator_names)
     }
     # Generator-based contextmanager methods only run their bodies upon
     # __enter__/__exit__, so do not add them to ordinary mutating methods.
@@ -12715,7 +13553,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings):
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
         and _function_uses_contextmanager_decorator(stmt, operator_bindings)
-        and _function_mutates_workers(stmt, operator_bindings)
+        and _function_mutates_workers(stmt, operator_bindings, mutator_names)
     }
     return (
         constructors,
@@ -12830,20 +13668,33 @@ def _function_delegates_type_call(func_node):
     return False
 
 
-def _effective_metaclass_names(class_nodes):
+def _effective_metaclass_names(class_nodes, class_name_aliases=None):
     """Return each class definition's explicit or inherited metaclass name."""
     effective = {}
     resolved = []
     for node in class_nodes:
+        reference_line = getattr(node, "lineno", 0)
         explicit = _explicit_metaclass_name(node)
         if explicit is not None:
-            metaclass_name = explicit
+            metaclass_name = _class_name_alias_target(
+                explicit,
+                class_name_aliases or {},
+                reference_line,
+            )
         else:
             metaclass_name = next(
                 (
-                    effective[base.id]
-                    for base in node.bases
-                    if isinstance(base, ast.Name) and base.id in effective
+                    effective[base_name]
+                    for base_name in (
+                        _class_name_alias_target(
+                            base.id,
+                            class_name_aliases or {},
+                            reference_line,
+                        )
+                        for base in node.bases
+                        if isinstance(base, ast.Name)
+                    )
+                    if base_name in effective
                 ),
                 None,
             )
@@ -13056,11 +13907,17 @@ def _instance_hook_is_active(
     """
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     for instance_line, instance_class in _instance_binding_candidates_at_line(
         instance_events,
         instance_name,
         reference_line,
     ):
+        instance_class = _class_name_alias_target(
+            instance_class,
+            class_name_aliases,
+            instance_line,
+        )
         if not _class_hierarchy_defines_method(
             methods,
             class_bases,
@@ -13146,7 +14003,17 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         class_name,
         reference_line,
     ):
-        return False
+        # A metaclass ``__call__`` that bypasses ``type.__call__`` still runs
+        # ``cls.__new__(...)`` in the usual implementations, so only the
+        # ``__init__`` lookup is skipped. This matches the
+        # ``_type_constructor_bases_trigger_workers(..., skip_init=True)``
+        # policy used for a replaced initializer.
+        return _class_mro_hook_triggers_workers(
+            class_name,
+            "__new__",
+            class_targets,
+            reference_line,
+        )
     return any(
         _class_mro_hook_triggers_workers(
             class_name, hook_name, class_targets, reference_line
@@ -14056,7 +14923,10 @@ def _subscript_uses_dynamic_class_introspection(sub, operator_bindings=None):
     if isinstance(value, ast.Attribute) and value.attr in {"__mro__", "__bases__"}:
         return _subscript_constant_index(sub.slice) is None
     if _is_class_mro_method_call(value):
-        return False
+        # ``Class.mro()[i]`` selects the same runtime MRO entry the
+        # ``Class.__mro__[i]`` spelling does, so a non-literal index is just as
+        # dynamic: only a constant index has a resolver.
+        return _subscript_constant_index(sub.slice) is None
     if (
         _subscript_constant_index(sub.slice) is None
         and isinstance(value, ast.Call)
@@ -14580,7 +15450,12 @@ def _constructed_receiver_call_triggers_workers(
     reference_line,
 ):
     """Return True when ClassName().method() resolves to a risky hook."""
-    class_name = receiver.func.id
+    aliases = class_targets[14] if len(class_targets) > 14 else {}
+    class_name = _class_name_alias_target(
+        receiver.func.id,
+        aliases,
+        reference_line,
+    )
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
     class_methods = class_targets[8] if len(class_targets) > 8 else None
     return (
@@ -15121,15 +15996,27 @@ def _attribute_access_triggers_workers(
     if not isinstance(expr, ast.Attribute):
         return False
     class_name = None
+    receiver_name = None
     instance_read = False
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
     if (
         isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Name)
     ):
-        class_name = expr.value.func.id
+        receiver_name = expr.value.func.id
+        class_name = _class_name_alias_target(
+            receiver_name,
+            class_name_aliases,
+            reference_line,
+        )
         instance_read = True
     elif isinstance(expr.value, ast.Name):
-        class_name = expr.value.id
+        receiver_name = expr.value.id
+        class_name = _class_name_alias_target(
+            receiver_name,
+            class_name_aliases,
+            reference_line,
+        )
     if (
         isinstance(expr.value, ast.Call)
         and _explicit_super_call_class_name(expr.value, class_targets) is not None
@@ -15163,7 +16050,7 @@ def _attribute_access_triggers_workers(
         class_targets,
         instance_events,
         properties | get_fields,
-        class_name,
+        receiver_name,
         expr.attr,
         reference_line,
         class_attributes=class_attributes,
@@ -15174,9 +16061,14 @@ def _class_subscript_triggers_workers(expr, class_targets):
     """Return True when Class[item] reaches a mutating __class_getitem__."""
     if not isinstance(expr, ast.Subscript) or not isinstance(expr.value, ast.Name):
         return False
-    class_name = expr.value.id
     reference_line = getattr(expr, "lineno", 0)
-    if not _class_binding_is_active(class_targets, class_name, reference_line):
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    class_name = _class_name_alias_target(
+        expr.value.id,
+        class_name_aliases,
+        reference_line,
+    )
+    if not _class_binding_is_active(class_targets, expr.value.id, reference_line):
         return False
     methods = class_targets[1]
     class_bases = class_targets[7] if len(class_targets) > 7 else {}
@@ -15285,6 +16177,12 @@ def _class_body_assigns_mutating_descriptor(class_node, class_targets):
 
 def _classdef_has_import_time_workers_side_effect(class_node, class_targets):
     """Return True when defining the class itself mutates ``workers``."""
+    if not class_targets:
+        # The class-hook map is still being collected, so no nested definition
+        # can be resolved against it yet. Class metadata is unavailable rather
+        # than empty, and treating it as "no side effect" keeps the scan
+        # running instead of raising on the missing tuple.
+        return False
     constructors = class_targets[0]
     methods = class_targets[1]
     metaclass_definitions = class_targets[3]
@@ -16149,7 +17047,10 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
         or _call_is_namespace_setdefault_workers(call, namespace_aliases)
         or _call_is_getattr_setdefault_workers(call, namespace_aliases)
         or _call_is_operator_setitem_workers(call, operator_bindings)
-        or _call_is_getattr_setitem_workers(call)
+        or _call_is_getattr_setitem_workers(
+            call,
+            operator_bindings[32] if len(operator_bindings) > 32 else None,
+        )
         or _call_is_dict_type_setitem_on_module_namespace(
             call,
             namespace_aliases,
@@ -16165,7 +17066,13 @@ def _call_has_direct_worker_indirection(call, operator_bindings):
             dict_shadow_line,
             operator_bindings,
         )
-        or _call_is_dict_type_ior_on_module_namespace(call, namespace_aliases, dict_shadow_line, dict_ior_aliases)
+        or _call_is_dict_type_ior_on_module_namespace(
+            call,
+            namespace_aliases,
+            dict_shadow_line,
+            dict_ior_aliases,
+            operator_bindings[32] if len(operator_bindings) > 32 else None,
+        )
         or _call_is_importlib_sys_namespace_mutation(call, operator_bindings)
         or _call_is_subscript_namespace_workers_update(call, namespace_aliases, mutator_aliases)
         or _call_is_operator_methodcaller_on_module_namespace(call, operator_bindings, namespace_aliases)
@@ -17360,7 +18267,12 @@ def _statement_scope_bound_names(node):
     """Return names bound directly by one statement in the current scope."""
     names = {
         name
-        for name, _value in _namespace_assignment_values(node)
+        # A value-less annotation still binds the name in the current scope
+        # (``name: T`` makes it local), even though it rebinds nothing at
+        # runtime. Alias tracking that models rebinding ignores it.
+        for name, _value in _namespace_assignment_values(
+            node, include_bare_annotations=True
+        )
     }
     if isinstance(node, (ast.For, ast.AsyncFor)):
         names.update(_loop_target_names(node.target))
@@ -17544,9 +18456,17 @@ class _GunicornWorkersScanState:
     found = False
 
     def clear_workers_assignment(self) -> None:
-        """Forget a static count that a later removal of ``workers`` invalidated."""
+        """Forget a static count that a later removal of ``workers`` invalidated.
+
+        An unconditional top-level ``del workers`` leaves no configured count at
+        all, so Gunicorn falls back to its ``WEB_CONCURRENCY``/default worker
+        count. A dynamic flag left over from the removed binding must be cleared
+        too, otherwise the fallback itself is reported as unverifiable and a
+        later static assignment can no longer be recorded.
+        """
         self.found = False
         self.count = 1
+        self.dynamic = False
 
     def record_workers_assignment(self, value, *, in_compound: bool) -> None:
         self.found = True
@@ -17581,11 +18501,17 @@ def _sync_callback_tracking(scan_state):
 
 
 def _simple_assignment_names(node):
-    """Return simple names definitely rebound by one assignment statement."""
+    """Return simple names definitely rebound by one assignment statement.
+
+    A value-less ``name: T`` annotation only updates ``__annotations__`` and
+    leaves the existing binding untouched, so it never rebinds the name.
+    """
     targets = []
     if isinstance(node, ast.Assign):
         targets = node.targets
     elif isinstance(node, ast.AnnAssign):
+        if node.value is None:
+            return set()
         targets = [node.target]
     elif isinstance(node, ast.NamedExpr):
         targets = [node.target]
@@ -18093,26 +19019,33 @@ def _builtin_call_is_active(call, name, operator_bindings):
     )
 
 
-def _expression_is_zero_arg_call_of_name(expr, name):
-    """Return True when an evaluated expression invokes ``name()``."""
+def _expression_is_zero_arg_call_of_name(expr, name, *, allow_arguments=False):
+    """Return True when an evaluated expression invokes ``name()``.
+
+    ``allow_arguments`` accepts an invocation with any argument list; callers
+    use it only when the callee is already proven to be a mutating callback.
+    """
     if isinstance(expr, ast.Lambda):
         return False
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Name)
         and expr.func.id == name
-        and not expr.args
-        and not expr.keywords
+        and (allow_arguments or (not expr.args and not expr.keywords))
     ):
         return True
     return any(
-        _expression_is_zero_arg_call_of_name(child, name)
+        _expression_is_zero_arg_call_of_name(
+            child,
+            name,
+            allow_arguments=allow_arguments,
+        )
         for child in ast.iter_child_nodes(expr)
         if isinstance(child, ast.expr)
     )
 
 
-def _statement_zero_arg_calls_name(node, name):
+def _statement_zero_arg_calls_name(node, name, *, allow_arguments=False):
     """Return True when an evaluated part of a statement invokes ``name()``."""
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return False
@@ -18120,11 +19053,13 @@ def _statement_zero_arg_calls_name(node, name):
         if isinstance(child, ast.expr) and _expression_is_zero_arg_call_of_name(
             child,
             name,
+            allow_arguments=allow_arguments,
         ):
             return True
         if isinstance(child, ast.stmt) and _statement_zero_arg_calls_name(
             child,
             name,
+            allow_arguments=allow_arguments,
         ):
             return True
     return False
@@ -18138,9 +19073,11 @@ def _for_loop_iter_holds_mutating_callbacks(node, operator_bindings):
     )
 
 
-def _comprehension_call_targets_loop_name(call, loop_name):
-    """Return True when a zero-arg call invokes the comprehension loop variable."""
-    if not isinstance(call, ast.Call) or call.args or call.keywords:
+def _comprehension_call_targets_loop_name(call, loop_name, *, allow_arguments=False):
+    """Return True when a call invokes the comprehension loop variable."""
+    if not isinstance(call, ast.Call):
+        return False
+    if not allow_arguments and (call.args or call.keywords):
         return False
     func = call.func
     if isinstance(func, ast.Name):
@@ -18158,10 +19095,14 @@ def _literal_expression_truthiness(expr):
         return None
 
 
-def _boolop_invokes_loop_callback(expr, loop_name):
+def _boolop_invokes_loop_callback(expr, loop_name, allow_arguments=False):
     """Respect literal short-circuiting while scanning a boolean expression."""
     for value in expr.values:
-        if _expression_invokes_loop_callback(value, loop_name):
+        if _expression_invokes_loop_callback(
+            value,
+            loop_name,
+            allow_arguments=allow_arguments,
+        ):
             return True
         truthiness = _literal_expression_truthiness(value)
         if isinstance(expr.op, ast.Or) and truthiness is True:
@@ -18171,24 +19112,52 @@ def _boolop_invokes_loop_callback(expr, loop_name):
     return False
 
 
-def _expression_invokes_loop_callback(expr, loop_name):
+def _expression_invokes_loop_callback(expr, loop_name, *, allow_arguments=False):
     """Return True when evaluating an expression can invoke ``loop_name()``."""
-    if _comprehension_call_targets_loop_name(expr, loop_name):
+    if _comprehension_call_targets_loop_name(
+        expr,
+        loop_name,
+        allow_arguments=allow_arguments,
+    ):
         return True
     if isinstance(expr, ast.BoolOp):
-        return _boolop_invokes_loop_callback(expr, loop_name)
+        return _boolop_invokes_loop_callback(
+            expr,
+            loop_name,
+            allow_arguments,
+        )
     if isinstance(expr, ast.IfExp):
         test_truthiness = _literal_expression_truthiness(expr.test)
         if test_truthiness is True:
-            return _expression_invokes_loop_callback(expr.body, loop_name)
+            return _expression_invokes_loop_callback(
+                expr.body,
+                loop_name,
+                allow_arguments=allow_arguments,
+            )
         if test_truthiness is False:
-            return _expression_invokes_loop_callback(expr.orelse, loop_name)
+            return _expression_invokes_loop_callback(
+                expr.orelse,
+                loop_name,
+                allow_arguments=allow_arguments,
+            )
         return (
-            _expression_invokes_loop_callback(expr.body, loop_name)
-            or _expression_invokes_loop_callback(expr.orelse, loop_name)
+            _expression_invokes_loop_callback(
+                expr.body,
+                loop_name,
+                allow_arguments=allow_arguments,
+            )
+            or _expression_invokes_loop_callback(
+                expr.orelse,
+                loop_name,
+                allow_arguments=allow_arguments,
+            )
         )
     if isinstance(expr, ast.UnaryOp):
-        return _expression_invokes_loop_callback(expr.operand, loop_name)
+        return _expression_invokes_loop_callback(
+            expr.operand,
+            loop_name,
+            allow_arguments=allow_arguments,
+        )
     return False
 
 
@@ -18561,13 +19530,7 @@ def _inspect_frameinfo_value_is_active(node, inspect_analysis):
 
 def _frame_globals_call_targets_live_frame(call, operator_bindings):
     """Return True when a frame f_globals receiver is a proven live frame."""
-    inspect_analysis = (
-        operator_bindings[-1]
-        if operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-        else {}
-    )
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
     reference_line = getattr(call, "lineno", 0)
     active_frame_names = {
         name
@@ -18614,13 +19577,27 @@ def _call_is_inspect_currentframe_globals_ior(call, operator_bindings):
 
 
 def _inspect_analysis_from_bindings(operator_bindings):
-    """Return the inspect/frame provenance bundle from operator bindings."""
-    if (
-        operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-    ):
-        return operator_bindings[-1]
+    """Return the inspect/frame provenance bundle from operator bindings.
+
+    The bundle is appended as the last tuple slot only after the early alias
+    passes have run, so a positional lookup misses it during the class-hook and
+    import-time mutator passes. The metadata store keeps the same bundle from
+    the start of the scan, and a shape lookup covers a caller that only received
+    the append.
+    """
+    if not operator_bindings:
+        return {}
+    store = (
+        operator_bindings[32]
+        if len(operator_bindings) > 32 and isinstance(operator_bindings[32], dict)
+        else {}
+    )
+    stored = store.get("inspect_analysis")
+    if isinstance(stored, dict):
+        return stored
+    for slot in reversed(operator_bindings):
+        if isinstance(slot, dict) and "frame_alias_events" in slot:
+            return slot
     return {}
 
 
@@ -18817,6 +19794,8 @@ def _call_is_operator_methodcaller_on_proven_frame_globals(
         )
     if method == "__setitem__":
         return len(factory.args) >= 3 and _key_may_be_workers(factory.args[1])
+    if method == "setdefault":
+        return len(factory.args) >= 2 and _key_may_be_workers(factory.args[1])
     return method is None
 
 
@@ -19139,13 +20118,7 @@ def _node_is_proven_live_frame(node, inspect_analysis, active_frame_names):
 
 def _augassign_mutates_proven_frame_globals(node, operator_bindings):
     """Return True for ``frame.f_globals |= {...}`` style worker mutations."""
-    inspect_analysis = (
-        operator_bindings[-1]
-        if operator_bindings
-        and isinstance(operator_bindings[-1], dict)
-        and "frame_alias_events" in operator_bindings[-1]
-        else {}
-    )
+    inspect_analysis = _inspect_analysis_from_bindings(operator_bindings)
     if not isinstance(node, ast.AugAssign) or not isinstance(node.op, ast.BitOr):
         return False
     target = node.target
@@ -19503,12 +20476,11 @@ def _mutating_callback_loop_target_names(node, operator_bindings):
     return set()
 
 
-def _expression_is_direct_zero_arg_call_of_names(expr, names):
-    """Return True when ``expr`` directly invokes one of ``names`` with no arguments."""
+def _expression_is_direct_zero_arg_call_of_names(expr, names, *, allow_arguments=False):
+    """Return True when ``expr`` directly invokes one of ``names``."""
     return (
         isinstance(expr, ast.Call)
-        and not expr.args
-        and not expr.keywords
+        and (allow_arguments or (not expr.args and not expr.keywords))
         and isinstance(expr.func, ast.Name)
         and expr.func.id in names
     )
@@ -19551,12 +20523,20 @@ def _comprehension_invokes_mutating_callback(
         return False
     if eager_consumer and isinstance(node, ast.GeneratorExp):
         return any(
-            _expression_invokes_loop_callback(element, loop_name)
+            _expression_invokes_loop_callback(
+                element,
+                loop_name,
+                allow_arguments=True,
+            )
             for element in elements
             for loop_name in loop_names
         )
     return any(
-        _expression_is_direct_zero_arg_call_of_names(element, loop_names)
+        _expression_is_direct_zero_arg_call_of_names(
+            element,
+            loop_names,
+            allow_arguments=True,
+        )
         for element in elements
     )
 
@@ -19733,7 +20713,11 @@ def _for_loop_invokes_mutating_callback(node, operator_bindings):
     if not loop_names:
         return False
     return any(
-        _statement_zero_arg_calls_name(stmt, name)
+        _statement_zero_arg_calls_name(
+            stmt,
+            name,
+            allow_arguments=True,
+        )
         for stmt in node.body
         for name in loop_names
     )
@@ -20244,8 +21228,15 @@ def _sync_callback_queue_get_subscript_mutates(expr, tracking):
     )
 
 
-def _record_sync_callback_cancel(node, tracking):
-    """Remove a proven mutating scheduler event canceled before run()."""
+def _record_sync_callback_cancel(node, tracking, *, conditional=False):
+    """Remove a proven mutating scheduler event canceled before run().
+
+    A ``s.cancel(ev)`` inside a branch may never execute, so it cannot prove
+    the event is gone; the asyncio twin already ignores conditional cancels for
+    the same reason.
+    """
+    if conditional:
+        return
     expr = _statement_value_expression(node)
     if not (
         isinstance(expr, ast.Call)
@@ -20349,11 +21340,13 @@ def _sync_callback_dispatch_mutates(node, tracking, operator_bindings):
     return _sync_callback_inner_accessor_dispatch_mutates(inner, tracking)
 
 
-def _track_sync_callback_dispatch(node, scan_state, operator_bindings):
+def _track_sync_callback_dispatch(
+    node, scan_state, operator_bindings, *, conditional=False
+):
     """Update container tracking and report proven synchronous callback execution."""
     tracking = _sync_callback_tracking(scan_state)
     _record_sync_callback_imports(node, tracking)
-    _record_sync_callback_cancel(node, tracking)
+    _record_sync_callback_cancel(node, tracking, conditional=conditional)
     dispatch_mutates = _sync_callback_dispatch_mutates(
         node,
         tracking,
@@ -20627,11 +21620,18 @@ def _imported_alias_event_column(node, name):
 
 
 def _collect_imported_name_alias_events(tree, module_name, imported_names, *, ordered_events=None):
-    """Track import-time aliases in module and compound statement bodies."""
+    """Track import-time aliases in module and compound statement bodies.
+
+    Only a top-level rebinding definitely replaces an imported name. An
+    assignment inside a compound statement may never run, so it keeps the
+    alias as a possible candidate, which matches the module-alias collector
+    and is the fail-closed direction for the worker scan.
+    """
     events = {}
     active = set()
     module_aliases = set()
     module_events = {}
+    top_level_nodes = {id(node) for node in tree.body}
     for node in _module_scope_ast_nodes(tree):
         if not isinstance(node, ast.stmt):
             continue
@@ -20655,7 +21655,8 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names, *, or
             events,
             line,
         )
-        _invalidate_imported_module_aliases(node, active, events, line)
+        if id(node) in top_level_nodes:
+            _invalidate_imported_module_aliases(node, active, events, line)
         _record_imported_name_alias_propagation(
             node,
             module_aliases,
@@ -20664,12 +21665,13 @@ def _collect_imported_name_alias_events(tree, module_name, imported_names, *, or
             events,
             line,
         )
-        _invalidate_imported_module_aliases(
-            node,
-            module_aliases,
-            module_events,
-            line,
-        )
+        if id(node) in top_level_nodes:
+            _invalidate_imported_module_aliases(
+                node,
+                module_aliases,
+                module_events,
+                line,
+            )
         if ordered_events is not None:
             for name, items in events.items():
                 for event in items[prior_counts.get(name, 0):]:
@@ -21278,6 +22280,23 @@ def _definition_time_expressions(node, defer_annotations=False):
     return expressions
 
 
+def _definition_time_worker_expressions(node, defer_annotations=False):
+    """Return every expression evaluated while a definition statement runs.
+
+    A ``def`` evaluates its decorators, defaults and annotations; a ``class``
+    evaluates its decorators, bases and keyword arguments (including
+    ``metaclass=``). All of them can call a helper that mutates ``workers``
+    before the body exists, so the worker scan inspects each of them.
+    """
+    expressions = [*getattr(node, "decorator_list", ())]
+    if isinstance(node, ast.ClassDef):
+        expressions.extend(node.bases)
+        expressions.extend(keyword.value for keyword in node.keywords)
+        return expressions
+    expressions.extend(_definition_time_expressions(node, defer_annotations))
+    return expressions
+
+
 def _definition_time_workers_effect(
     node,
     global_workers_mutators,
@@ -21296,7 +22315,10 @@ def _definition_time_workers_effect(
             class_targets=class_targets,
             dict_subclass_names=dict_subclass_names,
         )
-        for expression in _definition_time_expressions(node, defer_annotations)
+        for expression in _definition_time_worker_expressions(
+            node,
+            defer_annotations,
+        )
     )
 
 
@@ -21547,6 +22569,14 @@ def _handle_worker_scan_definition(
         return False
     if (
         _node_has_worker_mutating_decorator(node, global_workers_mutators)
+        or _definition_time_workers_effect(
+            node,
+            global_workers_mutators,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
+        )
         or _classdef_has_import_time_workers_side_effect(node, class_targets)
         or _class_body_has_dynamic_workers_effect(
             node.body,
@@ -21595,7 +22625,12 @@ def _walk_gunicorn_workers_statements(
             defer_annotations,
         ):
             continue
-        if _track_sync_callback_dispatch(node, state, operator_bindings):
+        if _track_sync_callback_dispatch(
+            node,
+            state,
+            operator_bindings,
+            conditional=in_compound,
+        ):
             state.dynamic = True
         if _track_asyncio_loop_schedule(
             node,
@@ -22060,7 +23095,11 @@ def _call_binds_hook_name(
         )
     if isinstance(func, ast.Call):
         module_aliases = operator_bindings[0] if operator_bindings else set()
-        if _getattr_operator_method_name(func, module_aliases) == "setitem":
+        if _getattr_operator_method_name(
+            func,
+            module_aliases,
+            operator_bindings[32] if len(operator_bindings) > 32 else None,
+        ) == "setitem":
             return _type_bound_hook_store_name(call, namespace_aliases)
     partial_hook = _partial_call_binds_hook_store_name(
         call, operator_bindings, namespace_aliases
@@ -22143,6 +23182,12 @@ def _hook_binding_name_is_live(child, name, explicit, scope):
             return name in declared_globals
         return may_run
     if in_class:
+        return name in declared_globals
+    if in_function:
+        # A ``def`` or a store in a function body binds a local, not a module
+        # hook, unless the name was declared ``global``. Without this a helper
+        # that returns a nested ``when_ready`` function would look like a live
+        # module hook even though the module namespace never gains the name.
         return name in declared_globals
     return may_run
 
@@ -22292,6 +23337,10 @@ def _provably_uncalled_function_names(tree):
         node.name
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        # A decorator is applied to the function object itself, without ever
+        # loading the function's name, so a decorated function can run during
+        # config import and is never provably uncalled.
+        and not node.decorator_list
         and node.name not in referenced
     )
 
@@ -22320,6 +23369,15 @@ def _gunicorn_config_has_runtime_hooks(
         in_class, _declared_globals, _may_run, in_function = scope
         with _evaluated_in_nested_scope(in_class or in_function):
             for child in ast.iter_child_nodes(node):
+                if (
+                    isinstance(node, ast.AnnAssign)
+                    and node.value is None
+                    and child is node.target
+                ):
+                    # A bare ``when_ready: ServerHook`` only records the type in
+                    # ``__annotations__``; the module namespace never gains a
+                    # ``when_ready`` entry, so Gunicorn installs no hook.
+                    continue
                 if _is_live_gunicorn_hook_binding(
                     child,
                     scope,
@@ -22364,6 +23422,94 @@ def _record_contextlib_alias_events(tree, operator_bindings):
     )
 
 
+def _collect_inspect_analysis(tree, operator_bindings):
+    """Collect the inspect/traceback frame provenance bundle.
+
+    The bundle is built before the class-hook and import-time mutator passes so
+    that a helper reached through ``sys._getframe().f_globals`` is already
+    resolvable while those passes run; the caller appends it as the last
+    operator-binding slot for the later statement walks.
+    """
+    inspect_analysis = {
+        "module_alias_events": _collect_imported_module_alias_events(
+            tree,
+            "inspect",
+        ),
+        "currentframe_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"currentframe"},
+        ),
+        "builtin_shadow_lines": (
+            operator_bindings[32] if len(operator_bindings) > 32 else {}
+        ),
+        "stack_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"stack"},
+        ),
+        "getouterframes_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"getouterframes"},
+        ),
+        "innerframes_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"innerframes"},
+        ),
+        "getmro_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "inspect",
+            {"getmro"},
+        ),
+        "traceback_module_alias_events": _collect_imported_module_alias_events(
+            tree,
+            "traceback",
+        ),
+        "walk_stack_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "traceback",
+            {"walk_stack"},
+        ),
+        "sys_module_alias_events": _collect_imported_module_alias_events(
+            tree,
+            "sys",
+        ),
+        "sys_getframe_alias_events": _collect_imported_name_alias_events(
+            tree,
+            "sys",
+            {"_getframe"},
+        ),
+    }
+    inspect_analysis["frameinfo_alias_spans"] = (
+        _collect_inspect_frameinfo_alias_spans(
+            tree,
+            inspect_analysis,
+        )
+    )
+    inspect_analysis["frameinfo_alias_events"] = (
+        _collect_inspect_frameinfo_alias_events(
+            tree,
+            inspect_analysis,
+        )
+    )
+    inspect_analysis["walk_stack_pair_alias_spans"] = (
+        _collect_walk_stack_pair_alias_spans(
+            tree,
+            inspect_analysis,
+        )
+    )
+    inspect_analysis["frame_alias_events"] = _collect_inspect_frame_alias_events(
+        tree,
+        inspect_analysis,
+    )
+    return inspect_analysis
+
+
+_CLASS_HOOK_REFINEMENT_PASSES = 8
+
+
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
@@ -22374,6 +23520,14 @@ def _scan_gunicorn_config_worker_details(tree):
         )
         if shadow_events:
             operator_bindings[32][builtin_name] = shadow_events
+    # The frame-provenance bundle is appended as the last binding slot at the end
+    # of the scan, but the early generator/class-hook and import-time mutator
+    # passes run before that. Storing the same bundle in the metadata map makes
+    # it visible to them without changing the tuple layout.
+    operator_bindings[32]["inspect_analysis"] = _collect_inspect_analysis(
+        tree,
+        operator_bindings,
+    )
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     runtime_dynamic = _gunicorn_config_has_runtime_hooks(
         tree, namespace_aliases, operator_bindings
@@ -22502,20 +23656,42 @@ def _scan_gunicorn_config_worker_details(tree):
         dict_shadow_line,
         operator_bindings[32],
     )
-    class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
-    # Function bodies are scanned before the late inspect-analysis bundle exists.
-    # Keep class targets in the existing metadata map, preserving tuple indices.
-    operator_bindings[32]["class_targets"] = class_targets
-    operator_bindings[32]["contextmanager_factory_events"] = (
-        _collect_contextmanager_factory_events(tree, class_targets, operator_bindings)
-    )
     operator_bindings[32]["dict_subclass_names"] = dict_subclass_names
-    import_time_workers_mutators = _collect_import_time_workers_mutators(
-        tree,
-        operator_bindings,
-        class_targets,
-        dict_subclass_names,
-    )
+    # Class hooks and the import-time mutator fixpoint depend on each other: a
+    # hook whose body calls a module-level helper is only risky once the helper
+    # is a known mutator, and the mutator set depends on the class hooks (an
+    # ``H()`` call at module scope runs ``H.__init__``). The mutator set only
+    # grows, so a bounded refinement pass reaches the same verdict as a full
+    # re-analysis, and the late inspect bundle is still appended afterwards.
+    class_targets = _collect_class_side_effect_targets(tree, operator_bindings)
+    import_time_workers_mutators = set()
+    for _ in range(_CLASS_HOOK_REFINEMENT_PASSES):
+        # Function bodies are scanned before the late inspect-analysis bundle
+        # exists. Keep class targets in the existing metadata map, preserving
+        # tuple indices.
+        operator_bindings[32]["class_targets"] = class_targets
+        operator_bindings[32]["contextmanager_factory_events"] = (
+            _collect_contextmanager_factory_events(
+                tree,
+                class_targets,
+                operator_bindings,
+            )
+        )
+        refined_mutators = _collect_import_time_workers_mutators(
+            tree,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+        )
+        if refined_mutators == import_time_workers_mutators:
+            break
+        import_time_workers_mutators = refined_mutators
+        class_targets = _collect_class_side_effect_targets(
+            tree,
+            operator_bindings,
+            import_time_workers_mutators,
+        )
+    operator_bindings[32]["class_targets"] = class_targets
     operator_bindings = (
         *operator_bindings,
         import_time_workers_mutators,
@@ -22709,82 +23885,7 @@ def _scan_gunicorn_config_worker_details(tree):
         *operator_bindings,
         future_analysis,
     )
-    inspect_module_alias_events = _collect_imported_module_alias_events(
-        tree,
-        "inspect",
-    )
-    inspect_currentframe_alias_events = _collect_imported_name_alias_events(
-        tree,
-        "inspect",
-        {"currentframe"},
-    )
-    inspect_analysis = {
-        "module_alias_events": inspect_module_alias_events,
-        "currentframe_alias_events": inspect_currentframe_alias_events,
-        "builtin_shadow_lines": (
-            operator_bindings[32] if len(operator_bindings) > 32 else {}
-        ),
-        "stack_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "inspect",
-            {"stack"},
-        ),
-        "getouterframes_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "inspect",
-            {"getouterframes"},
-        ),
-        "innerframes_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "inspect",
-            {"innerframes"},
-        ),
-        "getmro_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "inspect",
-            {"getmro"},
-        ),
-        "traceback_module_alias_events": _collect_imported_module_alias_events(
-            tree,
-            "traceback",
-        ),
-        "walk_stack_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "traceback",
-            {"walk_stack"},
-        ),
-        "sys_module_alias_events": _collect_imported_module_alias_events(
-            tree,
-            "sys",
-        ),
-        "sys_getframe_alias_events": _collect_imported_name_alias_events(
-            tree,
-            "sys",
-            {"_getframe"},
-        ),
-    }
-    inspect_analysis["frameinfo_alias_spans"] = (
-        _collect_inspect_frameinfo_alias_spans(
-            tree,
-            inspect_analysis,
-        )
-    )
-    inspect_analysis["frameinfo_alias_events"] = (
-        _collect_inspect_frameinfo_alias_events(
-            tree,
-            inspect_analysis,
-        )
-    )
-    inspect_analysis["walk_stack_pair_alias_spans"] = (
-        _collect_walk_stack_pair_alias_spans(
-            tree,
-            inspect_analysis,
-        )
-    )
-    inspect_analysis["frame_alias_events"] = _collect_inspect_frame_alias_events(
-        tree,
-        inspect_analysis,
-    )
+    inspect_analysis = _collect_inspect_analysis(tree, operator_bindings)
     inspect_analysis["class_targets"] = class_targets
     operator_bindings = (
         *operator_bindings,
@@ -22946,11 +24047,35 @@ def _static_gunicorn_chdir(tree):
     return value
 
 
+def _gunicorn_config_assigns_chdir(tree):
+    """Return True when the config assigns the ``chdir`` setting at all."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == "chdir"
+            for target in targets
+        ):
+            return True
+    return False
+
+
 def _gunicorn_config_chdir_status(config_path: Path, cwd: Path):
-    """Return whether a literal chdir resolves to cwd, or None when unverifiable."""
+    """Return whether a chdir explains cwd, or None when it cannot be verified."""
     tree = _parse_gunicorn_config_tree(config_path)
     if tree is None:
         return None
+    if not _gunicorn_config_assigns_chdir(tree):
+        # Without a chdir setting Gunicorn stays in its launch directory, so this
+        # config cannot be the one that moved the process to ``cwd``.
+        try:
+            return config_path.resolve().parent == cwd
+        except (OSError, RuntimeError):
+            return None
     raw_chdir = _static_gunicorn_chdir(tree)
     if raw_chdir is None:
         return None
@@ -23023,12 +24148,23 @@ def _gunicorn_pwd_fallback_is_ambiguous(
     cwd_exists,
     fail_closed_if_ambiguous,
 ):
-    """Return whether the unverified PWD config is the only candidate left."""
+    """Return whether the unverified PWD config is the one Gunicorn loaded.
+
+    Gunicorn resolves the implicit config against its launch directory and only
+    afterwards applies ``chdir``, so an unverifiable ``chdir`` leaves the PWD
+    file as the config Gunicorn actually executed. A cwd config existing at the
+    same time does not make the PWD file the wrong candidate: it is the file
+    Gunicorn never loaded, so the scan must prefer the launch-directory one and
+    keep the verdict fail-closed. Without a cwd config the PWD file is still the
+    only candidate that can be inspected.
+    """
     return (
         pwd_exists
-        and chdir_status is None
-        and not cwd_exists
         and not fail_closed_if_ambiguous
+        and (
+            chdir_status is None
+            or (chdir_status is False and not cwd_exists)
+        )
     )
 
 
