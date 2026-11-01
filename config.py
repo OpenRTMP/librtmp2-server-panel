@@ -5309,23 +5309,46 @@ def _deactivate_tracked_binding(events, name, line):
         events[name].append((line, False))
 
 
+def _loop_iterable_runs_at_least_once(iterable):
+    """Return True when a loop over ``iterable`` provably binds its target.
+
+    A literal non-empty sequence and a positive constant ``range`` iterate at
+    least once; anything else (including an empty literal) may run zero times
+    and must leave the previous binding in place.
+    """
+    if isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
+        return bool(iterable.elts)
+    if isinstance(iterable, ast.Dict):
+        return bool(iterable.keys)
+    if (
+        isinstance(iterable, ast.Call)
+        and isinstance(iterable.func, ast.Name)
+        and iterable.func.id == "range"
+        and len(iterable.args) == 1
+        and isinstance(iterable.args[0], ast.Constant)
+        and type(iterable.args[0].value) is int
+    ):
+        return iterable.args[0].value > 0
+    return False
+
+
 def _statement_rebound_names(node):
     """Return names a non-assignment statement definitely rebinds.
 
-    ``for`` / ``with ... as`` / ``except ... as`` targets and import bindings
-    replace an existing module binding exactly like an assignment does, so a
-    stale tracked binding has to be invalidated for them too.
+    ``with ... as`` targets and import bindings always replace an existing
+    module binding. A ``for`` target is only rebound when the loop body runs,
+    so an empty or unresolvable iterable keeps the previous binding as a
+    possibility instead of dropping it. An ``except ... as`` target only exists
+    while the handler runs, so it never proves the outer binding changed.
     """
     names = set()
     if isinstance(node, (ast.For, ast.AsyncFor)):
-        names.update(_loop_target_names(node.target))
+        if _loop_iterable_runs_at_least_once(node.iter):
+            names.update(_loop_target_names(node.target))
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         for item in node.items:
             if item.optional_vars is not None:
                 names.update(_loop_target_names(item.optional_vars))
-    elif isinstance(node, ast.ExceptHandler):
-        if node.name:
-            names.add(node.name)
     names.update(_import_bound_names(node))
     return names
 
@@ -6175,12 +6198,27 @@ def _warnings_showwarning_statement_replacement(node, operator_bindings):
 
 
 def _class_attribute_value_expression(class_attribute_values, expr):
-    """Resolve a ``Class.attribute`` reference to the class-body value."""
+    """Resolve a ``Class.attribute`` reference to the class-body value.
+
+    Class definitions are kept in source order, so a reference resolves to the
+    value bound *before* it: ``class Hooks(Hooks): showwarning =
+    Hooks.showwarning`` keeps the base class's value instead of pointing at
+    itself.
+    """
     if not class_attribute_values:
         return None
     if not (isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name)):
         return None
-    return class_attribute_values.get((expr.value.id, expr.attr))
+    events = class_attribute_values.get((expr.value.id, expr.attr))
+    if not events:
+        return None
+    reference_line = getattr(expr, "lineno", 0)
+    resolved = None
+    for event_line, value in events:
+        if reference_line and event_line >= reference_line:
+            break
+        resolved = value
+    return resolved
 
 
 def _warnings_showwarning_value_mutates(
@@ -6188,13 +6226,16 @@ def _warnings_showwarning_value_mutates(
     operator_bindings,
     mutator_names,
     class_attribute_values=None,
+    seen_values=frozenset(),
 ):
     """Return True when a showwarning replacement can mutate workers.
 
     ``_expression_mutates_workers`` only inspects definition-time expressions,
     so a replacement wrapped in a conditional, an ``or`` chain or a class
     attribute reference would otherwise be reported as safe even though the
-    selected callable mutates ``workers``.
+    selected callable mutates ``workers``. ``seen_values`` guards the recursive
+    class-attribute resolution against a reference that resolves to itself
+    (``class Hooks(Hooks): showwarning = Hooks.showwarning``).
     """
     if isinstance(value, ast.Name):
         return value.id in mutator_names
@@ -6206,11 +6247,13 @@ def _warnings_showwarning_value_mutates(
             operator_bindings,
             mutator_names,
             class_attribute_values,
+            seen_values,
         ) or _warnings_showwarning_value_mutates(
             value.orelse,
             operator_bindings,
             mutator_names,
             class_attribute_values,
+            seen_values,
         )
     if isinstance(value, ast.BoolOp):
         return any(
@@ -6219,6 +6262,7 @@ def _warnings_showwarning_value_mutates(
                 operator_bindings,
                 mutator_names,
                 class_attribute_values,
+                seen_values,
             )
             for operand in value.values
         )
@@ -6231,20 +6275,22 @@ def _warnings_showwarning_value_mutates(
                 operator_bindings,
                 mutator_names,
                 class_attribute_values,
+                seen_values,
             )
     assigned = _class_attribute_value_expression(class_attribute_values, value)
-    if assigned is not None:
+    if assigned is not None and id(assigned) not in seen_values:
         return _warnings_showwarning_value_mutates(
             assigned,
             operator_bindings,
             mutator_names,
             class_attribute_values,
+            seen_values | {id(assigned)},
         )
     return _expression_mutates_workers(value, operator_bindings)
 
 
 def _collect_class_attribute_value_expressions(tree):
-    """Map ``(class, attribute)`` to the value its class body binds."""
+    """Map ``(class, attribute)`` to its class-body values in source order."""
     values = {}
     for node in _iter_import_time_class_definitions(tree.body):
         for stmt in node.body:
@@ -6254,9 +6300,12 @@ def _collect_class_attribute_value_expressions(tree):
                 targets, value = [stmt.target], stmt.value
             else:
                 continue
+            line = getattr(stmt, "lineno", 0)
             for target in targets:
                 if isinstance(target, ast.Name):
-                    values[(node.name, target.id)] = value
+                    values.setdefault((node.name, target.id), []).append(
+                        (line, value)
+                    )
     return values
 
 
@@ -12811,6 +12860,17 @@ def _scan_class_instance_bindings(
                 _deactivate_tracked_binding(events, node.name, line)
             continue
         _record_class_instance_statement(node, line, events, conditional, enum_members)
+        if isinstance(node, _TRY_STATEMENT_NODES):
+            # ``except Error as name`` binds an instance only while the handler
+            # runs, so it is recorded as a conditional candidate.
+            for handler in node.handlers:
+                _record_class_instance_statement(
+                    handler,
+                    getattr(handler, "lineno", line),
+                    events,
+                    True,
+                    enum_members,
+                )
         for block in _compound_statement_blocks(node):
             _scan_class_instance_bindings(
                 block,
@@ -18454,6 +18514,10 @@ class _GunicornWorkersScanState:
     count = 1
     dynamic = False
     found = False
+    # Set when a mutation that runs after import was proven (a started thread,
+    # for example). Unlike ``dynamic`` it is not a property of the configured
+    # binding, so removing ``workers`` cannot clear it.
+    pending_dynamic = False
 
     def clear_workers_assignment(self) -> None:
         """Forget a static count that a later removal of ``workers`` invalidated.
@@ -18462,7 +18526,9 @@ class _GunicornWorkersScanState:
         all, so Gunicorn falls back to its ``WEB_CONCURRENCY``/default worker
         count. A dynamic flag left over from the removed binding must be cleared
         too, otherwise the fallback itself is reported as unverifiable and a
-        later static assignment can no longer be recorded.
+        later static assignment can no longer be recorded. An outstanding
+        post-import mutation (``pending_dynamic``) is not a property of the
+        removed binding and keeps the config dynamic.
         """
         self.found = False
         self.count = 1
@@ -23345,6 +23411,31 @@ def _provably_uncalled_function_names(tree):
     )
 
 
+def _gunicorn_definition_time_child(node, child):
+    """Return True when ``child`` is evaluated in the enclosing scope.
+
+    A ``def`` evaluates its decorators, defaults and annotations while the
+    statement runs, and a ``class`` evaluates its decorators, bases and keyword
+    arguments (``metaclass=``). A walrus in any of them binds in the enclosing
+    scope, not in the body the definition introduces, so the hook walk must not
+    apply the new scope to those sub-trees.
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        if child is node.args or child is getattr(node, "returns", None):
+            return True
+        return any(
+            child is decorator
+            for decorator in getattr(node, "decorator_list", ())
+        )
+    if isinstance(node, ast.ClassDef):
+        if any(child is decorator for decorator in node.decorator_list):
+            return True
+        if any(child is base for base in node.bases):
+            return True
+        return any(child is keyword.value for keyword in node.keywords)
+    return False
+
+
 def _gunicorn_config_has_runtime_hooks(
     tree, namespace_aliases=None, operator_bindings=None
 ):
@@ -23363,9 +23454,13 @@ def _gunicorn_config_has_runtime_hooks(
     setitem_alias_events = _collect_imported_name_alias_events(
         tree, "operator", {"setitem"}
     )
-    stack = [(tree, (False, frozenset(), True, False))]
+    root_scope = (False, frozenset(), True, False)
+    # Each entry carries the scope of the node and the scope its definition-time
+    # expressions belong to (the scope of its parent): a default, decorator,
+    # base or annotation is evaluated before the new scope exists.
+    stack = [(tree, root_scope, root_scope)]
     while stack:
-        node, scope = stack.pop()
+        node, scope, definition_scope = stack.pop()
         in_class, _declared_globals, _may_run, in_function = scope
         with _evaluated_in_nested_scope(in_class or in_function):
             for child in ast.iter_child_nodes(node):
@@ -23386,9 +23481,15 @@ def _gunicorn_config_has_runtime_hooks(
                     setitem_alias_events,
                 ):
                     return True
-                stack.append(
-                    (child, _gunicorn_hook_binding_scope(child, scope, uncalled_names))
-                )
+                if _gunicorn_definition_time_child(node, child):
+                    child_scope = definition_scope
+                else:
+                    child_scope = _gunicorn_hook_binding_scope(
+                        child,
+                        scope,
+                        uncalled_names,
+                    )
+                stack.append((child, child_scope, scope))
     return False
 
 
@@ -23896,7 +23997,9 @@ def _scan_gunicorn_config_worker_details(tree):
         operator_bindings,
         import_time_workers_mutators,
     ):
-        state.dynamic = True
+        # A started thread mutates ``workers`` after import, so this is not a
+        # property of the configured binding and ``del workers`` cannot clear it.
+        state.pending_dynamic = True
     _walk_gunicorn_workers_statements(
         tree.body,
         state,
@@ -23908,7 +24011,7 @@ def _scan_gunicorn_config_worker_details(tree):
         defer_annotations=_config_defers_annotations(tree),
     )
     configured_count = state.count if state.found else None
-    return configured_count, state.dynamic, runtime_dynamic
+    return configured_count, state.dynamic or state.pending_dynamic, runtime_dynamic
 
 
 
