@@ -20,6 +20,7 @@ COPY VERSION ./
 COPY templates templates/
 COPY static static/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY gunicorn_config_probe.py /usr/local/bin/gunicorn_config_probe.py
 
 RUN version="${APP_VERSION:-$(cat VERSION)}" && \
     mkdir -p /data /usr/local/share/openrtmp && \

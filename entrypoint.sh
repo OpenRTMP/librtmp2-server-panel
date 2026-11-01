@@ -40,7 +40,11 @@ option_takes_value() {
         --statsd-host|--dogstatsd|--paste|--pythonpath|--reload-engine|\
         --reload-extra-file|--limit-request-line|--limit-request-fields|\
         --limit-request-field-size|--sendfile|--raw-passthrough|--spec|\
-        --wsgi-app)
+        --wsgi-app|--protocol|--log-config|--log-config-json|--header-map|\
+        --forwarder-headers|--root-path|--statsd-prefix|--dogstatsd-tags|\
+        --log-syslog-to|--log-syslog-facility|--log-syslog-prefix|\
+        --cert-reqs|--http-protocols|--http-parser|--control-socket|\
+        --paste-global|--paster|--uwsgi-allow-from|--asgi-*|--dirty-*)
             return 0 ;;
         *)
             return 1 ;;
@@ -120,56 +124,65 @@ app_target_supplied() {
     return 1
 }
 
-# Return 0 when the arguments carry a Gunicorn bind option, i.e. "-b",
-# "--bind" or "--bind=ADDRESS". A host:port value (for example the
-# "0.0.0.0:8000" of the default --bind) is not a bind option.
-bind_option_supplied() {
-    for arg in "$@"; do
-        case "$arg" in
-            -b|-b*|--bind|--bind=*)
-                return 0 ;;
-            *)
-                ;;
-        esac
-    done
-    return 1
+# Path to the helper that mirrors Gunicorn's configuration precedence without
+# importing or executing the operator's config file.
+PROBE_SCRIPT="${OPENRTMP_CONFIG_PROBE:-}"
+if [ -z "$PROBE_SCRIPT" ]; then
+    case "$0" in
+        */*)
+            PROBE_SCRIPT="$(dirname "$0")/gunicorn_config_probe.py" ;;
+        *)
+            PROBE_SCRIPT=/usr/local/bin/gunicorn_config_probe.py ;;
+    esac
+fi
+
+# Gunicorn is a Python program, so the image always ships an interpreter; the
+# loop only keeps a shell-only environment from failing outright.
+PYTHON_BIN=
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        PYTHON_BIN="$candidate"
+        break
+    fi
+done
+
+# Ask the probe whether the effective Gunicorn configuration provides a
+# setting. Returns 0 when it does, 1 when it provably does not, and 2 when the
+# configuration cannot be inspected (no interpreter or no helper script).
+config_probe() {
+    probe_mode="$1"
+    shift
+    if [ -z "$PYTHON_BIN" ] || [ ! -r "$PROBE_SCRIPT" ]; then
+        return 2
+    fi
+    set +e
+    "$PYTHON_BIN" "$PROBE_SCRIPT" "$probe_mode" "$@"
+    probe_status=$?
+    set -e
+    return "$probe_status"
 }
 
-# Return 0 when the arguments name a Gunicorn config file that provides the
-# application itself (``wsgi_app``). Gunicorn serves the first positional
-# argument in preference to ``wsgi_app``, so the image's default application
-# must not be added when the operator's config already supplies one.
+# Return 0 when the effective configuration already supplies a bind address.
+# Gunicorn reads GUNICORN_CMD_ARGS (shlex-split), then the -c config file and
+# the implicit gunicorn.conf.py, and the command line; the probe mirrors that
+# order. An uninspectable configuration counts as supplied so the image never
+# overrides an operator setting with its own default.
+bind_configured() {
+    probe_status=0
+    config_probe bind "$@" || probe_status=$?
+    [ "$probe_status" -ne 1 ]
+}
+
+# Return 0 when the effective configuration already supplies the application
+# itself (``wsgi_app``). Gunicorn serves the first positional argument in
+# preference to ``wsgi_app``, so the image's default application must not be
+# added when the operator's config already supplies one. An uninspectable
+# configuration is not treated as supplied here: without a positional argument
+# and without the default, Gunicorn would refuse to start.
 config_supplies_app() {
-    expect_value=0
-    config_path=
-    for arg in "$@"; do
-        if [ "$expect_value" -eq 1 ]; then
-            config_path="$arg"
-            expect_value=0
-            continue
-        fi
-        case "$arg" in
-            --config=*)
-                config_path="${arg#--config=}" ;;
-            -c|--config)
-                expect_value=1 ;;
-            -c*)
-                config_path="${arg#-c}" ;;
-            *)
-                ;;
-        esac
-    done
-    case "$config_path" in
-        ''|python:*)
-            # An empty value or a module reference cannot be inspected here.
-            return 1 ;;
-        file:*)
-            config_path="${config_path#file:}" ;;
-        *)
-            ;;
-    esac
-    [ -r "$config_path" ] || return 1
-    grep -qE '^[[:space:]]*wsgi_app[[:space:]]*=' "$config_path"
+    probe_status=0
+    config_probe wsgi-app "$@" || probe_status=$?
+    [ "$probe_status" -eq 0 ]
 }
 
 # The image's default command (kept in sync with the Dockerfile CMD). Without
@@ -181,7 +194,7 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
     # by the operator has to replace the image's default one instead of
     # being appended to it: otherwise the service keeps listening on
     # 0.0.0.0:8000 and the operator's restriction is defeated.
-    if bind_option_supplied "$@"; then
+    if bind_configured "$@"; then
         default_bind=
     else
         default_bind="--bind 0.0.0.0:8000"
