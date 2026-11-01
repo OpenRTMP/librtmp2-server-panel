@@ -157,6 +157,13 @@ _DEFINITION_TIME_CASES = [
         True,
     ),
     (
+        "walrus in a class keyword binds at module scope",
+        "workers = 1\n"
+        "class Holder(object, metaclass=(when_ready := type)):\n"
+        "    pass\n",
+        True,
+    ),
+    (
         "walrus inside a function body stays a local binding",
         "workers = 1\n"
         "def install():\n"

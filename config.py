@@ -23577,7 +23577,7 @@ def _gunicorn_definition_time_child(node, child):
             return True
         if any(child is base for base in node.bases):
             return True
-        return any(child is keyword.value for keyword in node.keywords)
+        return any(child is keyword for keyword in node.keywords)
     return False
 
 
