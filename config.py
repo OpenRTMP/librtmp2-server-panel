@@ -13677,6 +13677,11 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
             mutator_names,
         )
     )
+    _record_deferred_type_class_constructors(
+        tree.body,
+        constructors,
+        operator_bindings,
+    )
     _record_module_class_super_methods(
         tree, class_bases, methods, class_methods, constructors,
     )
@@ -16485,6 +16490,44 @@ def _call_is_type_constructor_side_effect(call, operator_bindings):
     if keyword_effect:
         return True
     return _type_constructor_bases_trigger_workers(constructor, operator_bindings)
+
+
+def _assigned_unshadowed_type_call(node, builtin_shadow_lines):
+    """Return an assigned built-in ``type(...)`` call, or None."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return None
+    value = node.value
+    if not isinstance(value, ast.Call):
+        return None
+    if not isinstance(value.func, ast.Name) or value.func.id != "type":
+        return None
+    if not _name_is_unshadowed_builtin(
+        "type", getattr(value, "lineno", 0), builtin_shadow_lines
+    ):
+        return None
+    return value
+
+
+def _record_deferred_type_class_constructors(
+    statements,
+    constructors,
+    operator_bindings,
+):
+    """Register module names bound to a dynamic ``type(...)`` that mutates on ``Name()``."""
+    builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    for node in statements:
+        value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
+        if value is None:
+            continue
+        instantiated = ast.Call(func=value, args=[], keywords=[])
+        if not _call_is_type_constructor_side_effect(
+            instantiated,
+            operator_bindings,
+        ):
+            continue
+        for target in _statement_simple_targets(node):
+            if isinstance(target, ast.Name):
+                constructors.add(target.id)
 
 
 def _partial_reduce_initializer(partial_call, invocation, invocation_start):
