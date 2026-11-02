@@ -63,6 +63,28 @@ def test_delete_stream_treats_404_as_success():
         client.delete_stream("missing")
 
 
+def test_delete_stream_202_treats_numeric_upstream_id_as_same_stream():
+    """Upstream JSON may encode id as int while the panel passes str stream_id."""
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
+        "lrtmp2_client.requests.get"
+    ) as mock_get, patch("lrtmp2_client.time.sleep") as mock_sleep, patch(
+        "lrtmp2_client.time.monotonic"
+    ) as mock_monotonic:
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 202
+
+        still_present = type("R", (), {"ok": True, "json": lambda self: [{"id": 42}]})()
+        gone = type("R", (), {"ok": True, "json": lambda self: []})()
+        mock_get.side_effect = [still_present, gone]
+        mock_monotonic.side_effect = [0, 1, 2]
+
+        client.delete_stream("42", wait_timeout=5, poll_interval=0.1)
+
+    assert mock_get.call_count == 2
+    mock_sleep.assert_called_once()
+
+
 def test_delete_stream_polls_until_gone_on_202():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete, patch(
