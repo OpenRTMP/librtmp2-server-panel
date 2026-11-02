@@ -53,6 +53,20 @@ DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS = (
     DELETE_STREAM_DRAIN_WAIT_SECONDS + ADMIN_REQUEST_TIMEOUT_SECONDS + 20
 )
 
+# Keep in sync with app.CLUSTER_KEY_TYPES / app._stream_id_matches: list payloads
+# may use non-string scalar ids while route/query ids are always str.
+_STREAM_ID_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _stream_id_matches(upstream_id, requested_id):
+    """Return True when an upstream list entry denotes the requested stream id."""
+    if upstream_id == requested_id:
+        return True
+    return (
+        isinstance(upstream_id, _STREAM_ID_SCALAR_TYPES)
+        and str(upstream_id) == str(requested_id)
+    )
+
 
 def _api_error(resp, operation):
     """Return a user-safe error; log details only in the exception message prefix."""
@@ -209,7 +223,7 @@ class Lrtmp2Client:
         if not isinstance(streams, list):
             return None
         if any(
-            isinstance(item, dict) and item.get("id") == stream_id
+            isinstance(item, dict) and _stream_id_matches(item.get("id"), stream_id)
             for item in streams
         ):
             return False
