@@ -133,6 +133,12 @@ _DYNAMIC_CASES = [
         "from multiprocessing import pool\n"
         "pool.ThreadPool(1).apply(lambda: globals().update({'workers': 4}))\n",
     ),
+    (
+        "deferred type() alias instantiation rebinding workers is dynamic",
+        "workers = 1\n"
+        "T = type('T', (), {'__init__': lambda self: globals().__setitem__('workers', 4)})\n"
+        "T()\n",
+    ),
 ]
 
 _SAFE_CASES = [
