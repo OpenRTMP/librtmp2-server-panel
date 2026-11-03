@@ -16824,28 +16824,41 @@ _MAPPING_MUTATOR_METHODS = {
 }
 
 
+def _mutation_statement_targets(node):
+    """Yield the targets a mapping-mutating assignment/delete operates on."""
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        yield from node.targets
+    elif isinstance(node, ast.AugAssign):
+        yield node.target
+
+
+def _attribute_mutator_name(node):
+    """Return the mapping name of a ``ns.update(...)``-style call, if any."""
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return None
+    function = node.value.func
+    if (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.attr in _MAPPING_MUTATOR_METHODS
+    ):
+        return function.value.id
+    return None
+
+
 def _mapping_mutation_names(node):
     """Yield names whose mapping contents a module-scope statement changes."""
-    if isinstance(node, (ast.Assign, ast.Delete)):
-        for target in node.targets:
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                yield target.value.id
-        return
-    if isinstance(node, ast.AugAssign):
-        target = node.target
+    for target in _mutation_statement_targets(node):
         if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
             yield target.value.id
-        elif isinstance(target, ast.Name) and isinstance(node.op, ast.BitOr):
-            yield target.id
-        return
-    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-        function = node.value.func
-        if (
-            isinstance(function, ast.Attribute)
-            and isinstance(function.value, ast.Name)
-            and function.attr in _MAPPING_MUTATOR_METHODS
+        elif (
+            isinstance(node, ast.AugAssign)
+            and isinstance(target, ast.Name)
+            and isinstance(node.op, ast.BitOr)
         ):
-            yield function.value.id
+            yield target.id
+    if (name := _attribute_mutator_name(node)) is not None:
+        yield name
 
 
 def _record_literal_namespace_value(targets, value, values, ambiguous):
@@ -16870,8 +16883,7 @@ def _module_literal_namespace_values(tree):
     values = {}
     ambiguous = set()
     for node, _conditional in _iter_import_time_module_statements_with_flags(tree.body):
-        for mutated in _mapping_mutation_names(node):
-            ambiguous.add(mutated)
+        ambiguous.update(_mapping_mutation_names(node))
         assignment = _module_assign_targets_value(node)
         if assignment is None:
             continue
