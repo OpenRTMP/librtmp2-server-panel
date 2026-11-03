@@ -5161,3 +5161,94 @@ def test_nov03_type_ambiguous_namespace_variable_stays_static(tmp_path):
         "T = type('T', (), ns)\n"
         "T()\n",
     ) == (1, False)
+
+
+def test_nov03_definite_base_reassignment_replaces_the_earlier_tuple(tmp_path):
+    # ``bases`` is rebound unconditionally before the class statement, so the
+    # runtime hierarchy is (Mutator,) only; unioning would hide the mutating
+    # initializer behind the harmless one.
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "class Safe:\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        "class Mutator:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "bases = (Safe,)\n"
+        "bases = (Mutator,)\n"
+        "class Child(*bases):\n"
+        "    pass\n"
+        "Child()\n",
+    ) == (1, True)
+
+
+def test_nov03_nested_metaclass_cannot_shadow_the_module_binding(tmp_path):
+    # A bare ``metaclass=Meta`` at module scope never resolves to Holder.Meta,
+    # so the nested class must not decide whether construction is bypassed.
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "class Meta(type):\n"
+        "    pass\n"
+        "class Holder:\n"
+        "    class Meta(type):\n"
+        "        def __call__(cls, *args, **kwargs):\n"
+        "            return None\n"
+        "class Child(Base, metaclass=Meta):\n"
+        "    pass\n"
+        "Child()\n",
+    ) == (1, True)
+
+
+def test_nov03_mutated_literal_namespace_is_not_trusted(tmp_path):
+    # ``del ns['__init__']`` makes the literal a stale description of the
+    # namespace handed to type(), so it must not suppress the inherited
+    # initializer.
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        globals().update({'workers': 4})\n"
+        "ns = {'__init__': lambda self: None}\n"
+        "del ns['__init__']\n"
+        "T = type('T', (Base,), ns)\n"
+        "T()\n",
+    ) == (1, True)
+
+
+def test_nov03_unclosed_exit_stack_push_does_not_count_the_hook(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import contextlib\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        globals().update({'workers': 4})\n"
+        "stack = contextlib.ExitStack()\n"
+        "stack.push(CM())\n",
+    ) == (1, False)
+
+
+def test_nov03_pushed_exit_stack_hook_counts_after_unwind(tmp_path):
+    # A stack that is closed does run the registered __exit__.
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import contextlib\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, exc_type, exc, tb):\n"
+        "        globals().update({'workers': 4})\n"
+        "stack = contextlib.ExitStack()\n"
+        "stack.push(CM())\n"
+        "stack.close()\n",
+    ) == (1, True)

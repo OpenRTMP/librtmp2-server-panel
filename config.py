@@ -6349,7 +6349,7 @@ def _class_attribute_assignment(stmt):
 def _collect_class_attribute_value_expressions(tree):
     """Map ``(class, attribute)`` to its class-body values in source order."""
     values = {}
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         for stmt in node.body:
             assignment = _class_attribute_assignment(stmt)
             if assignment is None:
@@ -7125,7 +7125,9 @@ def _call_is_exit_stack_push_mutation(
     """Return True for ``stack.push(...)`` on a tracked ExitStack.
 
     ``push(cm)`` runs ``cm.__exit__`` on unwind exactly like ``enter_context``
-    does, and ``push(fn)`` registers a plain callback.
+    does, and ``push(fn)`` registers a plain callback. Nothing runs unless the
+    stack actually unwinds, so a stack that is never closed or exited must not
+    count as an executed hook.
     """
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
         return False
@@ -7136,6 +7138,12 @@ def _call_is_exit_stack_push_mutation(
         call.func.value,
         operator_bindings,
         reference_line,
+    ):
+        return False
+    if not _exit_stack_closes_after_enter(
+        call.func.value.id,
+        reference_line,
+        operator_bindings,
     ):
         return False
     if _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
@@ -12559,12 +12567,27 @@ def _iter_import_time_module_statements(statements):
     that look at assignments: a ``if``/``try``/``with`` block still runs at
     import time, so its statements must be visible.
     """
-    for node in statements:
+    for node, _conditional in _iter_import_time_module_statements_with_flags(statements):
         yield node
+
+
+def _iter_import_time_module_statements_with_flags(statements, conditional=False):
+    """Yield ``(statement, conditional)`` for module-scope statements.
+
+    ``conditional`` is true when the statement sits in a branch, loop or
+    ``try`` body, i.e. when reaching it is not guaranteed. Callers use it to
+    tell a definite rebinding from one that may not run.
+    """
+    for node in statements:
+        yield node, conditional
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+        nested = conditional or isinstance(
+            node,
+            (ast.If, ast.Try, ast.TryStar, ast.For, ast.AsyncFor, ast.While, ast.Match),
+        )
         for block in _compound_statement_blocks(node):
-            yield from _iter_import_time_module_statements(block)
+            yield from _iter_import_time_module_statements_with_flags(block, nested)
 
 
 def _iter_import_time_class_definitions(statements):
@@ -12578,9 +12601,39 @@ def _iter_import_time_class_definitions(statements):
                 yield from _iter_import_time_class_definitions(block)
 
 
+def _iter_module_scope_class_definitions(statements):
+    """Yield classes bound by a simple module-scope name."""
+    for node in statements:
+        if isinstance(node, ast.ClassDef):
+            yield node
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for block in _compound_statement_blocks(node):
+                yield from _iter_module_scope_class_definitions(block)
+
+
+def _visible_class_definitions(tree):
+    """Yield definitions that a bare name can actually resolve to.
+
+    A class nested in another class is only reachable as ``Outer.Inner``; no
+    bare-name lookup (bases, ``metaclass=``, ``Child()``) can reach it. When a
+    module-level class claims the same simple name, the nested definition must
+    therefore stay out of the name-keyed tables, or its bases, hooks and
+    metaclass would silently rewrite the module class's hierarchy. A nested
+    class with a name of its own stays visible, because it is the only binding
+    that name can mean.
+    """
+    module_nodes = list(_iter_module_scope_class_definitions(tree.body))
+    module_ids = {id(node) for node in module_nodes}
+    module_names = {node.name for node in module_nodes}
+    for node in _iter_import_time_class_definitions(tree.body):
+        if id(node) not in module_ids and node.name in module_names:
+            continue
+        yield node
+
+
 def _collect_metaclass_class_names(tree):
     """Return locally defined classes that are type or stdlib metaclass subclasses."""
-    class_nodes = list(_iter_import_time_class_definitions(tree.body))
+    class_nodes = list(_visible_class_definitions(tree))
     local_names = {node.name for node in class_nodes}
     # Any locally defined class can be used as an explicit metaclass: Python
     # calls it with (name, bases, ns) even when it does not subclass ``type``
@@ -12620,7 +12673,7 @@ def _collect_mutating_metaclass_hook_definitions(
     """Return mutating hook definitions owned by local metaclass classes."""
     return {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         if node.name in metaclass_names
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
@@ -12691,7 +12744,7 @@ def _classes_with_mutating_effective_metaclass(
 ):
     """Return classes whose effective metaclass runs a mutating hook."""
     class_names = {
-        node.name for node in _iter_import_time_class_definitions(tree.body)
+        node.name for node in _visible_class_definitions(tree)
     }
     aliases = _collect_class_name_aliases(tree, class_names)
     mutating_metaclasses = _mutating_metaclass_names_for_hooks(
@@ -12702,7 +12755,7 @@ def _classes_with_mutating_effective_metaclass(
         aliases,
     )
     affected = set()
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         reference_line = getattr(node, 'lineno', 0)
         explicit = _explicit_metaclass_name(node)
         if explicit is not None:
@@ -13448,18 +13501,26 @@ def _literal_base_names(value):
     return names
 
 
-def _merge_base_names(values, targets, names):
-    """Union one assignment's names into every simple target."""
+def _merge_base_names(values, targets, names, conditional):
+    """Record one assignment's names into every simple target.
+
+    A definite assignment replaces the tuple that was bound before it: the
+    earlier one never reaches the ``class`` statement, and unioning them would
+    invent a multiple-inheritance hierarchy whose MRO masks the real
+    initializer. An assignment inside ``if``/``try``/loop may or may not run,
+    so it is unioned into the existing tuple instead.
+    """
     for target in targets:
-        if isinstance(target, ast.Name):
-            # Union every reachable assignment: a later assignment in a
-            # conditional branch may or may not run, so dropping the definite
-            # earlier tuple would lose a real base relationship.
-            merged = values.get(target.id, ())
-            for name in names:
-                if name not in merged:
-                    merged = (*merged, name)
-            values[target.id] = merged
+        if not isinstance(target, ast.Name):
+            continue
+        if conditional and target.id in values:
+            merged = values[target.id]
+            values[target.id] = (
+                *merged,
+                *(name for name in names if name not in merged),
+            )
+        else:
+            values[target.id] = tuple(names)
 
 
 def _module_literal_base_names(tree):
@@ -13470,14 +13531,14 @@ def _module_literal_base_names(tree):
     dropping the subclass relationship.
     """
     values = {}
-    for node in _iter_import_time_module_statements(tree.body):
+    for node, conditional in _iter_import_time_module_statements_with_flags(tree.body):
         assignment = _module_assign_targets_value(node)
         if assignment is None:
             continue
         targets, value = assignment
         names = _literal_base_names(value)
         if names is not None:
-            _merge_base_names(values, targets, names)
+            _merge_base_names(values, targets, names, conditional)
     return values
 
 
@@ -13507,21 +13568,27 @@ def _iter_class_base_names(
 
 
 def _collect_class_definition_metadata(tree, class_name_aliases=None):
-    """Collect class bases, defined methods, and plain class attributes."""
+    """Collect class bases, defined methods, and plain class attributes.
+
+    A name defined more than once at module scope (``if``/``else`` variants)
+    keeps every base it was ever declared with: dropping one of the two
+    hierarchies would hide a mutating initializer behind the surviving one.
+    """
     class_bases = {}
     class_methods = set()
     class_attributes = set()
     literal_bases = _module_literal_base_names(tree)
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         reference_line = getattr(node, "lineno", 0)
-        class_bases[node.name] = tuple(
-            _iter_class_base_names(
-                node,
-                reference_line,
-                class_name_aliases,
-                literal_bases,
-            )
-        )
+        bases = class_bases.setdefault(node.name, [])
+        for base_name in _iter_class_base_names(
+            node,
+            reference_line,
+            class_name_aliases,
+            literal_bases,
+        ):
+            if base_name is not None and base_name not in bases:
+                bases.append(base_name)
         class_methods.update(
             (node.name, stmt.name)
             for stmt in node.body
@@ -13531,7 +13598,11 @@ def _collect_class_definition_metadata(tree, class_name_aliases=None):
             (node.name, attribute_name)
             for attribute_name in _class_body_plain_attribute_names(node)
         )
-    return class_bases, class_methods, class_attributes
+    return (
+        {name: tuple(bases) for name, bases in class_bases.items()},
+        class_methods,
+        class_attributes,
+    )
 
 
 def _collect_class_name_aliases(tree, class_names):
@@ -13679,7 +13750,7 @@ def _record_class_constructor_assignment_barriers(
     or mutating assigned constructors stay unrecorded, leaving the existing
     inherited-constructor lookup unchanged.
     """
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         for stmt in node.body:
             for name in _class_constructor_assignment_names(
                 stmt,
@@ -13692,7 +13763,7 @@ def _record_inherited_nested_constructors(
     tree, methods, class_bases, class_methods, nested_constructor_pairs,
 ):
     """Include inner constructors inherited through a local class hierarchy."""
-    for outer in _iter_import_time_class_definitions(tree.body):
+    for outer in _visible_class_definitions(tree):
         for inner in outer.body:
             if isinstance(inner, ast.ClassDef) and any(
                 _class_hierarchy_defines_method(
@@ -13732,7 +13803,7 @@ def _class_definition_line_events(tree):
 
 def _metaclass_bypass_binding_events(tree, class_bases, class_name_aliases=None):
     """Track which locally defined metaclasses bypass construction."""
-    class_nodes = list(_iter_import_time_class_definitions(tree.body))
+    class_nodes = list(_visible_class_definitions(tree))
     class_nodes_by_name = {node.name: node for node in class_nodes}
     events = {}
     for node, metaclass_name in _effective_metaclass_names(
@@ -13752,7 +13823,7 @@ def _record_module_class_super_methods(
     tree, class_bases, methods, class_methods, constructors,
 ):
     """Record mutating superclass dispatch for top-level classes."""
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         _record_mutating_super_methods(
             node, class_bases, methods, class_methods, constructors,
         )
@@ -13817,7 +13888,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
         tree,
         {
             node.name
-            for node in _iter_import_time_class_definitions(tree.body)
+            for node in _visible_class_definitions(tree)
         },
     )
 
@@ -13887,7 +13958,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     nested_attribute_bindings = _nested_constructor_rebinding_events(
         tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
     )
-    class_nodes = list(_iter_import_time_class_definitions(tree.body))
+    class_nodes = list(_visible_class_definitions(tree))
     class_metaclass_names = {
         node.name: metaclass_name
         for node, metaclass_name in _effective_metaclass_names(
@@ -13900,7 +13971,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     # separate from ordinary method calls, which merely create coroutines.
     async_entry_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aenter__"
@@ -13909,7 +13980,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     }
     async_exit_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aexit__"
@@ -13920,7 +13991,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     # __enter__/__exit__, so do not add them to ordinary mutating methods.
     contextmanager_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
         and _function_uses_contextmanager_decorator(stmt, operator_bindings)
@@ -16741,6 +16812,42 @@ def _module_assign_targets_value(node):
     return None
 
 
+_MAPPING_MUTATOR_METHODS = {
+    "update",
+    "pop",
+    "popitem",
+    "clear",
+    "setdefault",
+    "__setitem__",
+    "__delitem__",
+    "__ior__",
+}
+
+
+def _mapping_mutation_names(node):
+    """Yield names whose mapping contents a module-scope statement changes."""
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        for target in node.targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                yield target.value.id
+        return
+    if isinstance(node, ast.AugAssign):
+        target = node.target
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            yield target.value.id
+        elif isinstance(target, ast.Name) and isinstance(node.op, ast.BitOr):
+            yield target.id
+        return
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        function = node.value.func
+        if (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.attr in _MAPPING_MUTATOR_METHODS
+        ):
+            yield function.value.id
+
+
 def _record_literal_namespace_value(targets, value, values, ambiguous):
     """Record one literal dict binding, marking rebinding as ambiguous."""
     for target in targets:
@@ -16755,12 +16862,16 @@ def _record_literal_namespace_value(targets, value, values, ambiguous):
 def _module_literal_namespace_values(tree):
     """Map module-level names to a single literal dict namespace.
 
-    A name that is rebound, or bound to a non-literal value, is ambiguous and
-    omitted so a computed namespace is never trusted.
+    A name that is rebound, bound to a non-literal value, or mutated after
+    binding (``del ns['k']``, ``ns.update(...)``) is ambiguous and omitted:
+    the literal no longer describes the mapping the ``type()`` call receives,
+    and trusting the stale contents could hide a mutating initializer.
     """
     values = {}
     ambiguous = set()
-    for node in _iter_import_time_module_statements(tree.body):
+    for node, _conditional in _iter_import_time_module_statements_with_flags(tree.body):
+        for mutated in _mapping_mutation_names(node):
+            ambiguous.add(mutated)
         assignment = _module_assign_targets_value(node)
         if assignment is None:
             continue
