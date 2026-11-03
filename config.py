@@ -12571,6 +12571,23 @@ def _iter_import_time_module_statements(statements):
         yield node
 
 
+_CONDITIONAL_STATEMENT_NODES = tuple(
+    node
+    for node in (
+        ast.If,
+        ast.Try,
+        # `TryStar` (3.11+) and `Match` (3.10+) are looked up defensively: the
+        # panel still supports 3.10, where `ast.TryStar` does not exist.
+        getattr(ast, "TryStar", None),
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        getattr(ast, "Match", None),
+    )
+    if node is not None
+)
+
+
 def _iter_import_time_module_statements_with_flags(statements, conditional=False):
     """Yield ``(statement, conditional)`` for module-scope statements.
 
@@ -12582,10 +12599,7 @@ def _iter_import_time_module_statements_with_flags(statements, conditional=False
         yield node, conditional
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        nested = conditional or isinstance(
-            node,
-            (ast.If, ast.Try, ast.TryStar, ast.For, ast.AsyncFor, ast.While, ast.Match),
-        )
+        nested = conditional or isinstance(node, _CONDITIONAL_STATEMENT_NODES)
         for block in _compound_statement_blocks(node):
             yield from _iter_import_time_module_statements_with_flags(block, nested)
 
