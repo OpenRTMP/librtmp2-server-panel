@@ -12564,7 +12564,7 @@ def _iter_import_time_module_statements(statements):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         for block in _compound_statement_blocks(node):
-            yield from _iter_import_time_statements(block)
+            yield from _iter_import_time_module_statements(block)
 
 
 def _iter_import_time_class_definitions(statements):
@@ -13471,12 +13471,10 @@ def _module_literal_base_names(tree):
     """
     values = {}
     for node in _iter_import_time_module_statements(tree.body):
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets, value = [node.target], node.value
-        else:
+        assignment = _module_assign_targets_value(node)
+        if assignment is None:
             continue
+        targets, value = assignment
         names = _literal_base_names(value)
         if names is not None:
             _merge_base_names(values, targets, names)
@@ -16734,6 +16732,26 @@ def _init_callback_workers_effect(callback, operator_bindings):
     return None
 
 
+def _module_assign_targets_value(node):
+    """Return ``(targets, value)`` for a module-scope assignment, or None."""
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target], node.value
+    return None
+
+
+def _record_literal_namespace_value(targets, value, values, ambiguous):
+    """Record one literal dict binding, marking rebinding as ambiguous."""
+    for target in targets:
+        if not isinstance(target, ast.Name):
+            continue
+        if not isinstance(value, ast.Dict) or target.id in values:
+            ambiguous.add(target.id)
+            continue
+        values[target.id] = value
+
+
 def _module_literal_namespace_values(tree):
     """Map module-level names to a single literal dict namespace.
 
@@ -16743,19 +16761,11 @@ def _module_literal_namespace_values(tree):
     values = {}
     ambiguous = set()
     for node in _iter_import_time_module_statements(tree.body):
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets, value = [node.target], node.value
-        else:
+        assignment = _module_assign_targets_value(node)
+        if assignment is None:
             continue
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
-            if not isinstance(value, ast.Dict) or target.id in values:
-                ambiguous.add(target.id)
-                continue
-            values[target.id] = value
+        targets, value = assignment
+        _record_literal_namespace_value(targets, value, values, ambiguous)
     for name in ambiguous:
         values.pop(name, None)
     return values
