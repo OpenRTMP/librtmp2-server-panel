@@ -5260,5 +5260,7 @@ def test_nov03_conditional_statement_nodes_tolerate_missing_ast_types():
     # without a None placeholder) instead of raising at import.
     nodes = config._CONDITIONAL_STATEMENT_NODES
     assert None not in nodes
-    assert ast.If in nodes and ast.Try in nodes and ast.For in nodes
+    assert ast.If in nodes
+    assert ast.Try in nodes
+    assert ast.For in nodes
     assert all(isinstance(node, type) for node in nodes)
