@@ -7944,42 +7944,33 @@ def _partial_namespace_payload_may_set_workers(partial_call, attribute):
     return _thread_key_payload_may_be_workers(bound[0])
 
 
-def _thread_target_mutates_workers(
-    target,
+def _partial_target_mutates_workers(
+    partial_call,
     operator_bindings,
     mutator_names,
-    call=None,
 ):
-    """Return whether one Thread target can mutate workers."""
-    if isinstance(target, ast.Lambda):
-        return _lambda_mutates_workers(target, operator_bindings)
-    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
-    partial_call = _partial_factory_call(target, partial_aliases)
-    if partial_call is not None:
-        if not partial_call.args:
-            return False
-        bound_target = partial_call.args[0]
-        namespace_aliases = (
-            operator_bindings[2] if len(operator_bindings) > 2 else set()
+    """Resolve a Thread target bound through ``functools.partial``."""
+    if not partial_call.args:
+        return False
+    bound_target = partial_call.args[0]
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if (
+        isinstance(bound_target, ast.Attribute)
+        and _is_module_namespace_mapping(bound_target.value, namespace_aliases)
+        and bound_target.attr in {"update", "__setitem__", "setdefault", "__ior__"}
+    ):
+        return _partial_namespace_payload_may_set_workers(
+            partial_call, bound_target.attr
         )
-        if (
-            isinstance(bound_target, ast.Attribute)
-            and _is_module_namespace_mapping(
-                bound_target.value, namespace_aliases
-            )
-            and bound_target.attr
-            in {"update", "__setitem__", "setdefault", "__ior__"}
-        ):
-            return _partial_namespace_payload_may_set_workers(
-                partial_call, bound_target.attr
-            )
-        return _thread_target_mutates_workers(
-            bound_target,
-            operator_bindings,
-            mutator_names,
-        )
-    if isinstance(target, ast.Name):
-        return target.id in mutator_names
+    return _thread_target_mutates_workers(
+        bound_target,
+        operator_bindings,
+        mutator_names,
+    )
+
+
+def _namespace_target_mutates_workers(target, operator_bindings, call):
+    """Check a ``globals().update``-style target with its Thread payload."""
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if not (
         isinstance(target, ast.Attribute)
@@ -7999,6 +7990,26 @@ def _thread_target_mutates_workers(
             _thread_keyword_arguments_payload(call, operator_bindings)
         )
     return _thread_key_payload_may_be_workers(payload)
+
+
+def _thread_target_mutates_workers(
+    target,
+    operator_bindings,
+    mutator_names,
+    call=None,
+):
+    """Return whether one Thread target can mutate workers."""
+    if isinstance(target, ast.Lambda):
+        return _lambda_mutates_workers(target, operator_bindings)
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    partial_call = _partial_factory_call(target, partial_aliases)
+    if partial_call is not None:
+        return _partial_target_mutates_workers(
+            partial_call, operator_bindings, mutator_names
+        )
+    if isinstance(target, ast.Name):
+        return target.id in mutator_names
+    return _namespace_target_mutates_workers(target, operator_bindings, call)
 
 
 def _thread_targets(call):
@@ -13423,6 +13434,34 @@ def _class_base_expression_name(base, reference_line, class_name_aliases=None):
     return None
 
 
+def _literal_base_names(value):
+    """Return the class names a literal base tuple holds, or None."""
+    if not isinstance(value, (ast.Tuple, ast.List)):
+        return None
+    names = tuple(
+        element.id for element in value.elts if isinstance(element, ast.Name)
+    )
+    if len(names) != len(value.elts):
+        # A non-name element cannot be resolved, so the tuple is not a
+        # provable base list.
+        return None
+    return names
+
+
+def _merge_base_names(values, targets, names):
+    """Union one assignment's names into every simple target."""
+    for target in targets:
+        if isinstance(target, ast.Name):
+            # Union every reachable assignment: a later assignment in a
+            # conditional branch may or may not run, so dropping the definite
+            # earlier tuple would lose a real base relationship.
+            merged = values.get(target.id, ())
+            for name in names:
+                if name not in merged:
+                    merged = (*merged, name)
+            values[target.id] = merged
+
+
 def _module_literal_base_names(tree):
     """Map module-level names to the literal class names a tuple holds.
 
@@ -13438,25 +13477,9 @@ def _module_literal_base_names(tree):
             targets, value = [node.target], node.value
         else:
             continue
-        if not isinstance(value, (ast.Tuple, ast.List)):
-            continue
-        names = tuple(
-            element.id for element in value.elts if isinstance(element, ast.Name)
-        )
-        if len(names) != len(value.elts):
-            # A non-name element cannot be resolved, so the tuple is not a
-            # provable base list.
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                # Union every reachable assignment: a later assignment in a
-                # conditional branch may or may not run, so dropping the
-                # definite earlier tuple would lose a real base relationship.
-                merged = values.get(target.id, ())
-                for name in names:
-                    if name not in merged:
-                        merged = (*merged, name)
-                values[target.id] = merged
+        names = _literal_base_names(value)
+        if names is not None:
+            _merge_base_names(values, targets, names)
     return values
 
 
@@ -15618,36 +15641,51 @@ def _call_invokes_resolved_risky_class_constructor(
 
 
 
+def _update_call_installs_mutating_init(node, operator_bindings):
+    """Return True for ``ns.update({'__init__': <mutator>})``."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+    ):
+        return False
+    for argument in node.args:
+        if not isinstance(argument, ast.Dict):
+            continue
+        for key, item in zip(argument.keys, argument.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "__init__"
+                and _init_callback_workers_effect(item, operator_bindings)
+            ):
+                return True
+    return False
+
+
+def _subscript_assign_installs_mutating_init(node, operator_bindings):
+    """Return True for ``ns['__init__'] = <mutator>``."""
+    if not isinstance(node, ast.Assign):
+        return False
+    for target in node.targets:
+        if (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "__init__"
+            and _init_callback_workers_effect(node.value, operator_bindings)
+        ):
+            return True
+    return False
+
+
 def _exec_body_installs_mutating_init(value, operator_bindings):
     """Return True when an ``exec_body=lambda ns: ...`` installs a mutating init."""
     if not isinstance(value, ast.Lambda):
         return False
-    for node in ast.walk(value.body):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "update"
-        ):
-            for argument in node.args:
-                if not isinstance(argument, ast.Dict):
-                    continue
-                for key, item in zip(argument.keys, argument.values):
-                    if (
-                        isinstance(key, ast.Constant)
-                        and key.value == "__init__"
-                        and _init_callback_workers_effect(item, operator_bindings)
-                    ):
-                        return True
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Subscript)
-                    and isinstance(target.slice, ast.Constant)
-                    and target.slice.value == "__init__"
-                    and _init_callback_workers_effect(node.value, operator_bindings)
-                ):
-                    return True
-    return False
+    return any(
+        _update_call_installs_mutating_init(node, operator_bindings)
+        or _subscript_assign_installs_mutating_init(node, operator_bindings)
+        for node in ast.walk(value.body)
+    )
 
 
 def _types_new_class_exec_body(call):
@@ -15660,10 +15698,8 @@ def _types_new_class_exec_body(call):
     return None
 
 
-def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
-    """Check new_class base hooks at creation, and constructors if invoked."""
-    if not isinstance(call, ast.Call):
-        return False
+def _types_new_class_call_target(call, operator_bindings):
+    """Return ``(call, instantiated)`` for a ``types.new_class`` expression."""
     inner = call.func if isinstance(call.func, ast.Call) else call
     types_module_aliases = operator_bindings[25] if len(operator_bindings) > 25 else set()
     func = inner.func
@@ -15673,8 +15709,19 @@ def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
         and isinstance(func.value, ast.Name)
         and func.value.id in types_module_aliases
     ):
+        return None
+    return inner, inner is not call
+
+
+def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
+    """Check new_class base hooks at creation, and constructors if invoked."""
+    if not isinstance(call, ast.Call):
         return False
-    if inner is not call:
+    target = _types_new_class_call_target(call, operator_bindings)
+    if target is None:
+        return False
+    inner, instantiated = target
+    if instantiated:
         # Calling the created class runs its ``__init__``; creating it only
         # evaluates bases and ``__init_subclass__``. ``exec_body`` merely
         # installs the callable, so it cannot mutate workers on its own.
@@ -15686,7 +15733,7 @@ def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
     return _type_constructor_bases_trigger_workers(
         inner,
         operator_bindings,
-        creation_only=(inner is call),
+        creation_only=not instantiated,
     )
 
 
@@ -16687,6 +16734,16 @@ def _init_callback_workers_effect(callback, operator_bindings):
     return None
 
 
+def _dict_literal_init_workers_effect(namespace_dict, operator_bindings):
+    """Return the first ``__init__`` effect of a literal namespace mapping."""
+    for key, value in zip(namespace_dict.keys, namespace_dict.values):
+        if isinstance(key, ast.Constant) and key.value == "__init__":
+            effect = _init_callback_workers_effect(value, operator_bindings)
+            if effect is not None:
+                return effect
+    return None
+
+
 def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
     """Return the first ``__init__`` callback effect, or None when absent."""
     if isinstance(namespace_dict, ast.Call):
@@ -16703,12 +16760,7 @@ def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
         return None
     if not isinstance(namespace_dict, ast.Dict):
         return None
-    for key, value in zip(namespace_dict.keys, namespace_dict.values):
-        if isinstance(key, ast.Constant) and key.value == "__init__":
-            effect = _init_callback_workers_effect(value, operator_bindings)
-            if effect is not None:
-                return effect
-    return None
+    return _dict_literal_init_workers_effect(namespace_dict, operator_bindings)
 
 
 def _keyword_init_lambda_workers_effect(keywords, operator_bindings):
@@ -16812,6 +16864,45 @@ def _statement_calls_name(statement, name):
     )
 
 
+def _register_deferred_type_names(
+    node, constructors, operator_bindings, builtin_shadow_lines
+):
+    """Register a name assigned from a mutating dynamic ``type(...)``."""
+    value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
+    if value is None:
+        return False
+    instantiated = ast.Call(func=value, args=[], keywords=[])
+    if not _call_is_type_constructor_side_effect(instantiated, operator_bindings):
+        return False
+    for target in _statement_simple_targets(node):
+        if isinstance(target, ast.Name):
+            constructors.add(target.id)
+    return True
+
+
+def _register_deferred_new_class_names(
+    node, statements, constructors, operator_bindings
+):
+    """Register a ``types.new_class`` name that is later instantiated."""
+    new_class = _assigned_types_new_class_call(node, operator_bindings)
+    if new_class is None:
+        return False
+    # Creating the class only installs the ``exec_body`` namespace; the
+    # mutating ``__init__`` runs on instantiation, so register the name only
+    # when the module calls it.
+    exec_body = _types_new_class_exec_body(new_class)
+    if exec_body is None or not _exec_body_installs_mutating_init(
+        exec_body, operator_bindings
+    ):
+        return False
+    for target in _statement_simple_targets(node):
+        if isinstance(target, ast.Name) and any(
+            _statement_calls_name(stmt, target.id) for stmt in statements
+        ):
+            constructors.add(target.id)
+    return True
+
+
 def _record_deferred_type_class_constructors(
     statements,
     constructors,
@@ -16821,35 +16912,13 @@ def _record_deferred_type_class_constructors(
     materialized = list(statements)
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
     for node in materialized:
-        value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
-        if value is None:
-            new_class = _assigned_types_new_class_call(node, operator_bindings)
-            if new_class is None:
-                continue
-            # Creating the class only installs the ``exec_body`` namespace;
-            # the mutating ``__init__`` runs on instantiation, so register the
-            # name only when the module calls it.
-            exec_body = _types_new_class_exec_body(new_class)
-            if exec_body is None or not _exec_body_installs_mutating_init(
-                exec_body, operator_bindings
-            ):
-                continue
-            for target in _statement_simple_targets(node):
-                if isinstance(target, ast.Name) and any(
-                    _statement_calls_name(stmt, target.id)
-                    for stmt in materialized
-                ):
-                    constructors.add(target.id)
-            continue
-        instantiated = ast.Call(func=value, args=[], keywords=[])
-        if not _call_is_type_constructor_side_effect(
-            instantiated,
-            operator_bindings,
+        if _register_deferred_type_names(
+            node, constructors, operator_bindings, builtin_shadow_lines
         ):
             continue
-        for target in _statement_simple_targets(node):
-            if isinstance(target, ast.Name):
-                constructors.add(target.id)
+        _register_deferred_new_class_names(
+            node, materialized, constructors, operator_bindings
+        )
 
 
 def _partial_reduce_initializer(partial_call, invocation, invocation_start):
