@@ -4723,3 +4723,261 @@ def test_security_review_oct25_weakref_finalize_named_callback_is_dynamic(
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(config_content, encoding="utf-8")
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+# Security review 2026-11-03: fail-open gaps in the gunicorn worker scan.
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        "workers = 1\n(globals().__class__.__dict__['__setitem__'])(globals(), 'workers', 4)\n",
+        "workers = 1\ndict.__dict__['__ior__'](globals(), {'workers': 4})\n",
+        "workers = 1\ndict.__dict__['setdefault'](globals(), 'workers', 4)\n",
+        "workers = 1\n(globals().__class__.__dict__['setdefault'])(globals(), 'workers', 4)\n",
+    ],
+    ids=["globals-class-dict-setitem", "dict-dict-ior", "dict-dict-setdefault", "globals-class-dict-setdefault"],
+)
+def test_nov03_dict_class_dict_mutator_subscripts_are_dynamic(
+    tmp_path, config_content
+):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import multiprocessing.pool\n"
+            "def bump(_):\n"
+            "    globals().update(workers=4)\n"
+            "pool = multiprocessing.pool.ThreadPool(2)\n"
+            "pool.map_async(bump, [1]).wait()\n"
+        ),
+        (
+            "workers = 1\n"
+            "import multiprocessing.pool\n"
+            "def bump(_):\n"
+            "    globals().update(workers=4)\n"
+            "pool = multiprocessing.pool.ThreadPool(2)\n"
+            "pool.starmap_async(bump, [(1,)]).wait()\n"
+        ),
+    ],
+    ids=["map-async", "starmap-async"],
+)
+def test_nov03_thread_pool_async_maps_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_exit_stack_push_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import contextlib\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *exc):\n"
+        "        globals().update(workers=4)\n"
+        "stack = contextlib.ExitStack()\n"
+        "stack.push(CM())\n"
+        "stack.close()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_partial_thread_target_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import functools\n"
+        "import threading\n"
+        "def bump(_):\n"
+        "    globals().update(workers=4)\n"
+        "t = threading.Thread(target=functools.partial(bump, 1))\n"
+        "t.start()\n"
+        "t.join()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_partial_key_callback_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import functools\n"
+        "def bump(x):\n"
+        "    globals().update(workers=4)\n"
+        "    return x\n"
+        "sorted([1], key=functools.partial(bump))\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_conditional_super_constructor_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import os\n"
+        "if os.sep:\n"
+        "    class Base:\n"
+        "        def __init__(self):\n"
+        "            globals().update({'workers': 4})\n"
+        "    class Child(Base):\n"
+        "        def __init__(self):\n"
+        "            super().__init__()\n"
+        "    Child()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_conditional_starred_bases_are_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import os\n"
+        "if os.sep:\n"
+        "    class Base:\n"
+        "        def __init__(self):\n"
+        "            globals().update({'workers': 4})\n"
+        "    bases = (Base,)\n"
+        "    class Child(*bases):\n"
+        "        pass\n"
+        "    Child()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_conditional_constructor_barrier_stays_static(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import os\n"
+        "if os.sep:\n"
+        "    class Base:\n"
+        "        def __init__(self):\n"
+        "            globals().update({'workers': 4})\n"
+        "    class Child(Base):\n"
+        "        __init__ = object.__init__\n"
+        "    Child()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, False)
+
+
+def test_nov03_conditional_metaclass_getitem_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import os\n"
+        "if os.sep:\n"
+        "    class Meta(type):\n"
+        "        def __getitem__(cls, item):\n"
+        "            globals().update({'workers': 4})\n"
+        "            return cls\n"
+        "    class Holder(metaclass=Meta):\n"
+        "        pass\n"
+        "    Holder[0]\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_heapq_keyword_key_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import heapq\n"
+        "def boom(x):\n"
+        "    globals().update({'workers': 4})\n"
+        "    return x\n"
+        "heapq.nsmallest(n=1, iterable=[1, 2], key=boom)\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_conditional_deferred_type_constructor_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "if True:\n"
+        "    T = type('T', (), {'__init__': lambda self: globals().__setitem__('workers', 4)})\n"
+        "T()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "def bump(self):\n"
+            "    globals().update({'workers': 4})\n"
+            "T = type('T', (), {'__init__': bump})\n"
+            "T()\n"
+        ),
+        (
+            "workers = 1\n"
+            "T = type('T', (), dict(__init__=lambda self: globals().update({'workers': 4})))\n"
+            "T()\n"
+        ),
+    ],
+    ids=["named-init-callback", "dict-call-namespace"],
+)
+def test_nov03_type_namespace_shapes_are_dynamic(tmp_path, config_content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(config_content, encoding="utf-8")
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_nested_def_default_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def bump():\n"
+        "    globals().update({'workers': 4})\n"
+        "def setup():\n"
+        "    def inner(x=bump()):\n"
+        "        return x\n"
+        "    return inner\n"
+        "setup()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_new_class_exec_body_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "import types\n"
+        "T = types.new_class('T', (), exec_body=lambda ns: ns.update({'__init__': lambda self: globals().update({'workers': 4})}))\n"
+        "T()\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+
+def test_nov03_bare_metaclass_name_is_dynamic(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 1\n"
+        "def bump(name, bases, namespace):\n"
+        "    global workers\n"
+        "    workers = 4\n"
+        "    return type(name, bases, namespace)\n"
+        "class App(metaclass=bump):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)

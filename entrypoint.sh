@@ -44,6 +44,7 @@ option_takes_value() {
         --forwarder-headers|--root-path|--statsd-prefix|--dogstatsd-tags|\
         --log-syslog-to|--log-syslog-facility|--log-syslog-prefix|\
         --cert-reqs|--http-protocols|--http-parser|--control-socket|\
+        --proxy-protocol|--http2-*|--server-hooks|\
         --paste-global|--paster|--uwsgi-allow-from|--asgi-*|--dirty-*)
             return 0 ;;
         *)

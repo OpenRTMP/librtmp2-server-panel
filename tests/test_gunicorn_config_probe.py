@@ -172,3 +172,19 @@ def test_unknown_mode_is_uninspectable(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GUNICORN_CMD_ARGS", "")
     assert probe.main(["probe", "something-else"]) == probe.UNKNOWN
+
+
+def test_bom_prefixed_config_reports_absent_bind(tmp_path):
+    """Gunicorn loads a BOM'd config through importlib; the probe must too."""
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "workers = 4\nloglevel = 'info'\n",
+        encoding="utf-8-sig",
+    )
+    assert _config_provides(config_file) == probe.ABSENT
+
+
+def test_crlf_config_is_still_parsed(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_bytes(b"bind = '0.0.0.0:8000'\r\nworkers = 2\r\n")
+    assert _config_provides(config_file) == probe.SUPPLIED
