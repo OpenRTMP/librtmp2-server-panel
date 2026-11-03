@@ -7152,6 +7152,8 @@ def _call_is_exit_stack_push_mutation(
         operator_bindings,
         local_class_aliases or {},
         include_exit=True,
+        # ``push`` registers ``__exit__`` without calling ``__enter__``.
+        include_entry=False,
     )
 
 
@@ -7920,6 +7922,28 @@ def _thread_constructor_is_active(call, operator_bindings):
     )
 
 
+def _partial_namespace_payload_may_set_workers(partial_call, attribute):
+    """Check the arguments a partial binds to a module-namespace mutator."""
+    bound = partial_call.args[1:]
+    keyword_values = [keyword.value for keyword in partial_call.keywords]
+    if any(keyword.arg is None for keyword in partial_call.keywords):
+        # ``**mapping`` cannot be resolved.
+        return True
+    if attribute in {"update", "__ior__"}:
+        if any(_thread_update_payload_may_set_workers(argument) for argument in bound):
+            return True
+        if not keyword_values:
+            return False
+        bound_dict = ast.Dict(
+            keys=[ast.Constant(keyword.arg) for keyword in partial_call.keywords],
+            values=keyword_values,
+        )
+        return _thread_update_payload_may_set_workers(bound_dict)
+    if not bound:
+        return False
+    return _thread_key_payload_may_be_workers(bound[0])
+
+
 def _thread_target_mutates_workers(
     target,
     operator_bindings,
@@ -7934,8 +7958,23 @@ def _thread_target_mutates_workers(
     if partial_call is not None:
         if not partial_call.args:
             return False
+        bound_target = partial_call.args[0]
+        namespace_aliases = (
+            operator_bindings[2] if len(operator_bindings) > 2 else set()
+        )
+        if (
+            isinstance(bound_target, ast.Attribute)
+            and _is_module_namespace_mapping(
+                bound_target.value, namespace_aliases
+            )
+            and bound_target.attr
+            in {"update", "__setitem__", "setdefault", "__ior__"}
+        ):
+            return _partial_namespace_payload_may_set_workers(
+                partial_call, bound_target.attr
+            )
         return _thread_target_mutates_workers(
-            partial_call.args[0],
+            bound_target,
             operator_bindings,
             mutator_names,
         )
@@ -11726,6 +11765,15 @@ def _heapq_call_targets_module(call, operator_bindings, reference_line):
 
 def _heapq_arguments_mutate_workers(call, operator_bindings):
     """True when a heapq key/iterable argument can mutate workers."""
+    if (
+        _key_lambda_mutates_workers(call, operator_bindings)
+        or _heapq_positional_key_mutates_workers(call, operator_bindings)
+        or _key_lambda_invokes_mutating_callback_container(call, operator_bindings)
+    ):
+        return True
+    if any(keyword.arg is None for keyword in call.keywords):
+        # ``**mapping`` may carry ``key=`` / ``iterable=``.
+        return True
     iterable = (
         call.args[1]
         if len(call.args) >= 2
@@ -11740,12 +11788,6 @@ def _heapq_arguments_mutate_workers(call, operator_bindings):
     )
     if iterable is None:
         return False
-    if (
-        _key_lambda_mutates_workers(call, operator_bindings)
-        or _heapq_positional_key_mutates_workers(call, operator_bindings)
-        or _key_lambda_invokes_mutating_callback_container(call, operator_bindings)
-    ):
-        return True
     return _iterable_holds_mutating_callbacks(
         iterable, operator_bindings
     ) or _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
@@ -12499,7 +12541,7 @@ def _collect_metaclass_base_aliases(tree):
     return base_aliases, module_alias_events
 
 
-def _iter_import_time_statements(statements):
+def _iter_import_time_module_statements(statements):
     """Yield module-scope statements, including compound-statement bodies.
 
     Mirrors [`_iter_import_time_class_definitions`] for the sibling collectors
@@ -13389,7 +13431,7 @@ def _module_literal_base_names(tree):
     dropping the subclass relationship.
     """
     values = {}
-    for node in _iter_import_time_statements(tree.body):
+    for node in _iter_import_time_module_statements(tree.body):
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
@@ -13407,7 +13449,14 @@ def _module_literal_base_names(tree):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
-                values[target.id] = names
+                # Union every reachable assignment: a later assignment in a
+                # conditional branch may or may not run, so dropping the
+                # definite earlier tuple would lose a real base relationship.
+                merged = values.get(target.id, ())
+                for name in names:
+                    if name not in merged:
+                        merged = (*merged, name)
+                values[target.id] = merged
     return values
 
 
@@ -13557,7 +13606,12 @@ def _record_mutating_super_methods(
 def _class_constructor_assignment_is_non_mutating(value, operator_bindings):
     """Return True when an assigned constructor provably cannot mutate workers."""
     if isinstance(value, ast.Lambda):
-        return not _lambda_mutates_workers(value, operator_bindings)
+        if _lambda_mutates_workers(value, operator_bindings):
+            return False
+        # Any call inside the lambda may invoke a helper that mutates workers;
+        # without the module mutator set this cannot be proven harmless, so a
+        # called constructor is not recorded as a barrier.
+        return not any(isinstance(node, ast.Call) for node in ast.walk(value.body))
     if (
         isinstance(value, ast.Attribute)
         and value.attr in ("__init__", "__post_init__")
@@ -13802,7 +13856,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
         )
     )
     _record_deferred_type_class_constructors(
-        _iter_import_time_statements(tree.body),
+        _iter_import_time_module_statements(tree.body),
         constructors,
         operator_bindings,
     )
@@ -15596,6 +15650,16 @@ def _exec_body_installs_mutating_init(value, operator_bindings):
     return False
 
 
+def _types_new_class_exec_body(call):
+    """Return the ``exec_body`` expression of a ``types.new_class`` call."""
+    for keyword in call.keywords:
+        if keyword.arg == "exec_body":
+            return keyword.value
+    if len(call.args) >= 4:
+        return call.args[3]
+    return None
+
+
 def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
     """Check new_class base hooks at creation, and constructors if invoked."""
     if not isinstance(call, ast.Call):
@@ -15610,12 +15674,15 @@ def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
         and func.value.id in types_module_aliases
     ):
         return False
-    if any(
-        keyword.arg == "exec_body"
-        and _exec_body_installs_mutating_init(keyword.value, operator_bindings)
-        for keyword in inner.keywords
-    ):
-        return True
+    if inner is not call:
+        # Calling the created class runs its ``__init__``; creating it only
+        # evaluates bases and ``__init_subclass__``. ``exec_body`` merely
+        # installs the callable, so it cannot mutate workers on its own.
+        exec_body = _types_new_class_exec_body(inner)
+        if exec_body is not None and _exec_body_installs_mutating_init(
+            exec_body, operator_bindings
+        ):
+            return True
     return _type_constructor_bases_trigger_workers(
         inner,
         operator_bindings,
@@ -16659,6 +16726,10 @@ def _call_is_type_constructor_side_effect(call, operator_bindings):
     """Detect side effects of dynamic type creation and subsequent instantiation."""
     if not isinstance(call, ast.Call):
         return False
+    if isinstance(call.func, ast.Call) and _call_is_types_new_class_constructor_side_effect(
+        call, operator_bindings
+    ):
+        return True
     constructor = call.func if isinstance(call.func, ast.Call) else call
     func = constructor.func
     if not (isinstance(func, ast.Name) and func.id == "type"):
@@ -16710,16 +16781,65 @@ def _assigned_unshadowed_type_call(node, builtin_shadow_lines):
     return value
 
 
+def _assigned_types_new_class_call(node, operator_bindings):
+    """Return an assigned ``types.new_class(...)`` call, or None."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return None
+    value = node.value
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    types_module_aliases = (
+        operator_bindings[25] if len(operator_bindings) > 25 else set()
+    )
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "new_class"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in types_module_aliases
+    ):
+        return None
+    return value
+
+
+def _statement_calls_name(statement, name):
+    """Return True when the statement invokes a bare ``name(...)``."""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+        for node in ast.walk(statement)
+    )
+
+
 def _record_deferred_type_class_constructors(
     statements,
     constructors,
     operator_bindings,
 ):
-    """Register module names bound to a dynamic ``type(...)`` that mutates on ``Name()``."""
+    """Register module names bound to a dynamic class that mutates on ``Name()``."""
+    materialized = list(statements)
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    for node in statements:
+    for node in materialized:
         value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
         if value is None:
+            new_class = _assigned_types_new_class_call(node, operator_bindings)
+            if new_class is None:
+                continue
+            # Creating the class only installs the ``exec_body`` namespace;
+            # the mutating ``__init__`` runs on instantiation, so register the
+            # name only when the module calls it.
+            exec_body = _types_new_class_exec_body(new_class)
+            if exec_body is None or not _exec_body_installs_mutating_init(
+                exec_body, operator_bindings
+            ):
+                continue
+            for target in _statement_simple_targets(node):
+                if isinstance(target, ast.Name) and any(
+                    _statement_calls_name(stmt, target.id)
+                    for stmt in materialized
+                ):
+                    constructors.add(target.id)
             continue
         instantiated = ast.Call(func=value, args=[], keywords=[])
         if not _call_is_type_constructor_side_effect(
@@ -18417,12 +18537,15 @@ def _context_manager_item_mutates_workers(
     local_class_aliases,
     *,
     include_exit=True,
+    include_entry=True,
 ):
     """Check context entry immediately, and exit only when it executes."""
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
-    if isinstance(with_node, ast.With) and _contextlib_closing_close_mutates_workers(
+    if include_entry and isinstance(
+        with_node, ast.With
+    ) and _contextlib_closing_close_mutates_workers(
         item,
         reference_line,
         class_targets,
@@ -18431,13 +18554,15 @@ def _context_manager_item_mutates_workers(
         local_class_aliases,
     ):
         return True
-    if _expression_has_class_workers_side_effect(
+    if include_entry and _expression_has_class_workers_side_effect(
         context_expr,
         class_targets,
         operator_bindings=operator_bindings,
     ):
         return True
-    if isinstance(with_node, ast.With) and _deferred_contextmanager_entry_mutates_workers(
+    if include_entry and isinstance(
+        with_node, ast.With
+    ) and _deferred_contextmanager_entry_mutates_workers(
         context_expr, class_targets, operator_bindings, reference_line
     ):
         return True
@@ -18452,7 +18577,7 @@ def _context_manager_item_mutates_workers(
     entry_methods, enter_attr = _context_manager_entry_methods(
         with_node, class_targets
     )
-    if _context_manager_hook_mutates_workers(
+    if include_entry and _context_manager_hook_mutates_workers(
         context_expr,
         enter_attr,
         entry_methods,
@@ -18787,6 +18912,12 @@ def _function_mutates_workers(
     The body runs in the function's own scope, which is what the nested-scope
     marker around the walk below tells ``_is_module_namespace_mapping``.
     """
+    if not defer_annotations:
+        # Callers without the tree still honour a module-level
+        # ``from __future__ import annotations`` / PEP 649.
+        defer_annotations = bool(
+            _operator_bindings_metadata(operator_bindings, "defer_annotations")
+        )
     with _evaluated_in_nested_scope():
         if _statements_start_mutating_thread(
             func_node.body,
@@ -24028,6 +24159,10 @@ def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    # Make the annotation policy available to every collector below: on
+    # CPython 3.14 (PEP 649) and under ``from __future__ import annotations`` a
+    # nested ``def`` does not evaluate its annotations.
+    operator_bindings[32]["defer_annotations"] = _config_defers_annotations(tree)
     for builtin_name in ("type", "__import__"):
         shadow_events = _collect_module_scope_builtin_shadow_events(
             tree, builtin_name
@@ -24242,6 +24377,7 @@ def _scan_gunicorn_config_worker_details(tree):
         mutating_generator_alias_events,
         *operator_bindings[43:],
     )
+    operator_bindings[32]["defer_annotations"] = _config_defers_annotations(tree)
     operator_bindings[32]["warnings_showwarning_mutation_events"] = (
         _collect_warnings_showwarning_mutation_events(
             tree,

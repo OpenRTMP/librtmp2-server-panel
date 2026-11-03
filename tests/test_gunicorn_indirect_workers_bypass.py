@@ -4981,3 +4981,160 @@ def test_nov03_bare_metaclass_name_is_dynamic(tmp_path):
         encoding="utf-8",
     )
     assert config._workers_from_gunicorn_config_path(str(config_file)) == (1, True)
+
+# Review follow-ups 2026-11-03 (Codex/CodeRabbit on the r19 PR).
+def _scan(tmp_path, content):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(content, encoding="utf-8")
+    return config._workers_from_gunicorn_config_path(str(config_file))
+
+
+def test_nov03_conditional_base_tuple_does_not_erase_definite_assignment(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import os\n"
+        "if os.sep:\n"
+        "    class Base:\n"
+        "        def __init__(self):\n"
+        "            globals().update({'workers': 4})\n"
+        "bases = (Base,)\n"
+        "if False:\n"
+        "    bases = ()\n"
+        "if os.sep:\n"
+        "    class Child(*bases):\n"
+        "        pass\n"
+        "    Child()\n",
+    ) == (1, True)
+
+
+def test_nov03_conditional_lambda_calling_named_mutator_is_not_a_barrier(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import os\n"
+        "def bump():\n"
+        "    globals().update({'workers': 4})\n"
+        "if os.sep:\n"
+        "    class Base:\n"
+        "        def __init__(self):\n"
+        "            globals().update({'workers': 4})\n"
+        "    class Child(Base):\n"
+        "        __init__ = lambda self: bump()\n"
+        "    Child()\n",
+    ) == (1, True)
+
+
+def test_nov03_new_class_without_instantiation_stays_static(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import types\n"
+        "T = types.new_class('T', (), exec_body=lambda ns: ns.update("
+        "{'__init__': lambda self: globals().update({'workers': 4})}))\n",
+    ) == (1, False)
+
+
+def test_nov03_new_class_instantiation_is_dynamic(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import types\n"
+        "T = types.new_class('T', (), exec_body=lambda ns: ns.update("
+        "{'__init__': lambda self: globals().update({'workers': 4})}))\n"
+        "T()\n",
+    ) == (1, True)
+
+
+def test_nov03_new_class_positional_exec_body_is_dynamic(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import types\n"
+        "T = types.new_class('T', (), {}, lambda ns: ns.update("
+        "{'__init__': lambda self: globals().update({'workers': 4})}))\n"
+        "T()\n",
+    ) == (1, True)
+
+
+def test_nov03_exit_stack_push_ignores_enter_hook(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import contextlib\n"
+        "class CM:\n"
+        "    def __enter__(self):\n"
+        "        globals().update(workers=4)\n"
+        "        return self\n"
+        "    def __exit__(self, *exc):\n"
+        "        return False\n"
+        "stack = contextlib.ExitStack()\n"
+        "stack.push(CM())\n"
+        "stack.close()\n",
+    ) == (1, False)
+
+
+def test_nov03_partial_thread_target_bound_payload_is_static(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "import functools\n"
+        "import threading\n"
+        "t = threading.Thread(target=functools.partial("
+        "globals().update, loglevel='debug'))\n"
+        "t.start()\n"
+        "t.join()\n",
+    ) == (1, False)
+
+
+@pytest.mark.parametrize(
+    "config_content",
+    [
+        (
+            "workers = 1\n"
+            "import heapq\n"
+            "def boom(x):\n"
+            "    globals().update({'workers': 4})\n"
+            "    return x\n"
+            "heapq.nsmallest(*(1, [1, 2]), key=boom)\n"
+        ),
+        (
+            "workers = 1\n"
+            "import heapq\n"
+            "def boom(x):\n"
+            "    globals().update({'workers': 4})\n"
+            "    return x\n"
+            "heapq.nsmallest(**{'iterable': [1], 'key': boom})\n"
+        ),
+    ],
+    ids=["starred-args", "double-star-kwargs"],
+)
+def test_nov03_heapq_unpacked_arguments_are_dynamic(tmp_path, config_content):
+    assert _scan(tmp_path, config_content) == (1, True)
+
+
+def test_nov03_future_annotations_in_nested_def_stay_static(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "from __future__ import annotations\n"
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        def inner(x: globals().update(workers=4)):\n"
+        "            pass\n"
+        "        inner()\n"
+        "C()\n",
+    ) == (1, False)
+
+
+def test_nov03_nested_def_default_is_still_dynamic(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        def inner(x=globals().update(workers=4)):\n"
+        "            pass\n"
+        "        inner()\n"
+        "C()\n",
+    ) == (1, True)
