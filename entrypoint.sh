@@ -40,11 +40,23 @@ option_takes_value() {
         --statsd-host|--dogstatsd|--paste|--pythonpath|--reload-engine|\
         --reload-extra-file|--limit-request-line|--limit-request-fields|\
         --limit-request-field-size|--sendfile|--raw-passthrough|--spec|\
-        --wsgi-app|--protocol|--log-config|--log-config-json|--header-map|\
+        --protocol|--log-config|--log-config-json|--header-map|\
         --forwarder-headers|--root-path|--statsd-prefix|--dogstatsd-tags|\
         --log-syslog-to|--log-syslog-facility|--log-syslog-prefix|\
         --cert-reqs|--http-protocols|--http-parser|--control-socket|\
+        --http2-*|--server-hooks|\
         --paste-global|--paster|--uwsgi-allow-from|--asgi-*|--dirty-*)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+# Return 0 when the option takes its value only when the next token is not
+# another flag (Gunicorn's ``--proxy-protocol`` is MODE with nargs='?').
+option_takes_optional_value() {
+    case "$1" in
+        --proxy-protocol)
             return 0 ;;
         *)
             return 1 ;;
@@ -101,10 +113,18 @@ is_app_target() {
 # are skipped, so "--config gunicorn.conf.py" is not read as an application.
 app_target_supplied() {
     expect_value=0
+    expect_optional=0
     for arg in "$@"; do
         if [ "$expect_value" -eq 1 ]; then
             expect_value=0
             continue
+        fi
+        if [ "$expect_optional" -eq 1 ]; then
+            expect_optional=0
+            case "$arg" in
+                -*) ;;
+                *) continue ;;
+            esac
         fi
         case "$arg" in
             --*=*)
@@ -112,6 +132,8 @@ app_target_supplied() {
             -*)
                 if option_takes_value "$arg"; then
                     expect_value=1
+                elif option_takes_optional_value "$arg"; then
+                    expect_optional=1
                 fi
                 continue ;;
             *)

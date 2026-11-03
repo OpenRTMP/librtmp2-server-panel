@@ -2070,6 +2070,32 @@ def _dict_name_is_builtin_at_line(reference_line, dict_shadow_line=None):
     )
 
 
+def _is_dict_class_dict_mutator_subscript(
+    node,
+    names,
+    *,
+    reference_line=0,
+    dict_shadow_line=None,
+    builtin_shadow_lines=None,
+):
+    """Return True for ``dict.__dict__['<dunder>']`` style mutator lookups.
+
+    Also covers ``globals().__class__.__dict__['<dunder>']``, the same spelling
+    the sibling ``update`` resolver already accepts.
+    """
+    if not isinstance(node, ast.Subscript):
+        return False
+    if not isinstance(node.slice, ast.Constant) or node.slice.value not in names:
+        return False
+    receiver = node.value
+    if not (isinstance(receiver, ast.Attribute) and receiver.attr == "__dict__"):
+        return False
+    inner = receiver.value
+    if isinstance(inner, ast.Name) and inner.id == "dict":
+        return _dict_name_is_builtin_at_line(reference_line, dict_shadow_line)
+    return _is_globals_class_dict_reference(inner, builtin_shadow_lines)
+
+
 def _is_dict_type_setitem_callable(
     func,
     *,
@@ -2087,6 +2113,14 @@ def _is_dict_type_setitem_callable(
     one unless the collected shadow state still shows the builtin.
     """
     func = _dunder_call_mutator_callee(func)
+    if isinstance(func, ast.Subscript):
+        return _is_dict_class_dict_mutator_subscript(
+            func,
+            {"__setitem__", "setdefault"},
+            reference_line=reference_line,
+            dict_shadow_line=dict_shadow_line,
+            builtin_shadow_lines=builtin_shadow_lines,
+        )
     if isinstance(func, ast.Attribute):
         if (
             func.attr == "__setitem__"
@@ -2181,6 +2215,14 @@ def _is_dict_type_ior_callable(
     func = _dunder_call_mutator_callee(func)
     if isinstance(func, ast.Name):
         return func.id in aliases
+    if isinstance(func, ast.Subscript):
+        return _is_dict_class_dict_mutator_subscript(
+            func,
+            {"__ior__"},
+            reference_line=reference_line,
+            dict_shadow_line=dict_shadow_line,
+            builtin_shadow_lines=builtin_shadow_lines,
+        )
     if not _dict_name_is_builtin_at_line(reference_line, dict_shadow_line):
         return False
     if isinstance(func, ast.Attribute):
@@ -6307,7 +6349,7 @@ def _class_attribute_assignment(stmt):
 def _collect_class_attribute_value_expressions(tree):
     """Map ``(class, attribute)`` to its class-body values in source order."""
     values = {}
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         for stmt in node.body:
             assignment = _class_attribute_assignment(stmt)
             if assignment is None:
@@ -7071,6 +7113,55 @@ def _call_is_exit_stack_enter_context_mutation(
         include_exit=_exit_stack_closes_after_enter(
             call.func.value.id, reference_line, operator_bindings
         ),
+    )
+
+
+def _call_is_exit_stack_push_mutation(
+    call,
+    operator_bindings,
+    class_targets,
+    local_class_aliases=None,
+):
+    """Return True for ``stack.push(...)`` on a tracked ExitStack.
+
+    ``push(cm)`` runs ``cm.__exit__`` on unwind exactly like ``enter_context``
+    does, and ``push(fn)`` registers a plain callback. Nothing runs unless the
+    stack actually unwinds, so a stack that is never closed or exited must not
+    count as an executed hook.
+    """
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "push" or not call.args:
+        return False
+    reference_line = getattr(call, "lineno", 0)
+    if not _exit_stack_instance_is_active(
+        call.func.value,
+        operator_bindings,
+        reference_line,
+    ):
+        return False
+    if not _exit_stack_closes_after_enter(
+        call.func.value.id,
+        reference_line,
+        operator_bindings,
+    ):
+        return False
+    if _thread_pool_callback_mutates_workers(call.args[0], operator_bindings):
+        return True
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    with_node = ast.With(items=[ast.withitem(context_expr=call.args[0])], body=[])
+    ast.copy_location(with_node, call)
+    return _context_manager_item_mutates_workers(
+        with_node.items[0],
+        with_node,
+        reference_line,
+        class_targets,
+        instance_events,
+        operator_bindings,
+        local_class_aliases or {},
+        include_exit=True,
+        # ``push`` registers ``__exit__`` without calling ``__enter__``.
+        include_entry=False,
     )
 
 
@@ -7839,17 +7930,55 @@ def _thread_constructor_is_active(call, operator_bindings):
     )
 
 
-def _thread_target_mutates_workers(
-    target,
+def _partial_namespace_payload_may_set_workers(partial_call, attribute):
+    """Check the arguments a partial binds to a module-namespace mutator."""
+    bound = partial_call.args[1:]
+    keyword_values = [keyword.value for keyword in partial_call.keywords]
+    if any(keyword.arg is None for keyword in partial_call.keywords):
+        # ``**mapping`` cannot be resolved.
+        return True
+    if attribute in {"update", "__ior__"}:
+        if any(_thread_update_payload_may_set_workers(argument) for argument in bound):
+            return True
+        if not keyword_values:
+            return False
+        bound_dict = ast.Dict(
+            keys=[ast.Constant(keyword.arg) for keyword in partial_call.keywords],
+            values=keyword_values,
+        )
+        return _thread_update_payload_may_set_workers(bound_dict)
+    if not bound:
+        return False
+    return _thread_key_payload_may_be_workers(bound[0])
+
+
+def _partial_target_mutates_workers(
+    partial_call,
     operator_bindings,
     mutator_names,
-    call=None,
 ):
-    """Return whether one Thread target can mutate workers."""
-    if isinstance(target, ast.Lambda):
-        return _lambda_mutates_workers(target, operator_bindings)
-    if isinstance(target, ast.Name):
-        return target.id in mutator_names
+    """Resolve a Thread target bound through ``functools.partial``."""
+    if not partial_call.args:
+        return False
+    bound_target = partial_call.args[0]
+    namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
+    if (
+        isinstance(bound_target, ast.Attribute)
+        and _is_module_namespace_mapping(bound_target.value, namespace_aliases)
+        and bound_target.attr in {"update", "__setitem__", "setdefault", "__ior__"}
+    ):
+        return _partial_namespace_payload_may_set_workers(
+            partial_call, bound_target.attr
+        )
+    return _thread_target_mutates_workers(
+        bound_target,
+        operator_bindings,
+        mutator_names,
+    )
+
+
+def _namespace_target_mutates_workers(target, operator_bindings, call):
+    """Check a ``globals().update``-style target with its Thread payload."""
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if not (
         isinstance(target, ast.Attribute)
@@ -7869,6 +7998,26 @@ def _thread_target_mutates_workers(
             _thread_keyword_arguments_payload(call, operator_bindings)
         )
     return _thread_key_payload_may_be_workers(payload)
+
+
+def _thread_target_mutates_workers(
+    target,
+    operator_bindings,
+    mutator_names,
+    call=None,
+):
+    """Return whether one Thread target can mutate workers."""
+    if isinstance(target, ast.Lambda):
+        return _lambda_mutates_workers(target, operator_bindings)
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    partial_call = _partial_factory_call(target, partial_aliases)
+    if partial_call is not None:
+        return _partial_target_mutates_workers(
+            partial_call, operator_bindings, mutator_names
+        )
+    if isinstance(target, ast.Name):
+        return target.id in mutator_names
+    return _namespace_target_mutates_workers(target, operator_bindings, call)
 
 
 def _thread_targets(call):
@@ -8516,6 +8665,16 @@ def _thread_pool_callback_mutates_workers(callback, operator_bindings):
 
 def _named_callback_mutates_workers(callback, operator_bindings):
     """Return whether a named callback can mutate module workers."""
+    partial_aliases = operator_bindings[4] if len(operator_bindings) > 4 else set()
+    partial_call = _partial_factory_call(callback, partial_aliases)
+    if partial_call is not None:
+        # ``partial(bump, ...)`` runs ``bump`` when the callback is invoked.
+        if not partial_call.args:
+            return False
+        return _named_callback_mutates_workers(
+            partial_call.args[0],
+            operator_bindings,
+        )
     namespace_aliases = operator_bindings[2] if len(operator_bindings) > 2 else set()
     if _expression_is_namespace_update_reference(callback, namespace_aliases):
         return True
@@ -8600,7 +8759,7 @@ def _thread_pool_map_arguments(call):
 
 
 _THREAD_POOL_CALLBACK_METHODS = frozenset(
-    {"map", "imap", "imap_unordered", "starmap"}
+    {"map", "imap", "imap_unordered", "starmap", "map_async", "starmap_async"}
 )
 
 
@@ -11625,15 +11784,29 @@ def _heapq_call_targets_module(call, operator_bindings, reference_line):
 
 def _heapq_arguments_mutate_workers(call, operator_bindings):
     """True when a heapq key/iterable argument can mutate workers."""
-    if len(call.args) < 2:
-        return False
     if (
         _key_lambda_mutates_workers(call, operator_bindings)
         or _heapq_positional_key_mutates_workers(call, operator_bindings)
         or _key_lambda_invokes_mutating_callback_container(call, operator_bindings)
     ):
         return True
-    iterable = call.args[1]
+    if any(keyword.arg is None for keyword in call.keywords):
+        # ``**mapping`` may carry ``key=`` / ``iterable=``.
+        return True
+    iterable = (
+        call.args[1]
+        if len(call.args) >= 2
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "iterable"
+            ),
+            None,
+        )
+    )
+    if iterable is None:
+        return False
     return _iterable_holds_mutating_callbacks(
         iterable, operator_bindings
     ) or _expression_is_mutating_lazy_iterator(iterable, operator_bindings)
@@ -12387,6 +12560,50 @@ def _collect_metaclass_base_aliases(tree):
     return base_aliases, module_alias_events
 
 
+def _iter_import_time_module_statements(statements):
+    """Yield module-scope statements, including compound-statement bodies.
+
+    Mirrors [`_iter_import_time_class_definitions`] for the sibling collectors
+    that look at assignments: a ``if``/``try``/``with`` block still runs at
+    import time, so its statements must be visible.
+    """
+    for node, _conditional in _iter_import_time_module_statements_with_flags(statements):
+        yield node
+
+
+_CONDITIONAL_STATEMENT_NODES = tuple(
+    node
+    for node in (
+        ast.If,
+        ast.Try,
+        # `TryStar` (3.11+) and `Match` (3.10+) are looked up defensively: the
+        # panel still supports 3.10, where `ast.TryStar` does not exist.
+        getattr(ast, "TryStar", None),
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        getattr(ast, "Match", None),
+    )
+    if node is not None
+)
+
+
+def _iter_import_time_module_statements_with_flags(statements, conditional=False):
+    """Yield ``(statement, conditional)`` for module-scope statements.
+
+    ``conditional`` is true when the statement sits in a branch, loop or
+    ``try`` body, i.e. when reaching it is not guaranteed. Callers use it to
+    tell a definite rebinding from one that may not run.
+    """
+    for node in statements:
+        yield node, conditional
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        nested = conditional or isinstance(node, _CONDITIONAL_STATEMENT_NODES)
+        for block in _compound_statement_blocks(node):
+            yield from _iter_import_time_module_statements_with_flags(block, nested)
+
+
 def _iter_import_time_class_definitions(statements):
     """Include nested class bodies, but never definitions inside deferred functions."""
     for node in statements:
@@ -12398,9 +12615,39 @@ def _iter_import_time_class_definitions(statements):
                 yield from _iter_import_time_class_definitions(block)
 
 
+def _iter_module_scope_class_definitions(statements):
+    """Yield classes bound by a simple module-scope name."""
+    for node in statements:
+        if isinstance(node, ast.ClassDef):
+            yield node
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for block in _compound_statement_blocks(node):
+                yield from _iter_module_scope_class_definitions(block)
+
+
+def _visible_class_definitions(tree):
+    """Yield definitions that a bare name can actually resolve to.
+
+    A class nested in another class is only reachable as ``Outer.Inner``; no
+    bare-name lookup (bases, ``metaclass=``, ``Child()``) can reach it. When a
+    module-level class claims the same simple name, the nested definition must
+    therefore stay out of the name-keyed tables, or its bases, hooks and
+    metaclass would silently rewrite the module class's hierarchy. A nested
+    class with a name of its own stays visible, because it is the only binding
+    that name can mean.
+    """
+    module_nodes = list(_iter_module_scope_class_definitions(tree.body))
+    module_ids = {id(node) for node in module_nodes}
+    module_names = {node.name for node in module_nodes}
+    for node in _iter_import_time_class_definitions(tree.body):
+        if id(node) not in module_ids and node.name in module_names:
+            continue
+        yield node
+
+
 def _collect_metaclass_class_names(tree):
     """Return locally defined classes that are type or stdlib metaclass subclasses."""
-    class_nodes = list(_iter_import_time_class_definitions(tree.body))
+    class_nodes = list(_visible_class_definitions(tree))
     local_names = {node.name for node in class_nodes}
     # Any locally defined class can be used as an explicit metaclass: Python
     # calls it with (name, bases, ns) even when it does not subclass ``type``
@@ -12440,7 +12687,7 @@ def _collect_mutating_metaclass_hook_definitions(
     """Return mutating hook definitions owned by local metaclass classes."""
     return {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         if node.name in metaclass_names
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
@@ -12511,7 +12758,7 @@ def _classes_with_mutating_effective_metaclass(
 ):
     """Return classes whose effective metaclass runs a mutating hook."""
     class_names = {
-        node.name for node in _iter_import_time_class_definitions(tree.body)
+        node.name for node in _visible_class_definitions(tree)
     }
     aliases = _collect_class_name_aliases(tree, class_names)
     mutating_metaclasses = _mutating_metaclass_names_for_hooks(
@@ -12522,7 +12769,7 @@ def _classes_with_mutating_effective_metaclass(
         aliases,
     )
     affected = set()
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         reference_line = getattr(node, 'lineno', 0)
         explicit = _explicit_metaclass_name(node)
         if explicit is not None:
@@ -13254,6 +13501,42 @@ def _class_base_expression_name(base, reference_line, class_name_aliases=None):
     return None
 
 
+def _literal_base_names(value):
+    """Return the class names a literal base tuple holds, or None."""
+    if not isinstance(value, (ast.Tuple, ast.List)):
+        return None
+    names = tuple(
+        element.id for element in value.elts if isinstance(element, ast.Name)
+    )
+    if len(names) != len(value.elts):
+        # A non-name element cannot be resolved, so the tuple is not a
+        # provable base list.
+        return None
+    return names
+
+
+def _merge_base_names(values, targets, names, conditional):
+    """Record one assignment's names into every simple target.
+
+    A definite assignment replaces the tuple that was bound before it: the
+    earlier one never reaches the ``class`` statement, and unioning them would
+    invent a multiple-inheritance hierarchy whose MRO masks the real
+    initializer. An assignment inside ``if``/``try``/loop may or may not run,
+    so it is unioned into the existing tuple instead.
+    """
+    for target in targets:
+        if not isinstance(target, ast.Name):
+            continue
+        if conditional and target.id in values:
+            merged = values[target.id]
+            values[target.id] = (
+                *merged,
+                *(name for name in names if name not in merged),
+            )
+        else:
+            values[target.id] = tuple(names)
+
+
 def _module_literal_base_names(tree):
     """Map module-level names to the literal class names a tuple holds.
 
@@ -13262,25 +13545,14 @@ def _module_literal_base_names(tree):
     dropping the subclass relationship.
     """
     values = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets, value = [node.target], node.value
-        else:
+    for node, conditional in _iter_import_time_module_statements_with_flags(tree.body):
+        assignment = _module_assign_targets_value(node)
+        if assignment is None:
             continue
-        if not isinstance(value, (ast.Tuple, ast.List)):
-            continue
-        names = tuple(
-            element.id for element in value.elts if isinstance(element, ast.Name)
-        )
-        if len(names) != len(value.elts):
-            # A non-name element cannot be resolved, so the tuple is not a
-            # provable base list.
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                values[target.id] = names
+        targets, value = assignment
+        names = _literal_base_names(value)
+        if names is not None:
+            _merge_base_names(values, targets, names, conditional)
     return values
 
 
@@ -13310,21 +13582,27 @@ def _iter_class_base_names(
 
 
 def _collect_class_definition_metadata(tree, class_name_aliases=None):
-    """Collect class bases, defined methods, and plain class attributes."""
+    """Collect class bases, defined methods, and plain class attributes.
+
+    A name defined more than once at module scope (``if``/``else`` variants)
+    keeps every base it was ever declared with: dropping one of the two
+    hierarchies would hide a mutating initializer behind the surviving one.
+    """
     class_bases = {}
     class_methods = set()
     class_attributes = set()
     literal_bases = _module_literal_base_names(tree)
-    for node in _iter_import_time_class_definitions(tree.body):
+    for node in _visible_class_definitions(tree):
         reference_line = getattr(node, "lineno", 0)
-        class_bases[node.name] = tuple(
-            _iter_class_base_names(
-                node,
-                reference_line,
-                class_name_aliases,
-                literal_bases,
-            )
-        )
+        bases = class_bases.setdefault(node.name, [])
+        for base_name in _iter_class_base_names(
+            node,
+            reference_line,
+            class_name_aliases,
+            literal_bases,
+        ):
+            if base_name is not None and base_name not in bases:
+                bases.append(base_name)
         class_methods.update(
             (node.name, stmt.name)
             for stmt in node.body
@@ -13334,7 +13612,11 @@ def _collect_class_definition_metadata(tree, class_name_aliases=None):
             (node.name, attribute_name)
             for attribute_name in _class_body_plain_attribute_names(node)
         )
-    return class_bases, class_methods, class_attributes
+    return (
+        {name: tuple(bases) for name, bases in class_bases.items()},
+        class_methods,
+        class_attributes,
+    )
 
 
 def _collect_class_name_aliases(tree, class_names):
@@ -13430,7 +13712,12 @@ def _record_mutating_super_methods(
 def _class_constructor_assignment_is_non_mutating(value, operator_bindings):
     """Return True when an assigned constructor provably cannot mutate workers."""
     if isinstance(value, ast.Lambda):
-        return not _lambda_mutates_workers(value, operator_bindings)
+        if _lambda_mutates_workers(value, operator_bindings):
+            return False
+        # Any call inside the lambda may invoke a helper that mutates workers;
+        # without the module mutator set this cannot be proven harmless, so a
+        # called constructor is not recorded as a barrier.
+        return not any(isinstance(node, ast.Call) for node in ast.walk(value.body))
     if (
         isinstance(value, ast.Attribute)
         and value.attr in ("__init__", "__post_init__")
@@ -13477,9 +13764,7 @@ def _record_class_constructor_assignment_barriers(
     or mutating assigned constructors stay unrecorded, leaving the existing
     inherited-constructor lookup unchanged.
     """
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _visible_class_definitions(tree):
         for stmt in node.body:
             for name in _class_constructor_assignment_names(
                 stmt,
@@ -13492,7 +13777,7 @@ def _record_inherited_nested_constructors(
     tree, methods, class_bases, class_methods, nested_constructor_pairs,
 ):
     """Include inner constructors inherited through a local class hierarchy."""
-    for outer in _iter_import_time_class_definitions(tree.body):
+    for outer in _visible_class_definitions(tree):
         for inner in outer.body:
             if isinstance(inner, ast.ClassDef) and any(
                 _class_hierarchy_defines_method(
@@ -13532,7 +13817,7 @@ def _class_definition_line_events(tree):
 
 def _metaclass_bypass_binding_events(tree, class_bases, class_name_aliases=None):
     """Track which locally defined metaclasses bypass construction."""
-    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    class_nodes = list(_visible_class_definitions(tree))
     class_nodes_by_name = {node.name: node for node in class_nodes}
     events = {}
     for node, metaclass_name in _effective_metaclass_names(
@@ -13552,11 +13837,10 @@ def _record_module_class_super_methods(
     tree, class_bases, methods, class_methods, constructors,
 ):
     """Record mutating superclass dispatch for top-level classes."""
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            _record_mutating_super_methods(
-                node, class_bases, methods, class_methods, constructors,
-            )
+    for node in _visible_class_definitions(tree):
+        _record_mutating_super_methods(
+            node, class_bases, methods, class_methods, constructors,
+        )
 
 
 def _nested_constructor_binding_pair(target, aliases, reference_line):
@@ -13618,7 +13902,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
         tree,
         {
             node.name
-            for node in _iter_import_time_class_definitions(tree.body)
+            for node in _visible_class_definitions(tree)
         },
     )
 
@@ -13678,7 +13962,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
         )
     )
     _record_deferred_type_class_constructors(
-        tree.body,
+        _iter_import_time_module_statements(tree.body),
         constructors,
         operator_bindings,
     )
@@ -13688,7 +13972,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     nested_attribute_bindings = _nested_constructor_rebinding_events(
         tree, class_name_aliases, nested_constructor_pairs, operator_bindings,
     )
-    class_nodes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    class_nodes = list(_visible_class_definitions(tree))
     class_metaclass_names = {
         node.name: metaclass_name
         for node, metaclass_name in _effective_metaclass_names(
@@ -13701,7 +13985,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     # separate from ordinary method calls, which merely create coroutines.
     async_entry_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aenter__"
@@ -13710,7 +13994,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     }
     async_exit_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.AsyncFunctionDef)
         and stmt.name == "__aexit__"
@@ -13721,7 +14005,7 @@ def _collect_class_side_effect_targets(tree, operator_bindings, mutator_names=No
     # __enter__/__exit__, so do not add them to ordinary mutating methods.
     contextmanager_methods = {
         (node.name, stmt.name)
-        for node in _iter_import_time_class_definitions(tree.body)
+        for node in _visible_class_definitions(tree)
         for stmt in node.body
         if isinstance(stmt, ast.FunctionDef)
         and _function_uses_contextmanager_decorator(stmt, operator_bindings)
@@ -15440,10 +15724,65 @@ def _call_invokes_resolved_risky_class_constructor(
 
 
 
-def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
-    """Check new_class base hooks at creation, and constructors if invoked."""
-    if not isinstance(call, ast.Call):
+def _update_call_installs_mutating_init(node, operator_bindings):
+    """Return True for ``ns.update({'__init__': <mutator>})``."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+    ):
         return False
+    for argument in node.args:
+        if not isinstance(argument, ast.Dict):
+            continue
+        for key, item in zip(argument.keys, argument.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "__init__"
+                and _init_callback_workers_effect(item, operator_bindings)
+            ):
+                return True
+    return False
+
+
+def _subscript_assign_installs_mutating_init(node, operator_bindings):
+    """Return True for ``ns['__init__'] = <mutator>``."""
+    if not isinstance(node, ast.Assign):
+        return False
+    for target in node.targets:
+        if (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "__init__"
+            and _init_callback_workers_effect(node.value, operator_bindings)
+        ):
+            return True
+    return False
+
+
+def _exec_body_installs_mutating_init(value, operator_bindings):
+    """Return True when an ``exec_body=lambda ns: ...`` installs a mutating init."""
+    if not isinstance(value, ast.Lambda):
+        return False
+    return any(
+        _update_call_installs_mutating_init(node, operator_bindings)
+        or _subscript_assign_installs_mutating_init(node, operator_bindings)
+        for node in ast.walk(value.body)
+    )
+
+
+def _types_new_class_exec_body(call):
+    """Return the ``exec_body`` expression of a ``types.new_class`` call."""
+    for keyword in call.keywords:
+        if keyword.arg == "exec_body":
+            return keyword.value
+    if len(call.args) >= 4:
+        return call.args[3]
+    return None
+
+
+def _types_new_class_call_target(call, operator_bindings):
+    """Return ``(call, instantiated)`` for a ``types.new_class`` expression."""
     inner = call.func if isinstance(call.func, ast.Call) else call
     types_module_aliases = operator_bindings[25] if len(operator_bindings) > 25 else set()
     func = inner.func
@@ -15453,11 +15792,31 @@ def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
         and isinstance(func.value, ast.Name)
         and func.value.id in types_module_aliases
     ):
+        return None
+    return inner, inner is not call
+
+
+def _call_is_types_new_class_constructor_side_effect(call, operator_bindings):
+    """Check new_class base hooks at creation, and constructors if invoked."""
+    if not isinstance(call, ast.Call):
         return False
+    target = _types_new_class_call_target(call, operator_bindings)
+    if target is None:
+        return False
+    inner, instantiated = target
+    if instantiated:
+        # Calling the created class runs its ``__init__``; creating it only
+        # evaluates bases and ``__init_subclass__``. ``exec_body`` merely
+        # installs the callable, so it cannot mutate workers on its own.
+        exec_body = _types_new_class_exec_body(inner)
+        if exec_body is not None and _exec_body_installs_mutating_init(
+            exec_body, operator_bindings
+        ):
+            return True
     return _type_constructor_bases_trigger_workers(
         inner,
         operator_bindings,
-        creation_only=(inner is call),
+        creation_only=not instantiated,
     )
 
 
@@ -16431,15 +16790,163 @@ def _call_is_map_lambda_namespace_update(call, operator_bindings):
     )
 
 
-def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
-    """Return the first ``__init__`` lambda effect, or None when absent."""
-    if not isinstance(namespace_dict, ast.Dict):
+def _dict_namespace_call_keywords(node, operator_bindings):
+    """Return the keywords of a proven builtin ``dict(...)`` namespace call."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dict"
+    ):
         return None
+    shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
+    if not _name_is_unshadowed_builtin(
+        "dict", getattr(node, "lineno", 0), shadow_lines
+    ):
+        return None
+    return node.keywords
+
+
+def _init_callback_workers_effect(callback, operator_bindings):
+    """Return a proven ``__init__`` effect, or None when it cannot be resolved."""
+    if isinstance(callback, ast.Lambda):
+        return _expression_mutates_workers(callback.body, operator_bindings)
+    if isinstance(callback, (ast.Name, ast.Attribute)):
+        # A named callable cannot be proven harmless here (the worker-mutator
+        # set is not available at this call site), so fail closed.
+        return True
+    return None
+
+
+def _module_assign_targets_value(node):
+    """Return ``(targets, value)`` for a module-scope assignment, or None."""
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target], node.value
+    return None
+
+
+_MAPPING_MUTATOR_METHODS = {
+    "update",
+    "pop",
+    "popitem",
+    "clear",
+    "setdefault",
+    "__setitem__",
+    "__delitem__",
+    "__ior__",
+}
+
+
+def _mutation_statement_targets(node):
+    """Yield the targets a mapping-mutating assignment/delete operates on."""
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        yield from node.targets
+    elif isinstance(node, ast.AugAssign):
+        yield node.target
+
+
+def _attribute_mutator_name(node):
+    """Return the mapping name of a ``ns.update(...)``-style call, if any."""
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return None
+    function = node.value.func
+    if (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.attr in _MAPPING_MUTATOR_METHODS
+    ):
+        return function.value.id
+    return None
+
+
+def _mapping_mutation_names(node):
+    """Yield names whose mapping contents a module-scope statement changes."""
+    for target in _mutation_statement_targets(node):
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            yield target.value.id
+        elif (
+            isinstance(node, ast.AugAssign)
+            and isinstance(target, ast.Name)
+            and isinstance(node.op, ast.BitOr)
+        ):
+            yield target.id
+    if (name := _attribute_mutator_name(node)) is not None:
+        yield name
+
+
+def _record_literal_namespace_value(targets, value, values, ambiguous):
+    """Record one literal dict binding, marking rebinding as ambiguous."""
+    for target in targets:
+        if not isinstance(target, ast.Name):
+            continue
+        if not isinstance(value, ast.Dict) or target.id in values:
+            ambiguous.add(target.id)
+            continue
+        values[target.id] = value
+
+
+def _module_literal_namespace_values(tree):
+    """Map module-level names to a single literal dict namespace.
+
+    A name that is rebound, bound to a non-literal value, or mutated after
+    binding (``del ns['k']``, ``ns.update(...)``) is ambiguous and omitted:
+    the literal no longer describes the mapping the ``type()`` call receives,
+    and trusting the stale contents could hide a mutating initializer.
+    """
+    values = {}
+    ambiguous = set()
+    for node, _conditional in _iter_import_time_module_statements_with_flags(tree.body):
+        ambiguous.update(_mapping_mutation_names(node))
+        assignment = _module_assign_targets_value(node)
+        if assignment is None:
+            continue
+        targets, value = assignment
+        _record_literal_namespace_value(targets, value, values, ambiguous)
+    for name in ambiguous:
+        values.pop(name, None)
+    return values
+
+
+def _dict_literal_init_workers_effect(namespace_dict, operator_bindings):
+    """Return the first ``__init__`` effect of a literal namespace mapping."""
     for key, value in zip(namespace_dict.keys, namespace_dict.values):
         if isinstance(key, ast.Constant) and key.value == "__init__":
-            if isinstance(value, ast.Lambda):
-                return _expression_mutates_workers(value.body, operator_bindings)
+            effect = _init_callback_workers_effect(value, operator_bindings)
+            if effect is not None:
+                return effect
     return None
+
+
+def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
+    """Return the first ``__init__`` callback effect, or None when absent."""
+    if isinstance(namespace_dict, ast.Call):
+        # ``type('T', (), dict(__init__=...))`` builds the same namespace the
+        # literal spelling does.
+        keywords = _dict_namespace_call_keywords(namespace_dict, operator_bindings)
+        if keywords is None:
+            return None
+        for keyword in keywords:
+            if keyword.arg == "__init__":
+                return _init_callback_workers_effect(
+                    keyword.value, operator_bindings
+                )
+        return None
+    if isinstance(namespace_dict, ast.Name):
+        # ``ns = {...}; type('T', (), ns)`` (only a single literal binding).
+        stored = (
+            _operator_bindings_metadata(
+                operator_bindings, "literal_namespace_values"
+            )
+            or {}
+        )
+        resolved = stored.get(namespace_dict.id)
+        if resolved is None:
+            return None
+        return _dict_literal_init_workers_effect(resolved, operator_bindings)
+    if not isinstance(namespace_dict, ast.Dict):
+        return None
+    return _dict_literal_init_workers_effect(namespace_dict, operator_bindings)
 
 
 def _keyword_init_lambda_workers_effect(keywords, operator_bindings):
@@ -16457,6 +16964,10 @@ def _call_is_type_constructor_side_effect(call, operator_bindings):
     """Detect side effects of dynamic type creation and subsequent instantiation."""
     if not isinstance(call, ast.Call):
         return False
+    if isinstance(call.func, ast.Call) and _call_is_types_new_class_constructor_side_effect(
+        call, operator_bindings
+    ):
+        return True
     constructor = call.func if isinstance(call.func, ast.Call) else call
     func = constructor.func
     if not (isinstance(func, ast.Name) and func.id == "type"):
@@ -16508,26 +17019,92 @@ def _assigned_unshadowed_type_call(node, builtin_shadow_lines):
     return value
 
 
+def _assigned_types_new_class_call(node, operator_bindings):
+    """Return an assigned ``types.new_class(...)`` call, or None."""
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return None
+    value = node.value
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    types_module_aliases = (
+        operator_bindings[25] if len(operator_bindings) > 25 else set()
+    )
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "new_class"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in types_module_aliases
+    ):
+        return None
+    return value
+
+
+def _statement_calls_name(statement, name):
+    """Return True when the statement invokes a bare ``name(...)``."""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+        for node in ast.walk(statement)
+    )
+
+
+def _register_deferred_type_names(
+    node, constructors, operator_bindings, builtin_shadow_lines
+):
+    """Register a name assigned from a mutating dynamic ``type(...)``."""
+    value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
+    if value is None:
+        return False
+    instantiated = ast.Call(func=value, args=[], keywords=[])
+    if not _call_is_type_constructor_side_effect(instantiated, operator_bindings):
+        return False
+    for target in _statement_simple_targets(node):
+        if isinstance(target, ast.Name):
+            constructors.add(target.id)
+    return True
+
+
+def _register_deferred_new_class_names(
+    node, statements, constructors, operator_bindings
+):
+    """Register a ``types.new_class`` name that is later instantiated."""
+    new_class = _assigned_types_new_class_call(node, operator_bindings)
+    if new_class is None:
+        return False
+    # Creating the class only installs the ``exec_body`` namespace; the
+    # mutating ``__init__`` runs on instantiation, so register the name only
+    # when the module calls it.
+    exec_body = _types_new_class_exec_body(new_class)
+    if exec_body is None or not _exec_body_installs_mutating_init(
+        exec_body, operator_bindings
+    ):
+        return False
+    for target in _statement_simple_targets(node):
+        if isinstance(target, ast.Name) and any(
+            _statement_calls_name(stmt, target.id) for stmt in statements
+        ):
+            constructors.add(target.id)
+    return True
+
+
 def _record_deferred_type_class_constructors(
     statements,
     constructors,
     operator_bindings,
 ):
-    """Register module names bound to a dynamic ``type(...)`` that mutates on ``Name()``."""
+    """Register module names bound to a dynamic class that mutates on ``Name()``."""
+    materialized = list(statements)
     builtin_shadow_lines = operator_bindings[32] if len(operator_bindings) > 32 else {}
-    for node in statements:
-        value = _assigned_unshadowed_type_call(node, builtin_shadow_lines)
-        if value is None:
-            continue
-        instantiated = ast.Call(func=value, args=[], keywords=[])
-        if not _call_is_type_constructor_side_effect(
-            instantiated,
-            operator_bindings,
+    for node in materialized:
+        if _register_deferred_type_names(
+            node, constructors, operator_bindings, builtin_shadow_lines
         ):
             continue
-        for target in _statement_simple_targets(node):
-            if isinstance(target, ast.Name):
-                constructors.add(target.id)
+        _register_deferred_new_class_names(
+            node, materialized, constructors, operator_bindings
+        )
 
 
 def _partial_reduce_initializer(partial_call, invocation, invocation_start):
@@ -17825,13 +18402,12 @@ def _expression_enters_exit_stack_context(
     expr, class_targets, operator_bindings, bound_class_aliases
 ):
     """Recognize mutating context entry through a tracked ExitStack."""
-    return bool(
-        isinstance(expr, ast.Call)
-        and operator_bindings
-        and class_targets
-        and _call_is_exit_stack_enter_context_mutation(
-            expr, operator_bindings, class_targets, bound_class_aliases
-        )
+    if not (isinstance(expr, ast.Call) and operator_bindings and class_targets):
+        return False
+    return _call_is_exit_stack_enter_context_mutation(
+        expr, operator_bindings, class_targets, bound_class_aliases
+    ) or _call_is_exit_stack_push_mutation(
+        expr, operator_bindings, class_targets, bound_class_aliases
     )
 
 
@@ -18216,12 +18792,15 @@ def _context_manager_item_mutates_workers(
     local_class_aliases,
     *,
     include_exit=True,
+    include_entry=True,
 ):
     """Check context entry immediately, and exit only when it executes."""
     context_expr = _resolve_local_class_context(
         item.context_expr, local_class_aliases, reference_line
     )
-    if isinstance(with_node, ast.With) and _contextlib_closing_close_mutates_workers(
+    if include_entry and isinstance(
+        with_node, ast.With
+    ) and _contextlib_closing_close_mutates_workers(
         item,
         reference_line,
         class_targets,
@@ -18230,13 +18809,15 @@ def _context_manager_item_mutates_workers(
         local_class_aliases,
     ):
         return True
-    if _expression_has_class_workers_side_effect(
+    if include_entry and _expression_has_class_workers_side_effect(
         context_expr,
         class_targets,
         operator_bindings=operator_bindings,
     ):
         return True
-    if isinstance(with_node, ast.With) and _deferred_contextmanager_entry_mutates_workers(
+    if include_entry and isinstance(
+        with_node, ast.With
+    ) and _deferred_contextmanager_entry_mutates_workers(
         context_expr, class_targets, operator_bindings, reference_line
     ):
         return True
@@ -18251,7 +18832,7 @@ def _context_manager_item_mutates_workers(
     entry_methods, enter_attr = _context_manager_entry_methods(
         with_node, class_targets
     )
-    if _context_manager_hook_mutates_workers(
+    if include_entry and _context_manager_hook_mutates_workers(
         context_expr,
         enter_attr,
         entry_methods,
@@ -18361,8 +18942,20 @@ def _statement_mutates_workers(
         # when the nested ``def`` runs, in this scope, so under ``global
         # workers`` a ``workers`` walrus there rebinds the module attribute. The
         # body is deferred and must not be scanned.
-        return bool(global_workers) and _node_has_workers_walrus(
+        if bool(global_workers) and _node_has_workers_walrus(
             node, operator_bindings, bound_names, defer_annotations
+        ):
+            return True
+        # Defaults/annotations of a nested ``def`` are evaluated when the
+        # enclosing scope runs, so a ``def inner(x=bump())`` mutates workers
+        # even though the nested body stays deferred.
+        return _definition_time_workers_effect(
+            node,
+            mutator_names,
+            operator_bindings,
+            class_targets,
+            dict_subclass_names,
+            defer_annotations,
         )
     if isinstance(node, ast.ClassDef):
         # A class body runs while the ``class`` statement executes, so a
@@ -18574,6 +19167,12 @@ def _function_mutates_workers(
     The body runs in the function's own scope, which is what the nested-scope
     marker around the walk below tells ``_is_module_namespace_mapping``.
     """
+    if not defer_annotations:
+        # Callers without the tree still honour a module-level
+        # ``from __future__ import annotations`` / PEP 649.
+        defer_annotations = bool(
+            _operator_bindings_metadata(operator_bindings, "defer_annotations")
+        )
     with _evaluated_in_nested_scope():
         if _statements_start_mutating_thread(
             func_node.body,
@@ -18652,7 +19251,7 @@ def _parse_gunicorn_config_tree(path):
         # The path comes only from Gunicorn's process startup arguments/environment,
         # not from an HTTP request. Service-managed absolute configs (for example
         # /etc/gunicorn.conf.py) must be inspected to enforce multi-worker guards.
-        source = path.read_text(encoding="utf-8")  # NOSONAR pythonsecurity:S8707
+        source = path.read_text(encoding="utf-8-sig")  # NOSONAR pythonsecurity:S8707
         return ast.parse(source, filename=str(path))
     except (OSError, UnicodeError, SyntaxError):
         return None
@@ -22551,6 +23150,16 @@ def _definition_time_worker_expressions(node, defer_annotations=False):
     return expressions
 
 
+def _class_metaclass_keyword_invokes_mutator(node, mutator_names):
+    """Return True for ``class X(metaclass=<mutating function>)``."""
+    return isinstance(node, ast.ClassDef) and any(
+        keyword.arg == "metaclass"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id in mutator_names
+        for keyword in node.keywords
+    )
+
+
 def _definition_time_workers_effect(
     node,
     global_workers_mutators,
@@ -22560,6 +23169,8 @@ def _definition_time_workers_effect(
     defer_annotations=False,
 ):
     """Return True when a definition-time expression mutates the worker count."""
+    if _class_metaclass_keyword_invokes_mutator(node, global_workers_mutators):
+        return True
     return any(
         _expression_invokes_function(expression, global_workers_mutators)
         or _node_has_dynamic_workers_effect(
@@ -23803,6 +24414,13 @@ def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
+    # Make the annotation policy available to every collector below: on
+    # CPython 3.14 (PEP 649) and under ``from __future__ import annotations`` a
+    # nested ``def`` does not evaluate its annotations.
+    operator_bindings[32]["defer_annotations"] = _config_defers_annotations(tree)
+    operator_bindings[32]["literal_namespace_values"] = (
+        _module_literal_namespace_values(tree)
+    )
     for builtin_name in ("type", "__import__"):
         shadow_events = _collect_module_scope_builtin_shadow_events(
             tree, builtin_name

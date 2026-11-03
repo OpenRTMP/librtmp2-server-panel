@@ -169,7 +169,10 @@ def _assigned_target_names(node):
 def config_provides_setting(path, name):
     """Return ``0``/``1``/``2`` for whether ``path`` assigns ``name``."""
     try:
-        source = path.read_text(encoding="utf-8")
+        # Gunicorn loads the file through importlib, which strips a UTF-8 BOM;
+        # `utf-8-sig` gives the probe the same view instead of a bogus
+        # SyntaxError that the entrypoint reads as "config supplies bind".
+        source = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         return UNKNOWN
     try:
