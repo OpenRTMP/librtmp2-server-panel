@@ -16734,6 +16734,33 @@ def _init_callback_workers_effect(callback, operator_bindings):
     return None
 
 
+def _module_literal_namespace_values(tree):
+    """Map module-level names to a single literal dict namespace.
+
+    A name that is rebound, or bound to a non-literal value, is ambiguous and
+    omitted so a computed namespace is never trusted.
+    """
+    values = {}
+    ambiguous = set()
+    for node in _iter_import_time_module_statements(tree.body):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if not isinstance(value, ast.Dict) or target.id in values:
+                ambiguous.add(target.id)
+                continue
+            values[target.id] = value
+    for name in ambiguous:
+        values.pop(name, None)
+    return values
+
+
 def _dict_literal_init_workers_effect(namespace_dict, operator_bindings):
     """Return the first ``__init__`` effect of a literal namespace mapping."""
     for key, value in zip(namespace_dict.keys, namespace_dict.values):
@@ -16758,6 +16785,18 @@ def _dict_init_lambda_workers_effect(namespace_dict, operator_bindings):
                     keyword.value, operator_bindings
                 )
         return None
+    if isinstance(namespace_dict, ast.Name):
+        # ``ns = {...}; type('T', (), ns)`` (only a single literal binding).
+        stored = (
+            _operator_bindings_metadata(
+                operator_bindings, "literal_namespace_values"
+            )
+            or {}
+        )
+        resolved = stored.get(namespace_dict.id)
+        if resolved is None:
+            return None
+        return _dict_literal_init_workers_effect(resolved, operator_bindings)
     if not isinstance(namespace_dict, ast.Dict):
         return None
     return _dict_literal_init_workers_effect(namespace_dict, operator_bindings)
@@ -24232,6 +24271,9 @@ def _scan_gunicorn_config_worker_details(tree):
     # CPython 3.14 (PEP 649) and under ``from __future__ import annotations`` a
     # nested ``def`` does not evaluate its annotations.
     operator_bindings[32]["defer_annotations"] = _config_defers_annotations(tree)
+    operator_bindings[32]["literal_namespace_values"] = (
+        _module_literal_namespace_values(tree)
+    )
     for builtin_name in ("type", "__import__"):
         shadow_events = _collect_module_scope_builtin_shadow_events(
             tree, builtin_name
@@ -24446,7 +24488,6 @@ def _scan_gunicorn_config_worker_details(tree):
         mutating_generator_alias_events,
         *operator_bindings[43:],
     )
-    operator_bindings[32]["defer_annotations"] = _config_defers_annotations(tree)
     operator_bindings[32]["warnings_showwarning_mutation_events"] = (
         _collect_warnings_showwarning_mutation_events(
             tree,

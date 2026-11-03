@@ -40,7 +40,7 @@ option_takes_value() {
         --statsd-host|--dogstatsd|--paste|--pythonpath|--reload-engine|\
         --reload-extra-file|--limit-request-line|--limit-request-fields|\
         --limit-request-field-size|--sendfile|--raw-passthrough|--spec|\
-        --wsgi-app|--protocol|--log-config|--log-config-json|--header-map|\
+        --protocol|--log-config|--log-config-json|--header-map|\
         --forwarder-headers|--root-path|--statsd-prefix|--dogstatsd-tags|\
         --log-syslog-to|--log-syslog-facility|--log-syslog-prefix|\
         --cert-reqs|--http-protocols|--http-parser|--control-socket|\

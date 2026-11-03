@@ -5138,3 +5138,26 @@ def test_nov03_nested_def_default_is_still_dynamic(tmp_path):
         "        inner()\n"
         "C()\n",
     ) == (1, True)
+
+
+def test_nov03_type_computed_namespace_variable_is_dynamic(tmp_path):
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "ns = {'__init__': lambda self: globals().update({'workers': 4})}\n"
+        "T = type('T', (), ns)\n"
+        "T()\n",
+    ) == (1, True)
+
+
+def test_nov03_type_ambiguous_namespace_variable_stays_static(tmp_path):
+    # A rebound namespace cannot be resolved statically; the scanner must not
+    # guess a value.
+    assert _scan(
+        tmp_path,
+        "workers = 1\n"
+        "ns = {'__init__': lambda self: globals().update({'workers': 4})}\n"
+        "ns = make_namespace()\n"
+        "T = type('T', (), ns)\n"
+        "T()\n",
+    ) == (1, False)
