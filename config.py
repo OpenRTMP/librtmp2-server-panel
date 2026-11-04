@@ -30,6 +30,22 @@ _MIN_SECRET_KEY_LEN = 32
 _REQUIRE_LOGIN_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
+_BUILTIN_UNARY_DUNDER_DISPATCH = {
+    "repr": "__repr__",
+    "str": "__str__",
+    "bool": "__bool__",
+    "len": "__len__",
+    "hash": "__hash__",
+    "bytes": "__bytes__",
+    "abs": "__abs__",
+}
+_UNARY_OP_DUNDER = {
+    ast.Not: "__bool__",
+    ast.USub: "__neg__",
+    ast.UAdd: "__pos__",
+    ast.Invert: "__invert__",
+}
+
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -16672,6 +16688,21 @@ def _expression_triggers_class_workers_side_effect(
             instance_events,
             reference_line,
         )
+        or _builtin_unary_dunder_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+        )
+        or _unary_op_dunder_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
     )
 
 
@@ -21624,6 +21655,62 @@ def _unshadowed_builtin_call(call, name, operator_bindings):
         name,
         getattr(call, "lineno", 0),
         shadow_lines,
+    )
+
+
+def _builtin_unary_dunder_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings,
+):
+    """Return True when a builtin unary call dispatches a mutating dunder hook."""
+    if not (isinstance(expr, ast.Call) and operator_bindings):
+        return False
+    if not isinstance(expr.func, ast.Name):
+        return False
+    builtin_name = expr.func.id
+    dunder = _BUILTIN_UNARY_DUNDER_DISPATCH.get(builtin_name)
+    if dunder is None:
+        if builtin_name != "print":
+            return False
+        dunder = "__str__"
+    if not _unshadowed_builtin_call(expr, builtin_name, operator_bindings):
+        return False
+    if len(expr.args) != 1 or expr.keywords:
+        return False
+    return _receiver_method_call_triggers_workers(
+        expr.args[0],
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _unary_op_dunder_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when a unary operator dispatches a mutating dunder hook."""
+    if not isinstance(expr, ast.UnaryOp):
+        return False
+    dunder = _UNARY_OP_DUNDER.get(type(expr.op))
+    if dunder is None:
+        return False
+    return _receiver_method_call_triggers_workers(
+        expr.operand,
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
     )
 
 

@@ -139,6 +139,24 @@ _DYNAMIC_CASES = [
         "T = type('T', (), {'__init__': lambda self: globals().__setitem__('workers', 4)})\n"
         "T()\n",
     ),
+    (
+        "builtin repr() invoking mutating __repr__ at import is dynamic",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __repr__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 'x'\n"
+        "repr(H())\n",
+    ),
+    (
+        "builtin len() invoking mutating __len__ at import is dynamic",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __len__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 0\n"
+        "len(H())\n",
+    ),
 ]
 
 _SAFE_CASES = [
