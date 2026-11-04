@@ -12818,7 +12818,10 @@ def _record_class_side_effect_target(
     if stmt.name == "__class_getitem__":
         methods.add((class_name, stmt.name))
         return True
-    if stmt.name in ("__init__", "__post_init__"):
+    if stmt.name in ("__init__", "__post_init__", "__del__"):
+        # ``ClassName()`` can run ``__del__`` synchronously when the instance is
+        # immediately unreferenced during config import, mutating ``workers``
+        # after the scanner would otherwise treat the setting as static.
         constructors.add(class_name)
         methods.add((class_name, stmt.name))
         return True
