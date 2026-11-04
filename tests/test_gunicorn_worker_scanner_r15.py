@@ -157,6 +157,59 @@ _DYNAMIC_CASES = [
         "        return 0\n"
         "len(H())\n",
     ),
+
+    (
+        "class __del__ rebinding workers at import is dynamic",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __del__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "H()\n",
+    ),
+    (
+        "metaclass repr on class object invokes mutating metaclass hook",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __repr__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 'meta'\n"
+        "class H(metaclass=Meta):\n"
+        "    pass\n"
+        "repr(H)\n",
+    ),
+    (
+        "metaclass unary plus on class invokes mutating metaclass hook",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __pos__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "        return cls\n"
+        "class H(metaclass=Meta):\n"
+        "    pass\n"
+        "+H\n",
+    ),
+    (
+        "class alias dispatches metaclass dunder after name rebind",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __repr__(cls):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 'meta'\n"
+        "class H(metaclass=Meta):\n"
+        "    pass\n"
+        "Alias = H\n"
+        "H = None\n"
+        "repr(Alias)\n",
+    ),
+    (
+        "unary plus on constructed instance invokes mutating hook",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __pos__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return self\n"
+        "+H()\n",
+    ),
 ]
 
 _SAFE_CASES = [
@@ -179,6 +232,50 @@ _SAFE_CASES = [
         "    def __init__(self):\n"
         "        helper()\n"
         "H()\n",
+    ),
+
+    (
+        "repr of a class does not invoke its instance __repr__",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __repr__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 'x'\n"
+        "repr(H)\n",
+    ),
+    (
+        "repr of class alias does not invoke instance __repr__",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __repr__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 'x'\n"
+        "Alias = H\n"
+        "repr(Alias)\n",
+    ),
+    (
+        "len on a class uses its safe metaclass __len__",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __len__(cls):\n"
+        "        return 0\n"
+        "class H(metaclass=Meta):\n"
+        "    def __len__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return 0\n"
+        "len(H)\n",
+    ),
+    (
+        "unary plus on class calls metaclass rather than instance hook",
+        "workers = 1\n"
+        "class Meta(type):\n"
+        "    def __pos__(cls):\n"
+        "        return cls\n"
+        "class H(metaclass=Meta):\n"
+        "    def __pos__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "        return self\n"
+        "+H\n",
     ),
 ]
 
