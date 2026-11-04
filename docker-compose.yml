@@ -32,11 +32,13 @@ services:
       - RATELIMIT_STORAGE_URI=${RATELIMIT_STORAGE_URI:-redis://redis:6379/0}
       - PANEL_PUBLIC_URL=${PANEL_PUBLIC_URL:-}
       - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-}
-      # This compose publishes plain HTTP on 8000. Behind a TLS terminator set
-      # PANEL_PUBLIC_URL=https://... (or SESSION_COOKIE_SECURE=1) and this to 0.
+      # This compose publishes plain HTTP on 8000. For HTTPS deployments set
+      # PANEL_PUBLIC_URL=https://... (or SESSION_COOKIE_SECURE=true) and this to 0.
+      # Remove conflicting PANEL_PUBLIC_URL=http://... or SESSION_COOKIE_SECURE=false overrides.
       - PANEL_ALLOW_INSECURE_HTTP=${PANEL_ALLOW_INSECURE_HTTP:-1}
       - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-0}
       - TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-}
+      - TRUSTED_PROXY_CLIENT_IP_HEADER=${TRUSTED_PROXY_CLIENT_IP_HEADER:-}
       # Live stats polling limits for /streams/<id>/stats.json (per minute):
       # - STATS_RATE_LIMIT_PER_IP=600
       # - STATS_RATE_LIMIT_PER_STREAM=25
