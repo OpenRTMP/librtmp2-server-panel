@@ -86,6 +86,19 @@ _DYNAMIC_CASES = [
         "        return False\n"
         "Bump() == 1\n",
     ),
+    (
+        "an inherited implicit hook is resolved through the MRO",
+        "workers = 1\n"
+        "class Bump:\n"
+        "    def __iter__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return iter(())\n"
+        "class Child(Bump):\n"
+        "    pass\n"
+        "for _ in Child():\n"
+        "    pass\n",
+    ),
 ]
 
 _SAFE_CASES = [

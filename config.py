@@ -14536,6 +14536,16 @@ def _class_call_triggers_workers(expr, constructors, class_targets, reference_li
         return False
     if class_name in constructors:
         return True
+    # An inherited implicit hook (``class Child(Bump): pass`` then
+    # ``Child() + 1``) runs exactly like the base's; resolve it through the
+    # same MRO and binding checks used for __new__/__init__ below.
+    if any(
+        _class_mro_hook_triggers_workers(
+            class_name, hook_name, class_targets, reference_line
+        )
+        for hook_name in _IMPLICIT_INSTANCE_HOOKS
+    ):
+        return True
     metaclass_bypass_events = (
         class_targets[12] if len(class_targets) > 12 else {}
     )
