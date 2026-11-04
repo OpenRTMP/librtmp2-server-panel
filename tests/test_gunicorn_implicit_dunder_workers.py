@@ -99,6 +99,17 @@ _DYNAMIC_CASES = [
         "for _ in Child():\n"
         "    pass\n",
     ),
+    (
+        "in-place operator dispatch through __iadd__",
+        "workers = 1\n"
+        "class Bump:\n"
+        "    def __iadd__(self, other):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return self\n"
+        "h = Bump()\n"
+        "h += 1\n",
+    ),
 ]
 
 _SAFE_CASES = [
