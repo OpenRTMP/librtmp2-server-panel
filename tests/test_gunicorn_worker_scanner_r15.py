@@ -139,6 +139,14 @@ _DYNAMIC_CASES = [
         "T = type('T', (), {'__init__': lambda self: globals().__setitem__('workers', 4)})\n"
         "T()\n",
     ),
+    (
+        "class __del__ rebinding workers at import is dynamic",
+        "workers = 1\n"
+        "class H:\n"
+        "    def __del__(self):\n"
+        "        globals()['workers'] = 4\n"
+        "H()\n",
+    ),
 ]
 
 _SAFE_CASES = [
