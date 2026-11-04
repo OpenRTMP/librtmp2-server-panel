@@ -366,17 +366,44 @@ def ip_in_trusted_proxy_networks(address, networks):
     )
 
 
+def _appended_client_ip(xff_header, real_ip_header):
+    """Return a proxy-appended client IP, never a client-written XFF prefix.
+
+    ``X-Real-IP`` is normally overwritten by the edge proxy. The last
+    ``X-Forwarded-For`` entry is appended by the proxy closest to us, so with
+    an over-counted ``TRUSTED_PROXY_COUNT`` it still cannot be chosen by the
+    client (the spoofable entries are to its left).
+    """
+    candidates = []
+    if real_ip_header:
+        candidates.append(real_ip_header)
+    if xff_header:
+        candidates.append(xff_header.split(",")[-1])
+    for value in candidates:
+        try:
+            return str(ipaddress.ip_address(value.strip()))
+        except ValueError:
+            continue
+    return ""
+
+
 def client_ip_for_rate_limit(
     *,
     direct_addr,
     forwarded_addr,
     trusted_proxy_count,
     trusted_networks,
+    xff_header="",
+    real_ip_header="",
 ):
     """Choose the client IP bucket for rate limiting.
 
     When forwarded headers are trusted only from known proxy IPs, direct clients
-    cannot pick arbitrary X-Forwarded-For values to bypass per-IP limits.
+    cannot pick arbitrary X-Forwarded-For values to bypass per-IP limits. A
+    trusted proxy's forwarded value is only used when it is one the proxy
+    appended (``X-Real-IP`` or the last XFF entry); the position selected by
+    ``TRUSTED_PROXY_COUNT`` is not used because an over-counted hop number would
+    let the client supply it.
     """
     if not trusted_proxy_count:
         return forwarded_addr
@@ -387,7 +414,7 @@ def client_ip_for_rate_limit(
         # bucket all such requests together so they cannot rotate identities.
         return "unknown"
     if ip_in_trusted_proxy_networks(direct_addr, trusted_networks):
-        return forwarded_addr
+        return _appended_client_ip(xff_header, real_ip_header) or direct_addr
     return direct_addr
 
 
@@ -418,7 +445,16 @@ def _session_cookie_secure_default():
         max_value=10,
         name="TRUSTED_PROXY_COUNT",
     )
-    return trusted_proxy_count > 0
+    if trusted_proxy_count > 0:
+        return True
+    # Neither an explicit public URL nor a trusted proxy: fail closed. An
+    # operator who deliberately serves the panel over plain HTTP (local
+    # quickstart, a test client) must opt in explicitly; otherwise the admin
+    # session cookie would travel without Secure by default.
+    allow_insecure = _parse_optional_bool(
+        os.environ.get("PANEL_ALLOW_INSECURE_HTTP", "")
+    )
+    return allow_insecure is not True
 
 
 def _parse_positive_int(value, default, *, min_value=1, max_value=10_000, name="value"):

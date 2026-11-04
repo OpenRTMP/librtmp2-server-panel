@@ -34,8 +34,48 @@ def test_client_ip_for_rate_limit_uses_forwarded_ip_from_trusted_proxy():
         forwarded_addr="198.51.100.25",
         trusted_proxy_count=1,
         trusted_networks=networks,
+        xff_header="198.51.100.25",
     )
     assert client_ip == "198.51.100.25"
+
+
+def test_client_ip_for_rate_limit_ignores_a_spoofable_xff_position():
+    networks = [ipaddress.ip_network("10.0.0.0/8")]
+    # An over-counted TRUSTED_PROXY_COUNT makes ProxyFix select the first
+    # entry (5.6.7.8), which the client wrote. The limiter must use the
+    # proxy-appended last entry instead.
+    client_ip = config.client_ip_for_rate_limit(
+        direct_addr="10.0.0.2",
+        forwarded_addr="5.6.7.8",
+        trusted_proxy_count=2,
+        trusted_networks=networks,
+        xff_header="5.6.7.8, 198.51.100.25",
+    )
+    assert client_ip == "198.51.100.25"
+
+
+def test_client_ip_for_rate_limit_prefers_x_real_ip():
+    networks = [ipaddress.ip_network("10.0.0.0/8")]
+    client_ip = config.client_ip_for_rate_limit(
+        direct_addr="10.0.0.2",
+        forwarded_addr="5.6.7.8",
+        trusted_proxy_count=1,
+        trusted_networks=networks,
+        xff_header="5.6.7.8",
+        real_ip_header="198.51.100.25",
+    )
+    assert client_ip == "198.51.100.25"
+
+
+def test_client_ip_for_rate_limit_falls_back_to_the_proxy_without_headers():
+    networks = [ipaddress.ip_network("10.0.0.0/8")]
+    client_ip = config.client_ip_for_rate_limit(
+        direct_addr="10.0.0.2",
+        forwarded_addr="5.6.7.8",
+        trusted_proxy_count=1,
+        trusted_networks=networks,
+    )
+    assert client_ip == "10.0.0.2"
 
 
 def test_client_ip_for_rate_limit_uses_forwarded_ip_from_dual_stack_proxy():
@@ -49,6 +89,7 @@ def test_client_ip_for_rate_limit_uses_forwarded_ip_from_dual_stack_proxy():
             forwarded_addr="198.51.100.25",
             trusted_proxy_count=1,
             trusted_networks=networks,
+            xff_header="198.51.100.25",
         )
         == "198.51.100.25"
     )

@@ -417,6 +417,8 @@ class _PanelRuntime:
             forwarded_addr=get_remote_address(),
             trusted_proxy_count=self.app.config["TRUSTED_PROXY_COUNT"],
             trusted_networks=self.app.config["TRUSTED_PROXY_NETWORKS"],
+            xff_header=request.headers.get("X-Forwarded-For", ""),
+            real_ip_header=request.headers.get("X-Real-IP", ""),
         )
 
     def _stats_rate_limit_key(self):
