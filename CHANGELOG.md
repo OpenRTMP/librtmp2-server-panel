@@ -13,6 +13,17 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- `SESSION_COOKIE_SECURE` defaults to enabled when neither `PANEL_PUBLIC_URL`
+  nor `TRUSTED_PROXY_COUNT` indicates plain HTTP. Set
+  `PANEL_ALLOW_INSECURE_HTTP=1` for a local HTTP setup; the bundled compose
+  files do.
+- The rate limiter keys on the proxy-appended value (the last
+  `X-Forwarded-For` entry, or the header named by
+  `TRUSTED_PROXY_CLIENT_IP_HEADER`), not on the position selected by
+  `TRUSTED_PROXY_COUNT`, so an over-counted hop number can no longer let a
+  client choose its own bucket.
+
 ## [0.1.14] — 2026-11-01
 
 ### Security
