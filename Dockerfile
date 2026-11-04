@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --only-binary :all: --require-hashes --prefix=/install -r requirements.txt
 
-FROM python:3.15-alpine
+FROM python:3.14-alpine
 
 ARG APP_VERSION=""
 

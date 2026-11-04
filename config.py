@@ -45,6 +45,65 @@ _UNARY_OP_DUNDER = {
     ast.UAdd: "__pos__",
     ast.Invert: "__invert__",
 }
+# Instance hooks Python can invoke implicitly on an object the config merely
+# constructed: arithmetic/comparison operators, ``f"{obj}"``/``format(obj)``,
+# ``for``/``in``/``reversed``, and truth tests. They are not covered by the
+# explicit call/attribute analysis, so a class whose hook mutates ``workers``
+# must make its construction count as an eager side effect; otherwise
+# ``Bump() + 1``, ``f"{Bump()}"``, ``for _ in Bump():`` or ``if Bump():``
+# leaves ``workers = 1`` looking static.
+_IMPLICIT_INSTANCE_HOOKS = frozenset(
+    {
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__matmul__",
+        "__rmatmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__floordiv__",
+        "__rfloordiv__",
+        "__mod__",
+        "__rmod__",
+        "__divmod__",
+        "__rdivmod__",
+        "__pow__",
+        "__rpow__",
+        "__lshift__",
+        "__rlshift__",
+        "__rshift__",
+        "__rrshift__",
+        "__and__",
+        "__rand__",
+        "__xor__",
+        "__rxor__",
+        "__or__",
+        "__ror__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__eq__",
+        "__ne__",
+        "__format__",
+        "__str__",
+        "__repr__",
+        "__bytes__",
+        "__hash__",
+        "__iter__",
+        "__reversed__",
+        "__contains__",
+        "__bool__",
+        "__len__",
+        "__index__",
+        "__int__",
+        "__float__",
+        "__complex__",
+    }
+)
 
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
@@ -12837,6 +12896,14 @@ def _record_class_side_effect_target(
     if stmt.name in ("__init__", "__post_init__", "__del__"):
         # Instances without another reference can run __del__ on import.
         # This is an eager construction side effect from main.
+        constructors.add(class_name)
+        methods.add((class_name, stmt.name))
+        return True
+    if stmt.name in _IMPLICIT_INSTANCE_HOOKS:
+        # Python can invoke this hook implicitly on an instance the config
+        # constructed (operator, f-string, iteration, membership or truth
+        # test), so treat the construction itself as an eager side effect and
+        # fail closed instead of modelling every trigger site.
         constructors.add(class_name)
         methods.add((class_name, stmt.name))
         return True
