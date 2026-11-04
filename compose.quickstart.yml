@@ -50,13 +50,14 @@ services:
       RATELIMIT_STORAGE_URI: redis://redis:6379/0
       PANEL_PUBLIC_URL: ${PANEL_PUBLIC_URL:-}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-}
-      # The quickstart serves plain HTTP on localhost:8000. Production
-      # deployments behind TLS must set PANEL_PUBLIC_URL=https://... or
-      # PANEL_ALLOW_INSECURE_HTTP=0; otherwise the default of 1 leaves the
-      # session cookie without the Secure attribute.
+      # The quickstart serves plain HTTP on localhost:8000. For HTTPS,
+      # set PANEL_PUBLIC_URL=https://... or SESSION_COOKIE_SECURE=true and
+      # PANEL_ALLOW_INSECURE_HTTP=0. The opt-out alone cannot override an
+      # HTTP public URL or SESSION_COOKIE_SECURE=false.
       PANEL_ALLOW_INSECURE_HTTP: ${PANEL_ALLOW_INSECURE_HTTP:-1}
       TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-0}
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+      TRUSTED_PROXY_CLIENT_IP_HEADER: ${TRUSTED_PROXY_CLIENT_IP_HEADER:-}
     ports:
       - "8000:8000"
     networks:
