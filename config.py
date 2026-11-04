@@ -30,6 +30,22 @@ _MIN_SECRET_KEY_LEN = 32
 _REQUIRE_LOGIN_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUIRE_LOGIN_FALSE = frozenset({"0", "false", "no", "off"})
 
+_BUILTIN_UNARY_DUNDER_DISPATCH = {
+    "repr": "__repr__",
+    "str": "__str__",
+    "bool": "__bool__",
+    "len": "__len__",
+    "hash": "__hash__",
+    "bytes": "__bytes__",
+    "abs": "__abs__",
+}
+_UNARY_OP_DUNDER = {
+    ast.Not: "__bool__",
+    ast.USub: "__neg__",
+    ast.UAdd: "__pos__",
+    ast.Invert: "__invert__",
+}
+
 MIN_PASSWORD_LEN = 12
 RATELIMIT_MEMORY_URI = "memory://"
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -12819,9 +12835,8 @@ def _record_class_side_effect_target(
         methods.add((class_name, stmt.name))
         return True
     if stmt.name in ("__init__", "__post_init__", "__del__"):
-        # ``ClassName()`` can run ``__del__`` synchronously when the instance is
-        # immediately unreferenced during config import, mutating ``workers``
-        # after the scanner would otherwise treat the setting as static.
+        # Instances without another reference can run __del__ on import.
+        # This is an eager construction side effect from main.
         constructors.add(class_name)
         methods.add((class_name, stmt.name))
         return True
@@ -16671,6 +16686,21 @@ def _expression_triggers_class_workers_side_effect(
             expr,
             properties,
             descriptor_fields,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
+        or _builtin_unary_dunder_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+            operator_bindings,
+        )
+        or _unary_op_dunder_triggers_workers(
+            expr,
+            methods,
             class_targets,
             instance_events,
             reference_line,
@@ -21627,6 +21657,114 @@ def _unshadowed_builtin_call(call, name, operator_bindings):
         name,
         getattr(call, "lineno", 0),
         shadow_lines,
+    )
+
+
+
+def _implicit_dunder_receiver_class_name(receiver, class_targets, reference_line):
+    """Identify a live class object rather than an instance bound to a name."""
+    if not isinstance(receiver, ast.Name):
+        return None
+    aliases = class_targets[14] if len(class_targets) > 14 else {}
+    class_name = _class_name_alias_target(receiver.id, aliases, reference_line)
+    definitions = class_targets[11] if len(class_targets) > 11 else {}
+    if class_name not in definitions:
+        return None
+    # A class alias retains the class reference after the original name is
+    # rebound; otherwise respect source-ordered class binding invalidation.
+    if receiver.id not in aliases and not _class_binding_is_active(
+        class_targets, class_name, reference_line
+    ):
+        return None
+    return class_name
+
+
+def _implicit_dunder_dispatch_triggers_workers(
+    receiver,
+    dunder,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Resolve implicit special methods on type(receiver), not on receiver."""
+    class_name = _implicit_dunder_receiver_class_name(
+        receiver, class_targets, reference_line
+    )
+    if class_name is not None:
+        # Class objects dispatch implicit dunders through their metaclass;
+        # their own instance methods are never invoked by repr(Class), +Class,
+        # etc. An ordinary class has the built-in 'type' metaclass.
+        metaclasses = class_targets[17] if len(class_targets) > 17 else {}
+        metaclass = metaclasses.get(class_name)
+        return bool(
+            metaclass and _class_mro_hook_triggers_workers(
+                metaclass, dunder, class_targets, reference_line
+            )
+        )
+    return _receiver_method_call_triggers_workers(
+        receiver,
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _builtin_unary_dunder_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings,
+):
+    """Return True when a builtin unary call dispatches a mutating dunder hook."""
+    if not (isinstance(expr, ast.Call) and operator_bindings):
+        return False
+    if not isinstance(expr.func, ast.Name):
+        return False
+    builtin_name = expr.func.id
+    dunder = _BUILTIN_UNARY_DUNDER_DISPATCH.get(builtin_name)
+    if dunder is None:
+        if builtin_name != "print":
+            return False
+        dunder = "__str__"
+    if not _unshadowed_builtin_call(expr, builtin_name, operator_bindings):
+        return False
+    if len(expr.args) != 1 or expr.keywords:
+        return False
+    return _implicit_dunder_dispatch_triggers_workers(
+        expr.args[0],
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _unary_op_dunder_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when a unary operator dispatches a mutating dunder hook."""
+    if not isinstance(expr, ast.UnaryOp):
+        return False
+    dunder = _UNARY_OP_DUNDER.get(type(expr.op))
+    if dunder is None:
+        return False
+    return _implicit_dunder_dispatch_triggers_workers(
+        expr.operand,
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
     )
 
 
