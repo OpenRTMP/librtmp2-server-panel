@@ -366,17 +366,18 @@ def ip_in_trusted_proxy_networks(address, networks):
     )
 
 
-def _appended_client_ip(xff_header, real_ip_header):
-    """Return a proxy-appended client IP, never a client-written XFF prefix.
+def _appended_client_ip(xff_header, proxy_client_ip):
+    """Return a client IP the trusted proxy chain appended.
 
-    ``X-Real-IP`` is normally overwritten by the edge proxy. The last
-    ``X-Forwarded-For`` entry is appended by the proxy closest to us, so with
-    an over-counted ``TRUSTED_PROXY_COUNT`` it still cannot be chosen by the
-    client (the spoofable entries are to its left).
+    ``proxy_client_ip`` is the value of the explicitly configured
+    ``TRUSTED_PROXY_CLIENT_IP_HEADER`` (normally overwritten by the edge); the
+    last ``X-Forwarded-For`` entry is the one appended by the proxy closest to
+    us. The spoofable entries to their left are never used, so an over-counted
+    ``TRUSTED_PROXY_COUNT`` cannot select a client-written value.
     """
     candidates = []
-    if real_ip_header:
-        candidates.append(real_ip_header)
+    if proxy_client_ip:
+        candidates.append(proxy_client_ip)
     if xff_header:
         candidates.append(xff_header.split(",")[-1])
     for value in candidates:
@@ -394,16 +395,18 @@ def client_ip_for_rate_limit(
     trusted_proxy_count,
     trusted_networks,
     xff_header="",
-    real_ip_header="",
+    proxy_client_ip="",
 ):
     """Choose the client IP bucket for rate limiting.
 
     When forwarded headers are trusted only from known proxy IPs, direct clients
     cannot pick arbitrary X-Forwarded-For values to bypass per-IP limits. A
     trusted proxy's forwarded value is only used when it is one the proxy
-    appended (``X-Real-IP`` or the last XFF entry); the position selected by
-    ``TRUSTED_PROXY_COUNT`` is not used because an over-counted hop number would
-    let the client supply it.
+    appended (the explicitly configured client-IP header, or the last XFF
+    entry); the position selected by ``TRUSTED_PROXY_COUNT`` is not used
+    because an over-counted hop number would let the client supply it. With
+    several proxies choose ``TRUSTED_PROXY_CLIENT_IP_HEADER`` at the edge so
+    the bucket still identifies the client.
     """
     if not trusted_proxy_count:
         return forwarded_addr
@@ -414,7 +417,7 @@ def client_ip_for_rate_limit(
         # bucket all such requests together so they cannot rotate identities.
         return "unknown"
     if ip_in_trusted_proxy_networks(direct_addr, trusted_networks):
-        return _appended_client_ip(xff_header, real_ip_header) or direct_addr
+        return _appended_client_ip(xff_header, proxy_client_ip) or direct_addr
     return direct_addr
 
 
@@ -25694,6 +25697,24 @@ class Config:
     TRUSTED_PROXY_NETWORKS = _parse_trusted_proxy_networks(
         os.environ.get("TRUSTED_PROXY_IPS")
     )
+    # Optional header the edge proxy overwrites with the client address (for
+    # example X-Real-IP). Only used when explicitly configured: an unconfigured
+    # header may be passed through from the client, which would let it choose
+    # its own rate-limit bucket.
+    TRUSTED_PROXY_CLIENT_IP_HEADER = os.environ.get(
+        "TRUSTED_PROXY_CLIENT_IP_HEADER", ""
+    ).strip()
+    if TRUSTED_PROXY_CLIENT_IP_HEADER:
+        if TRUSTED_PROXY_COUNT == 0:
+            _emit_config_error(
+                "TRUSTED_PROXY_CLIENT_IP_HEADER requires TRUSTED_PROXY_COUNT > 0."
+            )
+            sys.exit(1)
+        if re.fullmatch(r"[A-Za-z0-9-]+", TRUSTED_PROXY_CLIENT_IP_HEADER) is None:
+            _emit_config_error(
+                "TRUSTED_PROXY_CLIENT_IP_HEADER must be a header name."
+            )
+            sys.exit(1)
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
     RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI)

@@ -97,12 +97,13 @@ Copy `.env.example` to `.env` for a manual setup and adjust:
 | `PANEL_ALLOW_INSECURE_HTTP` | Allow the session cookie without `Secure` when no HTTPS URL/proxy is configured; only for local HTTP setups | No |
 | `TRUSTED_PROXY_COUNT` | Trusted value count used independently for `X-Forwarded-For` and `X-Forwarded-Proto`; default `0` ignores both | No |
 | `TRUSTED_PROXY_IPS` | Comma-separated proxy IPs/CIDR ranges trusted for rate-limit client IP selection | When `TRUSTED_PROXY_COUNT > 0` |
+| `TRUSTED_PROXY_CLIENT_IP_HEADER` | Header the edge proxy overwrites with the client IP (e.g. `X-Real-IP`); only used for rate-limit keys when set | No |
 
 ### Reverse proxy deployments
 
 Keep `TRUSTED_PROXY_COUNT=0` when port `8000` is directly reachable. Enable it only when the panel is reachable **exclusively** through trusted proxies.
 
-`ProxyFix` applies the configured count independently to `X-Forwarded-For` and `X-Forwarded-Proto`. Therefore every trusted proxy in the chain must append or normalize both headers so they contain the same number of trusted values. Whenever `TRUSTED_PROXY_COUNT > 0`, `TRUSTED_PROXY_IPS` must also list the trusted proxies' IPs/CIDR ranges - the panel refuses to start without it. Rate limiting only uses a forwarded address when the direct TCP peer is one of these trusted proxies, and then only an address the proxy appended (`X-Real-IP`, or the last `X-Forwarded-For` entry); the position selected by `TRUSTED_PROXY_COUNT` is never used as a limiter key, because an over-counted hop number would let the client supply it. Without either header the proxy's own address is used, so clients behind it share one bucket. A common safe one-proxy setup is:
+`ProxyFix` applies the configured count independently to `X-Forwarded-For` and `X-Forwarded-Proto`. Therefore every trusted proxy in the chain must append or normalize both headers so they contain the same number of trusted values. Whenever `TRUSTED_PROXY_COUNT > 0`, `TRUSTED_PROXY_IPS` must also list the trusted proxies' IPs/CIDR ranges - the panel refuses to start without it. Rate limiting only uses a forwarded address when the direct TCP peer is one of these trusted proxies, and then only a proxy-appended value: the header named by `TRUSTED_PROXY_CLIENT_IP_HEADER` when configured, otherwise the last `X-Forwarded-For` entry. The position selected by `TRUSTED_PROXY_COUNT` is never used as a limiter key, because an over-counted hop number would let the client supply it. With several proxies in the chain, set `TRUSTED_PROXY_CLIENT_IP_HEADER` at the edge (and make the edge overwrite it); otherwise every client behind the innermost proxy shares one bucket. Without either header the proxy's own address is used. A common safe one-proxy setup is:
 
 ```env
 PANEL_PUBLIC_URL=https://panel.example.com

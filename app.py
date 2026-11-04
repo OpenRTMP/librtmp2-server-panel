@@ -412,13 +412,17 @@ class _PanelRuntime:
     def _rate_limit_remote_addr(self):
         """Rate-limit by real client IP, ignoring spoofed XFF from untrusted peers."""
         direct = request.environ.get(DIRECT_REMOTE_ADDR_KEY) or ""
+        client_ip_header = self.app.config.get("TRUSTED_PROXY_CLIENT_IP_HEADER", "")
+        proxy_client_ip = (
+            request.headers.get(client_ip_header, "") if client_ip_header else ""
+        )
         return client_ip_for_rate_limit(
             direct_addr=direct,
             forwarded_addr=get_remote_address(),
             trusted_proxy_count=self.app.config["TRUSTED_PROXY_COUNT"],
             trusted_networks=self.app.config["TRUSTED_PROXY_NETWORKS"],
             xff_header=request.headers.get("X-Forwarded-For", ""),
-            real_ip_header=request.headers.get("X-Real-IP", ""),
+            proxy_client_ip=proxy_client_ip,
         )
 
     def _stats_rate_limit_key(self):

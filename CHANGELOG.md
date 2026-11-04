@@ -18,8 +18,9 @@ only begin at a future `1.0.0`.
   nor `TRUSTED_PROXY_COUNT` indicates plain HTTP. Set
   `PANEL_ALLOW_INSECURE_HTTP=1` for a local HTTP setup; the bundled compose
   files do.
-- The rate limiter keys on `X-Real-IP` or the last `X-Forwarded-For` entry
-  appended by the trusted proxy, not on the position selected by
+- The rate limiter keys on the proxy-appended value (the last
+  `X-Forwarded-For` entry, or the header named by
+  `TRUSTED_PROXY_CLIENT_IP_HEADER`), not on the position selected by
   `TRUSTED_PROXY_COUNT`, so an over-counted hop number can no longer let a
   client choose its own bucket.
 
