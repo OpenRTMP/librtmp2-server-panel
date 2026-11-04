@@ -63,6 +63,7 @@ def test_session_cookie_secure_defaults_secure_without_public_url(monkeypatch):
     monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
     monkeypatch.delenv("PANEL_PUBLIC_URL", raising=False)
     monkeypatch.delenv("TRUSTED_PROXY_COUNT", raising=False)
+    monkeypatch.delenv("TRUSTED_PROXY_CLIENT_IP_HEADER", raising=False)
     monkeypatch.delenv("PANEL_ALLOW_INSECURE_HTTP", raising=False)
     import config
 
@@ -74,6 +75,7 @@ def test_session_cookie_secure_allows_explicit_insecure_http(monkeypatch):
     monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
     monkeypatch.delenv("PANEL_PUBLIC_URL", raising=False)
     monkeypatch.delenv("TRUSTED_PROXY_COUNT", raising=False)
+    monkeypatch.delenv("TRUSTED_PROXY_CLIENT_IP_HEADER", raising=False)
     monkeypatch.setenv("PANEL_ALLOW_INSECURE_HTTP", "1")
     import config
 
