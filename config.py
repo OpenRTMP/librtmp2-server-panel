@@ -24689,24 +24689,61 @@ def _collect_inspect_analysis(tree, operator_bindings):
 _CLASS_HOOK_REFINEMENT_PASSES = 8
 
 
+_TRACE_HOOK_NAMES = frozenset(
+    {
+        "setprofile",
+        "setprofile_all_threads",
+        "settrace",
+        "settrace_all_threads",
+    }
+)
+
+
+def _trace_hook_aliases(tree):
+    """Return names locally bound to a sys/threading trace installer."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in ("sys", "threading"):
+            for alias in node.names:
+                if alias.name == "*":
+                    aliases.update(_TRACE_HOOK_NAMES)
+                elif alias.name in _TRACE_HOOK_NAMES:
+                    aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            value = node.value
+            value_name = None
+            if isinstance(value, ast.Name):
+                value_name = value.id
+            elif isinstance(value, ast.Attribute):
+                value_name = value.attr
+            if value_name in _TRACE_HOOK_NAMES:
+                aliases.update(
+                    target.id
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                )
+    return aliases
+
+
 def _installs_process_wide_trace_hook(tree):
     """Return True when the config installs a trace/profile callback.
 
     A trace callback can run at every line, call or return and rewrite module
     globals from the frame, so the static walk cannot prove the effective
     worker count. Treat the whole config as dynamic instead of modelling every
-    possible hook body.
+    possible hook body. Direct ``from sys import settrace`` aliases and simple
+    local assignments are resolved as well as attribute calls.
     """
+    aliases = _trace_hook_aliases(tree)
     return any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in {
-            "setprofile",
-            "setprofile_all_threads",
-            "settrace",
-            "settrace_all_threads",
-        }
+        and (
+            (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in _TRACE_HOOK_NAMES
+            )
+            or (isinstance(node.func, ast.Name) and node.func.id in aliases)
+        )
         for node in ast.walk(tree)
     )
 

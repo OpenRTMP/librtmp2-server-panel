@@ -42,10 +42,23 @@ sys.settrace(_trace)
 _noop()
 """
 
+DIRECT_IMPORT_TRACE_SOURCE = """
+workers = 1
+from sys import settrace as install
+def _trace(frame, event, arg):
+    if event == 'call':
+        frame.f_globals['workers'] = 8
+    return _trace
+def _noop():
+    pass
+install(_trace)
+_noop()
+"""
+
 
 @pytest.mark.parametrize(
     "source",
-    [GETATTR_SOURCE, MISSING_SOURCE, SETTRACE_SOURCE],
+    [GETATTR_SOURCE, MISSING_SOURCE, SETTRACE_SOURCE, DIRECT_IMPORT_TRACE_SOURCE],
 )
 def test_implicit_dispatch_worker_mutation_is_dynamic(config_module, source):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (

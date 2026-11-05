@@ -175,18 +175,29 @@ def _target_names(target):
 
 
 def _iter_module_scope_nodes(node):
-    """Yield expression nodes without entering nested function/class scopes.
+    """Yield expression nodes evaluated in the enclosing module scope.
 
     ``ast.walk`` would descend into a lambda body or a nested ``def`` inside a
     compound statement; a walrus there binds the nested scope, not the module.
+    Decorators, defaults, bases and class keywords still run while the
+    definition executes, so they are visited.
     """
     yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        children = [
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ]
+        if not isinstance(node, ast.Lambda):
+            children = [*node.decorator_list, *children]
+        for child in children:
+            yield from _iter_module_scope_nodes(child)
+        return
+    if isinstance(node, ast.ClassDef):
+        for child in [*node.decorator_list, *node.bases, *node.keywords]:
+            yield from _iter_module_scope_nodes(child)
+        return
     for child in ast.iter_child_nodes(node):
-        if isinstance(
-            child,
-            (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        ):
-            continue
         yield from _iter_module_scope_nodes(child)
 
 
@@ -231,7 +242,7 @@ def _import_binding_kind(node, name):
     if isinstance(node, ast.ImportFrom):
         if any(alias.name == "*" for alias in node.names):
             return "wildcard"
-        if any(alias.name == name for alias in node.names):
+        if any((alias.asname or alias.name) == name for alias in node.names):
             return "explicit"
     elif isinstance(node, ast.Import):
         if any(
@@ -242,21 +253,30 @@ def _import_binding_kind(node, name):
     return None
 
 
+def _target_writes_name(target, name):
+    """Return True when an assignment target writes attribute ``name``."""
+    if isinstance(target, ast.Attribute):
+        return target.attr == name
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_writes_name(element, name) for element in target.elts)
+    if isinstance(target, ast.Starred):
+        return _target_writes_name(target.value, name)
+    return False
+
+
 def _statement_writes_named_attribute(node, name):
     """Return True for ``obj.bind = ...`` at module scope.
 
     The object can be the module itself (``sys.modules[__name__]``); without
     resolving it statically the only safe answer is "possibly supplied".
+    Unpacking targets are inspected recursively.
     """
     targets = ()
     if isinstance(node, (ast.Assign, ast.AnnAssign)):
         targets = (
             node.targets if isinstance(node, ast.Assign) else [node.target]
         )
-    return any(
-        isinstance(target, ast.Attribute) and target.attr == name
-        for target in targets
-    )
+    return any(_target_writes_name(target, name) for target in targets)
 
 
 def _has_dynamic_namespace_write(node):
@@ -271,7 +291,7 @@ def _has_dynamic_namespace_write(node):
                 and child.func.attr in _DYNAMIC_NAMESPACE_CALLS
             )
         )
-        for child in ast.walk(node)
+        for child in _iter_module_scope_nodes(node)
     )
 
 

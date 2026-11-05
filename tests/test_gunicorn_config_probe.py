@@ -116,6 +116,8 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         # probe cannot execute the import, so it must not claim ABSENT and let
         # the entrypoint prepend its 0.0.0.0 default over it.
         ("from settings import bind\n", probe.SUPPLIED),
+        ("from settings import private_bind as bind\n", probe.SUPPLIED),
+        ("from settings import bind as other\n", probe.ABSENT),
         ("from settings import *\n", probe.UNKNOWN),
         ("import settings as bind\n", probe.SUPPLIED),
         # Arbitrary namespace writes may define bind at import time. Returning
@@ -124,6 +126,10 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         ("vars()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
         ("setattr(sys.modules[__name__], 'bind', [])\n", probe.UNKNOWN),
         ("sys.modules[__name__].bind = []\n", probe.UNKNOWN),
+        (
+            "sys.modules[__name__].bind, workers = [], 1\n",
+            probe.UNKNOWN,
+        ),
         # A later explicit assignment is still proof even after a dynamic write.
         (
             "globals()['workers'] = 1\nbind = ['127.0.0.1:8000']\n",
@@ -137,6 +143,10 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
         (
             "if True:\n    def helper():\n        (bind := ['127.0.0.1:9000'])\n",
+            probe.ABSENT,
+        ),
+        (
+            "if True:\n    def helper():\n        globals()['bind'] = []\n",
             probe.ABSENT,
         ),
     ],
