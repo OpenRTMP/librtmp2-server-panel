@@ -174,6 +174,22 @@ def _target_names(target):
     return ()
 
 
+def _iter_module_scope_nodes(node):
+    """Yield expression nodes without entering nested function/class scopes.
+
+    ``ast.walk`` would descend into a lambda body or a nested ``def`` inside a
+    compound statement; a walrus there binds the nested scope, not the module.
+    """
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child,
+            (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            continue
+        yield from _iter_module_scope_nodes(child)
+
+
 def _assigned_target_names(node):
     """Return the simple names a module-scope statement binds.
 
@@ -200,25 +216,30 @@ def _assigned_target_names(node):
     names = [name for target in targets for name in _target_names(target)]
     # A walrus can bind the module name inside an otherwise unrelated
     # expression; it is rare but Gunicorn still reads the resulting global.
+    # Only module-scope expressions count: a lambda/def body is a local scope.
     names.extend(
         child.target.id
-        for child in ast.walk(node)
+        for child in _iter_module_scope_nodes(node)
         if isinstance(child, ast.NamedExpr)
         and isinstance(child.target, ast.Name)
     )
     return tuple(names)
 
 
-def _import_binds_name(node, name):
-    """Return True when a module-scope import can bind ``name``."""
+def _import_binding_kind(node, name):
+    """Return ``"explicit"``, ``"wildcard"`` or ``None`` for an import."""
     if isinstance(node, ast.ImportFrom):
-        return any(alias.name in (name, "*") for alias in node.names)
-    if isinstance(node, ast.Import):
-        return any(
+        if any(alias.name == "*" for alias in node.names):
+            return "wildcard"
+        if any(alias.name == name for alias in node.names):
+            return "explicit"
+    elif isinstance(node, ast.Import):
+        if any(
             (alias.asname or alias.name.split(".", 1)[0]) == name
             for alias in node.names
-        )
-    return False
+        ):
+            return "explicit"
+    return None
 
 
 def _statement_writes_named_attribute(node, name):
@@ -267,16 +288,26 @@ def config_provides_setting(path, name):
         tree = ast.parse(source, filename=str(path))
     except SyntaxError:
         return UNKNOWN
+    dynamic = False
     for node in _iter_module_assignments(tree.body):
-        if _import_binds_name(node, name):
+        binding_kind = _import_binding_kind(node, name)
+        if binding_kind == "explicit":
             return SUPPLIED
+        if binding_kind == "wildcard":
+            # A wildcard may or may not export this setting. The bind caller
+            # treats UNKNOWN as supplied (safe), while the app caller keeps its
+            # default because it only accepts SUPPLIED.
+            dynamic = True
         if name in _assigned_target_names(node):
             return SUPPLIED
         if _statement_writes_named_attribute(node, name):
-            return UNKNOWN
+            dynamic = True
         if _has_dynamic_namespace_write(node):
-            return UNKNOWN
-    return ABSENT
+            dynamic = True
+    # Keep scanning after a dynamic write: an explicit assignment later in the
+    # file still proves the setting is supplied. Only report uncertainty when
+    # no explicit binding was found.
+    return UNKNOWN if dynamic else ABSENT
 
 
 def _probe(mode, argv, env_args, cwd):
