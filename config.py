@@ -106,6 +106,11 @@ _IMPLICIT_INSTANCE_HOOKS = frozenset(
         "__repr__",
         "__bytes__",
         "__hash__",
+        # Instance attribute fallbacks are implicit dispatch too: ``obj.missing``
+        # runs ``__getattr__`` and ``mapping[missing]`` runs ``__missing__``.
+        "__getattr__",
+        "__getattribute__",
+        "__missing__",
         "__iter__",
         "__reversed__",
         "__contains__",
@@ -23862,6 +23867,10 @@ _DYNAMIC_NAME_LOOKUP_CALLS = frozenset(
         "locals",
         "methodcaller",
         "setattr",
+        "setprofile",
+        "setprofile_all_threads",
+        "settrace",
+        "settrace_all_threads",
         "vars",
     }
 )
@@ -24680,8 +24689,32 @@ def _collect_inspect_analysis(tree, operator_bindings):
 _CLASS_HOOK_REFINEMENT_PASSES = 8
 
 
+def _installs_process_wide_trace_hook(tree):
+    """Return True when the config installs a trace/profile callback.
+
+    A trace callback can run at every line, call or return and rewrite module
+    globals from the frame, so the static walk cannot prove the effective
+    worker count. Treat the whole config as dynamic instead of modelling every
+    possible hook body.
+    """
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr
+        in {
+            "setprofile",
+            "setprofile_all_threads",
+            "settrace",
+            "settrace_all_threads",
+        }
+        for node in ast.walk(tree)
+    )
+
+
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
+    if _installs_process_wide_trace_hook(tree):
+        return None, True, True
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
     # Make the annotation policy available to every collector below: on

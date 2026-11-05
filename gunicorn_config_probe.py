@@ -45,6 +45,13 @@ _BIND_OPTIONS = ("-b", "--bind")
 _TRY_STATEMENT_TYPES = (ast.Try,)
 if hasattr(ast, "TryStar"):  # pragma: no cover - Python 3.11+
     _TRY_STATEMENT_TYPES = (ast.Try, ast.TryStar)
+# Names whose call can write an arbitrary module global. The probe must not
+# claim the setting is absent after one of these: the entrypoint only skips its
+# default bind when the answer is not ABSENT, so a false UNKNOWN is safe while a
+# false ABSENT would override the operator's bind.
+_DYNAMIC_NAMESPACE_CALLS = frozenset(
+    {"eval", "exec", "globals", "locals", "setattr", "vars"}
+)
 
 
 def split_command_args(value):
@@ -152,17 +159,98 @@ def _iter_module_assignments(statements):
             yield from _iter_module_assignments(block)
 
 
+def _target_names(target):
+    """Return every simple name bound by one assignment target."""
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return tuple(
+            name
+            for element in target.elts
+            for name in _target_names(element)
+        )
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return ()
+
+
 def _assigned_target_names(node):
-    """Return the simple names a module-scope statement binds."""
+    """Return the simple names a module-scope statement binds.
+
+    Besides plain assignments this covers the other module-scope binding forms
+    Gunicorn sees in ``vars(module)``: loop targets, context-manager targets,
+    augmented assignments and walrus expressions.
+    """
+    targets = []
     if isinstance(node, ast.Assign):
-        targets = node.targets
+        targets = list(node.targets)
     elif isinstance(node, ast.AnnAssign) and node.value is not None:
         # ``bind: str`` only updates __annotations__; Gunicorn reads vars(mod).
         targets = [node.target]
-    else:
-        return ()
-    return tuple(
-        target.id for target in targets if isinstance(target, ast.Name)
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        targets = [node.target]
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        targets = [
+            item.optional_vars
+            for item in node.items
+            if item.optional_vars is not None
+        ]
+    elif isinstance(node, ast.AugAssign):
+        targets = [node.target]
+    names = [name for target in targets for name in _target_names(target)]
+    # A walrus can bind the module name inside an otherwise unrelated
+    # expression; it is rare but Gunicorn still reads the resulting global.
+    names.extend(
+        child.target.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.NamedExpr)
+        and isinstance(child.target, ast.Name)
+    )
+    return tuple(names)
+
+
+def _import_binds_name(node, name):
+    """Return True when a module-scope import can bind ``name``."""
+    if isinstance(node, ast.ImportFrom):
+        return any(alias.name in (name, "*") for alias in node.names)
+    if isinstance(node, ast.Import):
+        return any(
+            (alias.asname or alias.name.split(".", 1)[0]) == name
+            for alias in node.names
+        )
+    return False
+
+
+def _statement_writes_named_attribute(node, name):
+    """Return True for ``obj.bind = ...`` at module scope.
+
+    The object can be the module itself (``sys.modules[__name__]``); without
+    resolving it statically the only safe answer is "possibly supplied".
+    """
+    targets = ()
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+    return any(
+        isinstance(target, ast.Attribute) and target.attr == name
+        for target in targets
+    )
+
+
+def _has_dynamic_namespace_write(node):
+    """Return True when a module-scope statement can write any global name."""
+    return any(
+        isinstance(child, ast.Call)
+        and (
+            (isinstance(child.func, ast.Name)
+             and child.func.id in _DYNAMIC_NAMESPACE_CALLS)
+            or (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr in _DYNAMIC_NAMESPACE_CALLS
+            )
+        )
+        for child in ast.walk(node)
     )
 
 
@@ -180,8 +268,14 @@ def config_provides_setting(path, name):
     except SyntaxError:
         return UNKNOWN
     for node in _iter_module_assignments(tree.body):
+        if _import_binds_name(node, name):
+            return SUPPLIED
         if name in _assigned_target_names(node):
             return SUPPLIED
+        if _statement_writes_named_attribute(node, name):
+            return UNKNOWN
+        if _has_dynamic_namespace_write(node):
+            return UNKNOWN
     return ABSENT
 
 

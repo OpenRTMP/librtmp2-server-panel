@@ -105,8 +105,28 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         ("bind: list = ['127.0.0.1:8000']\n", probe.SUPPLIED),
         ("bind: list\n", probe.ABSENT),
         ("if True:\n    bind = ['127.0.0.1:8000']\n", probe.SUPPLIED),
+        ("for bind in [['127.0.0.1:8000']]:\n    pass\n", probe.SUPPLIED),
+        ("with open('x') as bind:\n    pass\n", probe.SUPPLIED),
+        ("bind, workers = ['127.0.0.1:8000'], 1\n", probe.SUPPLIED),
+        ("(bind := ['127.0.0.1:8000'])\n", probe.SUPPLIED),
+        ("bind += ['127.0.0.1:8000']\n", probe.SUPPLIED),
         ("workers = 1\n", probe.ABSENT),
         ("def configure():\n    bind = ['127.0.0.1:8000']\n", probe.ABSENT),
+        # An imported binding is still a module global Gunicorn reads. The
+        # probe cannot execute the import, so it must not claim ABSENT and let
+        # the entrypoint prepend its 0.0.0.0 default over it.
+        ("from settings import bind\n", probe.SUPPLIED),
+        ("from settings import *\n", probe.SUPPLIED),
+        ("import settings as bind\n", probe.SUPPLIED),
+        # Arbitrary namespace writes may define bind at import time. Returning
+        # UNKNOWN keeps the image from overriding a value it cannot inspect.
+        ("globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("vars()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("setattr(sys.modules[__name__], 'bind', [])\n", probe.UNKNOWN),
+        ("sys.modules[__name__].bind = []\n", probe.UNKNOWN),
+        # A dynamic write inside a function that the module never calls does
+        # not run at import time; the probe must still see a plain ABSENT.
+        ("def configure():\n    globals()['bind'] = []\n", probe.ABSENT),
     ],
 )
 def test_config_provides_setting_reads_module_assignments(tmp_path, source, expected):
