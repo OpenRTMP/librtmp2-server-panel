@@ -36,6 +36,10 @@ only begin at a future `1.0.0`.
   `__getattr__`/`__getattribute__`/`__missing__`, trace/profile installers,
   and the remaining dict-mutator, pool/`ExitStack`/`partial` callback,
   conditional class, `type()`/`new_class` namespace and metaclass spellings.
+  The scan also resolves aliased and annotation-only bindings and class
+  attribute hooks in source order. An implicit config that may have chdir'd
+  away from the current directory keeps the worker count dynamic instead of
+  assuming a single worker.
 - The entrypoint bind probe detects imported, destructured, loop/with/
   augmented/walrus and namespace-written `bind`/`wsgi_app` targets, including
   aliased imports and nested attribute writes, keeps an explicit app target
@@ -56,6 +60,8 @@ only begin at a future `1.0.0`.
 ### Changed
 - The image runs Python 3.15, installs the Gunicorn config probe, and builds
   its hash-pinned wheels on the same Python minor as the runtime stage.
+- The bundled compose files forward a configured
+  `TRUSTED_PROXY_CLIENT_IP_HEADER` to the panel.
 - Dependency updates: click 8.5.1, WTForms 3.3.2, pytest 9.2.0.
 
 ## [0.1.14] — 2026-11-01
