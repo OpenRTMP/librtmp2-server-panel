@@ -130,6 +130,49 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
             "sys.modules[__name__].bind, workers = [], 1\n",
             probe.UNKNOWN,
         ),
+        # The config module's own __dict__ is another alias for its globals.
+        (
+            "import sys\n"
+            "sys.modules[__name__].__dict__['bind'] = ['127.0.0.1:8000']\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import sys\n"
+            "sys.modules[__name__].__dict__.update(bind=['127.0.0.1:8000'])\n",
+            probe.UNKNOWN,
+        ),
+        # A definition evaluates its defaults while the module runs, so a
+        # dynamic write there reaches globals even though the body is deferred.
+        (
+            "def configure(bind=globals().update(bind=['127.0.0.1:8000'])):\n"
+            "    pass\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "if True:\n"
+            "    def configure(bind=globals().update(bind=['127.0.0.1:8000'])):\n"
+            "        pass\n",
+            probe.UNKNOWN,
+        ),
+        # A class body also runs at import time, but a plain class attribute is
+        # not a module binding and a method body is still deferred.
+        ("class Settings:\n    globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("class Settings:\n    bind = ['127.0.0.1:8000']\n", probe.ABSENT),
+        (
+            "class Settings:\n    (bind := ['127.0.0.1:8000'])\n",
+            probe.ABSENT,
+        ),
+        # A walrus in a function default runs at definition time in module scope.
+        (
+            "def configure(bind=(bind := ['127.0.0.1:8000'])):\n    pass\n",
+            probe.SUPPLIED,
+        ),
+        (
+            "class Settings:\n"
+            "    def configure(self):\n"
+            "        globals()['bind'] = ['127.0.0.1:8000']\n",
+            probe.ABSENT,
+        ),
         # A later explicit assignment is still proof even after a dynamic write.
         (
             "globals()['workers'] = 1\nbind = ['127.0.0.1:8000']\n",
@@ -245,3 +288,13 @@ def test_crlf_config_is_still_parsed(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_bytes(b"bind = '0.0.0.0:8000'\r\nworkers = 2\r\n")
     assert _config_provides(config_file) == probe.SUPPLIED
+
+
+def test_deep_expression_before_bind_reports_unknown(tmp_path):
+    """A valid but too-deep expression must not make the probe exit with 1."""
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "x = " + " + ".join(["1"] * 2000) + "\nbind = ['127.0.0.1:8000']\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file) == probe.UNKNOWN

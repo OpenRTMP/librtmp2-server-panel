@@ -153,6 +153,10 @@ def _iter_module_assignments(statements):
     """Yield module-scope statements without entering function or class bodies."""
     for node in statements:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # The definition itself runs at module scope: its decorators,
+            # defaults and class body can write globals. The deferred function
+            # body cannot, so it is not entered.
+            yield node
             continue
         yield node
         for block in _compound_statement_blocks(node):
@@ -196,8 +200,30 @@ def _iter_module_scope_nodes(node):
     if isinstance(node, ast.ClassDef):
         for child in [*node.decorator_list, *node.bases, *node.keywords]:
             yield from _iter_module_scope_nodes(child)
+        # A class body runs while the class definition executes, so a
+        # ``globals()`` write there reaches the module namespace. Plain
+        # class-body assignments stay class attributes; only the dynamic-write
+        # scan sees them, never ``_assigned_target_names``.
+        for statement in node.body:
+            yield from _iter_module_scope_nodes(statement)
         return
     for child in ast.iter_child_nodes(node):
+        yield from _iter_module_scope_nodes(child)
+
+
+def _iter_definition_header_nodes(node):
+    """Yield expressions a ``def``/``class`` evaluates in the enclosing scope."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        children = [
+            *getattr(node, "decorator_list", ()),
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ]
+    elif isinstance(node, ast.ClassDef):
+        children = [*node.decorator_list, *node.bases, *node.keywords]
+    else:
+        return
+    for child in children:
         yield from _iter_module_scope_nodes(child)
 
 
@@ -227,10 +253,15 @@ def _assigned_target_names(node):
     names = [name for target in targets for name in _target_names(target)]
     # A walrus can bind the module name inside an otherwise unrelated
     # expression; it is rare but Gunicorn still reads the resulting global.
-    # Only module-scope expressions count: a lambda/def body is a local scope.
+    # Only expressions the definition evaluates in the enclosing scope count:
+    # a class body or function body has its own namespace.
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        scope_nodes = _iter_definition_header_nodes(node)
+    else:
+        scope_nodes = _iter_module_scope_nodes(node)
     names.extend(
         child.target.id
-        for child in _iter_module_scope_nodes(node)
+        for child in scope_nodes
         if isinstance(child, ast.NamedExpr)
         and isinstance(child.target, ast.Name)
     )
@@ -252,10 +283,36 @@ def _import_binding_kind(node, name):
     return None
 
 
+def _is_module_dict_reference(node):
+    """Return True for ``sys.modules[...].__dict__``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__dict__"
+        and isinstance(node.value, ast.Subscript)
+        and isinstance(node.value.value, ast.Attribute)
+        and node.value.value.attr == "modules"
+        and isinstance(node.value.value.value, ast.Name)
+        and node.value.value.value.id == "sys"
+    )
+
+
+def _subscript_may_name(slice_node, name):
+    """Return False only when a literal subscript key is another name."""
+    if isinstance(slice_node, ast.Tuple):
+        return any(_subscript_may_name(element, name) for element in slice_node.elts)
+    if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+        return slice_node.value == name
+    return True
+
+
 def _target_writes_name(target, name):
-    """Return True when an assignment target writes attribute ``name``."""
+    """Return True when an assignment target writes module attribute ``name``."""
     if isinstance(target, ast.Attribute):
         return target.attr == name
+    if isinstance(target, ast.Subscript):
+        return _is_module_dict_reference(target.value) and _subscript_may_name(
+            target.slice, name
+        )
     if isinstance(target, (ast.Tuple, ast.List)):
         return any(_target_writes_name(element, name) for element in target.elts)
     if isinstance(target, ast.Starred):
@@ -263,19 +320,34 @@ def _target_writes_name(target, name):
     return False
 
 
-def _statement_writes_named_attribute(node, name):
-    """Return True for ``obj.bind = ...`` at module scope.
+def _module_dict_update_may_name(node, name):
+    """Return True for a module ``__dict__`` update that may set ``name``."""
+    return any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == "update"
+        and _is_module_dict_reference(child.func.value)
+        and (
+            bool(child.args)
+            or any(
+                keyword.arg is None or keyword.arg == name
+                for keyword in child.keywords
+            )
+        )
+        for child in _iter_module_scope_nodes(node)
+    )
 
-    The object can be the module itself (``sys.modules[__name__]``); without
-    resolving it statically the only safe answer is "possibly supplied".
-    Unpacking targets are inspected recursively.
-    """
+
+def _statement_writes_named_attribute(node, name):
+    """Return True for ``obj.bind = ...`` or a module ``__dict__`` write."""
     targets = ()
     if isinstance(node, (ast.Assign, ast.AnnAssign)):
         targets = (
             node.targets if isinstance(node, ast.Assign) else [node.target]
         )
-    return any(_target_writes_name(target, name) for target in targets)
+    return any(_target_writes_name(target, name) for target in targets) or (
+        _module_dict_update_may_name(node, name)
+    )
 
 
 def _has_dynamic_namespace_write(node):
@@ -305,24 +377,29 @@ def config_provides_setting(path, name):
         return UNKNOWN
     try:
         tree = ast.parse(source, filename=str(path))
-    except SyntaxError:
+    except (SyntaxError, RecursionError):
         return UNKNOWN
     dynamic = False
-    for node in _iter_module_assignments(tree.body):
-        binding_kind = _import_binding_kind(node, name)
-        if binding_kind == "explicit":
-            return SUPPLIED
-        if binding_kind == "wildcard":
-            # A wildcard may or may not export this setting. The bind caller
-            # treats UNKNOWN as supplied (safe), while the app caller keeps its
-            # default because it only accepts SUPPLIED.
-            dynamic = True
-        if name in _assigned_target_names(node):
-            return SUPPLIED
-        if _statement_writes_named_attribute(node, name):
-            dynamic = True
-        if _has_dynamic_namespace_write(node):
-            dynamic = True
+    try:
+        for node in _iter_module_assignments(tree.body):
+            binding_kind = _import_binding_kind(node, name)
+            if binding_kind == "explicit":
+                return SUPPLIED
+            if binding_kind == "wildcard":
+                # A wildcard may or may not export this setting. The bind caller
+                # treats UNKNOWN as supplied (safe), while the app caller keeps its
+                # default because it only accepts SUPPLIED.
+                dynamic = True
+            if name in _assigned_target_names(node):
+                return SUPPLIED
+            if _statement_writes_named_attribute(node, name):
+                dynamic = True
+            if _has_dynamic_namespace_write(node):
+                dynamic = True
+    except RecursionError:
+        # A deeply nested expression is valid Python but beyond this walk.
+        # Never claim ABSENT: the entrypoint would override the bind.
+        return UNKNOWN
     # Keep scanning after a dynamic write: an explicit assignment later in the
     # file still proves the setting is supplied. Only report uncertainty when
     # no explicit binding was found.

@@ -24715,18 +24715,22 @@ def _trace_hook_import_aliases(node):
     return aliases
 
 
-def _trace_hook_assignment_aliases(node):
-    """Return aliases bound by one simple trace-installer assignment."""
+def _trace_hook_assignment_aliases(node, known_aliases):
+    """Return aliases bound by one trace-installer assignment.
+
+    ``known_aliases`` carries the import and earlier assignment aliases so a
+    chain such as ``traced = install`` propagates the installer identity.
+    """
     if not isinstance(node, ast.Assign):
         return set()
     value = node.value
     if isinstance(value, ast.Name):
-        value_name = value.id
+        if value.id not in _TRACE_HOOK_NAMES and value.id not in known_aliases:
+            return set()
     elif isinstance(value, ast.Attribute):
-        value_name = value.attr
+        if value.attr not in _TRACE_HOOK_NAMES:
+            return set()
     else:
-        return set()
-    if value_name not in _TRACE_HOOK_NAMES:
         return set()
     return {
         target.id
@@ -24737,11 +24741,59 @@ def _trace_hook_assignment_aliases(node):
 
 def _trace_hook_aliases(tree):
     """Return names locally bound to a sys/threading trace installer."""
+    nodes = list(ast.walk(tree))
     aliases = set()
-    for node in ast.walk(tree):
+    for node in nodes:
         aliases.update(_trace_hook_import_aliases(node))
-        aliases.update(_trace_hook_assignment_aliases(node))
-    return aliases
+    # Resolve assignment chains (``traced = install`` after an aliased import)
+    # to a fixed point; the set only grows and is bounded by the file's names.
+    while True:
+        added = set()
+        for node in nodes:
+            added.update(_trace_hook_assignment_aliases(node, aliases | added))
+        added -= aliases
+        if not added:
+            return aliases
+        aliases.update(added)
+
+
+def _trace_hook_call_target(func, aliases):
+    """Return True when a call target resolves to a trace installer."""
+    if isinstance(func, ast.Attribute):
+        return func.attr in _TRACE_HOOK_NAMES
+    if isinstance(func, ast.Name):
+        return func.id in aliases
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value in _TRACE_HOOK_NAMES
+    )
+
+
+def _iter_trace_hook_nodes(node, uncalled_names):
+    """Yield nodes, skipping bodies of module functions nothing calls.
+
+    Decorators, defaults and annotations still run when the ``def`` executes,
+    so they stay visible; only the deferred body of a provably uncalled function
+    is skipped. Dunder names are never treated as uncalled because Python can
+    invoke them implicitly.
+    """
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        children = [*node.decorator_list, node.args, getattr(node, "returns", None)]
+        for child in children:
+            if child is not None:
+                yield from _iter_trace_hook_nodes(child, uncalled_names)
+        if node.name in uncalled_names:
+            return
+        for statement in node.body:
+            yield from _iter_trace_hook_nodes(statement, uncalled_names)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _iter_trace_hook_nodes(child, uncalled_names)
 
 
 def _installs_process_wide_trace_hook(tree):
@@ -24750,20 +24802,20 @@ def _installs_process_wide_trace_hook(tree):
     A trace callback can run at every line, call or return and rewrite module
     globals from the frame, so the static walk cannot prove the effective
     worker count. Treat the whole config as dynamic instead of modelling every
-    possible hook body. Direct ``from sys import settrace`` aliases and simple
-    local assignments are resolved as well as attribute calls.
+    possible hook body. Direct imports, assignment chains and ``getattr``
+    resolution are followed; installer calls in a function the file never
+    references do not count.
     """
     aliases = _trace_hook_aliases(tree)
+    uncalled_names = {
+        name
+        for name in _provably_uncalled_function_names(tree)
+        if not (name.startswith("__") and name.endswith("__"))
+    }
     return any(
         isinstance(node, ast.Call)
-        and (
-            (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in _TRACE_HOOK_NAMES
-            )
-            or (isinstance(node.func, ast.Name) and node.func.id in aliases)
-        )
-        for node in ast.walk(tree)
+        and _trace_hook_call_target(node.func, aliases)
+        for node in _iter_trace_hook_nodes(tree, uncalled_names)
     )
 
 

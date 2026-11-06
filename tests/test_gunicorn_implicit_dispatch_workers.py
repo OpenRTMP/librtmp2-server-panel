@@ -56,14 +56,80 @@ _noop()
 """
 
 
+ALIASED_TRACE_SOURCE = """
+workers = 1
+from sys import settrace as install
+traced = install
+def _trace(frame, event, arg):
+    if event == 'call':
+        frame.f_globals['workers'] = 8
+    return _trace
+def _noop():
+    pass
+traced(_trace)
+_noop()
+"""
+
+
+GETATTR_TRACE_SOURCE = """
+workers = 1
+import sys
+def _trace(frame, event, arg):
+    if event == 'call':
+        frame.f_globals['workers'] = 8
+    return _trace
+def _noop():
+    pass
+getattr(sys, 'settrace')(_trace)
+_noop()
+"""
+
+
+UNCALLED_TRACE_SOURCE = """
+workers = 1
+from sys import settrace as install
+def _debug():
+    install(lambda *args: None)
+"""
+
+
+UNCALLED_ALIASED_TRACE_SOURCE = """
+workers = 1
+from sys import settrace as install
+traced = install
+def _debug():
+    traced(lambda *args: None)
+"""
+
+
 @pytest.mark.parametrize(
     "source",
-    [GETATTR_SOURCE, MISSING_SOURCE, SETTRACE_SOURCE, DIRECT_IMPORT_TRACE_SOURCE],
+    [
+        GETATTR_SOURCE,
+        MISSING_SOURCE,
+        SETTRACE_SOURCE,
+        DIRECT_IMPORT_TRACE_SOURCE,
+        ALIASED_TRACE_SOURCE,
+        GETATTR_TRACE_SOURCE,
+    ],
 )
 def test_implicit_dispatch_worker_mutation_is_dynamic(config_module, source):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (
         1,
         True,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [UNCALLED_TRACE_SOURCE, UNCALLED_ALIASED_TRACE_SOURCE],
+)
+def test_installer_call_in_an_uncalled_function_stays_static(
+    config_module, source
+):
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (
+        1,
+        False,
     )
 
 
