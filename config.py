@@ -10707,6 +10707,22 @@ def _asyncio_consumer_call_mutates_workers(
     return False
 
 
+def _constructed_awaitable_triggers_workers(expr, class_targets, reference_line):
+    """Check whether awaiting a newly constructed instance mutates workers."""
+    if not class_targets or not isinstance(expr, ast.Call):
+        return False
+    if not isinstance(expr.func, ast.Name):
+        return False
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    return _constructed_receiver_call_triggers_workers(
+        expr,
+        "__await__",
+        methods,
+        class_targets,
+        reference_line,
+    )
+
+
 def _asyncio_awaitable_mutates_workers(
     expr,
     operator_bindings,
@@ -10717,20 +10733,10 @@ def _asyncio_awaitable_mutates_workers(
 ):
     """Return True when awaiting an expression can mutate module workers."""
     class_targets = _operator_bindings_class_targets(operator_bindings)
-    if class_targets:
-        methods = class_targets[1] if len(class_targets) > 1 else set()
-        if (
-            isinstance(expr, ast.Call)
-            and isinstance(expr.func, ast.Name)
-            and _constructed_receiver_call_triggers_workers(
-                expr,
-                "__await__",
-                methods,
-                class_targets,
-                reference_line,
-            )
-        ):
-            return True
+    if _constructed_awaitable_triggers_workers(
+        expr, class_targets, reference_line
+    ):
+        return True
     if not isinstance(expr, ast.Call):
         return False
     if class_targets:
@@ -10816,17 +10822,10 @@ def _expression_awaits_mutating_asyncio(
         ):
             return True
         class_targets = _operator_bindings_class_targets(operator_bindings)
-        if (
-            class_targets
-            and isinstance(awaited, ast.Call)
-            and isinstance(awaited.func, ast.Name)
-            and _constructed_receiver_call_triggers_workers(
-                awaited,
-                "__await__",
-                class_targets[1] if len(class_targets) > 1 else set(),
-                class_targets,
-                getattr(expr, "lineno", reference_line),
-            )
+        if _constructed_awaitable_triggers_workers(
+            awaited,
+            class_targets,
+            getattr(expr, "lineno", reference_line),
         ):
             return True
     return any(
@@ -16717,6 +16716,30 @@ def _attribute_call_triggers_workers(
     )
 
 
+def _attribute_access_receiver_details(value, class_targets, reference_line):
+    """Resolve a receiver's class alias and whether it is freshly constructed."""
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+        receiver_name = value.func.id
+        return (
+            _class_name_alias_target(
+                receiver_name, class_name_aliases, reference_line
+            ),
+            receiver_name,
+            True,
+        )
+    if isinstance(value, ast.Name):
+        receiver_name = value.id
+        return (
+            _class_name_alias_target(
+                receiver_name, class_name_aliases, reference_line
+            ),
+            receiver_name,
+            False,
+        )
+    return None, None, False
+
+
 def _attribute_access_triggers_workers(
     expr,
     properties,
@@ -16728,28 +16751,9 @@ def _attribute_access_triggers_workers(
     """Return True for property/descriptor reads that execute a risky hook."""
     if not isinstance(expr, ast.Attribute):
         return False
-    class_name = None
-    receiver_name = None
-    instance_read = False
-    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
-    if (
-        isinstance(expr.value, ast.Call)
-        and isinstance(expr.value.func, ast.Name)
-    ):
-        receiver_name = expr.value.func.id
-        class_name = _class_name_alias_target(
-            receiver_name,
-            class_name_aliases,
-            reference_line,
-        )
-        instance_read = True
-    elif isinstance(expr.value, ast.Name):
-        receiver_name = expr.value.id
-        class_name = _class_name_alias_target(
-            receiver_name,
-            class_name_aliases,
-            reference_line,
-        )
+    class_name, receiver_name, instance_read = _attribute_access_receiver_details(
+        expr.value, class_targets, reference_line
+    )
     if (
         isinstance(expr.value, ast.Call)
         and _explicit_super_call_class_name(expr.value, class_targets) is not None
