@@ -24699,29 +24699,48 @@ _TRACE_HOOK_NAMES = frozenset(
 )
 
 
+def _trace_hook_import_aliases(node):
+    """Return aliases bound by one ``from sys/threading import ...``."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module in ("sys", "threading")
+    ):
+        return set()
+    aliases = set()
+    for alias in node.names:
+        if alias.name == "*":
+            aliases.update(_TRACE_HOOK_NAMES)
+        elif alias.name in _TRACE_HOOK_NAMES:
+            aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def _trace_hook_assignment_aliases(node):
+    """Return aliases bound by one simple trace-installer assignment."""
+    if not isinstance(node, ast.Assign):
+        return set()
+    value = node.value
+    if isinstance(value, ast.Name):
+        value_name = value.id
+    elif isinstance(value, ast.Attribute):
+        value_name = value.attr
+    else:
+        return set()
+    if value_name not in _TRACE_HOOK_NAMES:
+        return set()
+    return {
+        target.id
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+
 def _trace_hook_aliases(tree):
     """Return names locally bound to a sys/threading trace installer."""
     aliases = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in ("sys", "threading"):
-            for alias in node.names:
-                if alias.name == "*":
-                    aliases.update(_TRACE_HOOK_NAMES)
-                elif alias.name in _TRACE_HOOK_NAMES:
-                    aliases.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Assign):
-            value = node.value
-            value_name = None
-            if isinstance(value, ast.Name):
-                value_name = value.id
-            elif isinstance(value, ast.Attribute):
-                value_name = value.attr
-            if value_name in _TRACE_HOOK_NAMES:
-                aliases.update(
-                    target.id
-                    for target in node.targets
-                    if isinstance(target, ast.Name)
-                )
+        aliases.update(_trace_hook_import_aliases(node))
+        aliases.update(_trace_hook_assignment_aliases(node))
     return aliases
 
 

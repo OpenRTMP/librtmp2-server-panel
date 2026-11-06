@@ -159,19 +159,19 @@ def _iter_module_assignments(statements):
             yield from _iter_module_assignments(block)
 
 
-def _target_names(target):
+def _target_names(target) -> list[str]:
     """Return every simple name bound by one assignment target."""
     if isinstance(target, ast.Name):
-        return (target.id,)
+        return [target.id]
     if isinstance(target, (ast.Tuple, ast.List)):
-        return tuple(
+        return [
             name
             for element in target.elts
             for name in _target_names(element)
-        )
+        ]
     if isinstance(target, ast.Starred):
         return _target_names(target.value)
-    return ()
+    return []
 
 
 def _iter_module_scope_nodes(node):
@@ -244,12 +244,11 @@ def _import_binding_kind(node, name):
             return "wildcard"
         if any((alias.asname or alias.name) == name for alias in node.names):
             return "explicit"
-    elif isinstance(node, ast.Import):
-        if any(
-            (alias.asname or alias.name.split(".", 1)[0]) == name
-            for alias in node.names
-        ):
-            return "explicit"
+    elif isinstance(node, ast.Import) and any(
+        (alias.asname or alias.name.split(".", 1)[0]) == name
+        for alias in node.names
+    ):
+        return "explicit"
     return None
 
 
