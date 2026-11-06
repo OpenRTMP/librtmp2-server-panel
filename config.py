@@ -38,6 +38,12 @@ _BUILTIN_UNARY_DUNDER_DISPATCH = {
     "hash": "__hash__",
     "bytes": "__bytes__",
     "abs": "__abs__",
+    "round": "__round__",
+}
+_MATH_UNARY_DUNDER_DISPATCH = {
+    "trunc": "__trunc__",
+    "floor": "__floor__",
+    "ceil": "__ceil__",
 }
 _UNARY_OP_DUNDER = {
     ast.Not: "__bool__",
@@ -10701,6 +10707,22 @@ def _asyncio_consumer_call_mutates_workers(
     return False
 
 
+def _constructed_awaitable_triggers_workers(expr, class_targets, reference_line):
+    """Check whether awaiting a newly constructed instance mutates workers."""
+    if not class_targets or not isinstance(expr, ast.Call):
+        return False
+    if not isinstance(expr.func, ast.Name):
+        return False
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    return _constructed_receiver_call_triggers_workers(
+        expr,
+        "__await__",
+        methods,
+        class_targets,
+        reference_line,
+    )
+
+
 def _asyncio_awaitable_mutates_workers(
     expr,
     operator_bindings,
@@ -10710,9 +10732,13 @@ def _asyncio_awaitable_mutates_workers(
     seen=None,
 ):
     """Return True when awaiting an expression can mutate module workers."""
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if _constructed_awaitable_triggers_workers(
+        expr, class_targets, reference_line
+    ):
+        return True
     if not isinstance(expr, ast.Call):
         return False
-    class_targets = _operator_bindings_class_targets(operator_bindings)
     if class_targets:
         instance_events = class_targets[6] if len(class_targets) > 6 else {}
         if _call_is_async_context_enter_mutation(
@@ -10793,6 +10819,13 @@ def _expression_awaits_mutating_asyncio(
             reference_line,
             local_state=local_state,
             seen=seen,
+        ):
+            return True
+        class_targets = _operator_bindings_class_targets(operator_bindings)
+        if _constructed_awaitable_triggers_workers(
+            awaited,
+            class_targets,
+            getattr(expr, "lineno", reference_line),
         ):
             return True
     return any(
@@ -16610,6 +16643,27 @@ def _receiver_method_call_triggers_workers(
     return False
 
 
+def _instance_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    reference_line,
+):
+    """Return True when ``ClassName()()`` dispatches a mutating ``__call__``."""
+    if not isinstance(expr, ast.Call):
+        return False
+    callee = expr.func
+    if not (isinstance(callee, ast.Call) and isinstance(callee.func, ast.Name)):
+        return False
+    return _constructed_receiver_call_triggers_workers(
+        callee,
+        "__call__",
+        methods,
+        class_targets,
+        reference_line,
+    )
+
+
 def _attribute_call_triggers_workers(
     expr,
     methods,
@@ -16662,6 +16716,30 @@ def _attribute_call_triggers_workers(
     )
 
 
+def _attribute_access_receiver_details(value, class_targets, reference_line):
+    """Resolve a receiver's class alias and whether it is freshly constructed."""
+    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+        receiver_name = value.func.id
+        return (
+            _class_name_alias_target(
+                receiver_name, class_name_aliases, reference_line
+            ),
+            receiver_name,
+            True,
+        )
+    if isinstance(value, ast.Name):
+        receiver_name = value.id
+        return (
+            _class_name_alias_target(
+                receiver_name, class_name_aliases, reference_line
+            ),
+            receiver_name,
+            False,
+        )
+    return None, None, False
+
+
 def _attribute_access_triggers_workers(
     expr,
     properties,
@@ -16673,28 +16751,9 @@ def _attribute_access_triggers_workers(
     """Return True for property/descriptor reads that execute a risky hook."""
     if not isinstance(expr, ast.Attribute):
         return False
-    class_name = None
-    receiver_name = None
-    instance_read = False
-    class_name_aliases = class_targets[14] if len(class_targets) > 14 else {}
-    if (
-        isinstance(expr.value, ast.Call)
-        and isinstance(expr.value.func, ast.Name)
-    ):
-        receiver_name = expr.value.func.id
-        class_name = _class_name_alias_target(
-            receiver_name,
-            class_name_aliases,
-            reference_line,
-        )
-        instance_read = True
-    elif isinstance(expr.value, ast.Name):
-        receiver_name = expr.value.id
-        class_name = _class_name_alias_target(
-            receiver_name,
-            class_name_aliases,
-            reference_line,
-        )
+    class_name, receiver_name, instance_read = _attribute_access_receiver_details(
+        expr.value, class_targets, reference_line
+    )
     if (
         isinstance(expr.value, ast.Call)
         and _explicit_super_call_class_name(expr.value, class_targets) is not None
@@ -16722,6 +16781,15 @@ def _attribute_access_triggers_workers(
     ):
         return True
     if instance_read:
+        methods = class_targets[1] if len(class_targets) > 1 else set()
+        if _constructed_receiver_call_triggers_workers(
+            expr.value,
+            "__getattribute__",
+            methods,
+            class_targets,
+            reference_line,
+        ):
+            return True
         return False
     class_attributes = class_targets[10] if len(class_targets) > 10 else None
     return _instance_hook_is_active(
@@ -16805,6 +16873,12 @@ def _expression_triggers_class_workers_side_effect(
             reference_line,
             operator_bindings,
         )
+        or _instance_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            reference_line,
+        )
         or _getattr_super_method_call_triggers_workers(
             expr,
             methods,
@@ -16826,6 +16900,13 @@ def _expression_triggers_class_workers_side_effect(
             instance_events,
             reference_line,
             operator_bindings,
+        )
+        or _math_unary_dunder_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
         )
         or _unary_op_dunder_triggers_workers(
             expr,
@@ -21861,6 +21942,36 @@ def _builtin_unary_dunder_call_triggers_workers(
             return False
         dunder = "__str__"
     if not _unshadowed_builtin_call(expr, builtin_name, operator_bindings):
+        return False
+    if len(expr.args) != 1 or expr.keywords:
+        return False
+    return _implicit_dunder_dispatch_triggers_workers(
+        expr.args[0],
+        dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _math_unary_dunder_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when ``math.trunc``/``floor``/``ceil`` dispatch a mutating dunder."""
+    if not isinstance(expr, ast.Call):
+        return False
+    func = expr.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    dunder = _MATH_UNARY_DUNDER_DISPATCH.get(func.attr)
+    if dunder is None:
+        return False
+    if not isinstance(func.value, ast.Name) or func.value.id != "math":
         return False
     if len(expr.args) != 1 or expr.keywords:
         return False
