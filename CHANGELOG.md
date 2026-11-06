@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-11-06
+
 ### Security
 - `SESSION_COOKIE_SECURE` defaults to enabled when neither `PANEL_PUBLIC_URL`
   nor `TRUSTED_PROXY_COUNT` indicates plain HTTP. Set
@@ -23,6 +25,38 @@ only begin at a future `1.0.0`.
   `TRUSTED_PROXY_CLIENT_IP_HEADER`), not on the position selected by
   `TRUSTED_PROXY_COUNT`, so an over-counted hop number can no longer let a
   client choose its own bucket.
+- The Gunicorn worker gate now fails closed for the remaining import-time
+  shapes that can raise the worker count behind `memory://` rate limiting:
+  implicit dunder hooks on constructed classes (`__add__`, `__format__`,
+  `__iter__`, `__bool__`, `__contains__`, `__eq__` and siblings, including
+  inherited and in-place forms), `__del__`, `repr`/`str`/`bool`/`len`/`hash`,
+  unary operators and `print`, `ClassName()()`, attribute reads on fresh
+  instances, `asyncio.run` on custom awaitables, `round`, `math.trunc`,
+  `math.floor` and `math.ceil`, deferred `type()` instantiation,
+  `__getattr__`/`__getattribute__`/`__missing__`, trace/profile installers,
+  and the remaining dict-mutator, pool/`ExitStack`/`partial` callback,
+  conditional class, `type()`/`new_class` namespace and metaclass spellings.
+- The entrypoint bind probe detects imported, destructured, loop/with/
+  augmented/walrus and namespace-written `bind`/`wsgi_app` targets, including
+  aliased imports and nested attribute writes, keeps an explicit app target
+  when value-taking Gunicorn flags precede it, mirrors Gunicorn's config
+  precedence (`-c`, `gunicorn.conf.py`, environment), accepts a BOM-prefixed
+  config and an optional-value `--proxy-protocol`, and treats wildcard imports
+  or recursion as unknown. The image default no longer overrides a supplied
+  bind.
+
+### Fixed
+- The delete drain poll matches numeric upstream stream ids, and creating a
+  stream whose id comes back as a number no longer reports it missing.
+- The RTMPS badge comes from the same `/health` payload when the streams
+  endpoint fails, instead of claiming RTMPS is disabled.
+- Display names reject the whole Unicode `Cc` category (C0, DEL and the C1
+  block), matching the server's `char::is_control` check.
+
+### Changed
+- The image runs Python 3.15, installs the Gunicorn config probe, and builds
+  its hash-pinned wheels on the same Python minor as the runtime stage.
+- Dependency updates: click 8.5.1, WTForms 3.3.2, pytest 9.2.0.
 
 ## [0.1.14] — 2026-11-01
 
@@ -504,7 +538,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.11...v0.1.12
