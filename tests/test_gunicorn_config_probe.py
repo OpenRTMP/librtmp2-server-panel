@@ -105,14 +105,114 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         ("bind: list = ['127.0.0.1:8000']\n", probe.SUPPLIED),
         ("bind: list\n", probe.ABSENT),
         ("if True:\n    bind = ['127.0.0.1:8000']\n", probe.SUPPLIED),
+        ("for bind in [['127.0.0.1:8000']]:\n    pass\n", probe.SUPPLIED),
+        ("with open('x') as bind:\n    pass\n", probe.SUPPLIED),
+        ("bind, workers = ['127.0.0.1:8000'], 1\n", probe.SUPPLIED),
+        ("(bind := ['127.0.0.1:8000'])\n", probe.SUPPLIED),
+        ("bind += ['127.0.0.1:8000']\n", probe.SUPPLIED),
         ("workers = 1\n", probe.ABSENT),
         ("def configure():\n    bind = ['127.0.0.1:8000']\n", probe.ABSENT),
+        # An imported binding is still a module global Gunicorn reads. The
+        # probe cannot execute the import, so it must not claim ABSENT and let
+        # the entrypoint prepend its 0.0.0.0 default over it.
+        ("from settings import bind\n", probe.SUPPLIED),
+        ("from settings import private_bind as bind\n", probe.SUPPLIED),
+        ("from settings import bind as other\n", probe.ABSENT),
+        ("from settings import *\n", probe.UNKNOWN),
+        ("import settings as bind\n", probe.SUPPLIED),
+        # Arbitrary namespace writes may define bind at import time. Returning
+        # UNKNOWN keeps the image from overriding a value it cannot inspect.
+        ("globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("vars()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("setattr(sys.modules[__name__], 'bind', [])\n", probe.UNKNOWN),
+        ("sys.modules[__name__].bind = []\n", probe.UNKNOWN),
+        (
+            "sys.modules[__name__].bind, workers = [], 1\n",
+            probe.UNKNOWN,
+        ),
+        # The config module's own __dict__ is another alias for its globals.
+        (
+            "import sys\n"
+            "sys.modules[__name__].__dict__['bind'] = ['127.0.0.1:8000']\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import sys\n"
+            "sys.modules[__name__].__dict__.update(bind=['127.0.0.1:8000'])\n",
+            probe.UNKNOWN,
+        ),
+        # A definition evaluates its defaults while the module runs, so a
+        # dynamic write there reaches globals even though the body is deferred.
+        (
+            "def configure(bind=globals().update(bind=['127.0.0.1:8000'])):\n"
+            "    pass\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "if True:\n"
+            "    def configure(bind=globals().update(bind=['127.0.0.1:8000'])):\n"
+            "        pass\n",
+            probe.UNKNOWN,
+        ),
+        # A class body also runs at import time, but a plain class attribute is
+        # not a module binding and a method body is still deferred.
+        ("class Settings:\n    globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("class Settings:\n    bind = ['127.0.0.1:8000']\n", probe.ABSENT),
+        (
+            "class Settings:\n    (bind := ['127.0.0.1:8000'])\n",
+            probe.ABSENT,
+        ),
+        # A walrus in a function default runs at definition time in module scope.
+        (
+            "def configure(bind=(bind := ['127.0.0.1:8000'])):\n    pass\n",
+            probe.SUPPLIED,
+        ),
+        (
+            "class Settings:\n"
+            "    def configure(self):\n"
+            "        globals()['bind'] = ['127.0.0.1:8000']\n",
+            probe.ABSENT,
+        ),
+        # A later explicit assignment is still proof even after a dynamic write.
+        (
+            "globals()['workers'] = 1\nbind = ['127.0.0.1:8000']\n",
+            probe.SUPPLIED,
+        ),
+        # A dynamic write inside a function that the module never calls does
+        # not run at import time; the probe must still see a plain ABSENT.
+        ("def configure():\n    globals()['bind'] = []\n", probe.ABSENT),
+        # A walrus inside a lambda or nested function binds that local scope,
+        # not the module, so it must not suppress the image default bind.
+        ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
+        (
+            "if True:\n    def helper():\n        (bind := ['127.0.0.1:9000'])\n",
+            probe.ABSENT,
+        ),
+        (
+            "if True:\n    def helper():\n        globals()['bind'] = []\n",
+            probe.ABSENT,
+        ),
     ],
 )
 def test_config_provides_setting_reads_module_assignments(tmp_path, source, expected):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(source, encoding="utf-8")
     assert _config_provides(config_file) == expected
+
+
+def test_dynamic_write_does_not_hide_a_later_explicit_wsgi_app_assignment(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "globals().update({'workers': 1})\nwsgi_app = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
+
+
+def test_wildcard_import_leaves_the_wsgi_app_unknown(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("from base_config import *\n", encoding="utf-8")
+    assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
 
 
 def test_config_provides_setting_reports_unreadable_and_unparsable_config(tmp_path):
@@ -188,3 +288,13 @@ def test_crlf_config_is_still_parsed(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_bytes(b"bind = '0.0.0.0:8000'\r\nworkers = 2\r\n")
     assert _config_provides(config_file) == probe.SUPPLIED
+
+
+def test_deep_expression_before_bind_reports_unknown(tmp_path):
+    """A valid but too-deep expression must not make the probe exit with 1."""
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "x = " + " + ".join(["1"] * 2000) + "\nbind = ['127.0.0.1:8000']\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file) == probe.UNKNOWN

@@ -112,6 +112,11 @@ _IMPLICIT_INSTANCE_HOOKS = frozenset(
         "__repr__",
         "__bytes__",
         "__hash__",
+        # Instance attribute fallbacks are implicit dispatch too: ``obj.missing``
+        # runs ``__getattr__`` and ``mapping[missing]`` runs ``__missing__``.
+        "__getattr__",
+        "__getattribute__",
+        "__missing__",
         "__iter__",
         "__reversed__",
         "__contains__",
@@ -23973,6 +23978,10 @@ _DYNAMIC_NAME_LOOKUP_CALLS = frozenset(
         "locals",
         "methodcaller",
         "setattr",
+        "setprofile",
+        "setprofile_all_threads",
+        "settrace",
+        "settrace_all_threads",
         "vars",
     }
 )
@@ -24791,8 +24800,140 @@ def _collect_inspect_analysis(tree, operator_bindings):
 _CLASS_HOOK_REFINEMENT_PASSES = 8
 
 
+_TRACE_HOOK_NAMES = frozenset(
+    {
+        "setprofile",
+        "setprofile_all_threads",
+        "settrace",
+        "settrace_all_threads",
+    }
+)
+
+
+def _trace_hook_import_aliases(node):
+    """Return aliases bound by one ``from sys/threading import ...``."""
+    if not (
+        isinstance(node, ast.ImportFrom)
+        and node.module in ("sys", "threading")
+    ):
+        return set()
+    aliases = set()
+    for alias in node.names:
+        if alias.name == "*":
+            aliases.update(_TRACE_HOOK_NAMES)
+        elif alias.name in _TRACE_HOOK_NAMES:
+            aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def _trace_hook_assignment_aliases(node, known_aliases):
+    """Return aliases bound by one trace-installer assignment.
+
+    ``known_aliases`` carries the import and earlier assignment aliases so a
+    chain such as ``traced = install`` propagates the installer identity.
+    """
+    if not isinstance(node, ast.Assign):
+        return set()
+    value = node.value
+    if isinstance(value, ast.Name):
+        if value.id not in _TRACE_HOOK_NAMES and value.id not in known_aliases:
+            return set()
+    elif isinstance(value, ast.Attribute):
+        if value.attr not in _TRACE_HOOK_NAMES:
+            return set()
+    else:
+        return set()
+    return {
+        target.id
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+
+def _trace_hook_aliases(tree):
+    """Return names locally bound to a sys/threading trace installer."""
+    nodes = list(ast.walk(tree))
+    aliases = set()
+    for node in nodes:
+        aliases.update(_trace_hook_import_aliases(node))
+    # Resolve assignment chains (``traced = install`` after an aliased import)
+    # to a fixed point; the set only grows and is bounded by the file's names.
+    while True:
+        added = set()
+        for node in nodes:
+            added.update(_trace_hook_assignment_aliases(node, aliases | added))
+        added -= aliases
+        if not added:
+            return aliases
+        aliases.update(added)
+
+
+def _trace_hook_call_target(func, aliases):
+    """Return True when a call target resolves to a trace installer."""
+    if isinstance(func, ast.Attribute):
+        return func.attr in _TRACE_HOOK_NAMES
+    if isinstance(func, ast.Name):
+        return func.id in aliases
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value in _TRACE_HOOK_NAMES
+    )
+
+
+def _iter_trace_hook_nodes(node, uncalled_names):
+    """Yield nodes, skipping bodies of module functions nothing calls.
+
+    Decorators, defaults and annotations still run when the ``def`` executes,
+    so they stay visible; only the deferred body of a provably uncalled function
+    is skipped. Dunder names are never treated as uncalled because Python can
+    invoke them implicitly.
+    """
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        children = [*node.decorator_list, node.args, getattr(node, "returns", None)]
+        for child in children:
+            if child is not None:
+                yield from _iter_trace_hook_nodes(child, uncalled_names)
+        if node.name in uncalled_names:
+            return
+        for statement in node.body:
+            yield from _iter_trace_hook_nodes(statement, uncalled_names)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _iter_trace_hook_nodes(child, uncalled_names)
+
+
+def _installs_process_wide_trace_hook(tree):
+    """Return True when the config installs a trace/profile callback.
+
+    A trace callback can run at every line, call or return and rewrite module
+    globals from the frame, so the static walk cannot prove the effective
+    worker count. Treat the whole config as dynamic instead of modelling every
+    possible hook body. Direct imports, assignment chains and ``getattr``
+    resolution are followed; installer calls in a function the file never
+    references do not count.
+    """
+    aliases = _trace_hook_aliases(tree)
+    uncalled_names = {
+        name
+        for name in _provably_uncalled_function_names(tree)
+        if not (name.startswith("__") and name.endswith("__"))
+    }
+    return any(
+        isinstance(node, ast.Call)
+        and _trace_hook_call_target(node.func, aliases)
+        for node in _iter_trace_hook_nodes(tree, uncalled_names)
+    )
+
+
 def _scan_gunicorn_config_worker_details(tree):
     """Return configured count, assignment dynamism, and runtime-hook dynamism."""
+    if _installs_process_wide_trace_hook(tree):
+        return None, True, True
     state = _GunicornWorkersScanState()
     operator_bindings = _collect_operator_setitem_bindings(tree)
     # Make the annotation policy available to every collector below: on
