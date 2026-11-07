@@ -552,7 +552,7 @@ def _call_invoked_names(node, definitions, aliases):
     return set()
 
 
-def _called_local_names(statements, definitions):
+def _called_local_names(statements, definitions, aliases=None):
     """Return local definitions invoked while the config module is imported.
 
     This covers direct calls, decorator names, local base classes, calls in a
@@ -561,12 +561,14 @@ def _called_local_names(statements, definitions):
     count when that function is invoked, which the transitive writer check
     below models.
     """
-    aliases = _collect_aliases(statements, definitions)
+    if aliases is None:
+        aliases = _collect_aliases(statements, definitions)
     called = set()
     for statement in _iter_module_assignments(statements):
         called.update(_definition_invoked_names(statement, definitions, aliases))
         for node in _iter_module_scope_nodes(statement):
-            called.update(_call_invoked_names(node, definitions, aliases))
+            if isinstance(node, ast.Call):
+                called.update(_call_invokes_writer(node, definitions, aliases))
     return called
 
 
@@ -685,23 +687,48 @@ def _definition_writes_setting(node, name):
     return _body_writes_global_name(node, name)
 
 
-def _called_names_in_definition(node):
-    """Return direct local names called anywhere in ``node``."""
-    return {
-        child.func.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
-    }
-
-
-def _definition_is_writer(node, name, writers):
-    """Return True when ``node`` writes the setting or calls a known writer."""
-    return _definition_writes_setting(node, name) or bool(
-        _called_names_in_definition(node) & writers
+def _is_partial_construction(node):
+    """Return True for ``partial(...)`` / ``functools.partial(...)`` calls."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        isinstance(func, ast.Name) and func.id == "partial"
+    ) or (
+        isinstance(func, ast.Attribute) and func.attr == "partial"
     )
 
 
-def _local_writer_names(definitions, name):
+def _call_invokes_writer(child, definitions, aliases):
+    """Return the local names a call inside a definition invokes."""
+    func = child.func
+    # Immediately-invoked partial: partial(configure)()
+    if isinstance(func, ast.Call) and _is_partial_construction(func):
+        resolved = _partial_target(func, definitions, aliases)
+        return {resolved} if resolved else set()
+    # Constructing a partial does not invoke the wrapped callable.
+    if _is_partial_construction(child):
+        return set()
+    return _call_invoked_names(child, definitions, aliases)
+
+
+def _called_names_in_definition(node, definitions, aliases):
+    """Return local names invoked anywhere inside ``node``."""
+    names = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            names.update(_call_invokes_writer(child, definitions, aliases))
+    return names
+
+
+def _definition_is_writer(node, name, writers, definitions, aliases):
+    """Return True when ``node`` writes the setting or calls a known writer."""
+    return _definition_writes_setting(node, name) or bool(
+        _called_names_in_definition(node, definitions, aliases) & writers
+    )
+
+
+def _local_writer_names(definitions, name, aliases):
     """Return local definitions that can write ``name``, including transitively."""
     writers = set()
     changed = True
@@ -710,7 +737,10 @@ def _local_writer_names(definitions, name):
         for definition_name, nodes in definitions.items():
             if definition_name in writers:
                 continue
-            if any(_definition_is_writer(node, name, writers) for node in nodes):
+            if any(
+                _definition_is_writer(node, name, writers, definitions, aliases)
+                for node in nodes
+            ):
                 writers.add(definition_name)
                 changed = True
     return writers
@@ -724,9 +754,9 @@ def _scan_module_bindings(statements, name):
         if binding_kind == "explicit":
             return SUPPLIED, dynamic
         if binding_kind == "wildcard":
-            # A wildcard may or may not export this setting. The bind caller
-            # treats UNKNOWN as supplied (safe), while the app caller keeps its
-            # default because it only accepts SUPPLIED.
+            # A wildcard may or may not export this setting. Both entrypoint
+            # callers treat UNKNOWN as supplied, so the image never overrides
+            # a setting it cannot see.
             dynamic = True
         if name in _assigned_target_names(node):
             return SUPPLIED, dynamic
@@ -758,8 +788,9 @@ def config_provides_setting(path, name):
         # A local helper invoked at import time can assign the setting even
         # though its body is not module scope. Only report uncertainty when the
         # called helper can actually write it; an unrelated helper stays ABSENT.
-        if _called_local_names(tree.body, definitions) & _local_writer_names(
-            definitions, name
+        aliases = _collect_aliases(tree.body, definitions)
+        if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
+            definitions, name, aliases
         ):
             dynamic = True
     except RecursionError:

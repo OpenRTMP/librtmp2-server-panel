@@ -288,6 +288,51 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
             "partial(configure)()\n",
             probe.UNKNOWN,
         ),
+        # An alias called inside a wrapper must still reach the writer.
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "f = configure\n"
+            "def wrapper():\n"
+            "    f()\n"
+            "wrapper()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "from functools import partial\n"
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "def wrapper():\n"
+            "    partial(configure)()\n"
+            "wrapper()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "class Configure:\n"
+            "    def apply(self):\n"
+            "        global bind\n"
+            "        bind = []\n"
+            "c = Configure()\n"
+            "def wrapper():\n"
+            "    c.apply()\n"
+            "wrapper()\n",
+            probe.UNKNOWN,
+        ),
+        # Constructing a partial is not invoking it; an unused partial leaves
+        # the helper non-writing.
+        (
+            "from functools import partial\n"
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "p = partial(configure)\n"
+            "def wrapper():\n"
+            "    p\n"
+            "wrapper()\n",
+            probe.ABSENT,
+        ),
         (
             "class Configure:\n"
             "    def apply(self):\n"
@@ -365,6 +410,21 @@ def test_dynamic_write_does_not_hide_a_later_explicit_wsgi_app_assignment(tmp_pa
         encoding="utf-8",
     )
     assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
+
+
+def test_transitive_alias_writer_marks_wsgi_app_unknown(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "def configure():\n"
+        "    global wsgi_app\n"
+        "    wsgi_app = 'wrapper:app'\n"
+        "f = configure\n"
+        "def wrapper():\n"
+        "    f()\n"
+        "wrapper()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
 
 
 def test_wildcard_import_leaves_the_wsgi_app_unknown(tmp_path):
