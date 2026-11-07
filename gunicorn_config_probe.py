@@ -366,6 +366,167 @@ def _has_dynamic_namespace_write(node):
     )
 
 
+def _module_local_definitions(statements):
+    """Map module-scope local function/class names to their definition."""
+    definitions = {}
+    for node in _iter_module_assignments(statements):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.setdefault(node.name, node)
+    return definitions
+
+
+def _called_local_names(statements, definitions):
+    """Return local definitions invoked while the config module is imported.
+
+    This covers direct calls, decorator names, local base classes and calls in
+    a class body. Calls inside a deferred function body only count when that
+    function is invoked, which the transitive writer check below models.
+    """
+    called = set()
+    for statement in statements:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for decorator in statement.decorator_list:
+                if isinstance(decorator, ast.Name) and decorator.id in definitions:
+                    called.add(decorator.id)
+            if isinstance(statement, ast.ClassDef):
+                # A local base runs its __init_subclass__/metaclass hooks.
+                for base in statement.bases:
+                    if isinstance(base, ast.Name) and base.id in definitions:
+                        called.add(base.id)
+        for node in _iter_module_scope_nodes(statement):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in definitions
+            ):
+                called.add(node.func.id)
+    return called
+
+
+def _assignment_target_names(node):
+    """Return the simple names bound by one assignment-like node."""
+    targets = ()
+    if isinstance(node, ast.Assign):
+        targets = tuple(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+        targets = (node.target,)
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        targets = tuple(
+            item.optional_vars for item in node.items if item.optional_vars is not None
+        )
+    elif isinstance(node, ast.Delete):
+        targets = tuple(node.targets)
+    return {name for target in targets for name in _target_names(target)}
+
+
+def _body_writes_global_name(node, name):
+    """Return True when executing ``node`` can rebind the module global ``name``.
+
+    A plain assignment inside a function is local unless the function declares
+    ``global <name>``; attribute writes and dynamic namespace writes can reach
+    the module regardless.
+    """
+    declares_global = any(
+        isinstance(child, ast.Global) and name in child.names
+        for child in ast.walk(node)
+    )
+    if declares_global:
+        assignment_nodes = (
+            ast.Assign,
+            ast.AnnAssign,
+            ast.AugAssign,
+            ast.For,
+            ast.AsyncFor,
+            ast.With,
+            ast.AsyncWith,
+            ast.Delete,
+        )
+        if any(
+            name in _assignment_target_names(child)
+            for child in ast.walk(node)
+            if isinstance(child, assignment_nodes)
+        ):
+            return True
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id in _DYNAMIC_NAMESPACE_CALLS
+            ) or (
+                isinstance(func, ast.Attribute)
+                and func.attr in _DYNAMIC_NAMESPACE_CALLS
+            ):
+                return True
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "update"
+                and _is_module_dict_reference(func.value)
+                and (not child.args or any(
+                    keyword.arg is None or keyword.arg == name
+                    for keyword in child.keywords
+                ))
+            ):
+                return True
+        if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
+            if any(_target_writes_name(target, name) for target in targets):
+                return True
+    return False
+
+
+def _definition_writes_setting(node, name):
+    """Return True when defining or invoking ``node`` can write the setting."""
+    if isinstance(node, ast.ClassDef):
+        # Class-body statements run at import time. Method bodies only run when
+        # that specific method is invoked, so only lifecycle hooks that a
+        # constructor/context-manager call can reach are considered.
+        bodies = [
+            child
+            for child in node.body
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        lifecycle = {
+            "__init__",
+            "__new__",
+            "__post_init__",
+            "__enter__",
+            "__exit__",
+            "__call__",
+            "__init_subclass__",
+            "__set_name__",
+        }
+        bodies.extend(
+            child
+            for child in node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and child.name in lifecycle
+        )
+        return any(_body_writes_global_name(body, name) for body in bodies)
+    return _body_writes_global_name(node, name)
+
+
+def _local_writer_names(definitions, name):
+    """Return local definitions that can write ``name``, including transitively."""
+    writers = set()
+    changed = True
+    while changed:
+        changed = False
+        for definition_name, node in definitions.items():
+            if definition_name in writers:
+                continue
+            called = {
+                child.func.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+            }
+            if _definition_writes_setting(node, name) or called & writers:
+                writers.add(definition_name)
+                changed = True
+    return writers
+
+
 def config_provides_setting(path, name):
     """Return ``0``/``1``/``2`` for whether ``path`` assigns ``name``."""
     try:
@@ -380,6 +541,7 @@ def config_provides_setting(path, name):
     except (SyntaxError, RecursionError):
         return UNKNOWN
     dynamic = False
+    definitions = _module_local_definitions(tree.body)
     try:
         for node in _iter_module_assignments(tree.body):
             binding_kind = _import_binding_kind(node, name)
@@ -396,6 +558,13 @@ def config_provides_setting(path, name):
                 dynamic = True
             if _has_dynamic_namespace_write(node):
                 dynamic = True
+        # A local helper invoked at import time can assign the setting even
+        # though its body is not module scope. Only report uncertainty when the
+        # called helper can actually write it; an unrelated helper stays ABSENT.
+        if _called_local_names(tree.body, definitions) & _local_writer_names(
+            definitions, name
+        ):
+            dynamic = True
     except RecursionError:
         # A deeply nested expression is valid Python but beyond this walk.
         # Never claim ABSENT: the entrypoint would override the bind.
