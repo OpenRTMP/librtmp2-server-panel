@@ -37,14 +37,15 @@ def test_index_api_failure_keeps_health_reported_rtmps_badge(monkeypatch):
     assert "RTMPS disabled" not in body
 
 
-def test_stream_created_accepts_numeric_upstream_id(monkeypatch):
+@pytest.mark.parametrize("upstream_id", [0, 42])
+def test_stream_created_accepts_numeric_upstream_id(monkeypatch, upstream_id):
     with patch("app.Lrtmp2Client") as mock_client_cls:
         mock_client = mock_client_cls.return_value
         mock_client.health.return_value = {"rtmps_enabled": False}
-        mock_client.create_stream.return_value = {"id": 42}
+        mock_client.create_stream.return_value = {"id": upstream_id}
         mock_client.list_streams.return_value = [
             {
-                "id": 42,
+                "id": upstream_id,
                 "name": "Cam",
                 "publish_key": "pub_k",
                 "play_key": "pl_k",
