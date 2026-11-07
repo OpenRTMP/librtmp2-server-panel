@@ -393,6 +393,15 @@ def _target_writes_namespace(target, name):
     return False
 
 
+def _targets_write_global(targets, name):
+    """Return True when any assignment target writes the named global."""
+    return any(
+        _target_writes_name(target, name)
+        or _target_writes_namespace(target, name)
+        for target in targets
+    )
+
+
 def _has_dynamic_namespace_write(node, name):
     """Return True when a module-scope statement can write the named global.
 
@@ -403,19 +412,12 @@ def _has_dynamic_namespace_write(node, name):
     for child in _iter_module_scope_nodes(node):
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
-            if any(
-                _target_writes_name(target, name)
-                or _target_writes_namespace(target, name)
-                for target in targets
-            ):
+            if _targets_write_global(targets, name):
                 return True
-        elif isinstance(child, ast.Delete):
-            if any(
-                _target_writes_name(target, name)
-                or _target_writes_namespace(target, name)
-                for target in child.targets
-            ):
-                return True
+        elif isinstance(child, ast.Delete) and _targets_write_global(
+            child.targets, name
+        ):
+            return True
         elif isinstance(child, ast.Call) and _call_writes_global(child, name):
             return True
     return False
@@ -457,6 +459,99 @@ def _local_callable_reference(value, definitions, aliases):
     return None
 
 
+def _assignment_targets_and_value(statement):
+    """Return ``(targets, value)`` for a module-scope assignment statement."""
+    if isinstance(statement, ast.Assign):
+        return statement.targets, statement.value
+    if isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        return (statement.target,), statement.value
+    return (), None
+
+
+def _collect_aliases(statements, definitions):
+    """Collect simple ``alias = local_callable`` bindings."""
+    aliases = {}
+    for statement in _iter_module_assignments(statements):
+        targets, value = _assignment_targets_and_value(statement)
+        if value is None:
+            continue
+        source = _local_callable_reference(value, definitions, aliases)
+        if source is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases[target.id] = source
+    return aliases
+
+
+def _add_resolved_name(target, names, definitions, aliases):
+    """Add the local definition named by ``target`` to ``names``."""
+    if not isinstance(target, ast.Name):
+        return
+    resolved = _resolve_local_name(target.id, definitions, aliases)
+    if resolved:
+        names.add(resolved)
+
+
+def _definition_invoked_names(statement, definitions, aliases):
+    """Return decorators and local base classes that run during definition."""
+    names = set()
+    if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return names
+    for decorator in statement.decorator_list:
+        _add_resolved_name(decorator, names, definitions, aliases)
+    if isinstance(statement, ast.ClassDef):
+        # A local base runs its __init_subclass__/metaclass hooks.
+        for base in statement.bases:
+            _add_resolved_name(base, names, definitions, aliases)
+    return names
+
+
+def _partial_target(call, definitions, aliases):
+    """Return the local callable a ``partial(...)`` call wraps, if any."""
+    if not call.args:
+        return None
+    return _local_callable_reference(call.args[0], definitions, aliases)
+
+
+def _name_call_invoked_name(func, node, definitions, aliases):
+    """Return the local definition a ``name(...)`` call invokes."""
+    resolved = _resolve_local_name(func.id, definitions, aliases)
+    if func.id == "partial":
+        resolved = _partial_target(node, definitions, aliases) or resolved
+    return resolved
+
+
+def _attribute_call_invoked_names(func, node, definitions, aliases):
+    """Return local definitions reached by an ``obj.method(...)`` call."""
+    names = set()
+    # functools.partial(configure)
+    if func.attr == "partial":
+        resolved = _partial_target(node, definitions, aliases)
+        if resolved:
+            names.add(resolved)
+    # Configure().apply() or instance.apply()
+    receiver = func.value
+    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+        _add_resolved_name(receiver.func, names, definitions, aliases)
+    elif isinstance(receiver, ast.Name):
+        _add_resolved_name(receiver, names, definitions, aliases)
+    return names
+
+
+def _call_invoked_names(node, definitions, aliases):
+    """Return local definitions a module-scope call can reach."""
+    if not isinstance(node, ast.Call):
+        return set()
+    func = node.func
+    if isinstance(func, ast.Name):
+        resolved = _name_call_invoked_name(func, node, definitions, aliases)
+        return {resolved} if resolved else set()
+    if isinstance(func, ast.Attribute):
+        return _attribute_call_invoked_names(func, node, definitions, aliases)
+    return set()
+
+
 def _called_local_names(statements, definitions):
     """Return local definitions invoked while the config module is imported.
 
@@ -466,112 +561,99 @@ def _called_local_names(statements, definitions):
     count when that function is invoked, which the transitive writer check
     below models.
     """
-    aliases = {}
-    for statement in _iter_module_assignments(statements):
-        targets = ()
-        value = None
-        if isinstance(statement, ast.Assign):
-            targets = statement.targets
-            value = statement.value
-        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
-            targets = (statement.target,)
-            value = statement.value
-        if value is None:
-            continue
-        source = _local_callable_reference(value, definitions, aliases)
-        if source is None:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                aliases[target.id] = source
-
+    aliases = _collect_aliases(statements, definitions)
     called = set()
     for statement in _iter_module_assignments(statements):
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            for decorator in statement.decorator_list:
-                if isinstance(decorator, ast.Name):
-                    resolved = _resolve_local_name(decorator.id, definitions, aliases)
-                    if resolved:
-                        called.add(resolved)
-            if isinstance(statement, ast.ClassDef):
-                # A local base runs its __init_subclass__/metaclass hooks.
-                for base in statement.bases:
-                    if isinstance(base, ast.Name):
-                        resolved = _resolve_local_name(base.id, definitions, aliases)
-                        if resolved:
-                            called.add(resolved)
+        called.update(_definition_invoked_names(statement, definitions, aliases))
         for node in _iter_module_scope_nodes(statement):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if isinstance(func, ast.Name):
-                if func.id == "partial" and node.args:
-                    resolved = _local_callable_reference(
-                        node.args[0], definitions, aliases
-                    )
-                    if resolved:
-                        called.add(resolved)
-                else:
-                    resolved = _resolve_local_name(func.id, definitions, aliases)
-                    if resolved:
-                        called.add(resolved)
-            elif isinstance(func, ast.Attribute):
-                # functools.partial(configure)
-                if func.attr == "partial" and node.args:
-                    resolved = _local_callable_reference(
-                        node.args[0], definitions, aliases
-                    )
-                    if resolved:
-                        called.add(resolved)
-                # Configure().apply() or instance.apply()
-                if isinstance(func.value, ast.Call) and isinstance(
-                    func.value.func, ast.Name
-                ):
-                    resolved = _resolve_local_name(
-                        func.value.func.id, definitions, aliases
-                    )
-                    if resolved:
-                        called.add(resolved)
-                elif isinstance(func.value, ast.Name):
-                    resolved = _resolve_local_name(
-                        func.value.id, definitions, aliases
-                    )
-                    if resolved:
-                        called.add(resolved)
+            called.update(_call_invoked_names(node, definitions, aliases))
     return called
 
 
-def _assignment_target_names(node):
-    """Return the simple names bound by one assignment-like node."""
-    targets = ()
-    if isinstance(node, ast.Assign):
-        targets = tuple(node.targets)
-    elif isinstance(node, ast.AnnAssign):
-        if node.value is None:
-            return set()
-        targets = (node.target,)
-    elif isinstance(node, (ast.AugAssign, ast.For, ast.AsyncFor)):
-        targets = (node.target,)
-    elif isinstance(node, (ast.With, ast.AsyncWith)):
-        targets = tuple(
-            item.optional_vars for item in node.items if item.optional_vars is not None
-        )
-    elif isinstance(node, ast.Delete):
-        targets = tuple(node.targets)
-    elif isinstance(node, ast.NamedExpr):
-        targets = (node.target,)
-    elif isinstance(node, ast.Import):
+def _import_target_names(node):
+    """Return names bound by an import node."""
+    if isinstance(node, ast.Import):
         return {
             alias.asname or alias.name.split(".", 1)[0]
             for alias in node.names
         }
-    elif isinstance(node, ast.ImportFrom):
-        return {alias.asname or alias.name for alias in node.names if alias.name != "*"}
-    elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+    if isinstance(node, ast.ImportFrom):
+        return {
+            alias.asname or alias.name
+            for alias in node.names
+            if alias.name != "*"
+        }
+    return set()
+
+
+def _assignment_targets(node):
+    """Return the target nodes of one assignment-like statement."""
+    if isinstance(node, ast.Assign):
+        return tuple(node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return (node.target,) if node.value is not None else ()
+    if isinstance(node, (ast.AugAssign, ast.For, ast.AsyncFor, ast.NamedExpr)):
+        return (node.target,)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return tuple(
+            item.optional_vars for item in node.items if item.optional_vars is not None
+        )
+    if isinstance(node, ast.Delete):
+        return tuple(node.targets)
+    return ()
+
+
+def _assignment_target_names(node):
+    """Return the simple names bound by one assignment-like node."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return _import_target_names(node)
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)):
         return {node.name} if node.name else set()
-    elif isinstance(node, ast.ExceptHandler) and node.name:
+    if isinstance(node, ast.ExceptHandler) and node.name:
         return {node.name}
+    targets = _assignment_targets(node)
     return {name for target in targets for name in _target_names(target)}
+
+
+_BINDING_NODES = (
+    ast.Assign,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.For,
+    ast.AsyncFor,
+    ast.With,
+    ast.AsyncWith,
+    ast.Delete,
+    ast.Import,
+    ast.ImportFrom,
+    ast.NamedExpr,
+    ast.MatchAs,
+    ast.MatchStar,
+    ast.ExceptHandler,
+)
+
+
+def _declares_global(node, name):
+    """Return True when ``node`` declares ``global <name>``."""
+    return any(
+        isinstance(child, ast.Global) and name in child.names
+        for child in ast.walk(node)
+    )
+
+
+def _binds_global(node, name):
+    """Return True when ``node`` contains a binding for ``name``."""
+    return any(
+        name in _assignment_target_names(child)
+        for child in ast.walk(node)
+        if isinstance(child, _BINDING_NODES)
+    )
+
+
+def _assignment_writes_global(node, name):
+    """Return True when an assignment target writes the named global."""
+    targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+    return _targets_write_global(targets, name)
 
 
 def _body_writes_global_name(node, name):
@@ -581,80 +663,15 @@ def _body_writes_global_name(node, name):
     ``global <name>``; attribute writes and dynamic namespace writes can reach
     the module regardless.
     """
-    declares_global = any(
-        isinstance(child, ast.Global) and name in child.names
-        for child in ast.walk(node)
-    )
-    if declares_global:
-        binding_nodes = (
-            ast.Assign,
-            ast.AnnAssign,
-            ast.AugAssign,
-            ast.For,
-            ast.AsyncFor,
-            ast.With,
-            ast.AsyncWith,
-            ast.Delete,
-            ast.Import,
-            ast.ImportFrom,
-            ast.NamedExpr,
-            ast.MatchAs,
-            ast.MatchStar,
-            ast.ExceptHandler,
-        )
-        if any(
-            name in _assignment_target_names(child)
-            for child in ast.walk(node)
-            if isinstance(child, binding_nodes)
+    if _declares_global(node, name) and _binds_global(node, name):
+        return True
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and _call_writes_global(child, name):
+            return True
+        if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and (
+            _assignment_writes_global(child, name)
         ):
             return True
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            func = child.func
-            if (
-                isinstance(func, ast.Name)
-                and func.id in {"exec", "eval", "setattr"}
-            ) or (
-                isinstance(func, ast.Attribute)
-                and func.attr in {"exec", "eval", "setattr"}
-            ):
-                return True
-            if isinstance(func, ast.Attribute) and func.attr in {
-                "get",
-                "keys",
-                "items",
-                "values",
-                "copy",
-            } and _is_namespace_reference(func.value):
-                # A read-only namespace lookup cannot bind the setting.
-                continue
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr in {"update", "setdefault", "pop"}
-                and (
-                    _is_namespace_reference(func.value)
-                    or _is_module_dict_reference(func.value)
-                )
-                and (
-                    bool(child.args)
-                    or any(
-                        keyword.arg is None or keyword.arg == name
-                        for keyword in child.keywords
-                    )
-                )
-            ):
-                return True
-        if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
-            if any(_target_writes_name(target, name) for target in targets):
-                return True
-            if any(
-                _is_namespace_reference(getattr(target, "value", None))
-                and isinstance(target, ast.Subscript)
-                and _subscript_may_name(target.slice, name)
-                for target in targets
-            ):
-                return True
     return False
 
 
@@ -668,6 +685,22 @@ def _definition_writes_setting(node, name):
     return _body_writes_global_name(node, name)
 
 
+def _called_names_in_definition(node):
+    """Return direct local names called anywhere in ``node``."""
+    return {
+        child.func.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+
+
+def _definition_is_writer(node, name, writers):
+    """Return True when ``node`` writes the setting or calls a known writer."""
+    return _definition_writes_setting(node, name) or bool(
+        _called_names_in_definition(node) & writers
+    )
+
+
 def _local_writer_names(definitions, name):
     """Return local definitions that can write ``name``, including transitively."""
     writers = set()
@@ -677,18 +710,31 @@ def _local_writer_names(definitions, name):
         for definition_name, nodes in definitions.items():
             if definition_name in writers:
                 continue
-            for node in nodes:
-                called = {
-                    child.func.id
-                    for child in ast.walk(node)
-                    if isinstance(child, ast.Call)
-                    and isinstance(child.func, ast.Name)
-                }
-                if _definition_writes_setting(node, name) or called & writers:
-                    writers.add(definition_name)
-                    changed = True
-                    break
+            if any(_definition_is_writer(node, name, writers) for node in nodes):
+                writers.add(definition_name)
+                changed = True
     return writers
+
+
+def _scan_module_bindings(statements, name):
+    """Return ``(SUPPLIED or None, dynamic)`` for module-scope statements."""
+    dynamic = False
+    for node in _iter_module_assignments(statements):
+        binding_kind = _import_binding_kind(node, name)
+        if binding_kind == "explicit":
+            return SUPPLIED, dynamic
+        if binding_kind == "wildcard":
+            # A wildcard may or may not export this setting. The bind caller
+            # treats UNKNOWN as supplied (safe), while the app caller keeps its
+            # default because it only accepts SUPPLIED.
+            dynamic = True
+        if name in _assigned_target_names(node):
+            return SUPPLIED, dynamic
+        if _statement_writes_named_attribute(node, name):
+            dynamic = True
+        if _has_dynamic_namespace_write(node, name):
+            dynamic = True
+    return None, dynamic
 
 
 def config_provides_setting(path, name):
@@ -704,24 +750,11 @@ def config_provides_setting(path, name):
         tree = ast.parse(source, filename=str(path))
     except (SyntaxError, RecursionError):
         return UNKNOWN
-    dynamic = False
     try:
         definitions = _module_local_definitions(tree.body)
-        for node in _iter_module_assignments(tree.body):
-            binding_kind = _import_binding_kind(node, name)
-            if binding_kind == "explicit":
-                return SUPPLIED
-            if binding_kind == "wildcard":
-                # A wildcard may or may not export this setting. The bind caller
-                # treats UNKNOWN as supplied (safe), while the app caller keeps its
-                # default because it only accepts SUPPLIED.
-                dynamic = True
-            if name in _assigned_target_names(node):
-                return SUPPLIED
-            if _statement_writes_named_attribute(node, name):
-                dynamic = True
-            if _has_dynamic_namespace_write(node, name):
-                dynamic = True
+        supplied, dynamic = _scan_module_bindings(tree.body, name)
+        if supplied == SUPPLIED:
+            return SUPPLIED
         # A local helper invoked at import time can assign the setting even
         # though its body is not module scope. Only report uncertainty when the
         # called helper can actually write it; an unrelated helper stays ABSENT.
