@@ -1074,7 +1074,7 @@ class _PanelRuntime:
             return render_template(CREATE_STREAM_HTML, error=error, form=form)
 
         created_id, error = self._create_stream(values)
-        if created_id:
+        if created_id is not None:
             return redirect(url_for("stream_created", stream_id=created_id))
         return render_template(CREATE_STREAM_HTML, error=error, form=form)
 
@@ -1151,7 +1151,7 @@ class _PanelRuntime:
         except Lrtmp2ApiError as exc:
             return None, str(exc)
         created_id = result.get("id") if isinstance(result, dict) else None
-        if not created_id:
+        if not _is_usable_id(created_id) or created_id == "":
             self.app.logger.warning("Create stream: server returned an invalid response")
             return None, "Server returned an invalid create-stream response."
         self.app.logger.info("Stream created (stream_tag=%s)", self._stream_tag(str(created_id)))
