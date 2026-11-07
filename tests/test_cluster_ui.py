@@ -27,7 +27,9 @@ def _stream_row():
 
 
 @contextlib.contextmanager
-def _cluster_index_client(monkeypatch, cluster_status, cluster_streams):
+def _cluster_index_client(
+    monkeypatch, cluster_status, cluster_streams, stream_row=None
+):
     """Yield a logged-in test client whose cluster endpoints return the payloads."""
     from lrtmp2_client import Lrtmp2ApiError
 
@@ -35,7 +37,7 @@ def _cluster_index_client(monkeypatch, cluster_status, cluster_streams):
         mock_client = mock_client_cls.return_value
         mock_client.health.side_effect = Lrtmp2ApiError("health timeout")
         mock_client.cluster_status.return_value = cluster_status
-        mock_client.list_streams.return_value = [_stream_row()]
+        mock_client.list_streams.return_value = [stream_row or _stream_row()]
         mock_client.cluster_streams.return_value = cluster_streams
 
         import app as app_module
@@ -160,6 +162,34 @@ def test_index_loads_placement_when_health_unknown(monkeypatch):
         assert b'data-cluster="1"' in r.data
         assert mock_client.cluster_status.call_count == 1
         assert mock_client.cluster_streams.call_count == 1
+
+
+def test_numeric_zero_cluster_stream_id_is_not_dropped(monkeypatch):
+    # Numeric scalar ids (including 0) are valid URL arguments; `or` used to
+    # treat 0 as missing, so the placement metadata was dropped or attached to
+    # a different stream.
+    row = _stream_row()
+    row["id"] = 0
+    cluster_streams = [
+        {
+            "stream_id": 0,
+            "owner_node_id": 1,
+            "epoch": 7,
+            "subscribed_nodes": [],
+            "standby_nodes": [],
+            "cluster_players": 0,
+        }
+    ]
+    with _cluster_index_client(
+        monkeypatch,
+        {"enabled": True, "cluster_id": "cid-1", "quorum": True},
+        cluster_streams,
+        stream_row=row,
+    ) as (client, _mock_client):
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"Cluster placement" in r.data
+        assert b"Ownership epoch" in r.data
 
 
 def test_index_normalizes_mistyped_cluster_node_lists(monkeypatch):

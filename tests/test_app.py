@@ -112,6 +112,23 @@ def test_stats_rate_limit_defaults(monkeypatch):
     assert config.Config.STATS_RATE_LIMIT_PER_STREAM == 25
 
 
+def test_limiter_storage_errors_include_cluster_exceptions(app_client):
+    """redis+cluster backends raise RedisClusterException, not RedisError."""
+    redis = pytest.importorskip("redis")
+    cluster_exception = getattr(redis.exceptions, "RedisClusterException", None)
+    if cluster_exception is None:
+        pytest.skip("installed redis-py has no RedisClusterException")
+    client, _mock_client = app_client
+    application = client.application
+    with application.test_request_context("/"):
+        response = application.handle_user_exception(
+            cluster_exception("cluster connection lost")
+        )
+    # The registered handler returns a (body, status) tuple; Flask finalizes it
+    # later, so assert on the status element.
+    assert response[1] == 503
+
+
 def test_config_rejects_env_example_placeholders(monkeypatch):
     valid = {
         "SECRET_KEY": "valid-test-secret-key-for-placeholder-check",

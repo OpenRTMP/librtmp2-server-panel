@@ -45,6 +45,9 @@ INDEX_HTML = "index.html"
 CREATE_STREAM_HTML = "create_stream.html"
 LOGIN_HTML = "login.html"
 ERR_INVALID_STREAM_ID = "Invalid stream ID"
+# Site-wide Flask-Limiter budget. Kept as one constant so the stats route's
+# unauthenticated fallback cannot drift from the Limiter default.
+DEFAULT_RATE_LIMIT = "100 per minute"
 
 ACCESS_KEY_HELP = (
     f"Must be {MIN_ACCESS_KEY_LEN}-63 characters and use only letters, numbers, dots, "
@@ -370,7 +373,7 @@ class _PanelRuntime:
         self.limiter = Limiter(
             key_func=self._rate_limit_remote_addr,
             app=app,
-            default_limits=["100 per minute"],
+            default_limits=[DEFAULT_RATE_LIMIT],
             storage_uri=app.config["RATELIMIT_STORAGE_URI"],
             # Bound how long a rate-limit check can block on the storage backend.
             # Without this, a Redis instance that's up but not responding hangs
@@ -394,10 +397,20 @@ class _PanelRuntime:
             import redis
         except ImportError:
             return
-        self.app.register_error_handler(
-            redis.exceptions.RedisError,
-            self.handle_limiter_storage_error,
+        exception_types = [redis.exceptions.RedisError]
+        # redis-py's cluster client raises RedisClusterException, which is not
+        # a subclass of RedisError; register it too so a cluster backend
+        # outage gets the same controlled 503 instead of an unhandled 500.
+        cluster_exception = getattr(
+            redis.exceptions, "RedisClusterException", None
         )
+        if cluster_exception is not None:
+            exception_types.append(cluster_exception)
+        for exception_type in exception_types:
+            self.app.register_error_handler(
+                exception_type,
+                self.handle_limiter_storage_error,
+            )
 
     def handle_limiter_storage_error(self, error):
         """Answer a rate-limit storage outage with the controlled 503 used for
@@ -577,12 +590,22 @@ class _PanelRuntime:
         stats_stream_limit = (
             f"{self.app.config['STATS_RATE_LIMIT_PER_STREAM']} per minute"
         )
+        # The view is exempted from Flask-Limiter's default limit below so an
+        # authenticated dashboard can poll more than 100 stats requests per
+        # minute under the scoped budgets. Unauthenticated/invalid requests do
+        # not consume those scoped buckets, so this extra limit supplies the
+        # site-wide default budget that the view-level exemption removes.
+        hook = self.limiter.limit(
+            DEFAULT_RATE_LIMIT,
+            key_func=self._rate_limit_remote_addr,
+            exempt_when=lambda: self._stats_unauthenticated_default_exempt(),
+        )(self._stream_stats_rate_limit)
         hook = self.limiter.limit(
             stats_stream_limit,
             key_func=self._stats_rate_limit_key,
             exempt_when=lambda: self._stream_stats_route_rate_limit_exempt()
             or self._stats_per_stream_rate_limit_exempt(),
-        )(self._stream_stats_rate_limit)
+        )(hook)
         hook = self.limiter.limit(
             stats_ip_limit,
             key_func=self._rate_limit_remote_addr,
@@ -590,6 +613,24 @@ class _PanelRuntime:
             or self._stats_ip_rate_limit_exempt(),
         )(hook)
         self.app.before_request(hook)
+
+    def _stats_unauthenticated_default_exempt(self):
+        """Keep the default budget off authenticated stats polling only.
+
+        An unauthenticated or invalid-id request is already exempt from the
+        scoped per-stream/per-IP stats budgets; applying the site-wide default
+        here bounds an anonymous flood without capping a logged-in dashboard.
+        """
+        if request.endpoint != "stream_stats":
+            return True
+        if not self.app.config["REQUIRE_LOGIN"]:
+            return True
+        try:
+            return self._session_is_authenticated()
+        except SessionBackendUnavailable:
+            # The login gate answers 503; keep that observable instead of
+            # turning the outage into a 429 for the first 100 requests.
+            return True
 
     def rtmps_from_health(self, health):
         """Derive RTMPS flags from an already-fetched /health payload."""
@@ -872,7 +913,9 @@ class _PanelRuntime:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            sid = entry.get("stream_id") or entry.get("id")
+            sid = entry.get("stream_id")
+            if sid is None:
+                sid = entry.get("id")
             if isinstance(sid, CLUSTER_KEY_TYPES):
                 # index.html joins these lists, so a mistyped scalar would raise
                 # TypeError in Jinja and 500 the whole page.
