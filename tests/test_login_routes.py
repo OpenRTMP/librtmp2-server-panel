@@ -577,6 +577,35 @@ def test_unauthenticated_stats_requests_do_not_consume_rate_limit():
             assert r.status_code == 200
 
 
+def test_unauthenticated_stats_requests_are_bounded_by_the_default_limit():
+    """Anonymous stats polling must not bypass every rate limiter.
+
+    The route is exempt from the site-wide default so a logged-in dashboard can
+    use the scoped budgets; unauthenticated requests are exempt from those
+    scoped budgets, so they need their own bounded bucket.
+    """
+    with patch("app.Lrtmp2Client") as mock_client_cls, patch(
+        "app.Config.RATELIMIT_STORAGE_URI", "memory://"
+    ):
+        mock_api = mock_client_cls.return_value
+        mock_api.health.return_value = {"rtmps_enabled": False}
+        mock_api.list_streams.return_value = []
+        mock_api.stream_stats_by_id.return_value = {"streams": []}
+
+        import app as app_module
+
+        application = app_module.create_app()
+        configure_testing_app(application)
+        application.config["REQUIRE_LOGIN"] = True
+        client = application.test_client()
+
+        statuses = [
+            client.get("/streams/s1/stats.json").status_code for _ in range(110)
+        ]
+        assert statuses.count(429) >= 1
+        assert statuses[0] == 401
+
+
 def test_create_stream_get_renders_form(app_client):
     client, _mock_api = app_client
     r = client.get("/streams/new")
