@@ -11235,12 +11235,40 @@ def _statement_schedules_mutating_asyncio_task(
     )
 
 
+def _async_for_iter_mutates_workers(
+    node,
+    operator_bindings,
+    reference_line,
+):
+    """Return True when an ``async for`` eagerly dispatches a mutating ``__aiter__``."""
+    if not isinstance(node, ast.AsyncFor):
+        return False
+    class_targets = _operator_bindings_class_targets(operator_bindings)
+    if not class_targets:
+        return False
+    methods = class_targets[1] if len(class_targets) > 1 else set()
+    instance_events = class_targets[6] if len(class_targets) > 6 else {}
+    return _implicit_dunder_dispatch_triggers_workers(
+        node.iter,
+        "__aiter__",
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
 def _async_statement_has_mutating_awaitable(
     node, operator_bindings, reference_line, local_state, seen
 ):
     """Detect directly awaited, scheduled, or registered worker mutations."""
     return (
-        _statement_awaits_mutating_asyncio(
+        _async_for_iter_mutates_workers(
+            node,
+            operator_bindings,
+            reference_line,
+        )
+        or _statement_awaits_mutating_asyncio(
             node, operator_bindings, reference_line, local_state, seen
         )
         or _statement_schedules_mutating_asyncio_task(
@@ -16920,6 +16948,20 @@ def _expression_triggers_class_workers_side_effect(
             instance_events,
             reference_line,
         )
+        or _pickle_dumps_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
+        or _copy_deepcopy_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
     )
 
 
@@ -22006,6 +22048,89 @@ def _unary_op_dunder_triggers_workers(
     return _implicit_dunder_dispatch_triggers_workers(
         expr.operand,
         dunder,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+_PICKLE_SERIALIZATION_HOOKS = frozenset(
+    {"__getstate__", "__reduce__", "__reduce_ex__"}
+)
+
+
+def _serialization_hooks_trigger_workers_on_arg(
+    arg,
+    hooks,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when serializing ``arg`` may invoke a mutating pickle hook."""
+    return any(
+        _implicit_dunder_dispatch_triggers_workers(
+            arg,
+            hook,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
+        for hook in hooks
+    )
+
+
+def _pickle_dumps_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when ``pickle.dumps`` runs a mutating serialization hook."""
+    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
+        return False
+    func = expr.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "dumps"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "pickle"
+    ):
+        return False
+    return _serialization_hooks_trigger_workers_on_arg(
+        expr.args[0],
+        _PICKLE_SERIALIZATION_HOOKS,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _copy_deepcopy_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when ``copy.deepcopy`` runs a mutating serialization hook."""
+    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
+        return False
+    func = expr.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "deepcopy"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "copy"
+    ):
+        return False
+    return _serialization_hooks_trigger_workers_on_arg(
+        expr.args[0],
+        _PICKLE_SERIALIZATION_HOOKS,
         methods,
         class_targets,
         instance_events,
