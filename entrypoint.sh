@@ -199,12 +199,14 @@ bind_configured() {
 # itself (``wsgi_app``). Gunicorn serves the first positional argument in
 # preference to ``wsgi_app``, so the image's default application must not be
 # added when the operator's config already supplies one. An uninspectable
-# configuration is not treated as supplied here: without a positional argument
-# and without the default, Gunicorn would refuse to start.
+# configuration counts as supplied: the alternative would silently override a
+# wrapper (for example an auth or IP-allowlist app) the probe cannot see. If the
+# config truly has no ``wsgi_app``, Gunicorn fails loudly instead of serving
+# the wrong application.
 config_supplies_app() {
     probe_status=0
     config_probe wsgi-app "$@" || probe_status=$?
-    [ "$probe_status" -eq 0 ]
+    [ "$probe_status" -ne 1 ]
 }
 
 # The image's default command (kept in sync with the Dockerfile CMD). Without

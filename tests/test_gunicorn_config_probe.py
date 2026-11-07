@@ -181,6 +181,164 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
         # A dynamic write inside a function that the module never calls does
         # not run at import time; the probe must still see a plain ABSENT.
         ("def configure():\n    globals()['bind'] = []\n", probe.ABSENT),
+        # A called helper runs at import time. If it can rebind the setting,
+        # the probe must not claim ABSENT and let the image override it.
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = ['127.0.0.1:9000']\n"
+            "configure()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "def wrapper():\n"
+            "    configure()\n"
+            "wrapper()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "def deco(fn):\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "    return fn\n"
+            "@deco\n"
+            "def handler():\n"
+            "    pass\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "class Configure:\n"
+            "    def __init__(self):\n"
+            "        global bind\n"
+            "        bind = []\n"
+            "Configure()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "class Ctx:\n"
+            "    def __enter__(self):\n"
+            "        global bind\n"
+            "        bind = []\n"
+            "    def __exit__(self, *args):\n"
+            "        pass\n"
+            "with Ctx():\n"
+            "    pass\n",
+            probe.UNKNOWN,
+        ),
+        # A local-only assignment stays in the helper's namespace, and an
+        # unrelated called helper cannot write the setting: both stay ABSENT.
+        (
+            "def configure():\n"
+            "    bind = ['127.0.0.1:9000']\n"
+            "configure()\n",
+            probe.ABSENT,
+        ),
+        (
+            "def helper():\n"
+            "    return 1\n"
+            "helper()\n"
+            "workers = 1\n",
+            probe.ABSENT,
+        ),
+        # A read-only namespace lookup does not bind the setting.
+        (
+            "value = globals().get('workers')\n",
+            probe.ABSENT,
+        ),
+        # Definitions nested in an if/try block still run at import time.
+        (
+            "if True:\n"
+            "    def deco(fn):\n"
+            "        global bind\n"
+            "        bind = []\n"
+            "        return fn\n"
+            "    @deco\n"
+            "    def handler():\n"
+            "        pass\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "if True:\n"
+            "    class Base:\n"
+            "        def __init_subclass__(cls):\n"
+            "            global bind\n"
+            "            bind = []\n"
+            "    class Child(Base):\n"
+            "        pass\n",
+            probe.UNKNOWN,
+        ),
+        # Aliases, partial wrappers and instance method calls can reach a
+        # writer without spelling its name at the call site.
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "f = configure\n"
+            "f()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "from functools import partial\n"
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "partial(configure)()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "class Configure:\n"
+            "    def apply(self):\n"
+            "        global bind\n"
+            "        bind = []\n"
+            "Configure().apply()\n",
+            probe.UNKNOWN,
+        ),
+        # A later redefinition that writes the setting must win over an
+        # earlier read-only definition with the same name.
+        (
+            "def configure():\n"
+            "    pass\n"
+            "def configure():\n"
+            "    global bind\n"
+            "    bind = []\n"
+            "configure()\n",
+            probe.UNKNOWN,
+        ),
+        # Other binding forms in a called helper with a global declaration.
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    (bind := [])\n"
+            "configure()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "def configure():\n"
+            "    global bind\n"
+            "    import os as bind\n"
+            "configure()\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "def configure(value):\n"
+            "    global bind\n"
+            "    match value:\n"
+            "        case [bind]:\n"
+            "            pass\n"
+            "configure([1])\n",
+            probe.UNKNOWN,
+        ),
+        # Positional __dict__.update arguments may contain the key.
+        (
+            "import sys\n"
+            "def configure():\n"
+            "    sys.modules[__name__].__dict__.update({'bind': []})\n"
+            "configure()\n",
+            probe.UNKNOWN,
+        ),
         # A walrus inside a lambda or nested function binds that local scope,
         # not the module, so it must not suppress the image default bind.
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
