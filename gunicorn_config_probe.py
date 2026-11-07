@@ -546,7 +546,11 @@ def _assignment_target_names(node):
     targets = ()
     if isinstance(node, ast.Assign):
         targets = tuple(node.targets)
-    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+    elif isinstance(node, ast.AnnAssign):
+        if node.value is None:
+            return set()
+        targets = (node.target,)
+    elif isinstance(node, (ast.AugAssign, ast.For, ast.AsyncFor)):
         targets = (node.target,)
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         targets = tuple(
