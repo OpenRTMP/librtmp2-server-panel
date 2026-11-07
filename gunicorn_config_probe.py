@@ -589,18 +589,18 @@ def _import_target_names(node):
 def _assignment_targets(node):
     """Return the target nodes of one assignment-like statement."""
     if isinstance(node, ast.Assign):
-        return tuple(node.targets)
+        return list(node.targets)
     if isinstance(node, ast.AnnAssign):
-        return (node.target,) if node.value is not None else ()
+        return [node.target] if node.value is not None else []
     if isinstance(node, (ast.AugAssign, ast.For, ast.AsyncFor, ast.NamedExpr)):
-        return (node.target,)
+        return [node.target]
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        return tuple(
+        return [
             item.optional_vars for item in node.items if item.optional_vars is not None
-        )
+        ]
     if isinstance(node, ast.Delete):
-        return tuple(node.targets)
-    return ()
+        return list(node.targets)
+    return []
 
 
 def _assignment_target_names(node):
