@@ -30,6 +30,7 @@ async function copyToClipboard(element) {
 }
 
 function copyWithTextarea(text) {
+    const previousFocus = document.activeElement;
     const textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.setAttribute('readonly', '');
@@ -44,6 +45,9 @@ function copyWithTextarea(text) {
         }
     } finally {
         textarea.remove();
+        if (previousFocus && typeof previousFocus.focus === 'function' && previousFocus.isConnected) {
+            previousFocus.focus();
+        }
     }
 }
 
