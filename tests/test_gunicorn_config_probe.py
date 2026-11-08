@@ -384,6 +384,22 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
             "configure()\n",
             probe.UNKNOWN,
         ),
+        # Type-bound namespace stores match the worker scanner hook gate.
+        ("dict.__setitem__(globals(), 'bind', [])\n", probe.UNKNOWN),
+        (
+            "import operator\n"
+            "operator.setitem(globals(), 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import sys\n"
+            "object.__setattr__(sys.modules[__name__], 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "getattr(dict, '__setitem__')(globals(), 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
         # A walrus inside a lambda or nested function binds that local scope,
         # not the module, so it must not suppress the image default bind.
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
