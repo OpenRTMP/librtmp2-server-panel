@@ -17,7 +17,11 @@ from flask_wtf.csrf import CSRFError, CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, RATELIMIT_MEMORY_URI, client_ip_for_rate_limit
-from lrtmp2_client import Lrtmp2ApiError, Lrtmp2Client
+from lrtmp2_client import (
+    Lrtmp2ApiError,
+    Lrtmp2Client,
+    Lrtmp2RateLimitError,
+)
 from session_store import (
     SessionBackendUnavailable,
     create_session_store,
@@ -1308,6 +1312,15 @@ class _PanelRuntime:
             return jsonify({"error": ERR_INVALID_STREAM_ID}), 400
         try:
             return jsonify(self.client.stream_stats_by_id(stream_id))
+        except Lrtmp2RateLimitError as exc:
+            # Surface the upstream budget instead of masking it as a 502: the
+            # dashboard's stats poller backs off on 429 and keeps the last
+            # good values on screen.
+            response = jsonify({"error": "Stats temporarily rate limited"})
+            response.status_code = 429
+            if exc.retry_after:
+                response.headers["Retry-After"] = exc.retry_after
+            return response
         except Lrtmp2ApiError:
             return jsonify({"error": "Failed to fetch stats"}), 502
 

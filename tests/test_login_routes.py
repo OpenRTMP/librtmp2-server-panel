@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 from flask_test_utils import configure_testing_app
 
+from lrtmp2_client import Lrtmp2RateLimitError
 from session_store import SessionBackendUnavailable
 
 
@@ -464,6 +465,16 @@ def test_stream_stats_json_api_failure_returns_502(app_client):
     r = client.get("/streams/s1/stats.json")
     assert r.status_code == 502
     assert r.get_json() == {"error": "Failed to fetch stats"}
+
+
+def test_stream_stats_json_maps_upstream_rate_limit_to_429(app_client):
+    client, mock_api = app_client
+    mock_api.stream_stats_by_id.side_effect = Lrtmp2RateLimitError(
+        "stats failed (HTTP 429)", "30"
+    )
+    r = client.get("/streams/s1/stats.json")
+    assert r.status_code == 429
+    assert r.headers["Retry-After"] == "30"
 
 
 def test_stream_stats_json_scoped_rate_limit_is_per_stream(app_client):
