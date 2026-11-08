@@ -38,4 +38,9 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -qO- http://localhost:8000/login || exit 1
 
 ENTRYPOINT ["entrypoint.sh"]
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--worker-class", "gthread", "--threads", "4", "--timeout", "450", "app:app"]
+# The entrypoint adds the default bind (and the worker flags) when the
+# effective Gunicorn configuration does not already supply a bind. Keeping
+# --bind out of the image CMD is required: Gunicorn applies CLI arguments
+# last, so a bind here would override an operator's GUNICORN_CMD_ARGS or
+# gunicorn.conf.py and expose the panel on 0.0.0.0.
+CMD ["app:app"]
