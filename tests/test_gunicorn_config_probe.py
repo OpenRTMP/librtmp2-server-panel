@@ -98,6 +98,18 @@ def test_config_path_python_reference_is_unresolvable(tmp_path):
     assert resolvable is False
 
 
+def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
+    """The probe must honor operator -c paths outside its working directory."""
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    config_file = tmp_path / "operator.conf.py"
+    config_file.write_text("bind = '127.0.0.1:9000'\n", encoding="utf-8")
+
+    assert probe._probe(
+        "bind", ["-c", "../operator.conf.py"], [], str(working_dir)
+    ) == probe.SUPPLIED
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
