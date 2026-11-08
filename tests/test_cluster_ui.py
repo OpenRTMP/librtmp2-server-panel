@@ -192,6 +192,31 @@ def test_numeric_zero_cluster_stream_id_is_not_dropped(monkeypatch):
         assert b"Ownership epoch" in r.data
 
 
+def test_empty_cluster_stream_id_falls_back_to_id(monkeypatch):
+    # An empty stream_id is not a usable id; the previous truthiness fallback
+    # used the entry's `id` instead of dropping the placement metadata.
+    cluster_streams = [
+        {
+            "stream_id": "",
+            "id": "stream42",
+            "owner_node_id": 1,
+            "epoch": 9,
+            "subscribed_nodes": [],
+            "standby_nodes": [],
+            "cluster_players": 1,
+        }
+    ]
+    with _cluster_index_client(
+        monkeypatch,
+        {"enabled": True, "cluster_id": "cid-1", "quorum": True},
+        cluster_streams,
+    ) as (client, _mock_client):
+        r = client.get("/")
+        assert r.status_code == 200
+        assert b"Cluster placement" in r.data
+        assert b"Ownership epoch" in r.data
+
+
 def test_index_normalizes_mistyped_cluster_node_lists(monkeypatch):
     # index.html joins subscribed/standby nodes, so a mistyped scalar used to
     # raise TypeError in Jinja and 500 the index page.
