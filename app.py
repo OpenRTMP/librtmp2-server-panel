@@ -592,9 +592,9 @@ class _PanelRuntime:
         )
         # The view is exempted from Flask-Limiter's default limit below so an
         # authenticated dashboard can poll more than 100 stats requests per
-        # minute under the scoped budgets. Unauthenticated/invalid requests do
-        # not consume those scoped buckets, so this extra limit supplies the
-        # site-wide default budget that the view-level exemption removes.
+        # minute under the scoped budgets. Unauthenticated requests are exempt
+        # from those scoped buckets, so this extra limit supplies the site-wide
+        # default budget that the view-level exemption removes.
         hook = self.limiter.limit(
             DEFAULT_RATE_LIMIT,
             key_func=self._rate_limit_remote_addr,
@@ -617,9 +617,9 @@ class _PanelRuntime:
     def _stats_unauthenticated_default_exempt(self):
         """Keep the default budget off authenticated stats polling only.
 
-        An unauthenticated or invalid-id request is already exempt from the
-        scoped per-stream/per-IP stats budgets; applying the site-wide default
-        here bounds an anonymous flood without capping a logged-in dashboard.
+        An unauthenticated request is exempt from the scoped per-stream and
+        per-IP stats budgets; applying the site-wide default here bounds an
+        anonymous flood without capping a logged-in dashboard.
         """
         if request.endpoint != "stream_stats":
             return True
@@ -628,9 +628,9 @@ class _PanelRuntime:
         try:
             return self._session_is_authenticated()
         except SessionBackendUnavailable:
-            # The login gate answers 503; keep that observable instead of
-            # turning the outage into a 429 for the first 100 requests.
-            return True
+            # A session-store outage must not remove the anonymous budget.
+            # The login gate still answers 503 for the requests that pass.
+            return False
 
     def rtmps_from_health(self, health):
         """Derive RTMPS flags from an already-fetched /health payload."""
@@ -914,7 +914,7 @@ class _PanelRuntime:
             if not isinstance(entry, dict):
                 continue
             sid = entry.get("stream_id")
-            if sid is None:
+            if sid is None or sid == "":
                 sid = entry.get("id")
             if isinstance(sid, CLUSTER_KEY_TYPES):
                 # index.html joins these lists, so a mistyped scalar would raise
