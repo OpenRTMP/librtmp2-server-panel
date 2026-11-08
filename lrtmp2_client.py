@@ -11,6 +11,14 @@ class Lrtmp2ApiError(Exception):
     pass
 
 
+class Lrtmp2RateLimitError(Lrtmp2ApiError):
+    """The upstream admin API answered 429; `retry_after` is its header value."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 # librtmp2-server's production DELETE_DRAIN_TIMEOUT is 300s (src/http.rs), but
 # the drain loop checks the deadline only after a serial per-peer cluster RPC
 # capped at 8s each (src/cluster/network.rs), so a successful delete can
@@ -82,6 +90,17 @@ def _api_error(resp, operation):
         if isinstance(err, str) and err:
             return Lrtmp2ApiError(f"{operation} failed: {err}")
     return Lrtmp2ApiError(msg)
+
+
+def _rate_limit_error(resp, operation):
+    """Return a rate-limit-specific error so callers can surface 429/Retry-After."""
+    retry_after = None
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        value = headers.get("Retry-After")
+        if isinstance(value, str) and value.strip():
+            retry_after = value.strip()
+    return Lrtmp2RateLimitError(f"{operation} failed (HTTP 429)", retry_after)
 
 
 def _parse_json(resp, operation):
@@ -170,6 +189,8 @@ class Lrtmp2Client:
         endpoint that returns a body (i.e. everything but the 404-tolerant
         deletes, which need their own status handling)."""
         resp = self._request(request_func, url, operation, **kwargs)
+        if getattr(resp, "status_code", None) == 429:
+            raise _rate_limit_error(resp, operation)
         if not resp.ok:
             raise _api_error(resp, operation)
         return _parse_json(resp, operation)

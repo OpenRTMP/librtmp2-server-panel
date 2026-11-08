@@ -7,6 +7,7 @@ from lrtmp2_client import (
     DELETE_STREAM_DRAIN_WAIT_SECONDS,
     Lrtmp2ApiError,
     Lrtmp2Client,
+    Lrtmp2RateLimitError,
 )
 
 
@@ -232,6 +233,18 @@ def test_admin_mutations_use_longer_timeout_than_reads():
         for call in mock_delete.call_args_list
     )
     assert mock_get.call_args.kwargs["timeout"] == client.timeout
+
+
+def test_rate_limited_upstream_raises_a_specific_error_with_retry_after():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.get") as mock_get:
+        response = mock_get.return_value
+        response.ok = False
+        response.status_code = 429
+        response.headers = {"Retry-After": "30"}
+        with pytest.raises(Lrtmp2RateLimitError) as exc:
+            client.health()
+    assert exc.value.retry_after == "30"
 
 
 def test_admin_timeout_never_shortens_a_caller_supplied_timeout():
