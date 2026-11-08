@@ -350,6 +350,90 @@ def _statement_writes_named_attribute(node, name):
     )
 
 
+def _is_sys_modules_subscript(node):
+    """Return True for ``sys.modules[...]`` used as a module binding target."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    value = node.value
+    if not (isinstance(value, ast.Attribute) and value.attr == "modules"):
+        return False
+    base = value.value
+    if isinstance(base, ast.Name) and base.id == "sys":
+        return True
+    return (
+        isinstance(base, ast.Call)
+        and isinstance(base.func, ast.Name)
+        and base.func.id == "__import__"
+        and base.args
+        and isinstance(base.args[0], ast.Constant)
+        and base.args[0].value == "sys"
+    )
+
+
+def _namespace_or_module_binding_target(node):
+    """Return True for a target that can hold a Gunicorn config global."""
+    return (
+        _is_namespace_reference(node)
+        or _is_module_dict_reference(node)
+        or _is_sys_modules_subscript(node)
+    )
+
+
+def _getattr_resolves_type_method(call, type_name, method_names):
+    """Return True when ``getattr`` fetches one of ``method_names`` from ``type_name``."""
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "getattr"
+        and len(call.args) >= 2
+    ):
+        return False
+    type_node, method_node = call.args[0], call.args[1]
+    if not (isinstance(type_node, ast.Name) and type_node.id == type_name):
+        return False
+    if isinstance(method_node, ast.Constant) and isinstance(method_node.value, str):
+        return method_node.value in method_names
+    return True
+
+
+def _call_is_typebound_namespace_store(call, name):
+    """Return True for ``dict.__setitem__(globals(), ...)``-style module writes."""
+    if len(call.args) < 2 or not _namespace_or_module_binding_target(call.args[0]):
+        return False
+    if not _subscript_may_name(call.args[1], name):
+        return False
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        if (
+            func.attr == "__setitem__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "dict"
+        ):
+            return True
+        if (
+            func.attr == "setitem"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "operator"
+        ):
+            return True
+        if (
+            func.attr == "__setattr__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "object"
+        ):
+            return True
+    if isinstance(func, ast.Name) and func.id == "setitem":
+        return True
+    if isinstance(func, ast.Call):
+        if _getattr_resolves_type_method(func, "dict", {"__setitem__"}):
+            return True
+        if _getattr_resolves_type_method(func, "operator", {"setitem"}):
+            return True
+        if _getattr_resolves_type_method(func, "object", {"__setattr__"}):
+            return True
+    return False
+
+
 def _call_writes_global(child, name):
     """Return True for a call that can write an arbitrary module global."""
     func = child.func
@@ -376,6 +460,8 @@ def _call_writes_global(child, name):
             )
         )
     ):
+        return True
+    if _call_is_typebound_namespace_store(child, name):
         return True
     return False
 
