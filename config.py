@@ -16962,6 +16962,13 @@ def _expression_triggers_class_workers_side_effect(
             instance_events,
             reference_line,
         )
+        or _copy_copy_call_triggers_workers(
+            expr,
+            methods,
+            class_targets,
+            instance_events,
+            reference_line,
+        )
     )
 
 
@@ -22056,7 +22063,13 @@ def _unary_op_dunder_triggers_workers(
 
 
 _PICKLE_SERIALIZATION_HOOKS = frozenset(
-    {"__getstate__", "__reduce__", "__reduce_ex__"}
+    {
+        "__getstate__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__copy__",
+        "__deepcopy__",
+    }
 )
 
 
@@ -22124,6 +22137,34 @@ def _copy_deepcopy_call_triggers_workers(
     if not (
         isinstance(func, ast.Attribute)
         and func.attr == "deepcopy"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "copy"
+    ):
+        return False
+    return _serialization_hooks_trigger_workers_on_arg(
+        expr.args[0],
+        _PICKLE_SERIALIZATION_HOOKS,
+        methods,
+        class_targets,
+        instance_events,
+        reference_line,
+    )
+
+
+def _copy_copy_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+):
+    """Return True when ``copy.copy`` runs a mutating shallow-copy hook."""
+    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
+        return False
+    func = expr.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "copy"
         and isinstance(func.value, ast.Name)
         and func.value.id == "copy"
     ):
