@@ -396,42 +396,38 @@ def _getattr_resolves_type_method(call, type_name, method_names):
     return True
 
 
+_TYPEBOUND_STORE_METHODS = (
+    ("dict", "__setitem__"),
+    ("operator", "setitem"),
+    ("object", "__setattr__"),
+)
+
+
+def _is_typebound_store_method(func):
+    """Recognize direct and getattr-resolved type-bound namespace stores."""
+    if isinstance(func, ast.Name):
+        return func.id == "setitem"
+    if isinstance(func, ast.Attribute):
+        return (
+            isinstance(func.value, ast.Name)
+            and (func.value.id, func.attr) in _TYPEBOUND_STORE_METHODS
+        )
+    if isinstance(func, ast.Call):
+        return any(
+            _getattr_resolves_type_method(func, type_name, {method_name})
+            for type_name, method_name in _TYPEBOUND_STORE_METHODS
+        )
+    return False
+
+
 def _call_is_typebound_namespace_store(call, name):
     """Return True for ``dict.__setitem__(globals(), ...)``-style module writes."""
-    if len(call.args) < 2 or not _namespace_or_module_binding_target(call.args[0]):
-        return False
-    if not _subscript_may_name(call.args[1], name):
-        return False
-    func = call.func
-    if isinstance(func, ast.Attribute):
-        if (
-            func.attr == "__setitem__"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "dict"
-        ):
-            return True
-        if (
-            func.attr == "setitem"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "operator"
-        ):
-            return True
-        if (
-            func.attr == "__setattr__"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "object"
-        ):
-            return True
-    if isinstance(func, ast.Name) and func.id == "setitem":
-        return True
-    if isinstance(func, ast.Call):
-        if _getattr_resolves_type_method(func, "dict", {"__setitem__"}):
-            return True
-        if _getattr_resolves_type_method(func, "operator", {"setitem"}):
-            return True
-        if _getattr_resolves_type_method(func, "object", {"__setattr__"}):
-            return True
-    return False
+    return (
+        len(call.args) >= 2
+        and _namespace_or_module_binding_target(call.args[0])
+        and _subscript_may_name(call.args[1], name)
+        and _is_typebound_store_method(call.func)
+    )
 
 
 def _call_writes_global(child, name):
@@ -859,7 +855,12 @@ def config_provides_setting(path, name):
         # Gunicorn loads the file through importlib, which strips a UTF-8 BOM;
         # `utf-8-sig` gives the probe the same view instead of a bogus
         # SyntaxError that the entrypoint reads as "config supplies bind".
-        source = path.read_text(encoding="utf-8-sig")
+        # This is the *same operator-selected config path* Gunicorn loads via
+        # -c/GUNICORN_CMD_ARGS; it supports absolute and parent-relative paths.
+        # No file contents are returned or logged, only a tri-state result.
+        # Restricting the path would make the probe override valid Gunicorn
+        # settings (potentially exposing the admin panel on 0.0.0.0).
+        source = path.read_text(encoding="utf-8-sig")  # NOSONAR
     except (OSError, UnicodeError):
         return UNKNOWN
     try:
