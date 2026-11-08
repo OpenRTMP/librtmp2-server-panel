@@ -209,15 +209,18 @@ config_supplies_app() {
     [ "$probe_status" -ne 1 ]
 }
 
-# The image's default command (kept in sync with the Dockerfile CMD). Without
-# this guard an empty argument list would exit 0 without ever starting
-# gunicorn, and a flag-first invocation would be consumed by the shell's own
-# exec builtin. Mirrors the guard in ../librtmp2-server/entrypoint.sh.
-if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
-    # Gunicorn's bind setting is append-valued, so a bind address supplied
-    # by the operator has to replace the image's default one instead of
-    # being appended to it: otherwise the service keeps listening on
-    # 0.0.0.0:8000 and the operator's restriction is defeated.
+# The image CMD is the WSGI target ("app:app"), not a full gunicorn command
+# line. Wrapping it here keeps the default bind/worker flags out of Gunicorn's
+# CLI layer: Gunicorn applies CLI settings last, so a `--bind` in CMD would
+# override an operator's GUNICORN_CMD_ARGS or gunicorn.conf.py. A flag-first
+# invocation and an empty argument list are wrapped too. An explicit
+# `gunicorn ...` command is executed unchanged.
+if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ] || [ "$1" = "app:app" ]; then
+    # Add the image's default bind only when the effective Gunicorn
+    # configuration does not already provide one. `bind` is append-valued
+    # within a single argparse parse, but a CLI value replaces config-file and
+    # environment values, so the default must not be present at all when the
+    # operator supplied one.
     if bind_configured "$@"; then
         default_bind=
     else

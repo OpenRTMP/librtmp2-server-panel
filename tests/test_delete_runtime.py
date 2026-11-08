@@ -18,12 +18,14 @@ def test_container_uses_threaded_gunicorn_for_long_running_deletes():
     assert match is not None, "Dockerfile must use a JSON-array CMD"
     command = json.loads(match.group(1))
 
-    assert command[0] == "gunicorn"
-    assert command[command.index("--worker-class") + 1] == "gthread"
-    assert command[command.index("--threads") + 1] == "4"
-    assert int(command[command.index("--timeout") + 1]) >= (
-        DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS
-    )
+    # The bind/worker flags live in entrypoint.sh so an operator bind in
+    # GUNICORN_CMD_ARGS or gunicorn.conf.py is not overridden by the image CMD.
+    assert command == ["app:app"]
+    entrypoint = (repository_root / "entrypoint.sh").read_text(encoding="utf-8")
+    assert "--worker-class gthread --threads 4 --timeout 450" in entrypoint
+    match = re.search(r"--timeout\s+(\d+)", entrypoint)
+    assert match is not None
+    assert int(match.group(1)) >= DELETE_ROUTE_MIN_GUNICORN_TIMEOUT_SECONDS
 
 
 def test_delete_stream_logs_api_failure(monkeypatch):

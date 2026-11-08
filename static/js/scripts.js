@@ -14,11 +14,36 @@ document.addEventListener('DOMContentLoaded', function () {
 async function copyToClipboard(element) {
     const text = element.dataset.url || '';
     try {
-        await navigator.clipboard.writeText(text);
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+        } else {
+            // navigator.clipboard is unavailable on plain-HTTP non-localhost
+            // origins (a supported panel deployment). Fall back to the legacy
+            // selection API so the primary copy action still works there.
+            copyWithTextarea(text);
+        }
         showCopyFeedback(element, 'Copied');
     } catch (err) {
         console.warn('Clipboard write failed', err);
         showCopyFeedback(element, 'Copy failed');
+    }
+}
+
+function copyWithTextarea(text) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-1000px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    try {
+        textarea.select();
+        if (!document.execCommand('copy')) {
+            throw new Error('execCommand copy failed');
+        }
+    } finally {
+        textarea.remove();
     }
 }
 

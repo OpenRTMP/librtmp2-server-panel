@@ -26135,7 +26135,12 @@ class Config:
             sys.exit(1)
 
     # Shared limiter backend for multi-worker deployments (e.g. redis://redis:6379/0).
-    RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", RATELIMIT_MEMORY_URI)
+    # Normalize the same way the worker-count gate does: a blank/whitespace value
+    # from the process environment must become memory:// instead of reaching
+    # Flask-Limiter as an unparsable scheme and crashing create_app().
+    RATELIMIT_STORAGE_URI = (
+        os.environ.get("RATELIMIT_STORAGE_URI", "").strip() or RATELIMIT_MEMORY_URI
+    )
 
     # Live stats polling limits for /streams/<id>/stats.json (Flask-Limiter).
     STATS_RATE_LIMIT_PER_IP = _parse_positive_int(
