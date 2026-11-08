@@ -598,7 +598,7 @@ class _PanelRuntime:
         hook = self.limiter.limit(
             DEFAULT_RATE_LIMIT,
             key_func=self._rate_limit_remote_addr,
-            exempt_when=lambda: self._stats_unauthenticated_default_exempt(),
+            exempt_when=self._stats_unauthenticated_default_exempt,
         )(self._stream_stats_rate_limit)
         hook = self.limiter.limit(
             stats_stream_limit,
