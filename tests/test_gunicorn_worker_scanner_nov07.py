@@ -39,6 +39,28 @@ _DYNAMIC_CASES = [
         "copy.deepcopy(Bump())\n",
     ),
     (
+        "copy.deepcopy __deepcopy__ dispatch",
+        "workers = 1\n"
+        "import copy\n"
+        "class Bump:\n"
+        "    def __deepcopy__(self, memo):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "copy.deepcopy(Bump())\n",
+    ),
+    (
+        "copy.copy __copy__ dispatch",
+        "workers = 1\n"
+        "import copy\n"
+        "class Bump:\n"
+        "    def __copy__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "copy.copy(Bump())\n",
+    ),
+    (
         "asyncio.run async for __aiter__ dispatch",
         "workers = 1\n"
         "import asyncio\n"
