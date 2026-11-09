@@ -40,7 +40,7 @@ function copyWithTextarea(text) {
     document.body.appendChild(textarea);
     try {
         textarea.select();
-        if (!document.execCommand('copy')) {
+        if (!document.execCommand('copy')) { // NOSONAR: no Clipboard API replacement exists on insecure origins
             throw new Error('execCommand copy failed');
         }
     } finally {
