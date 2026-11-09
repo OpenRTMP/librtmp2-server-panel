@@ -462,7 +462,7 @@ def _call_is_operator_methodcaller_setitem(call, name):
     return _namespace_or_module_binding_target(call.args[0])
 
 
-def _call_is_reduce_with_module_initializer(call, name):
+def _call_is_reduce_with_module_initializer(call):
     """Return True for ``reduce(..., globals())`` mutations."""
     func = call.func
     is_reduce = (
@@ -542,7 +542,7 @@ def _call_writes_global(child, name):
         return True
     if _call_is_operator_methodcaller_setitem(child, name):
         return True
-    if _call_is_reduce_with_module_initializer(child, name):
+    if _call_is_reduce_with_module_initializer(child):
         return True
     return False
 
