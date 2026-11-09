@@ -412,6 +412,26 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
             "getattr(dict, '__setitem__')(globals(), 'bind', [])\n",
             probe.UNKNOWN,
         ),
+        (
+            "import builtins\n"
+            "getattr(builtins.dict, '__setitem__')(globals(), 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "operator.call(operator.setitem, globals(), 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "operator.methodcaller('__setitem__', 'bind', [])(globals())\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "from functools import reduce\n"
+            "reduce(lambda g, _: dict.__setitem__(g, 'bind', []), [None], globals())\n",
+            probe.UNKNOWN,
+        ),
         # A walrus inside a lambda or nested function binds that local scope,
         # not the module, so it must not suppress the image default bind.
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
