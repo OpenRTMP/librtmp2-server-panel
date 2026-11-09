@@ -379,6 +379,13 @@ def _namespace_or_module_binding_target(node):
     )
 
 
+def _is_dict_type_reference(node):
+    """Return True for ``dict`` or ``<module>.dict`` (e.g. ``builtins.dict``)."""
+    if isinstance(node, ast.Name) and node.id == "dict":
+        return True
+    return isinstance(node, ast.Attribute) and node.attr == "dict"
+
+
 def _getattr_resolves_type_method(call, type_name, method_names):
     """Return True when ``getattr`` fetches one of ``method_names`` from ``type_name``."""
     if not (
@@ -389,7 +396,10 @@ def _getattr_resolves_type_method(call, type_name, method_names):
     ):
         return False
     type_node, method_node = call.args[0], call.args[1]
-    if not (isinstance(type_node, ast.Name) and type_node.id == type_name):
+    if type_name == "dict":
+        if not _is_dict_type_reference(type_node):
+            return False
+    elif not (isinstance(type_node, ast.Name) and type_node.id == type_name):
         return False
     if isinstance(method_node, ast.Constant) and isinstance(method_node.value, str):
         return method_node.value in method_names
@@ -403,11 +413,80 @@ _TYPEBOUND_STORE_METHODS = (
 )
 
 
+def _is_setitem_callable(node):
+    if isinstance(node, ast.Name) and node.id == "setitem":
+        return True
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "setitem"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "operator"
+    )
+
+
+def _call_is_operator_call_setitem(call, name):
+    """Return True for ``operator.call(operator.setitem, globals(), key, ...)``."""
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "call"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "operator"
+        and len(call.args) >= 3
+        and _is_setitem_callable(call.args[0])
+        and _namespace_or_module_binding_target(call.args[1])
+    ):
+        return False
+    return _subscript_may_name(call.args[2], name)
+
+
+def _call_is_operator_methodcaller_setitem(call, name):
+    """Return True for ``operator.methodcaller('__setitem__', key, ...)(globals())``."""
+    func = call.func
+    if not (isinstance(func, ast.Call) and call.args):
+        return False
+    factory = func.func
+    if not (
+        isinstance(factory, ast.Attribute)
+        and factory.attr == "methodcaller"
+        and isinstance(factory.value, ast.Name)
+        and factory.value.id == "operator"
+        and func.args
+    ):
+        return False
+    method = func.args[0]
+    if not (isinstance(method, ast.Constant) and method.value == "__setitem__"):
+        return False
+    if len(func.args) >= 2 and not _subscript_may_name(func.args[1], name):
+        return False
+    return _namespace_or_module_binding_target(call.args[0])
+
+
+def _call_is_reduce_with_module_initializer(call, name):
+    """Return True for ``reduce(..., globals())`` mutations."""
+    func = call.func
+    is_reduce = (
+        isinstance(func, ast.Name)
+        and func.id == "reduce"
+    ) or (
+        isinstance(func, ast.Attribute)
+        and func.attr == "reduce"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "functools"
+    )
+    if not is_reduce or len(call.args) < 2:
+        return False
+    initializer = call.args[-1]
+    return _namespace_or_module_binding_target(initializer)
+
+
 def _is_typebound_store_method(func):
     """Recognize direct and getattr-resolved type-bound namespace stores."""
     if isinstance(func, ast.Name):
         return func.id == "setitem"
     if isinstance(func, ast.Attribute):
+        if func.attr == "__setitem__" and _is_dict_type_reference(func.value):
+            return True
         return (
             isinstance(func.value, ast.Name)
             and (func.value.id, func.attr) in _TYPEBOUND_STORE_METHODS
@@ -458,6 +537,12 @@ def _call_writes_global(child, name):
     ):
         return True
     if _call_is_typebound_namespace_store(child, name):
+        return True
+    if _call_is_operator_call_setitem(child, name):
+        return True
+    if _call_is_operator_methodcaller_setitem(child, name):
+        return True
+    if _call_is_reduce_with_module_initializer(child, name):
         return True
     return False
 
