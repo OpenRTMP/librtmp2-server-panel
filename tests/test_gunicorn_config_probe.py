@@ -471,6 +471,54 @@ def test_config_provides_setting_reads_module_assignments(tmp_path, source, expe
     assert _config_provides(config_file) == expected
 
 
+@pytest.mark.parametrize(
+    ("source", "mode", "expected"),
+    [
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), {'wsgi_app': 'wrapper:app'})\n",
+            "wsgi-app",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), {'workers': 2})\n",
+            "wsgi-app",
+            probe.ABSENT,
+        ),
+        (
+            "import builtins\n"
+            "key = 'bind'\n"
+            "builtins.dict.update(globals(), {key: ['127.0.0.1:9000']})\n",
+            "bind",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), bind=['127.0.0.1:9000'])\n",
+            "bind",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), **settings)\n",
+            "bind",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), {})\n",
+            "bind",
+            probe.ABSENT,
+        ),
+    ],
+)
+def test_typebound_dict_update_payload_detection(tmp_path, source, mode, expected):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(source, encoding="utf-8")
+    assert _config_provides(config_file, mode) == expected
+
+
 def test_dynamic_write_does_not_hide_a_later_explicit_wsgi_app_assignment(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
