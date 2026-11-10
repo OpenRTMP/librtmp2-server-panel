@@ -423,6 +423,26 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
             probe.UNKNOWN,
         ),
         (
+            "import builtins\n"
+            "builtins.dict.update(globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "getattr(builtins.dict, 'update')(globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "operator.call(getattr(__import__('builtins').dict, 'update'), globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import builtins\n"
+            "builtins.dict.update(globals(), {'workers': 1})\n",
+            probe.ABSENT,
+        ),
+        (
             "import operator\n"
             "operator.methodcaller('__setitem__', 'bind', [])(globals())\n",
             probe.UNKNOWN,
