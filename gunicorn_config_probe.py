@@ -424,6 +424,67 @@ def _is_setitem_callable(node):
     )
 
 
+def _is_dict_type_update_callable(func):
+    """Return True for ``dict.update`` / ``builtins.dict.update`` callables."""
+    if isinstance(func, ast.Attribute) and func.attr == "update":
+        return _is_dict_type_reference(func.value)
+    if isinstance(func, ast.Call):
+        return _getattr_resolves_type_method(func, "dict", {"update"})
+    return False
+
+
+def _dict_update_payload_may_name(call, name, *, start_index=1):
+    """Return True when a dict ``update`` call may set module global ``name``."""
+    saw_payload = False
+    for arg in call.args[start_index:]:
+        saw_payload = True
+        if isinstance(arg, ast.Dict):
+            for key in arg.keys:
+                if key is None:
+                    return True
+                if isinstance(key, ast.Constant) and key.value == name:
+                    return True
+            continue
+        return True
+    for keyword in call.keywords:
+        if keyword.arg is None or keyword.arg == name:
+            return True
+        saw_payload = True
+    return False
+
+
+def _call_is_dict_type_update_on_namespace(call, name):
+    """Return True for ``builtins.dict.update(globals(), ...)``-style writes."""
+    if not _is_dict_type_update_callable(call.func):
+        return False
+    if not call.args or not _namespace_or_module_binding_target(call.args[0]):
+        return False
+    return _dict_update_payload_may_name(call, name, start_index=1)
+
+
+def _call_is_operator_call_dict_update(call, name):
+    """Return True for ``operator.call(dict.update, globals(), payload)`` writes."""
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "call"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "operator"
+        and len(call.args) >= 2
+        and _namespace_or_module_binding_target(call.args[1])
+    ):
+        return False
+    update_callable = call.args[0]
+    if not _is_dict_type_update_callable(update_callable):
+        return False
+    wrapped = ast.Call(
+        func=update_callable,
+        args=call.args[1:],
+        keywords=call.keywords,
+    )
+    return _dict_update_payload_may_name(wrapped, name, start_index=1)
+
+
 def _call_is_operator_call_setitem(call, name):
     """Return True for ``operator.call(operator.setitem, globals(), key, ...)``."""
     func = call.func
@@ -543,6 +604,10 @@ def _call_writes_global(child, name):
     if _call_is_operator_methodcaller_setitem(child, name):
         return True
     if _call_is_reduce_with_module_initializer(child):
+        return True
+    if _call_is_dict_type_update_on_namespace(child, name):
+        return True
+    if _call_is_operator_call_dict_update(child, name):
         return True
     return False
 
