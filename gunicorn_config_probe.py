@@ -435,22 +435,19 @@ def _is_dict_type_update_callable(func):
 
 def _dict_update_payload_may_name(call, name, *, start_index=1):
     """Return True when a dict ``update`` call may set module global ``name``."""
-    saw_payload = False
     for arg in call.args[start_index:]:
-        saw_payload = True
-        if isinstance(arg, ast.Dict):
-            for key in arg.keys:
-                if key is None:
-                    return True
-                if isinstance(key, ast.Constant) and key.value == name:
-                    return True
-            continue
-        return True
-    for keyword in call.keywords:
-        if keyword.arg is None or keyword.arg == name:
+        if not isinstance(arg, ast.Dict):
             return True
-        saw_payload = True
-    return False
+        if any(
+            key is None
+            or not isinstance(key, ast.Constant)
+            or key.value == name
+            for key in arg.keys
+        ):
+            return True
+    return any(
+        keyword.arg is None or keyword.arg == name for keyword in call.keywords
+    )
 
 
 def _call_is_dict_type_update_on_namespace(call, name):
