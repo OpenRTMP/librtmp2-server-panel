@@ -226,7 +226,13 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ] || [ "$1" = "app:app" ]; then
     else
         default_bind="--bind 0.0.0.0:8000"
     fi
-    if app_target_supplied "$@" || config_supplies_app "$@"; then
+    if [ "$#" -eq 1 ] && [ "$1" = "app:app" ] && config_supplies_app "$@"; then
+        # The image CMD is only a default. Gunicorn serves the first positional
+        # argument in preference to `wsgi_app`, so the default must be dropped
+        # when the operator's configuration names its own application (for
+        # example an auth or IP-allowlist wrapper).
+        set -- gunicorn $default_bind --worker-class gthread --threads 4 --timeout 450
+    elif app_target_supplied "$@" || config_supplies_app "$@"; then
         # Gunicorn serves the first positional argument, so an application
         # target supplied by the operator (or by its config) must not be
         # preceded by the image's default one.

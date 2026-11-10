@@ -44,6 +44,8 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         "import os, sys\n"
         "if sys.argv[1] == 'bind':\n"
         "    sys.exit(int(os.environ.get('PROBE_BIND_STATUS', '1')))\n"
+        "if sys.argv[1] == 'wsgi-app':\n"
+        "    sys.exit(int(os.environ.get('PROBE_WSGI_STATUS', '1')))\n"
         "sys.exit(2)\n",
         encoding="utf-8",
     )
@@ -66,9 +68,10 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         }
     )
 
-    def run(probe_status):
+    def run(probe_status, wsgi_status=1):
         env = dict(base_env)
         env["PROBE_BIND_STATUS"] = str(probe_status)
+        env["PROBE_WSGI_STATUS"] = str(wsgi_status)
         args_file.unlink(missing_ok=True)
         subprocess.run(
             [SH, script.as_posix(), "app:app"],
@@ -85,8 +88,16 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
     default_args = run(probe_status=1)
     assert "--bind" in default_args
     assert "0.0.0.0:8000" in default_args
+    assert "app:app" in default_args
 
     # Probe says a bind is configured: no default --bind may reach gunicorn.
     configured = run(probe_status=0)
     assert "0.0.0.0:8000" not in configured
     assert "--bind" not in configured
+
+    # The image CMD is a default, not an operator choice: when the effective
+    # Gunicorn configuration supplies ``wsgi_app``, the positional default must
+    # be dropped or Gunicorn serves it instead of the configured app.
+    config_app = run(probe_status=1, wsgi_status=0)
+    assert "app:app" not in config_app
+    assert "--worker-class" in config_app
