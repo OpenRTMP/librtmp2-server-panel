@@ -136,6 +136,8 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
         # UNKNOWN keeps the image from overriding a value it cannot inspect.
         ("globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
         ("vars()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("locals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("globals().__setitem__('bind', ['127.0.0.1:8000'])\n", probe.UNKNOWN),
         ("setattr(sys.modules[__name__], 'bind', [])\n", probe.UNKNOWN),
         ("sys.modules[__name__].bind = []\n", probe.UNKNOWN),
         (

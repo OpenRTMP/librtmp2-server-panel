@@ -275,11 +275,11 @@ def _import_binding_kind(node, name):
 
 
 def _is_namespace_reference(node):
-    """Return True for a ``globals()``/``vars()`` result expression."""
+    """Return True for a module-namespace expression (``globals()``/``locals()``/``vars()``)."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in {"globals", "vars"}
+        and node.func.id in {"globals", "locals", "vars"}
     )
 
 
@@ -543,8 +543,12 @@ def _is_typebound_store_method(func):
     if isinstance(func, ast.Name):
         return func.id == "setitem"
     if isinstance(func, ast.Attribute):
-        if func.attr == "__setitem__" and _is_dict_type_reference(func.value):
-            return True
+        if func.attr == "__setitem__":
+            # ``globals().__setitem__('bind', ...)`` is the method form of the
+            # already-handled ``globals()['bind'] = ...``.
+            return _is_dict_type_reference(func.value) or _is_namespace_reference(
+                func.value
+            )
         return (
             isinstance(func.value, ast.Name)
             and (func.value.id, func.attr) in _TYPEBOUND_STORE_METHODS
@@ -564,6 +568,18 @@ def _call_is_typebound_namespace_store(call, name):
         and _namespace_or_module_binding_target(call.args[0])
         and _subscript_may_name(call.args[1], name)
         and _is_typebound_store_method(call.func)
+    )
+
+
+def _call_is_bound_namespace_setitem(call, name):
+    """Return True for ``globals().__setitem__('bind', ...)``."""
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "__setitem__"
+        and _is_namespace_reference(func.value)
+        and bool(call.args)
+        and _subscript_may_name(call.args[0], name)
     )
 
 
@@ -595,6 +611,8 @@ def _call_writes_global(child, name):
     ):
         return True
     if _call_is_typebound_namespace_store(child, name):
+        return True
+    if _call_is_bound_namespace_setitem(child, name):
         return True
     if _call_is_operator_call_setitem(child, name):
         return True
