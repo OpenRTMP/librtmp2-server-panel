@@ -612,21 +612,15 @@ def _call_writes_global(child, name, allow_locals=True):
         )
     ):
         return True
-    if _call_is_typebound_namespace_store(child, name, allow_locals):
-        return True
-    if _call_is_bound_namespace_setitem(child, name, allow_locals):
-        return True
-    if _call_is_operator_call_setitem(child, name):
-        return True
-    if _call_is_operator_methodcaller_setitem(child, name):
-        return True
-    if _call_is_reduce_with_module_initializer(child):
-        return True
-    if _call_is_dict_type_update_on_namespace(child, name):
-        return True
-    if _call_is_operator_call_dict_update(child, name):
-        return True
-    return False
+    return (
+        _call_is_typebound_namespace_store(child, name, allow_locals)
+        or _call_is_bound_namespace_setitem(child, name, allow_locals)
+        or _call_is_operator_call_setitem(child, name)
+        or _call_is_operator_methodcaller_setitem(child, name)
+        or _call_is_reduce_with_module_initializer(child)
+        or _call_is_dict_type_update_on_namespace(child, name)
+        or _call_is_operator_call_dict_update(child, name)
+    )
 
 
 def _target_writes_namespace(target, name, allow_locals=True):
