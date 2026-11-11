@@ -44,6 +44,8 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         "import os, sys\n"
         "if sys.argv[1] == 'bind':\n"
         "    sys.exit(int(os.environ.get('PROBE_BIND_STATUS', '1')))\n"
+        "if sys.argv[1] == 'wsgi-app':\n"
+        "    sys.exit(int(os.environ.get('PROBE_WSGI_STATUS', '1')))\n"
         "sys.exit(2)\n",
         encoding="utf-8",
     )
@@ -66,9 +68,10 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         }
     )
 
-    def run(probe_status):
+    def run(probe_status, wsgi_status=1):
         env = dict(base_env)
         env["PROBE_BIND_STATUS"] = str(probe_status)
+        env["PROBE_WSGI_STATUS"] = str(wsgi_status)
         args_file.unlink(missing_ok=True)
         subprocess.run(
             [SH, script.as_posix(), "app:app"],
@@ -85,8 +88,44 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
     default_args = run(probe_status=1)
     assert "--bind" in default_args
     assert "0.0.0.0:8000" in default_args
+    assert "app:app" in default_args
 
     # Probe says a bind is configured: no default --bind may reach gunicorn.
     configured = run(probe_status=0)
     assert "0.0.0.0:8000" not in configured
     assert "--bind" not in configured
+
+    # The image CMD is a default, not an operator choice: when the effective
+    # Gunicorn configuration supplies ``wsgi_app``, the positional default must
+    # be dropped or Gunicorn serves it instead of the configured app.
+    config_app = run(probe_status=1, wsgi_status=0)
+    assert "app:app" not in config_app
+    assert "--worker-class" in config_app
+
+    # An uninspectable config (status 2) must keep the image default: dropping
+    # it would leave Gunicorn with no application at all.
+    unknown_app = run(probe_status=1, wsgi_status=2)
+    assert "app:app" in unknown_app
+
+    # Real probe end-to-end: Gunicorn treats wsgi_app = None as no configured
+    # application, so the image default must remain in the argument list.
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("wsgi_app = None\n", encoding="utf-8")
+    real_env = dict(base_env)
+    real_env["OPENRTMP_CONFIG_PROBE"] = (
+        ROOT / "gunicorn_config_probe.py"
+    ).as_posix()
+    real_env["GUNICORN_CMD_ARGS"] = f"--config {config_file.as_posix()}"
+    real_env.pop("PROBE_BIND_STATUS", None)
+    real_env.pop("PROBE_WSGI_STATUS", None)
+    args_file.unlink(missing_ok=True)
+    subprocess.run(
+        [SH, script.as_posix(), "app:app"],
+        cwd=ROOT,
+        env=real_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "app:app" in args_file.read_text(encoding="utf-8").splitlines()
