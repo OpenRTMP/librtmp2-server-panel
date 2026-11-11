@@ -187,6 +187,17 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
             probe.ABSENT,
         ),
         (
+            "class Settings:\n"
+            "    dict.update(locals(), {'bind': ['127.0.0.1:8000']})\n",
+            probe.ABSENT,
+        ),
+        (
+            "def configure():\n"
+            "    dict.update(locals(), {'bind': ['127.0.0.1:8000']})\n"
+            "configure()\n",
+            probe.ABSENT,
+        ),
+        (
             "class Settings:\n    globals().__setitem__('bind', ['127.0.0.1:8000'])\n",
             probe.UNKNOWN,
         ),
@@ -640,6 +651,21 @@ def test_wsgi_app_none_means_no_configured_app(tmp_path):
         "wsgi_app = None\nwsgi_app = 'wrapper:app'\n", encoding="utf-8"
     )
     assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
+
+
+def test_wsgi_app_dynamic_or_conditional_is_not_proof(tmp_path):
+    """Only a top-level literal string proves an effective application."""
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "import os\nwsgi_app = os.getenv('OPTIONAL_WRAPPER_APP')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
+
+    config_file.write_text(
+        "if True:\n    wsgi_app = 'wrapper:app'\n", encoding="utf-8"
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
 
 
 def test_main_reads_env_args_and_implicit_config(monkeypatch, tmp_path):

@@ -484,16 +484,18 @@ def _dict_update_payload_may_name(call, name, *, start_index=1):
     )
 
 
-def _call_is_dict_type_update_on_namespace(call, name):
+def _call_is_dict_type_update_on_namespace(call, name, allow_locals=True):
     """Return True for ``builtins.dict.update(globals(), ...)``-style writes."""
     if not _is_dict_type_update_callable(call.func):
         return False
-    if not call.args or not _namespace_or_module_binding_target(call.args[0]):
+    if not call.args or not _namespace_or_module_binding_target(
+        call.args[0], allow_locals
+    ):
         return False
     return _dict_update_payload_may_name(call, name, start_index=1)
 
 
-def _call_is_operator_call_dict_update(call, name):
+def _call_is_operator_call_dict_update(call, name, allow_locals=True):
     """Return True for ``operator.call(dict.update, globals(), payload)`` writes."""
     func = call.func
     if not (
@@ -502,7 +504,7 @@ def _call_is_operator_call_dict_update(call, name):
         and isinstance(func.value, ast.Name)
         and func.value.id == "operator"
         and len(call.args) >= 2
-        and _namespace_or_module_binding_target(call.args[1])
+        and _namespace_or_module_binding_target(call.args[1], allow_locals)
     ):
         return False
     update_callable = call.args[0]
@@ -516,7 +518,7 @@ def _call_is_operator_call_dict_update(call, name):
     return _dict_update_payload_may_name(wrapped, name, start_index=1)
 
 
-def _call_is_operator_call_setitem(call, name):
+def _call_is_operator_call_setitem(call, name, allow_locals=True):
     """Return True for ``operator.call(operator.setitem, globals(), key, ...)``."""
     func = call.func
     if not (
@@ -526,13 +528,13 @@ def _call_is_operator_call_setitem(call, name):
         and func.value.id == "operator"
         and len(call.args) >= 3
         and _operator_callable_is_setitem(call.args[0])
-        and _namespace_or_module_binding_target(call.args[1])
+        and _namespace_or_module_binding_target(call.args[1], allow_locals)
     ):
         return False
     return _subscript_may_name(call.args[2], name)
 
 
-def _call_is_operator_methodcaller_setitem(call, name):
+def _call_is_operator_methodcaller_setitem(call, name, allow_locals=True):
     """Return True for ``operator.methodcaller('__setitem__', key, ...)(globals())``."""
     func = call.func
     if not (isinstance(func, ast.Call) and call.args):
@@ -551,10 +553,10 @@ def _call_is_operator_methodcaller_setitem(call, name):
         return False
     if len(func.args) >= 2 and not _subscript_may_name(func.args[1], name):
         return False
-    return _namespace_or_module_binding_target(call.args[0])
+    return _namespace_or_module_binding_target(call.args[0], allow_locals)
 
 
-def _call_is_reduce_with_module_initializer(call):
+def _call_is_reduce_with_module_initializer(call, allow_locals=True):
     """Return True for ``reduce(..., globals())`` mutations."""
     func = call.func
     is_reduce = (
@@ -569,7 +571,7 @@ def _call_is_reduce_with_module_initializer(call):
     if not is_reduce or len(call.args) < 2:
         return False
     initializer = call.args[-1]
-    return _namespace_or_module_binding_target(initializer)
+    return _namespace_or_module_binding_target(initializer, allow_locals)
 
 
 def _is_typebound_store_method(func):
@@ -712,6 +714,8 @@ def _call_is_namespace_attribute_mutation(
         )
     ):
         return False
+    if func.attr == "update" and call.args and isinstance(call.args[0], ast.Dict):
+        return _dict_update_payload_may_name(call, name, start_index=0)
     return bool(call.args) or any(
         keyword.arg is None or keyword.arg == name
         for keyword in call.keywords
@@ -734,15 +738,15 @@ def _call_writes_global(
         return True
     if _call_is_typebound_namespace_store(child, name, allow_locals):
         return True
-    if _call_is_operator_call_setitem(child, name):
+    if _call_is_operator_call_setitem(child, name, allow_locals):
         return True
-    if _call_is_operator_methodcaller_setitem(child, name):
+    if _call_is_operator_methodcaller_setitem(child, name, allow_locals):
         return True
-    if _call_is_reduce_with_module_initializer(child):
+    if _call_is_reduce_with_module_initializer(child, allow_locals):
         return True
-    if _call_is_dict_type_update_on_namespace(child, name):
+    if _call_is_dict_type_update_on_namespace(child, name, allow_locals):
         return True
-    if _call_is_operator_call_dict_update(child, name):
+    if _call_is_operator_call_dict_update(child, name, allow_locals):
         return True
     return False
 
@@ -1129,26 +1133,7 @@ def _local_writer_names(definitions, name, aliases):
     return writers
 
 
-def _assignment_binds_none(node, name):
-    """Return True for a plain ``name = None`` / ``name: T = None``."""
-    if isinstance(node, ast.Assign):
-        targets, value = node.targets, node.value
-    elif isinstance(node, ast.AnnAssign):
-        targets, value = (node.target,), node.value
-    else:
-        return False
-    return (
-        len(targets) == 1
-        and isinstance(targets[0], ast.Name)
-        and targets[0].id == name
-        and isinstance(value, ast.Constant)
-        and value.value is None
-    )
-
-
-def _scan_module_bindings(
-    statements, name, globals_aliases=frozenset(), none_is_absent=False
-):
+def _scan_module_bindings(statements, name, globals_aliases=frozenset()):
     """Return ``(SUPPLIED or None, dynamic)`` for module-scope statements."""
     dynamic = False
     for node in _iter_module_assignments(statements):
@@ -1161,10 +1146,6 @@ def _scan_module_bindings(
             # a setting it cannot see.
             dynamic = True
         if name in _assigned_target_names(node):
-            # Gunicorn treats ``wsgi_app = None`` as "no configured app", so a
-            # literal None must not suppress the image's default application.
-            if none_is_absent and _assignment_binds_none(node, name):
-                continue
             return SUPPLIED, dynamic
         if _statement_writes_named_attribute(node, name):
             dynamic = True
@@ -1173,7 +1154,79 @@ def _scan_module_bindings(
     return None, dynamic
 
 
-def config_provides_setting(path, name, none_is_absent=False):
+def _assignment_targets_name(node, name):
+    """Return True when the assignment's simple target is exactly ``name``."""
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, ast.AnnAssign):
+        targets = (node.target,)
+    else:
+        return False
+    return (
+        len(targets) == 1
+        and isinstance(targets[0], ast.Name)
+        and targets[0].id == name
+    )
+
+
+def wsgi_app_provides_setting(path):
+    """Return ``0``/``1``/``2`` for a *proven* effective ``wsgi_app``.
+
+    Only a top-level literal non-empty string proves that Gunicorn has an
+    application. ``None``, a dynamic expression, a conditional assignment or an
+    uninspectable writer keeps the image default, because Gunicorn would
+    otherwise start with no application at all.
+    """
+    try:
+        source = path.read_text(encoding="utf-8-sig")  # NOSONAR
+    except (OSError, UnicodeError):
+        return UNKNOWN
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except (SyntaxError, RecursionError):
+        return UNKNOWN
+    try:
+        definitions = _module_local_definitions(tree.body)
+        globals_aliases = _collect_globals_aliases(tree.body)
+        proven = False
+        dynamic = False
+        for node in tree.body:
+            if _assignment_targets_name(node, "wsgi_app"):
+                value = node.value
+                if (
+                    isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                    and value.value
+                ):
+                    proven = True
+                elif isinstance(value, ast.Constant) and value.value is None:
+                    proven = False
+                else:
+                    dynamic = True
+                continue
+            # Any other statement that might write wsgi_app (a conditional, a
+            # class body, a dynamic namespace write, an import) is not proof.
+            if _has_dynamic_namespace_write(node, "wsgi_app", globals_aliases):
+                dynamic = True
+            else:
+                supplied, uncertain = _scan_module_bindings(
+                    [node], "wsgi_app", globals_aliases
+                )
+                if supplied == SUPPLIED or uncertain:
+                    dynamic = True
+        aliases = _collect_aliases(tree.body, definitions)
+        if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
+            definitions, "wsgi_app", aliases
+        ):
+            dynamic = True
+    except RecursionError:
+        return UNKNOWN
+    if dynamic:
+        return UNKNOWN
+    return SUPPLIED if proven else ABSENT
+
+
+def config_provides_setting(path, name):
     """Return ``0``/``1``/``2`` for whether ``path`` assigns ``name``."""
     try:
         # Gunicorn loads the file through importlib, which strips a UTF-8 BOM;
@@ -1195,7 +1248,7 @@ def config_provides_setting(path, name, none_is_absent=False):
         definitions = _module_local_definitions(tree.body)
         globals_aliases = _collect_globals_aliases(tree.body)
         supplied, dynamic = _scan_module_bindings(
-            tree.body, name, globals_aliases, none_is_absent
+            tree.body, name, globals_aliases
         )
         if supplied == SUPPLIED:
             return SUPPLIED
@@ -1234,8 +1287,9 @@ def _probe(mode, argv, env_args, cwd):
         return UNKNOWN
     if not path.is_file():
         return ABSENT
-    # Gunicorn treats a literal ``wsgi_app = None`` as no configured app.
-    return config_provides_setting(path, setting, none_is_absent=(mode == "wsgi-app"))
+    if mode == "wsgi-app":
+        return wsgi_app_provides_setting(path)
+    return config_provides_setting(path, setting)
 
 
 def main(arguments):
