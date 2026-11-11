@@ -546,6 +546,23 @@ def test_typebound_dict_update_payload_detection(tmp_path, source, mode, expecte
     assert _config_provides(config_file, mode) == expected
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("globals().update(bind='127.0.0.1:8000')\n", probe.UNKNOWN),
+        ("globals().update(workers=2)\n", probe.ABSENT),
+        ("globals().pop('bind', None)\n", probe.UNKNOWN),
+        ("exec('pass')\n", probe.UNKNOWN),
+        ("eval('1 + 1')\n", probe.UNKNOWN),
+        ("setattr(object(), 'value', 1)\n", probe.UNKNOWN),
+    ],
+)
+def test_dynamic_global_call_detection_after_refactor(tmp_path, source, expected):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(source, encoding="utf-8")
+    assert _config_provides(config_file) == expected
+
+
 def test_dynamic_write_does_not_hide_a_later_explicit_wsgi_app_assignment(tmp_path):
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(
