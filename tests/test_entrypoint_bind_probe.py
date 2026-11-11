@@ -106,3 +106,26 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
     # it would leave Gunicorn with no application at all.
     unknown_app = run(probe_status=1, wsgi_status=2)
     assert "app:app" in unknown_app
+
+    # Real probe end-to-end: Gunicorn treats wsgi_app = None as no configured
+    # application, so the image default must remain in the argument list.
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("wsgi_app = None\n", encoding="utf-8")
+    real_env = dict(base_env)
+    real_env["OPENRTMP_CONFIG_PROBE"] = (
+        ROOT / "gunicorn_config_probe.py"
+    ).as_posix()
+    real_env["GUNICORN_CMD_ARGS"] = f"--config {config_file.as_posix()}"
+    real_env.pop("PROBE_BIND_STATUS", None)
+    real_env.pop("PROBE_WSGI_STATUS", None)
+    args_file.unlink(missing_ok=True)
+    subprocess.run(
+        [SH, script.as_posix(), "app:app"],
+        cwd=ROOT,
+        env=real_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "app:app" in args_file.read_text(encoding="utf-8").splitlines()

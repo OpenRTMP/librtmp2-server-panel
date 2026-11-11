@@ -172,6 +172,20 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
         # not a module binding and a method body is still deferred.
         ("class Settings:\n    globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
         ("class Settings:\n    locals()['bind'] = ['127.0.0.1:8000']\n", probe.ABSENT),
+        # A class header runs in the enclosing (module) scope, so locals()
+        # there does write the module bind.
+        (
+            "class Settings(locals().__setitem__('bind', ['127.0.0.1:8000']) or object):\n"
+            "    pass\n",
+            probe.UNKNOWN,
+        ),
+        # A bare locals() inside a called helper is function-local, not module.
+        (
+            "def configure():\n"
+            "    locals()['bind'] = ['127.0.0.1:8000']\n"
+            "configure()\n",
+            probe.ABSENT,
+        ),
         (
             "class Settings:\n    globals().__setitem__('bind', ['127.0.0.1:8000'])\n",
             probe.UNKNOWN,
@@ -614,6 +628,18 @@ def test_wsgi_app_detection(tmp_path):
     config_file.write_text('wsgi_app = "app:app"\n', encoding="utf-8")
     assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
     assert _config_provides(config_file, "bind") == probe.ABSENT
+
+
+def test_wsgi_app_none_means_no_configured_app(tmp_path):
+    """Gunicorn treats wsgi_app=None as absent, so the image default must stay."""
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text("wsgi_app = None\n", encoding="utf-8")
+    assert _config_provides(config_file, "wsgi-app") == probe.ABSENT
+
+    config_file.write_text(
+        "wsgi_app = None\nwsgi_app = 'wrapper:app'\n", encoding="utf-8"
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
 
 
 def test_main_reads_env_args_and_implicit_config(monkeypatch, tmp_path):
