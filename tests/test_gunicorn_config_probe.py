@@ -171,6 +171,11 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
         # A class body also runs at import time, but a plain class attribute is
         # not a module binding and a method body is still deferred.
         ("class Settings:\n    globals()['bind'] = ['127.0.0.1:8000']\n", probe.UNKNOWN),
+        ("class Settings:\n    locals()['bind'] = ['127.0.0.1:8000']\n", probe.ABSENT),
+        (
+            "class Settings:\n    globals().__setitem__('bind', ['127.0.0.1:8000'])\n",
+            probe.UNKNOWN,
+        ),
         ("class Settings:\n    bind = ['127.0.0.1:8000']\n", probe.ABSENT),
         (
             "class Settings:\n    (bind := ['127.0.0.1:8000'])\n",

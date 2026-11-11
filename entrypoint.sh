@@ -209,6 +209,19 @@ config_supplies_app() {
     [ "$probe_status" -ne 1 ]
 }
 
+# Return 0 only when the probe positively establishes that the effective
+# configuration supplies an application. UNKNOWN is not enough here: when the
+# config cannot be inspected, the image's own default must be kept, otherwise a
+# valid config-only invocation (for example `--config python:settings` that only
+# sets a bind) would start with no application at all. Unknown wrappers remain
+# fail-closed for the flags-only invocations that already use
+# config_supplies_app.
+config_app_configured() {
+    probe_status=0
+    config_probe wsgi-app "$@" || probe_status=$?
+    [ "$probe_status" -eq 0 ]
+}
+
 # The image CMD is the WSGI target ("app:app"), not a full gunicorn command
 # line. Wrapping it here keeps the default bind/worker flags out of Gunicorn's
 # CLI layer: Gunicorn applies CLI settings last, so a `--bind` in CMD would
@@ -226,11 +239,12 @@ if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ] || [ "$1" = "app:app" ]; then
     else
         default_bind="--bind 0.0.0.0:8000"
     fi
-    if [ "$#" -eq 1 ] && [ "$1" = "app:app" ] && config_supplies_app "$@"; then
+    if [ "$#" -eq 1 ] && [ "$1" = "app:app" ] && config_app_configured "$@"; then
         # The image CMD is only a default. Gunicorn serves the first positional
         # argument in preference to `wsgi_app`, so the default must be dropped
         # when the operator's configuration names its own application (for
-        # example an auth or IP-allowlist wrapper).
+        # example an auth or IP-allowlist wrapper). An uninspectable config
+        # keeps the default: no application at all is worse than the default.
         set -- gunicorn $default_bind --worker-class gthread --threads 4 --timeout 450
     elif app_target_supplied "$@" || config_supplies_app "$@"; then
         # Gunicorn serves the first positional argument, so an application

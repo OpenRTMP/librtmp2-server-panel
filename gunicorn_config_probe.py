@@ -274,13 +274,19 @@ def _import_binding_kind(node, name):
     return None
 
 
-def _is_namespace_reference(node):
-    """Return True for a module-namespace expression (``globals()``/``locals()``/``vars()``)."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"globals", "locals", "vars"}
-    )
+def _is_namespace_reference(node, allow_locals=True):
+    """Return True for a module-namespace expression.
+
+    ``globals()`` and ``vars()`` always resolve the module namespace, even from
+    a class body. Bare ``locals()`` resolves the *enclosing* namespace, so it
+    only names the module from module scope; the caller disables it inside a
+    class body.
+    """
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+        return False
+    if node.func.id in {"globals", "vars"}:
+        return True
+    return allow_locals and node.func.id == "locals"
 
 
 def _is_module_dict_reference(node):
@@ -370,10 +376,10 @@ def _is_sys_modules_subscript(node):
     )
 
 
-def _namespace_or_module_binding_target(node):
+def _namespace_or_module_binding_target(node, allow_locals=True):
     """Return True for a target that can hold a Gunicorn config global."""
     return (
-        _is_namespace_reference(node)
+        _is_namespace_reference(node, allow_locals)
         or _is_module_dict_reference(node)
         or _is_sys_modules_subscript(node)
     )
@@ -544,11 +550,7 @@ def _is_typebound_store_method(func):
         return func.id == "setitem"
     if isinstance(func, ast.Attribute):
         if func.attr == "__setitem__":
-            # ``globals().__setitem__('bind', ...)`` is the method form of the
-            # already-handled ``globals()['bind'] = ...``.
-            return _is_dict_type_reference(func.value) or _is_namespace_reference(
-                func.value
-            )
+            return _is_dict_type_reference(func.value)
         return (
             isinstance(func.value, ast.Name)
             and (func.value.id, func.attr) in _TYPEBOUND_STORE_METHODS
@@ -561,29 +563,29 @@ def _is_typebound_store_method(func):
     return False
 
 
-def _call_is_typebound_namespace_store(call, name):
+def _call_is_typebound_namespace_store(call, name, allow_locals=True):
     """Return True for ``dict.__setitem__(globals(), ...)``-style module writes."""
     return (
         len(call.args) >= 2
-        and _namespace_or_module_binding_target(call.args[0])
+        and _namespace_or_module_binding_target(call.args[0], allow_locals)
         and _subscript_may_name(call.args[1], name)
         and _is_typebound_store_method(call.func)
     )
 
 
-def _call_is_bound_namespace_setitem(call, name):
+def _call_is_bound_namespace_setitem(call, name, allow_locals=True):
     """Return True for ``globals().__setitem__('bind', ...)``."""
     func = call.func
     return (
         isinstance(func, ast.Attribute)
         and func.attr == "__setitem__"
-        and _is_namespace_reference(func.value)
+        and _is_namespace_reference(func.value, allow_locals)
         and bool(call.args)
         and _subscript_may_name(call.args[0], name)
     )
 
 
-def _call_writes_global(child, name):
+def _call_writes_global(child, name, allow_locals=True):
     """Return True for a call that can write an arbitrary module global."""
     func = child.func
     if (
@@ -598,7 +600,7 @@ def _call_writes_global(child, name):
         isinstance(func, ast.Attribute)
         and func.attr in {"update", "setdefault", "pop"}
         and (
-            _is_namespace_reference(func.value)
+            _is_namespace_reference(func.value, allow_locals)
             or _is_module_dict_reference(func.value)
         )
         and (
@@ -610,9 +612,9 @@ def _call_writes_global(child, name):
         )
     ):
         return True
-    if _call_is_typebound_namespace_store(child, name):
+    if _call_is_typebound_namespace_store(child, name, allow_locals):
         return True
-    if _call_is_bound_namespace_setitem(child, name):
+    if _call_is_bound_namespace_setitem(child, name, allow_locals):
         return True
     if _call_is_operator_call_setitem(child, name):
         return True
@@ -627,45 +629,52 @@ def _call_writes_global(child, name):
     return False
 
 
-def _target_writes_namespace(target, name):
+def _target_writes_namespace(target, name, allow_locals=True):
     """Return True for ``globals()['bind'] = ...`` and similar targets."""
     if isinstance(target, ast.Subscript):
-        return _is_namespace_reference(target.value) and _subscript_may_name(
-            target.slice, name
+        return _is_namespace_reference(target.value, allow_locals) and (
+            _subscript_may_name(target.slice, name)
         )
     if isinstance(target, (ast.Tuple, ast.List)):
-        return any(_target_writes_namespace(element, name) for element in target.elts)
+        return any(
+            _target_writes_namespace(element, name, allow_locals)
+            for element in target.elts
+        )
     if isinstance(target, ast.Starred):
-        return _target_writes_namespace(target.value, name)
+        return _target_writes_namespace(target.value, name, allow_locals)
     return False
 
 
-def _targets_write_global(targets, name):
+def _targets_write_global(targets, name, allow_locals=True):
     """Return True when any assignment target writes the named global."""
     return any(
         _target_writes_name(target, name)
-        or _target_writes_namespace(target, name)
+        or _target_writes_namespace(target, name, allow_locals)
         for target in targets
     )
 
 
-def _has_dynamic_namespace_write(node, name):
+def _has_dynamic_namespace_write(node, name, allow_locals=True):
     """Return True when a module-scope statement can write the named global.
 
     ``_iter_module_scope_nodes`` does not enter deferred function or method
     bodies, so an uncalled helper stays ABSENT while a class body, decorator,
-    default argument or nested ``if``/``try`` statement is inspected.
+    default argument or nested ``if``/``try`` statement is inspected. A bare
+    ``locals()`` inside a class body names the class namespace, so the caller
+    disables that spelling for a class statement.
     """
     for child in _iter_module_scope_nodes(node):
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
-            if _targets_write_global(targets, name):
+            if _targets_write_global(targets, name, allow_locals):
                 return True
         elif isinstance(child, ast.Delete) and _targets_write_global(
-            child.targets, name
+            child.targets, name, allow_locals
         ):
             return True
-        elif isinstance(child, ast.Call) and _call_writes_global(child, name):
+        elif isinstance(child, ast.Call) and _call_writes_global(
+            child, name, allow_locals
+        ):
             return True
     return False
 
@@ -1009,7 +1018,9 @@ def _scan_module_bindings(statements, name):
             return SUPPLIED, dynamic
         if _statement_writes_named_attribute(node, name):
             dynamic = True
-        if _has_dynamic_namespace_write(node, name):
+        if _has_dynamic_namespace_write(
+            node, name, allow_locals=not isinstance(node, ast.ClassDef)
+        ):
             dynamic = True
     return None, dynamic
 

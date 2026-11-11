@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PIN = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)")
+PIN = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?==([^\s\\]+)")
 
 
 def _pins(path):

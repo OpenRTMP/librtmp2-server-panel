@@ -101,3 +101,8 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
     config_app = run(probe_status=1, wsgi_status=0)
     assert "app:app" not in config_app
     assert "--worker-class" in config_app
+
+    # An uninspectable config (status 2) must keep the image default: dropping
+    # it would leave Gunicorn with no application at all.
+    unknown_app = run(probe_status=1, wsgi_status=2)
+    assert "app:app" in unknown_app
