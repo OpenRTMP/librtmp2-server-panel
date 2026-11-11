@@ -15,16 +15,24 @@ def _pins(path):
 
 
 def test_compiled_requirements_match_the_declared_direct_pins():
-    """A direct pin and its hashed lockfile must not drift apart.
+    """A direct pin and its hashed lockfiles must not drift apart.
 
-    A dependency bot that updates only the compiled file leaves the declared
-    pin behind; regenerating per the README then silently downgrades it.
+    A dependency bot that updates only a compiled file leaves the declared pin
+    behind; regenerating per the README then silently downgrades it. Runtime
+    pins are checked against both locks, development pins against the
+    development lock.
     """
-    declared = _pins(ROOT / "requirements.in")
-    compiled = _pins(ROOT / "requirements.txt")
-    mismatch = {
-        name: (version, compiled.get(name))
-        for name, version in declared.items()
-        if compiled.get(name) != version
-    }
-    assert mismatch == {}
+    checks = [
+        ("requirements.in", "requirements.txt"),
+        ("requirements.in", "requirements-dev.txt"),
+        ("requirements-dev.in", "requirements-dev.txt"),
+    ]
+    for source, lockfile in checks:
+        declared = _pins(ROOT / source)
+        compiled = _pins(ROOT / lockfile)
+        mismatch = {
+            name: (version, compiled.get(name))
+            for name, version in declared.items()
+            if compiled.get(name) != version
+        }
+        assert mismatch == {}, f"{source} vs {lockfile}"

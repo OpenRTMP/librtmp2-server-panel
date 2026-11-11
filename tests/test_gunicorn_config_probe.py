@@ -668,6 +668,26 @@ def test_wsgi_app_dynamic_or_conditional_is_not_proof(tmp_path):
     assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
 
 
+def test_wsgi_app_later_literal_or_delete_is_tracked_in_order(tmp_path):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(
+        "globals().update(wsgi_app='old:app')\nwsgi_app = 'wrapper:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.SUPPLIED
+
+    config_file.write_text(
+        "wsgi_app = 'wrapper:app'\ndel wsgi_app\n", encoding="utf-8"
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.ABSENT
+
+    config_file.write_text(
+        "wsgi_app = 'wrapper:app'\nif True:\n    del wsgi_app\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(config_file, "wsgi-app") == probe.UNKNOWN
+
+
 def test_main_reads_env_args_and_implicit_config(monkeypatch, tmp_path):
     (tmp_path / "gunicorn.conf.py").write_text(
         'bind = ["127.0.0.1:18081"]\n',
