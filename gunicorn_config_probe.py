@@ -1169,8 +1169,20 @@ def _assignment_targets_name(node, name):
     )
 
 
+def _delete_targets_name(node, name):
+    """Return True for a ``del name`` statement."""
+    if not isinstance(node, ast.Delete):
+        return False
+    return any(
+        isinstance(target, ast.Name) and target.id == name
+        for target in node.targets
+    )
+
+
 def _wsgi_app_assignment_state(node):
-    """Return ``proven``/``none``/``dynamic`` for a direct assignment, else None."""
+    """Return ``proven``/``none``/``dynamic`` for a direct write, else None."""
+    if _delete_targets_name(node, "wsgi_app"):
+        return "none"
     if not _assignment_targets_name(node, "wsgi_app"):
         return None
     value = node.value
@@ -1184,6 +1196,10 @@ def _wsgi_app_assignment_state(node):
 
 def _wsgi_app_statement_is_uncertain(node, globals_aliases):
     """Return True when a non-direct statement may write ``wsgi_app``."""
+    if any(
+        _delete_targets_name(child, "wsgi_app") for child in ast.walk(node)
+    ):
+        return True
     if _has_dynamic_namespace_write(node, "wsgi_app", globals_aliases):
         return True
     supplied, uncertain = _scan_module_bindings(
@@ -1226,8 +1242,11 @@ def wsgi_app_provides_setting(path):
             state = _wsgi_app_assignment_state(node)
             if state == "proven":
                 proven = True
+                # A later unconditional assignment supersedes earlier writes.
+                dynamic = False
             elif state == "none":
                 proven = False
+                dynamic = False
             elif state == "dynamic" or _wsgi_app_statement_is_uncertain(
                 node, globals_aliases
             ):
