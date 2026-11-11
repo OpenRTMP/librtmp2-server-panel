@@ -274,13 +274,11 @@ def _import_binding_kind(node, name):
     return None
 
 
-def _is_namespace_reference(node):
+def _is_namespace_reference(node, globals_aliases=frozenset()):
     """Return True for a ``globals()``/``vars()`` result expression."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"globals", "vars"}
-    )
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+        return False
+    return node.func.id in {"globals", "vars"} or node.func.id in globals_aliases
 
 
 def _is_module_dict_reference(node):
@@ -491,7 +489,7 @@ def _call_is_operator_call_setitem(call, name):
         and isinstance(func.value, ast.Name)
         and func.value.id == "operator"
         and len(call.args) >= 3
-        and _is_setitem_callable(call.args[0])
+        and _operator_callable_is_setitem(call.args[0])
         and _namespace_or_module_binding_target(call.args[1])
     ):
         return False
@@ -567,7 +565,91 @@ def _call_is_typebound_namespace_store(call, name):
     )
 
 
-def _call_writes_global(child, name):
+def _operator_callable_is_setitem(node):
+    """Return True when a call argument resolves to a dict ``__setitem__`` hook."""
+    if _is_setitem_callable(node):
+        return True
+    return isinstance(node, ast.Call) and _getattr_resolves_type_method(
+        node, "dict", {"__setitem__"}
+    )
+
+
+def _call_is_getattr_namespace_store(call, name, globals_aliases=frozenset()):
+    """Return True for ``getattr(globals(), 'update')`` / ``__setitem__`` writes."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    inner = call.func
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "getattr"
+        and len(inner.args) >= 2
+        and _is_namespace_reference(inner.args[0], globals_aliases)
+    ):
+        return False
+    method = inner.args[1]
+    if not isinstance(method, ast.Constant) or not isinstance(method.value, str):
+        return False
+    if method.value == "update":
+        return _dict_update_payload_may_name(call, name, start_index=0)
+    if method.value in {"__setitem__", "setdefault"}:
+        return _subscript_may_name(call.args[0], name)
+    return False
+
+
+def _call_is_namespace_dunder_method(call, name, globals_aliases=frozenset()):
+    """Return True for ``globals().__setitem__`` / ``.update`` / ``.setdefault``."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr not in {"__setitem__", "setdefault", "update"}:
+        return False
+    if not _is_namespace_reference(func.value, globals_aliases):
+        return False
+    if func.attr == "update":
+        return _dict_update_payload_may_name(call, name, start_index=0)
+    return _subscript_may_name(call.args[0], name)
+
+
+def _call_is_invoked_partial_namespace_update(call, name):
+    """Return True for ``partial(dict.update, globals(), ...)(payload)()`` writes."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    partial_call = call.func
+    if not _is_partial_construction(partial_call) or len(partial_call.args) < 2:
+        return False
+    if not _is_dict_type_update_callable(partial_call.args[0]):
+        return False
+    if not _namespace_or_module_binding_target(partial_call.args[1]):
+        return False
+    wrapped = ast.Call(
+        func=partial_call.args[0],
+        args=partial_call.args[1:],
+        keywords=partial_call.keywords,
+    )
+    return _dict_update_payload_may_name(
+        ast.Call(func=wrapped, args=call.args, keywords=call.keywords),
+        name,
+        start_index=0,
+    )
+
+
+def _collect_globals_aliases(statements):
+    """Map simple ``g = globals`` aliases at module scope."""
+    aliases = set()
+    for statement in _iter_module_assignments(statements):
+        targets, value = _assignment_targets_and_value(statement)
+        if not isinstance(value, ast.Name) or value.id != "globals":
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases.add(target.id)
+    return aliases
+
+
+def _call_writes_global(child, name, globals_aliases=frozenset()):
     """Return True for a call that can write an arbitrary module global."""
     func = child.func
     if (
@@ -582,7 +664,7 @@ def _call_writes_global(child, name):
         isinstance(func, ast.Attribute)
         and func.attr in {"update", "setdefault", "pop"}
         and (
-            _is_namespace_reference(func.value)
+            _is_namespace_reference(func.value, globals_aliases)
             or _is_module_dict_reference(func.value)
         )
         and (
@@ -593,6 +675,12 @@ def _call_writes_global(child, name):
             )
         )
     ):
+        return True
+    if _call_is_getattr_namespace_store(child, name, globals_aliases):
+        return True
+    if _call_is_namespace_dunder_method(child, name, globals_aliases):
+        return True
+    if _call_is_invoked_partial_namespace_update(child, name):
         return True
     if _call_is_typebound_namespace_store(child, name):
         return True
@@ -609,29 +697,32 @@ def _call_writes_global(child, name):
     return False
 
 
-def _target_writes_namespace(target, name):
+def _target_writes_namespace(target, name, globals_aliases=frozenset()):
     """Return True for ``globals()['bind'] = ...`` and similar targets."""
     if isinstance(target, ast.Subscript):
-        return _is_namespace_reference(target.value) and _subscript_may_name(
+        return _is_namespace_reference(target.value, globals_aliases) and _subscript_may_name(
             target.slice, name
         )
     if isinstance(target, (ast.Tuple, ast.List)):
-        return any(_target_writes_namespace(element, name) for element in target.elts)
+        return any(
+            _target_writes_namespace(element, name, globals_aliases)
+            for element in target.elts
+        )
     if isinstance(target, ast.Starred):
-        return _target_writes_namespace(target.value, name)
+        return _target_writes_namespace(target.value, name, globals_aliases)
     return False
 
 
-def _targets_write_global(targets, name):
+def _targets_write_global(targets, name, globals_aliases=frozenset()):
     """Return True when any assignment target writes the named global."""
     return any(
         _target_writes_name(target, name)
-        or _target_writes_namespace(target, name)
+        or _target_writes_namespace(target, name, globals_aliases)
         for target in targets
     )
 
 
-def _has_dynamic_namespace_write(node, name):
+def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
     """Return True when a module-scope statement can write the named global.
 
     ``_iter_module_scope_nodes`` does not enter deferred function or method
@@ -641,13 +732,15 @@ def _has_dynamic_namespace_write(node, name):
     for child in _iter_module_scope_nodes(node):
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
-            if _targets_write_global(targets, name):
+            if _targets_write_global(targets, name, globals_aliases):
                 return True
         elif isinstance(child, ast.Delete) and _targets_write_global(
-            child.targets, name
+            child.targets, name, globals_aliases
         ):
             return True
-        elif isinstance(child, ast.Call) and _call_writes_global(child, name):
+        elif isinstance(child, ast.Call) and _call_writes_global(
+            child, name, globals_aliases
+        ):
             return True
     return False
 
@@ -975,7 +1068,7 @@ def _local_writer_names(definitions, name, aliases):
     return writers
 
 
-def _scan_module_bindings(statements, name):
+def _scan_module_bindings(statements, name, globals_aliases=frozenset()):
     """Return ``(SUPPLIED or None, dynamic)`` for module-scope statements."""
     dynamic = False
     for node in _iter_module_assignments(statements):
@@ -991,7 +1084,7 @@ def _scan_module_bindings(statements, name):
             return SUPPLIED, dynamic
         if _statement_writes_named_attribute(node, name):
             dynamic = True
-        if _has_dynamic_namespace_write(node, name):
+        if _has_dynamic_namespace_write(node, name, globals_aliases):
             dynamic = True
     return None, dynamic
 
@@ -1016,7 +1109,10 @@ def config_provides_setting(path, name):
         return UNKNOWN
     try:
         definitions = _module_local_definitions(tree.body)
-        supplied, dynamic = _scan_module_bindings(tree.body, name)
+        globals_aliases = _collect_globals_aliases(tree.body)
+        supplied, dynamic = _scan_module_bindings(
+            tree.body, name, globals_aliases
+        )
         if supplied == SUPPLIED:
             return SUPPLIED
         # A local helper invoked at import time can assign the setting even
