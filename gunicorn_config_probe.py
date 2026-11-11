@@ -649,32 +649,38 @@ def _collect_globals_aliases(statements):
     return aliases
 
 
-def _call_writes_global(child, name, globals_aliases=frozenset()):
-    """Return True for a call that can write an arbitrary module global."""
-    func = child.func
-    if (
-        isinstance(func, ast.Name)
-        and func.id in {"exec", "eval", "setattr"}
-    ) or (
-        isinstance(func, ast.Attribute)
-        and func.attr in {"exec", "eval", "setattr"}
-    ):
-        return True
-    if (
+def _call_is_dynamic_eval_or_setattr(func):
+    """Recognize calls that may execute code or change arbitrary attributes."""
+    if isinstance(func, ast.Name):
+        return func.id in {"exec", "eval", "setattr"}
+    return isinstance(func, ast.Attribute) and func.attr in {
+        "exec", "eval", "setattr"
+    }
+
+
+def _call_is_namespace_attribute_mutation(call, name, globals_aliases):
+    """Recognize writes through globals() or a module __dict__."""
+    func = call.func
+    if not (
         isinstance(func, ast.Attribute)
         and func.attr in {"update", "setdefault", "pop"}
         and (
             _is_namespace_reference(func.value, globals_aliases)
             or _is_module_dict_reference(func.value)
         )
-        and (
-            bool(child.args)
-            or any(
-                keyword.arg is None or keyword.arg == name
-                for keyword in child.keywords
-            )
-        )
     ):
+        return False
+    return bool(call.args) or any(
+        keyword.arg is None or keyword.arg == name
+        for keyword in call.keywords
+    )
+
+
+def _call_writes_global(child, name, globals_aliases=frozenset()):
+    """Return True for a call that can write an arbitrary module global."""
+    if _call_is_dynamic_eval_or_setattr(child.func):
+        return True
+    if _call_is_namespace_attribute_mutation(child, name, globals_aliases):
         return True
     if _call_is_getattr_namespace_store(child, name, globals_aliases):
         return True
