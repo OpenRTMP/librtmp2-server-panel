@@ -459,6 +459,33 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
             "reduce(lambda g, _: dict.__setitem__(g, 'bind', []), [None], globals())\n",
             probe.UNKNOWN,
         ),
+        (
+            "getattr(globals(), 'update')({'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "getattr(globals(), '__setitem__')('bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "globals().__setitem__('bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "g = globals\ng()['bind'] = []\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator, builtins\n"
+            "operator.call(getattr(builtins.dict, '__setitem__'), globals(), 'bind', [])\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "from functools import partial\n"
+            "import builtins\n"
+            "partial(builtins.dict.update, globals())({'bind': []})()\n",
+            probe.UNKNOWN,
+        ),
         # A walrus inside a lambda or nested function binds that local scope,
         # not the module, so it must not suppress the image default bind.
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
@@ -524,6 +551,23 @@ def test_typebound_dict_update_payload_detection(tmp_path, source, mode, expecte
     config_file = tmp_path / "gunicorn.conf.py"
     config_file.write_text(source, encoding="utf-8")
     assert _config_provides(config_file, mode) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("globals().update(bind='127.0.0.1:8000')\n", probe.UNKNOWN),
+        ("globals().update(workers=2)\n", probe.ABSENT),
+        ("globals().pop('bind', None)\n", probe.UNKNOWN),
+        ("exec('pass')\n", probe.UNKNOWN),
+        ("eval('1 + 1')\n", probe.UNKNOWN),
+        ("setattr(object(), 'value', 1)\n", probe.UNKNOWN),
+    ],
+)
+def test_dynamic_global_call_detection_after_refactor(tmp_path, source, expected):
+    config_file = tmp_path / "gunicorn.conf.py"
+    config_file.write_text(source, encoding="utf-8")
+    assert _config_provides(config_file) == expected
 
 
 def test_dynamic_write_does_not_hide_a_later_explicit_wsgi_app_assignment(tmp_path):
