@@ -1169,6 +1169,38 @@ def _assignment_targets_name(node, name):
     )
 
 
+def _wsgi_app_assignment_state(node):
+    """Return ``proven``/``none``/``dynamic`` for a direct assignment, else None."""
+    if not _assignment_targets_name(node, "wsgi_app"):
+        return None
+    value = node.value
+    if isinstance(value, ast.Constant):
+        if isinstance(value.value, str) and value.value:
+            return "proven"
+        if value.value is None:
+            return "none"
+    return "dynamic"
+
+
+def _wsgi_app_statement_is_uncertain(node, globals_aliases):
+    """Return True when a non-direct statement may write ``wsgi_app``."""
+    if _has_dynamic_namespace_write(node, "wsgi_app", globals_aliases):
+        return True
+    supplied, uncertain = _scan_module_bindings(
+        [node], "wsgi_app", globals_aliases
+    )
+    return supplied == SUPPLIED or uncertain
+
+
+def _called_helper_writes_wsgi_app(tree, definitions):
+    """Return True when a helper called at import time may write ``wsgi_app``."""
+    aliases = _collect_aliases(tree.body, definitions)
+    return bool(
+        _called_local_names(tree.body, definitions, aliases)
+        & _local_writer_names(definitions, "wsgi_app", aliases)
+    )
+
+
 def wsgi_app_provides_setting(path):
     """Return ``0``/``1``/``2`` for a *proven* effective ``wsgi_app``.
 
@@ -1191,33 +1223,16 @@ def wsgi_app_provides_setting(path):
         proven = False
         dynamic = False
         for node in tree.body:
-            if _assignment_targets_name(node, "wsgi_app"):
-                value = node.value
-                if (
-                    isinstance(value, ast.Constant)
-                    and isinstance(value.value, str)
-                    and value.value
-                ):
-                    proven = True
-                elif isinstance(value, ast.Constant) and value.value is None:
-                    proven = False
-                else:
-                    dynamic = True
-                continue
-            # Any other statement that might write wsgi_app (a conditional, a
-            # class body, a dynamic namespace write, an import) is not proof.
-            if _has_dynamic_namespace_write(node, "wsgi_app", globals_aliases):
+            state = _wsgi_app_assignment_state(node)
+            if state == "proven":
+                proven = True
+            elif state == "none":
+                proven = False
+            elif state == "dynamic" or _wsgi_app_statement_is_uncertain(
+                node, globals_aliases
+            ):
                 dynamic = True
-            else:
-                supplied, uncertain = _scan_module_bindings(
-                    [node], "wsgi_app", globals_aliases
-                )
-                if supplied == SUPPLIED or uncertain:
-                    dynamic = True
-        aliases = _collect_aliases(tree.body, definitions)
-        if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
-            definitions, "wsgi_app", aliases
-        ):
+        if _called_helper_writes_wsgi_app(tree, definitions):
             dynamic = True
     except RecursionError:
         return UNKNOWN
