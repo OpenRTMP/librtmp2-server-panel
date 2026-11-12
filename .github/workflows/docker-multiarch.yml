@@ -25,6 +25,10 @@ on:
         required: false
       QUAY_TOKEN:
         required: false
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
 
 jobs:
   build:
@@ -45,11 +49,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      #- name: Log in to Docker Hub
-        #uses: docker/login-action@v4.5.2
-        #with:
-          #username: ${{ secrets.DOCKERHUB_USERNAME }}
-          #password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'openrtmp' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -79,7 +84,10 @@ jobs:
           ghcr.io/openrtmp/librtmp2-server-panel:alpha
           quay.io/openrtmp/librtmp2-server-panel:latest
           quay.io/openrtmp/librtmp2-server-panel:beta
-          quay.io/openrtmp/librtmp2-server-panel:alpha"
+          quay.io/openrtmp/librtmp2-server-panel:alpha
+          openrtmp/librtmp2-server-panel:latest
+          openrtmp/librtmp2-server-panel:beta
+          openrtmp/librtmp2-server-panel:alpha"
           APP_VERSION=""
           if [ -n "$VERSION" ]; then
             # Only treat this as a "v"-prefixed release version (and mirror
@@ -100,7 +108,8 @@ jobs:
             APP_VERSION="$BARE_VERSION"
             TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server-panel:$BARE_VERSION
-          quay.io/openrtmp/librtmp2-server-panel:$BARE_VERSION"
+          quay.io/openrtmp/librtmp2-server-panel:$BARE_VERSION
+          openrtmp/librtmp2-server-panel:$BARE_VERSION"
             # Publish the v-prefixed alias too whenever this looks like a
             # semver-shaped release version (0.1.1 or v0.1.1 alike), so a
             # single dispatch always produces both tags regardless of which
@@ -110,7 +119,8 @@ jobs:
             if echo "$BARE_VERSION" | grep -qE '^[0-9]+\.[0-9]'; then
               TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server-panel:v$BARE_VERSION
-          quay.io/openrtmp/librtmp2-server-panel:v$BARE_VERSION"
+          quay.io/openrtmp/librtmp2-server-panel:v$BARE_VERSION
+          openrtmp/librtmp2-server-panel:v$BARE_VERSION"
             fi
           fi
           {

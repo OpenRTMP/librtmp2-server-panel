@@ -156,7 +156,7 @@ docker run -d \
   ghcr.io/openrtmp/librtmp2-server-panel:latest
 ```
 
-Prebuilt multi-architecture images are published for `amd64`, `arm64`, and `riscv64`. Available tags include release versions and the moving `latest`, `beta`, and `alpha` channels.
+Prebuilt multi-architecture images are published for `amd64`, `arm64`, and `riscv64`. Available tags include release versions and the moving `latest`, `beta`, and `alpha` channels. The same images are mirrored to Docker Hub as `openrtmp/librtmp2-server-panel`.
 
 ## Local Python development
 
