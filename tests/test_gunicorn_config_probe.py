@@ -511,6 +511,38 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
             "partial(builtins.dict.update, globals())({'bind': []})()\n",
             probe.UNKNOWN,
         ),
+        (
+            "import operator\n"
+            "operator.ior(globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "globals().__ior__({'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "dict.__ior__(globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "getattr(operator, 'ior')(globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "operator.call(operator.ior, globals(), {'bind': []})\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "import operator\n"
+            "operator.methodcaller('__ior__', {'bind': []})(globals())\n",
+            probe.UNKNOWN,
+        ),
+        (
+            "getattr(globals(), '__ior__')({'bind': []})\n",
+            probe.UNKNOWN,
+        ),
         # A walrus inside a lambda or nested function binds that local scope,
         # not the module, so it must not suppress the image default bind.
         ("helper = lambda: (bind := ['127.0.0.1:9000'])\n", probe.ABSENT),
