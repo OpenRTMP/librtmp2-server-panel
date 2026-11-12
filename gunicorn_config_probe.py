@@ -868,17 +868,16 @@ def _call_writes_global(
         return True
     if _call_is_operator_call_dict_update(child, name, allow_locals):
         return True
-    if _call_is_operator_ior_on_namespace(child, name, allow_locals):
-        return True
-    if _call_is_dict_type_ior_on_namespace(child, name, allow_locals):
-        return True
-    if _call_is_operator_call_ior(child, name, allow_locals):
-        return True
-    if _call_is_operator_methodcaller_ior(child, name, allow_locals):
-        return True
-    if _call_is_getattr_operator_ior(child, name, allow_locals):
-        return True
-    return False
+    return any(
+        checker(child, name, allow_locals)
+        for checker in (
+            _call_is_operator_ior_on_namespace,
+            _call_is_dict_type_ior_on_namespace,
+            _call_is_operator_call_ior,
+            _call_is_operator_methodcaller_ior,
+            _call_is_getattr_operator_ior,
+        )
+    )
 
 
 def _target_writes_namespace(
