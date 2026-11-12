@@ -13,6 +13,65 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.16] — 2026-11-12
+
+### Added
+- Docker Hub images. The multi-arch build now also publishes
+  `docker.io/openrtmp/librtmp2-server-panel` for release tags and the
+  `latest`, `beta` and `alpha` channels, next to GHCR and Quay.
+  `README.dockerhub.md` is the paste-ready repository description.
+
+### Security
+- The Gunicorn worker probe fails closed for serialization hooks
+  (`pickle.dumps`, `copy.copy`, `copy.deepcopy`), custom async iterators,
+  and namespace writes through `builtins.dict`, `dict.update`,
+  `operator.call`/`setitem`/`methodcaller`, `getattr(globals(), ...)`,
+  invoked `partial`/`reduce` helpers and `sys.modules`. A `memory://` rate
+  limiter can no longer pass startup validation while a config raises the
+  worker count behind the probe.
+- Called config helpers are treated as possible writers. A `bind` or
+  `wsgi_app` assigned in a direct, decorated, inherited, context-manager or
+  transitive helper now reports the setting as unknown or present instead of
+  absent, so the entrypoint no longer injects `0.0.0.0:8000` or `app:app`
+  over the operator's config. A bare `global bind: list` annotation is not a
+  write, and a deeply nested config returns unknown instead of exiting 1.
+- A top-level literal `wsgi_app` is only final when it is a literal string;
+  `None`, dynamic values, conditional assignments and imports keep the image
+  default. `locals()` writes are only considered at module scope, and
+  `wsgi_app` writes are evaluated in statement order, so a later
+  unconditional literal or `del` supersedes earlier writes.
+- The entrypoint bind probe recognises imported, destructured, loop, with,
+  augmented and walrus targets, alias/partial/instance-method wrappers,
+  BOM-prefixed configs and `--proxy-protocol` without a value, and follows
+  Gunicorn's `-c`/config/environment precedence. Wildcard imports and
+  recursion stay unknown. The image no longer overrides a supplied bind.
+
+### Fixed
+- Anonymous stats requests keep a rate limit when the stats view is exempt
+  from the scoped authenticated budgets. The default budget applies only to
+  unauthenticated requests, and a session or limiter outage reports the
+  request as unauthenticated instead of removing the budget.
+- Redis cluster limiter failures answer 503 instead of an unhandled 500
+  (`RedisClusterException` is not a `RedisError`).
+- A numeric `stream_id` of 0 is accepted as a real id in create-stream
+  responses and cluster placement; an empty string falls back to the entry
+  id instead of being treated as missing.
+- An upstream stats 429 is surfaced as the panel's 429 with `Retry-After`,
+  so the browser keeps the last good stats and pauses instead of showing a
+  generic 502.
+- A blank `RATELIMIT_STORAGE_URI` is normalised to `memory://` before
+  Flask-Limiter reads it.
+- The clipboard fallback restores focus after the textarea copy path, and
+  the deprecated fallback is documented.
+
+### Changed
+- The image default bind moved out of the Dockerfile `CMD`, so Gunicorn's
+  last-wins CLI layer cannot override `GUNICORN_CMD_ARGS` or
+  `gunicorn.conf.py`; the entrypoint adds it only when the probe reports no
+  bind.
+- Dependency update: gunicorn 27.
+- CI workflows pin third-party GitHub Actions to commit SHAs.
+
 ## [0.1.15] — 2026-11-06
 
 ### Security
@@ -544,7 +603,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.12...v0.1.13
