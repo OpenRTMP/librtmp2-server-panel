@@ -51,7 +51,7 @@ To use Docker Hub instead of GHCR, replace the two `image:` lines with
 ## Supported tags and architectures
 
 - `latest`, `beta`, `alpha` — moving channels
-- `0.1.15`, `v0.1.15` — pinned releases (both spellings are published)
+- `0.1.16`, `v0.1.16` — pinned releases (both spellings are published)
 - `linux/amd64`, `linux/arm64`, `linux/riscv64`
 
 Mirrors: `ghcr.io/openrtmp/librtmp2-server-panel` and
