@@ -467,6 +467,26 @@ def _is_dict_type_update_callable(func):
     return False
 
 
+def _is_dict_type_ior_callable(func):
+    """Return True for ``dict.__ior__`` / ``builtins.dict.__ior__`` callables."""
+    if isinstance(func, ast.Attribute) and func.attr == "__ior__":
+        return _is_dict_type_reference(func.value)
+    if isinstance(func, ast.Call):
+        return _getattr_resolves_type_method(func, "dict", {"__ior__"})
+    return False
+
+
+def _is_operator_ior_callable(func):
+    if isinstance(func, ast.Name) and func.id == "ior":
+        return True
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "ior"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "operator"
+    )
+
+
 def _dict_update_payload_may_name(call, name, *, start_index=1):
     """Return True when a dict ``update`` call may set module global ``name``."""
     for arg in call.args[start_index:]:
@@ -516,6 +536,104 @@ def _call_is_operator_call_dict_update(call, name, allow_locals=True):
         keywords=call.keywords,
     )
     return _dict_update_payload_may_name(wrapped, name, start_index=1)
+
+
+def _call_is_operator_ior_on_namespace(call, name, allow_locals=True):
+    """Return True for ``operator.ior(globals(), {...})`` module writes."""
+    if not _is_operator_ior_callable(call.func):
+        return False
+    if len(call.args) < 2:
+        return False
+    if not _namespace_or_module_binding_target(call.args[0], allow_locals):
+        return False
+    return _dict_update_payload_may_name(call, name, start_index=1)
+
+
+def _call_is_dict_type_ior_on_namespace(call, name, allow_locals=True):
+    """Return True for ``dict.__ior__(globals(), {...})`` module writes."""
+    if not _is_dict_type_ior_callable(call.func):
+        return False
+    if not call.args or not _namespace_or_module_binding_target(
+        call.args[0], allow_locals
+    ):
+        return False
+    return _dict_update_payload_may_name(call, name, start_index=1)
+
+
+def _operator_callable_is_ior(node):
+    if isinstance(node, ast.Name) and node.id == "ior":
+        return True
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == "ior"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "operator"
+    ):
+        return True
+    return isinstance(node, ast.Call) and _getattr_resolves_type_method(
+        node, "operator", {"ior"}
+    )
+
+
+def _call_is_getattr_operator_ior(call, name, allow_locals=True):
+    """Return True for ``getattr(operator, 'ior')(globals(), payload)`` writes."""
+    if not isinstance(call, ast.Call) or len(call.args) < 2:
+        return False
+    inner = call.func
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "getattr"
+        and len(inner.args) >= 2
+        and isinstance(inner.args[0], ast.Name)
+        and inner.args[0].id == "operator"
+        and isinstance(inner.args[1], ast.Constant)
+        and inner.args[1].value == "ior"
+    ):
+        return False
+    if not _namespace_or_module_binding_target(call.args[0], allow_locals):
+        return False
+    return _dict_update_payload_may_name(call, name, start_index=1)
+
+
+def _call_is_operator_call_ior(call, name, allow_locals=True):
+    """Return True for ``operator.call(operator.ior, globals(), payload)`` writes."""
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "call"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "operator"
+        and len(call.args) >= 2
+        and _operator_callable_is_ior(call.args[0])
+        and _namespace_or_module_binding_target(call.args[1], allow_locals)
+    ):
+        return False
+    return _dict_update_payload_may_name(call, name, start_index=2)
+
+
+def _call_is_operator_methodcaller_ior(call, name, allow_locals=True):
+    """Return True for ``operator.methodcaller('__ior__', payload)(globals())``."""
+    func = call.func
+    if not (isinstance(func, ast.Call) and call.args):
+        return False
+    factory = func.func
+    if not (
+        isinstance(factory, ast.Attribute)
+        and factory.attr == "methodcaller"
+        and isinstance(factory.value, ast.Name)
+        and factory.value.id == "operator"
+        and func.args
+    ):
+        return False
+    method = func.args[0]
+    if not (isinstance(method, ast.Constant) and method.value == "__ior__"):
+        return False
+    if len(func.args) >= 2:
+        payload_call = ast.Call(func=factory, args=func.args, keywords=func.keywords)
+        if not _dict_update_payload_may_name(payload_call, name, start_index=1):
+            return False
+    return _namespace_or_module_binding_target(call.args[0], allow_locals)
 
 
 def _call_is_operator_call_setitem(call, name, allow_locals=True):
@@ -632,6 +750,8 @@ def _call_is_getattr_namespace_store(
         return False
     if method.value == "update":
         return _dict_update_payload_may_name(call, name, start_index=0)
+    if method.value == "__ior__":
+        return _dict_update_payload_may_name(call, name, start_index=0)
     if method.value in {"__setitem__", "setdefault"}:
         return _subscript_may_name(call.args[0], name)
     return False
@@ -646,11 +766,11 @@ def _call_is_namespace_dunder_method(
     func = call.func
     if not isinstance(func, ast.Attribute):
         return False
-    if func.attr not in {"__setitem__", "setdefault", "update"}:
+    if func.attr not in {"__setitem__", "setdefault", "update", "__ior__"}:
         return False
     if not _is_namespace_reference(func.value, globals_aliases, allow_locals):
         return False
-    if func.attr == "update":
+    if func.attr in {"update", "__ior__"}:
         return _dict_update_payload_may_name(call, name, start_index=0)
     return _subscript_may_name(call.args[0], name)
 
@@ -747,6 +867,16 @@ def _call_writes_global(
     if _call_is_dict_type_update_on_namespace(child, name, allow_locals):
         return True
     if _call_is_operator_call_dict_update(child, name, allow_locals):
+        return True
+    if _call_is_operator_ior_on_namespace(child, name, allow_locals):
+        return True
+    if _call_is_dict_type_ior_on_namespace(child, name, allow_locals):
+        return True
+    if _call_is_operator_call_ior(child, name, allow_locals):
+        return True
+    if _call_is_operator_methodcaller_ior(child, name, allow_locals):
+        return True
+    if _call_is_getattr_operator_ior(child, name, allow_locals):
         return True
     return False
 
