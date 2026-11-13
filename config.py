@@ -16961,6 +16961,7 @@ def _expression_triggers_class_workers_side_effect(
             class_targets,
             instance_events,
             reference_line,
+            operator_bindings,
         )
         or _copy_copy_call_triggers_workers(
             expr,
@@ -16968,6 +16969,7 @@ def _expression_triggers_class_workers_side_effect(
             class_targets,
             instance_events,
             reference_line,
+            operator_bindings,
         )
     )
 
@@ -22123,23 +22125,49 @@ def _pickle_dumps_call_triggers_workers(
     )
 
 
-def _copy_deepcopy_call_triggers_workers(
+def _copy_alias_events(operator_bindings):
+    """Return tracked ``copy`` module and function import aliases."""
+    metadata = (
+        operator_bindings[32]
+        if operator_bindings is not None and len(operator_bindings) > 32
+        else {}
+    )
+    return (
+        metadata.get("copy_module_alias_events", {}),
+        metadata.get("copy_function_alias_events", {}),
+    )
+
+
+def _call_is_copy_module_serialization(
     expr,
+    method,
     methods,
     class_targets,
     instance_events,
     reference_line,
+    operator_bindings=None,
 ):
-    """Return True when ``copy.deepcopy`` runs a mutating serialization hook."""
+    """Return True when a ``copy`` helper runs a mutating serialization hook."""
     if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
         return False
     func = expr.func
-    if not (
+    line = reference_line or getattr(expr, "lineno", 0)
+    module_events, name_events = _copy_alias_events(operator_bindings)
+    matched = False
+    if (
         isinstance(func, ast.Attribute)
-        and func.attr == "deepcopy"
+        and func.attr == method
         and isinstance(func.value, ast.Name)
-        and func.value.id == "copy"
     ):
+        receiver = func.value.id
+        if receiver == "copy" or _module_alias_active_at_line(
+            func.value, set(), module_events, line
+        ):
+            matched = True
+    elif isinstance(func, ast.Name) and func.id == method:
+        if _imported_alias_is_active(name_events, func.id, line):
+            matched = True
+    if not matched:
         return False
     return _serialization_hooks_trigger_workers_on_arg(
         expr.args[0],
@@ -22147,7 +22175,27 @@ def _copy_deepcopy_call_triggers_workers(
         methods,
         class_targets,
         instance_events,
+        line,
+    )
+
+
+def _copy_deepcopy_call_triggers_workers(
+    expr,
+    methods,
+    class_targets,
+    instance_events,
+    reference_line,
+    operator_bindings=None,
+):
+    """Return True when ``copy.deepcopy`` runs a mutating serialization hook."""
+    return _call_is_copy_module_serialization(
+        expr,
+        "deepcopy",
+        methods,
+        class_targets,
+        instance_events,
         reference_line,
+        operator_bindings,
     )
 
 
@@ -22157,25 +22205,17 @@ def _copy_copy_call_triggers_workers(
     class_targets,
     instance_events,
     reference_line,
+    operator_bindings=None,
 ):
     """Return True when ``copy.copy`` runs a mutating shallow-copy hook."""
-    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
-        return False
-    func = expr.func
-    if not (
-        isinstance(func, ast.Attribute)
-        and func.attr == "copy"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "copy"
-    ):
-        return False
-    return _serialization_hooks_trigger_workers_on_arg(
-        expr.args[0],
-        _PICKLE_SERIALIZATION_HOOKS,
+    return _call_is_copy_module_serialization(
+        expr,
+        "copy",
         methods,
         class_targets,
         instance_events,
         reference_line,
+        operator_bindings,
     )
 
 
@@ -25192,6 +25232,12 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32]["dataclasses_dataclass_alias_events"] = (
         _collect_imported_name_alias_events(tree, "dataclasses", {"dataclass"})
+    )
+    operator_bindings[32]["copy_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "copy")
+    )
+    operator_bindings[32]["copy_function_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "copy", {"copy", "deepcopy"})
     )
     operator_bindings[32]["sys_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "sys")
