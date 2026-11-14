@@ -22164,8 +22164,11 @@ def _call_is_copy_module_serialization(
             func.value, set(), module_events, line
         ):
             matched = True
-    elif isinstance(func, ast.Name) and func.id == method:
-        if _imported_alias_is_active(name_events, func.id, line):
+    elif isinstance(func, ast.Name):
+        # Resolve the called name back to the imported original so an aliased
+        # import (`from copy import deepcopy as dc`) is not treated as static.
+        original = _alias_event_original_name(name_events, func.id, line)
+        if original == method and _imported_alias_is_active(name_events, func.id, line):
             matched = True
     if not matched:
         return False

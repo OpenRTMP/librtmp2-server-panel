@@ -72,6 +72,28 @@ _DYNAMIC_CASES = [
         "copy(Bump())\n",
     ),
     (
+        "from copy import copy as alias __copy__ dispatch",
+        "workers = 1\n"
+        "from copy import copy as duplicate\n"
+        "class Bump:\n"
+        "    def __copy__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "duplicate(Bump())\n",
+    ),
+    (
+        "from copy import deepcopy as alias __deepcopy__ dispatch",
+        "workers = 1\n"
+        "from copy import deepcopy as clone\n"
+        "class Bump:\n"
+        "    def __deepcopy__(self, memo):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "clone(Bump())\n",
+    ),
+    (
         "import copy as alias __copy__ dispatch",
         "workers = 1\n"
         "import copy as pickle_copy\n"
