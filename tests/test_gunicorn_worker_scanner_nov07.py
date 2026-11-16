@@ -28,6 +28,72 @@ _DYNAMIC_CASES = [
         "pickle.dumps(Bump())\n",
     ),
     (
+        "pickle module alias __reduce__ dispatch",
+        "workers = 1\n"
+        "import pickle as p\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "p.dumps(Bump())\n",
+    ),
+    (
+        "from pickle import dumps __reduce__ dispatch",
+        "workers = 1\n"
+        "from pickle import dumps\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "dumps(Bump())\n",
+    ),
+    (
+        "from pickle import dumps as alias __reduce__ dispatch",
+        "workers = 1\n"
+        "from pickle import dumps as d\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "d(Bump())\n",
+    ),
+    (
+        "pickle.dumps protocol keyword __reduce__ dispatch",
+        "workers = 1\n"
+        "import pickle\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "pickle.dumps(Bump(), protocol=5)\n",
+    ),
+    (
+        "pickle.dump __reduce__ dispatch",
+        "workers = 1\n"
+        "import pickle\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "pickle.dump(Bump(), None)\n",
+    ),
+    (
+        "from pickle import dump as alias __reduce__ dispatch",
+        "workers = 1\n"
+        "from pickle import dump as d\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "d(Bump(), None)\n",
+    ),
+    (
         "copy.deepcopy __reduce__ dispatch",
         "workers = 1\n"
         "import copy\n"
@@ -105,6 +171,17 @@ _DYNAMIC_CASES = [
         "pickle_copy.copy(Bump())\n",
     ),
     (
+        "copy.deepcopy memo keyword __deepcopy__ dispatch",
+        "workers = 1\n"
+        "import copy\n"
+        "class Bump:\n"
+        "    def __deepcopy__(self, memo):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "copy.deepcopy(Bump(), memo={})\n",
+    ),
+    (
         "asyncio.run async for __aiter__ dispatch",
         "workers = 1\n"
         "import asyncio\n"
@@ -130,3 +207,17 @@ _DYNAMIC_CASES = [
 )
 def test_nov07_serialization_and_async_iter_gaps_are_dynamic(config_module, source):
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (1, True)
+
+
+def test_nov07_unrelated_dumps_is_not_a_pickle_hook(config_module):
+    source = (
+        'workers = 1\n'
+        'import json\n'
+        'class Bump:\n'
+        '    def __reduce__(self):\n'
+        '        global workers\n'
+        '        workers = 4\n'
+        '        return (int, (0,))\n'
+        'json.dumps(Bump())\n'
+    )
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (1, False)

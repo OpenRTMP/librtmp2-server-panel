@@ -16954,6 +16954,7 @@ def _expression_triggers_class_workers_side_effect(
             class_targets,
             instance_events,
             reference_line,
+            operator_bindings,
         )
         or _copy_deepcopy_call_triggers_workers(
             expr,
@@ -22103,17 +22104,44 @@ def _pickle_dumps_call_triggers_workers(
     class_targets,
     instance_events,
     reference_line,
+    operator_bindings=None,
 ):
-    """Return True when ``pickle.dumps`` runs a mutating serialization hook."""
-    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
+    """Return True when ``pickle.dump(s)`` runs a mutating serialization hook.
+
+    ``dump``, ``dumps``, module aliases (``import pickle as p``), direct
+    imports (``from pickle import dumps [as d]``) and calls that pass
+    ``protocol``/``memo`` keywords all run the same ``__reduce__`` family, so
+    every spelling must reach the hook analysis.
+    """
+    if not isinstance(expr, ast.Call) or not expr.args:
         return False
     func = expr.func
-    if not (
+    line = reference_line or getattr(expr, "lineno", 0)
+    metadata = (
+        operator_bindings[32]
+        if operator_bindings is not None and len(operator_bindings) > 32
+        else {}
+    )
+    module_events = metadata.get("pickle_module_alias_events", {})
+    name_events = metadata.get("pickle_function_alias_events", {})
+    matched = False
+    if (
         isinstance(func, ast.Attribute)
-        and func.attr == "dumps"
+        and func.attr in {"dump", "dumps"}
         and isinstance(func.value, ast.Name)
-        and func.value.id == "pickle"
     ):
+        receiver = func.value.id
+        if receiver == "pickle" or _module_alias_active_at_line(
+            func.value, set(), module_events, line
+        ):
+            matched = True
+    elif isinstance(func, ast.Name):
+        original = _alias_event_original_name(name_events, func.id, line)
+        if original in {"dump", "dumps"} and _imported_alias_is_active(
+            name_events, func.id, line
+        ):
+            matched = True
+    if not matched:
         return False
     return _serialization_hooks_trigger_workers_on_arg(
         expr.args[0],
@@ -22148,7 +22176,7 @@ def _call_is_copy_module_serialization(
     operator_bindings=None,
 ):
     """Return True when a ``copy`` helper runs a mutating serialization hook."""
-    if not isinstance(expr, ast.Call) or not expr.args or expr.keywords:
+    if not isinstance(expr, ast.Call) or not expr.args:
         return False
     func = expr.func
     line = reference_line or getattr(expr, "lineno", 0)
@@ -25241,6 +25269,12 @@ def _scan_gunicorn_config_worker_details(tree):
     )
     operator_bindings[32]["copy_function_alias_events"] = (
         _collect_imported_name_alias_events(tree, "copy", {"copy", "deepcopy"})
+    )
+    operator_bindings[32]["pickle_module_alias_events"] = (
+        _collect_imported_module_alias_events(tree, "pickle")
+    )
+    operator_bindings[32]["pickle_function_alias_events"] = (
+        _collect_imported_name_alias_events(tree, "pickle", {"dump", "dumps"})
     )
     operator_bindings[32]["sys_module_alias_events"] = (
         _collect_imported_module_alias_events(tree, "sys")
