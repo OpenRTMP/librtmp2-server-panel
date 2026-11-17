@@ -1277,6 +1277,36 @@ def _alias_event_original_name(events, name, line):
     return original
 
 
+def _alias_event_before_line(events, name, line):
+    """Return the alias state strictly before ``line``."""
+    state = None
+    original = None
+    for event in events.get(name, ()):
+        if line and event[0] >= line:
+            break
+        state = event[1]
+        if len(event) >= 3 and event[2]:
+            original = event[2]
+    return state, original
+
+
+def _alias_event_at_or_before_line(events, name, line):
+    """Return the alias state at ``line`` plus a same-line deactivation flag."""
+    state = None
+    original = None
+    deactivated = False
+    for event in events.get(name, ()):
+        event_line = event[0]
+        if line and event_line > line:
+            break
+        state = event[1]
+        if len(event) >= 3 and event[2]:
+            original = event[2]
+        if line and event_line == line and not event[1]:
+            deactivated = True
+    return state, original, deactivated
+
+
 def _imported_alias_at_call(events, name, line):
     """Return ``(active, original)`` for an alias used on ``line``.
 
@@ -1287,27 +1317,13 @@ def _imported_alias_at_call(events, name, line):
     hook. A call that genuinely follows the rebinding is over-approximated,
     which only makes the worker scan stricter.
     """
-    latest_state = None
-    latest_original = None
-    prior_state = None
-    prior_original = None
-    deactivated_on_line = False
-    for event in events.get(name, ()):
-        event_line = event[0]
-        if line and event_line > line:
-            break
-        if line and event_line < line:
-            prior_state = event[1]
-            if len(event) >= 3 and event[2]:
-                prior_original = event[2]
-        if line and event_line == line and not event[1]:
-            deactivated_on_line = True
-        latest_state = event[1]
-        if len(event) >= 3 and event[2]:
-            latest_original = event[2]
-    if deactivated_on_line and prior_state and prior_original:
+    prior_state, prior_original = _alias_event_before_line(events, name, line)
+    state, original, deactivated = _alias_event_at_or_before_line(
+        events, name, line
+    )
+    if deactivated and prior_state and prior_original:
         return True, prior_original
-    return bool(latest_state), latest_original
+    return bool(state), original
 
 
 def _instance_binding_candidates_at_line(events, name, line):
