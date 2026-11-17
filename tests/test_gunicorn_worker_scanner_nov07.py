@@ -226,6 +226,16 @@ _DYNAMIC_CASES = [
         "        return (int, (0,))\n"
         "p(Bump()); p = None\n",
     ),    (
+        "pickle.dumps empty splat before obj keyword",
+        "workers = 1\n"
+        "import pickle\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "pickle.dumps(*(), obj=Bump())\n",
+    ),    (
         "asyncio.run async for __aiter__ dispatch",
         "workers = 1\n"
         "import asyncio\n"
@@ -263,5 +273,19 @@ def test_nov07_unrelated_dumps_is_not_a_pickle_hook(config_module):
         '        workers = 4\n'
         '        return (int, (0,))\n'
         'json.dumps(Bump())\n'
+    )
+    assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (1, False)
+
+def test_reimported_name_is_not_treated_as_the_old_pickle_alias(config_module):
+    source = (
+        "workers = 1\n"
+        "from pickle import dumps as d\n"
+        "from json import dumps as d\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "d(Bump())\n"
     )
     assert config_module._scan_gunicorn_config_workers(ast.parse(source)) == (1, False)

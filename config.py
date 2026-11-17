@@ -22133,8 +22133,13 @@ def _serialization_hooks_trigger_workers_on_arg(
 
 def _serialization_call_object(expr, keyword_names):
     """Return the object argument of a serialization call, positional or named."""
-    if expr.args:
-        return expr.args[0]
+    args = [
+        arg
+        for arg in expr.args
+        if not (isinstance(arg, ast.Starred) and _is_empty_container_literal(arg.value))
+    ]
+    if args and not isinstance(args[0], ast.Starred):
+        return args[0]
     for keyword in expr.keywords:
         if keyword.arg in keyword_names:
             return keyword.value
@@ -23045,6 +23050,22 @@ def _collect_imported_module_alias_events(tree, module_name):
 
 
 
+def _invalidate_replaced_import_aliases(node, active, events, line):
+    """Deactivate aliases rebound by a later definite top-level import."""
+    if isinstance(node, ast.Import):
+        names = [alias.asname or alias.name.split(".", 1)[0] for alias in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        names = [
+            alias.asname or alias.name
+            for alias in node.names
+            if alias.name != "*"
+        ]
+    else:
+        return
+    for name in names:
+        _deactivate_imported_module_alias(name, active, events, line)
+
+
 def _record_imported_name_aliases(
     node,
     module_name,
@@ -23128,6 +23149,8 @@ def _process_imported_alias_node(
         module_events,
         line,
     )
+    if top_level:
+        _invalidate_replaced_import_aliases(node, active, events, line)
     _record_imported_name_aliases(
         node,
         module_name,
