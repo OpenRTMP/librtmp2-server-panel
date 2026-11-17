@@ -1277,6 +1277,39 @@ def _alias_event_original_name(events, name, line):
     return original
 
 
+def _imported_alias_at_call(events, name, line):
+    """Return ``(active, original)`` for an alias used on ``line``.
+
+    Events carry lines, not columns. A same-line rebinding after the call
+    would otherwise make the alias look inactive. If the line contains a
+    deactivation but the alias was active before that line, fail closed and
+    keep the prior binding: the alternative is to miss a real serialization
+    hook. A call that genuinely follows the rebinding is over-approximated,
+    which only makes the worker scan stricter.
+    """
+    latest_state = None
+    latest_original = None
+    prior_state = None
+    prior_original = None
+    deactivated_on_line = False
+    for event in events.get(name, ()):
+        event_line = event[0]
+        if line and event_line > line:
+            break
+        if line and event_line < line:
+            prior_state = event[1]
+            if len(event) >= 3 and event[2]:
+                prior_original = event[2]
+        if line and event_line == line and not event[1]:
+            deactivated_on_line = True
+        latest_state = event[1]
+        if len(event) >= 3 and event[2]:
+            latest_original = event[2]
+    if deactivated_on_line and prior_state and prior_original:
+        return True, prior_original
+    return bool(latest_state), latest_original
+
+
 def _instance_binding_candidates_at_line(events, name, line):
     """Return ``(event_line, class_name)`` instance candidates visible at ``line``.
 
@@ -22098,6 +22131,16 @@ def _serialization_hooks_trigger_workers_on_arg(
     )
 
 
+def _serialization_call_object(expr, keyword_names):
+    """Return the object argument of a serialization call, positional or named."""
+    if expr.args:
+        return expr.args[0]
+    for keyword in expr.keywords:
+        if keyword.arg in keyword_names:
+            return keyword.value
+    return None
+
+
 def _pickle_dumps_call_triggers_workers(
     expr,
     methods,
@@ -22110,10 +22153,13 @@ def _pickle_dumps_call_triggers_workers(
 
     ``dump``, ``dumps``, module aliases (``import pickle as p``), direct
     imports (``from pickle import dumps [as d]``) and calls that pass
-    ``protocol``/``memo`` keywords all run the same ``__reduce__`` family, so
-    every spelling must reach the hook analysis.
+    ``protocol`` all run the same ``__reduce__`` family, so every spelling
+    must reach the hook analysis.
     """
-    if not isinstance(expr, ast.Call) or not expr.args:
+    if not isinstance(expr, ast.Call):
+        return False
+    obj = _serialization_call_object(expr, {"obj"})
+    if obj is None:
         return False
     func = expr.func
     line = reference_line or getattr(expr, "lineno", 0)
@@ -22136,15 +22182,13 @@ def _pickle_dumps_call_triggers_workers(
         ):
             matched = True
     elif isinstance(func, ast.Name):
-        original = _alias_event_original_name(name_events, func.id, line)
-        if original in {"dump", "dumps"} and _imported_alias_is_active(
-            name_events, func.id, line
-        ):
+        active, original = _imported_alias_at_call(name_events, func.id, line)
+        if active and original in {"dump", "dumps"}:
             matched = True
     if not matched:
         return False
     return _serialization_hooks_trigger_workers_on_arg(
-        expr.args[0],
+        obj,
         _PICKLE_SERIALIZATION_HOOKS,
         methods,
         class_targets,
@@ -22176,7 +22220,10 @@ def _call_is_copy_module_serialization(
     operator_bindings=None,
 ):
     """Return True when a ``copy`` helper runs a mutating serialization hook."""
-    if not isinstance(expr, ast.Call) or not expr.args:
+    if not isinstance(expr, ast.Call):
+        return False
+    obj = _serialization_call_object(expr, {"x"})
+    if obj is None:
         return False
     func = expr.func
     line = reference_line or getattr(expr, "lineno", 0)
@@ -22195,13 +22242,13 @@ def _call_is_copy_module_serialization(
     elif isinstance(func, ast.Name):
         # Resolve the called name back to the imported original so an aliased
         # import (`from copy import deepcopy as dc`) is not treated as static.
-        original = _alias_event_original_name(name_events, func.id, line)
-        if original == method and _imported_alias_is_active(name_events, func.id, line):
+        active, original = _imported_alias_at_call(name_events, func.id, line)
+        if active and original == method:
             matched = True
     if not matched:
         return False
     return _serialization_hooks_trigger_workers_on_arg(
-        expr.args[0],
+        obj,
         _PICKLE_SERIALIZATION_HOOKS,
         methods,
         class_targets,
@@ -22963,6 +23010,10 @@ def _invalidate_imported_module_aliases(node, active, events, line):
         _deactivate_imported_module_alias(node.name, active, events, line)
         return
     for name, _value in _namespace_assignment_values(node):
+        # `name = name` evaluates the RHS before rebinding, so an imported
+        # callable alias stays valid. Do not fold it into a deactivation.
+        if isinstance(_value, ast.Name) and _value.id == name:
+            continue
         _deactivate_imported_module_alias(name, active, events, line)
 
 

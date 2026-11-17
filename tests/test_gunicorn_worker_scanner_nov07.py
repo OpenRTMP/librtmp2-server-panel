@@ -182,6 +182,50 @@ _DYNAMIC_CASES = [
         "copy.deepcopy(Bump(), memo={})\n",
     ),
     (
+        "pickle.dumps obj keyword __reduce__ dispatch",
+        "workers = 1\n"
+        "import pickle\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "pickle.dumps(obj=Bump())\n",
+    ),
+    (
+        "copy.deepcopy x keyword __deepcopy__ dispatch",
+        "workers = 1\n"
+        "import copy\n"
+        "class Bump:\n"
+        "    def __deepcopy__(self, memo):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return Bump()\n"
+        "copy.deepcopy(x=Bump())\n",
+    ),
+    (
+        "pickle alias self-assignment keeps the callable",
+        "workers = 1\n"
+        "from pickle import dumps as d\n"
+        "d = d\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "d(Bump())\n",
+    ),
+    (
+        "pickle same-line rebinding after the call",
+        "workers = 1\n"
+        "from pickle import dumps as p\n"
+        "class Bump:\n"
+        "    def __reduce__(self):\n"
+        "        global workers\n"
+        "        workers = 4\n"
+        "        return (int, (0,))\n"
+        "p(Bump()); p = None\n",
+    ),    (
         "asyncio.run async for __aiter__ dispatch",
         "workers = 1\n"
         "import asyncio\n"
