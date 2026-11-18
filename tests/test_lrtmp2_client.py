@@ -64,6 +64,26 @@ def test_delete_stream_treats_404_as_success():
         client.delete_stream("missing")
 
 
+def test_delete_stream_does_not_treat_a_followed_redirect_as_success():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete:
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 302
+        mock_delete.return_value.json.side_effect = ValueError("html")
+        with pytest.raises(Lrtmp2ApiError, match="HTTP 302"):
+            client.delete_stream("s1")
+
+
+def test_delete_player_does_not_treat_a_followed_redirect_as_success():
+    client = Lrtmp2Client("http://example.test", "tok")
+    with patch("lrtmp2_client.requests.delete") as mock_delete:
+        mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 302
+        mock_delete.return_value.json.side_effect = ValueError("html")
+        with pytest.raises(Lrtmp2ApiError, match="HTTP 302"):
+            client.delete_player("s1", "vi_" + "0" * 32)
+
+
 def test_delete_stream_202_treats_numeric_upstream_id_as_same_stream():
     """Upstream JSON may encode id as int while the panel passes str stream_id."""
     client = Lrtmp2Client("http://example.test", "tok")

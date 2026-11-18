@@ -1226,6 +1226,7 @@ def test_delete_stream_url_encodes_stream_id():
     client = Lrtmp2Client("http://example.test", "tok")
     with patch("lrtmp2_client.requests.delete") as mock_delete:
         mock_delete.return_value.ok = True
+        mock_delete.return_value.status_code = 200
         client.delete_stream("a/b?c")
 
     assert mock_delete.call_args.args[0] == "http://example.test/api/v1/streams/a%2Fb%3Fc"
