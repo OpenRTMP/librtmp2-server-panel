@@ -72,6 +72,7 @@ def test_delete_stream_does_not_treat_a_followed_redirect_as_success():
         mock_delete.return_value.json.side_effect = ValueError("html")
         with pytest.raises(Lrtmp2ApiError, match="HTTP 302"):
             client.delete_stream("s1")
+        assert mock_delete.call_args.kwargs["allow_redirects"] is False
 
 
 def test_delete_player_does_not_treat_a_followed_redirect_as_success():
@@ -82,6 +83,7 @@ def test_delete_player_does_not_treat_a_followed_redirect_as_success():
         mock_delete.return_value.json.side_effect = ValueError("html")
         with pytest.raises(Lrtmp2ApiError, match="HTTP 302"):
             client.delete_player("s1", "vi_" + "0" * 32)
+        assert mock_delete.call_args.kwargs["allow_redirects"] is False
 
 
 def test_delete_stream_202_treats_numeric_upstream_id_as_same_stream():

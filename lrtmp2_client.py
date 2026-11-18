@@ -287,6 +287,7 @@ class Lrtmp2Client:
             headers=self._headers(),
             timeout=self.admin_timeout,
             ok_404=True,
+            allow_redirects=False,
         )
         if not _delete_status_ok(resp):
             raise _api_error(resp, "delete_stream")
@@ -332,6 +333,7 @@ class Lrtmp2Client:
             headers=self._headers(),
             timeout=self.admin_timeout,
             ok_404=True,
+            allow_redirects=False,
         )
         if not _delete_status_ok(resp):
             raise _api_error(resp, "delete_player")
