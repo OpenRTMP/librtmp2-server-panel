@@ -103,6 +103,17 @@ def _rate_limit_error(resp, operation):
     return Lrtmp2RateLimitError(f"{operation} failed (HTTP 429)", retry_after)
 
 
+def _delete_status_ok(resp):
+    """Only 2xx (and the idempotent 404) prove a DELETE took effect.
+
+    ``requests`` treats a followed 3xx as ``resp.ok``; accepting that would
+    report a revoked key as deleted when a proxy redirected the DELETE to a
+    login page.
+    """
+    status = getattr(resp, "status_code", None)
+    return isinstance(status, int) and (200 <= status < 300 or status == 404)
+
+
 def _parse_json(resp, operation):
     """Parse a successful response body, surfacing malformed JSON as an API error
     instead of letting a raw ValueError escape to the caller."""
@@ -277,7 +288,7 @@ class Lrtmp2Client:
             timeout=self.admin_timeout,
             ok_404=True,
         )
-        if not resp.ok and resp.status_code != 404:
+        if not _delete_status_ok(resp):
             raise _api_error(resp, "delete_stream")
         if resp.status_code == 202:
             deadline = time.monotonic() + wait_timeout
@@ -322,7 +333,7 @@ class Lrtmp2Client:
             timeout=self.admin_timeout,
             ok_404=True,
         )
-        if not resp.ok and resp.status_code != 404:
+        if not _delete_status_ok(resp):
             raise _api_error(resp, "delete_player")
 
     def stream_stats(self, stats_key):
