@@ -586,6 +586,20 @@ def test_class_body_delete_of_bind_is_not_a_module_write(tmp_path):
     assert _config_provides(path) == probe.ABSENT
 
 
+def test_uncalled_helper_receiving_an_alias_is_not_a_writer(tmp_path):
+    """A call inside a deferred helper does not run at import time."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "def apply_overrides(settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "def reload_settings():\n"
+        "    apply_overrides(g)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"

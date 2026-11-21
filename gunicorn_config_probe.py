@@ -1781,14 +1781,17 @@ def _direct_wsgi_state(node, namespace_aliases):
 
 
 def _call_receives_namespace_alias(node, definitions, call_aliases, aliases):
-    """Return True when a local helper receives a namespace alias argument."""
-    for child in ast.walk(node):
+    """Return True when an import-time local helper receives a namespace alias."""
+    for child, in_class_body in _iter_module_scope_entries(node):
         if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Name):
             continue
         if _resolve_local_name(child.func.id, definitions, call_aliases) is None:
             continue
         values = [*child.args, *(keyword.value for keyword in child.keywords)]
-        if any(_is_namespace_reference(value, aliases) for value in values):
+        if any(
+            _is_namespace_reference(value, aliases, not in_class_body)
+            for value in values
+        ):
             return True
     return False
 
