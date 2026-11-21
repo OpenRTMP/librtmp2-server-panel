@@ -445,6 +445,36 @@ def test_helper_after_a_definite_rebinding_is_not_a_module_writer(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.ABSENT
 
 
+def test_helper_after_a_definite_private_rebinding_is_not_a_writer(tmp_path):
+    """A helper update through a definitely private g keeps the literal app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g = {}\n"
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g.update(wsgi_app=None)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_helper_delete_through_namespace_alias_clears_the_app(tmp_path):
+    """A helper can delete wsgi_app through a globals() alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    del g['wsgi_app']\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
