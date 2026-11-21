@@ -971,6 +971,17 @@ def test_bind_probe_follows_a_helper_returned_alias(tmp_path):
     assert _config_provides(path) == probe.UNKNOWN
 
 
+def test_bind_write_before_alias_rebinding_is_seen(tmp_path):
+    """The assignment RHS writes through the old alias before it is replaced."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "options = globals()\n"
+        "options = {'bind': options.setdefault('bind', 'unix:/tmp/panel.sock')}\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
