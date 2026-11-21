@@ -310,18 +310,25 @@ def _import_binding_kind(node, name):
 def _is_namespace_reference(node, globals_aliases=frozenset(), allow_locals=True):
     """Return True for a module-namespace expression.
 
-    ``globals()``, ``vars()`` and a ``globals`` alias always resolve the module
-    namespace, even from a class body. Bare ``locals()`` resolves the
-    *enclosing* namespace, so the caller disables it inside a class body.
+    ``globals()`` and a ``globals`` alias always resolve the module namespace,
+    even from a class body. Bare ``locals()`` and ``vars()`` resolve the
+    *enclosing* namespace, so the caller disables them inside a class body or
+    function. ``vars(obj)`` returns ``obj.__dict__``, not a namespace.
     An alias of the namespace *value* (``g = globals()``) is a plain name.
     """
     if isinstance(node, ast.Name):
         return node.id in globals_aliases
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
         return False
-    if node.func.id in {"globals", "vars"} or node.func.id in globals_aliases:
+    if node.func.id == "globals" or node.func.id in globals_aliases:
         return True
-    return allow_locals and node.func.id == "locals"
+    if node.func.id in {"locals", "vars"}:
+        return (
+            allow_locals
+            and not node.args
+            and not node.keywords
+        )
+    return False
 
 
 def _is_module_dict_reference(node):
@@ -1725,7 +1732,9 @@ def _scan_module_bindings(statements, name, globals_aliases=frozenset()):
             return SUPPLIED, dynamic
         if _statement_writes_named_attribute(node, name):
             dynamic = True
-        if _has_dynamic_namespace_write(node, name, globals_aliases):
+        if _has_dynamic_namespace_write(
+            node, name, globals_aliases
+        ) and not _is_namespace_clear(node, globals_aliases):
             dynamic = True
     return None, dynamic
 
@@ -1993,8 +2002,16 @@ def _call_return_kind(call, definitions, call_aliases):
         for child in _iter_scope_nodes(definition):
             if not isinstance(child, ast.Return) or child.value is None:
                 continue
-            if _is_module_namespace_value(child.value):
+            if _is_global_namespace_value(child.value):
                 kinds.add("namespace")
+            elif (
+                isinstance(child.value, ast.Call)
+                and isinstance(child.value.func, ast.Name)
+                and child.value.func.id in {"locals", "vars"}
+                and not child.value.args
+                and not child.value.keywords
+            ):
+                kinds.add("other")
             elif isinstance(
                 child.value,
                 (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant),
@@ -2004,9 +2021,9 @@ def _call_return_kind(call, definitions, call_aliases):
                 kinds.add("unknown")
     if not kinds:
         return "other"
-    if "namespace" in kinds:
+    if kinds == {"namespace"}:
         return "namespace"
-    if "unknown" in kinds:
+    if "unknown" in kinds or "namespace" in kinds:
         return "unknown"
     return "other"
 
@@ -2030,6 +2047,28 @@ def _apply_alias_rebinding(
             else:
                 possible_aliases.discard(alias)
         return
+    if rebound is None:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        value = getattr(node, "value", None)
+        if (
+            len(targets) == 1
+            and isinstance(targets[0], ast.Name)
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and _resolve_local_name(value.func.id, definitions, call_aliases)
+        ):
+            kind = _call_return_kind(value, definitions, call_aliases)
+            if kind in {"namespace", "unknown"}:
+                possible_aliases.add(targets[0].id)
+                if kind == "namespace":
+                    namespace_aliases.add(targets[0].id)
+                return
     # A conditional can restore or discard an alias; only a top-level
     # assignment makes the new value definite.
     for child in _iter_module_assignments([node]):
@@ -2066,7 +2105,10 @@ def _helper_restored_aliases(node, definitions, call_aliases):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         for target in targets:
             assigned.update(_target_names(target))
-    return restored - assigned
+        if assigned and isinstance(node.value, ast.Call):
+            if _call_return_kind(node.value, definitions, call_aliases) == "other":
+                restored -= assigned
+    return restored
 
 
 def _later_targets_may_write(node):
@@ -2107,10 +2149,26 @@ def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
     return bool(called & writers)
 
 
+def _is_namespace_clear(node, aliases):
+    """Return True for a single ``clear()``/``popitem()`` call on a namespace."""
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return False
+    call = node.value
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"clear", "popitem"}
+        and _is_namespace_reference(call.func.value, aliases)
+    )
+
+
 def _statement_keeps_app_unknown(
     node, definitions, call_aliases, namespace_aliases, possible_aliases, proven
 ):
     """Return True when a statement without a direct write may clear the app."""
+    if not proven and _is_namespace_clear(node, possible_aliases):
+        # A clear cannot introduce an application; with no proven app it is
+        # harmless and the image default must stay.
+        return False
     if _is_exact_wsgi_setdefault(node, possible_aliases):
         # It only writes when the key is absent. If an earlier literal
         # assignment proved the app, this is a no-op.

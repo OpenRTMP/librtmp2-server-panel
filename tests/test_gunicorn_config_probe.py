@@ -843,6 +843,94 @@ def test_helper_returning_a_private_dict_does_not_keep_the_alias(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
 
 
+def test_returned_locals_is_not_a_namespace_alias(tmp_path):
+    """locals() returned from a helper is that helper's local mapping."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def options():\n"
+        "    return locals()\n"
+        "g = globals()\n"
+        "g = options()\n"
+        "g['wsgi_app'] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_mixed_helper_returns_are_not_a_definite_namespace(tmp_path):
+    """A branch that returns a private dict makes the alias only possible."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def options(flag):\n"
+        "    if flag:\n"
+        "        return globals()\n"
+        "    return {}\n"
+        "g = options(True)\n"
+        "g['wsgi_app'] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_helper_returning_the_restored_alias_is_tracked(tmp_path):
+    """A restore helper that returns g keeps g possible for a later pop."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def restore():\n"
+        "    global g\n"
+        "    g = globals()\n"
+        "    return g\n"
+        "g = restore()\n"
+        "g.pop('wsgi_app', None)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_class_vars_is_the_class_namespace(tmp_path):
+    """vars() in a class body does not name the module."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "class Options:\n"
+        "    vars().update(bind='127.0.0.1:9000')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_lambda_vars_is_the_lambda_namespace(tmp_path):
+    """vars() inside an immediately invoked lambda is local."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "(lambda: vars().update(wsgi_app='custom:app'))()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_clear_without_a_proven_app_keeps_the_default(tmp_path):
+    """A namespace clear cannot introduce an application."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g.clear()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_clear_without_a_bind_keeps_the_default(tmp_path):
+    """A namespace clear cannot introduce a bind."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g.clear()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
