@@ -33,6 +33,9 @@ only begin at a future `1.0.0`.
   longer replaced by the image default.
 
 ### Fixed
+- The `wsgi_app` probe treats a `globals()` alias restored in a conditional
+  or inside a called helper as a possible writer, so a helper that clears the
+  app keeps the image default instead of dropping `app:app`.
 - Stream and player deletes treat only a 2xx or the idempotent 404 as success
   and do not follow redirects, so a proxy redirect to a login page can no
   longer be reported as a revoked key.
@@ -44,6 +47,9 @@ only begin at a future `1.0.0`.
 
 ### Changed
 - Dependency update: gunicorn 27.0.1.
+- The app probe skips the transitive helper-writer scan for a statement that
+  calls no local helper, avoiding repeated work on configs with many uncalled
+  hooks.
 
 ## [0.1.16] — 2026-11-12
 
