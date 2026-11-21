@@ -1716,10 +1716,29 @@ def _local_writer_names(
     return writers
 
 
-def _scan_module_bindings(statements, name, globals_aliases=frozenset()):
+def _scan_module_bindings(
+    statements,
+    name,
+    globals_aliases=frozenset(),
+    definitions=None,
+    call_aliases=None,
+):
     """Return ``(SUPPLIED or None, dynamic)`` for module-scope statements."""
     dynamic = False
+    namespace_aliases = set(globals_aliases)
+    possible_aliases = set(globals_aliases)
     for node in _iter_module_assignments(statements):
+        if definitions is not None:
+            _apply_alias_rebinding(
+                node,
+                namespace_aliases,
+                possible_aliases,
+                definitions,
+                call_aliases,
+            )
+            possible_aliases |= _helper_restored_aliases(
+                node, definitions, call_aliases
+            )
         binding_kind = _import_binding_kind(node, name)
         if binding_kind == "explicit":
             return SUPPLIED, dynamic
@@ -1733,8 +1752,8 @@ def _scan_module_bindings(statements, name, globals_aliases=frozenset()):
         if _statement_writes_named_attribute(node, name):
             dynamic = True
         if _has_dynamic_namespace_write(
-            node, name, globals_aliases
-        ) and not _is_namespace_clear(node, globals_aliases):
+            node, name, possible_aliases
+        ) and not _is_namespace_clear(node, possible_aliases):
             dynamic = True
     return None, dynamic
 
@@ -1990,6 +2009,16 @@ def _wsgi_app_call_aliases(tree, definitions):
     return _collect_aliases(tree.body, definitions)
 
 
+def _is_builtin_constructor_call(value, definitions):
+    """Return True for an unshadowed call to a builtin container/scalar."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in _KNOWN_SCALAR_TYPES
+        and value.func.id not in (definitions or {})
+    )
+
+
 def _call_return_kind(call, definitions, call_aliases):
     """Classify a local helper's return as namespace, other, or unknown."""
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
@@ -2004,6 +2033,8 @@ def _call_return_kind(call, definitions, call_aliases):
                 continue
             if _is_global_namespace_value(child.value):
                 kinds.add("namespace")
+            elif _is_builtin_constructor_call(child.value, definitions):
+                kinds.add("other")
             elif (
                 isinstance(child.value, ast.Call)
                 and isinstance(child.value.func, ast.Name)
@@ -2028,15 +2059,34 @@ def _call_return_kind(call, definitions, call_aliases):
     return "other"
 
 
+def _override_return_kind(value):
+    """Classify a module binding that shadows a helper name."""
+    if isinstance(value, ast.Name) and value.id in _KNOWN_SCALAR_TYPES:
+        return "other"
+    if _is_module_namespace_value(value):
+        return "namespace"
+    return "unknown"
+
+
 def _apply_alias_rebinding(
-    node, namespace_aliases, possible_aliases, definitions, call_aliases
+    node,
+    namespace_aliases,
+    possible_aliases,
+    definitions,
+    call_aliases,
+    overrides=None,
 ):
     """Update live namespace aliases for one top-level statement."""
+    overrides = overrides or {}
     rebound = _alias_rebinding(node, possible_aliases)
     if rebound is not None:
         kind, alias = rebound
         if kind == "unknown" and isinstance(node.value, ast.Call):
-            kind = _call_return_kind(node.value, definitions, call_aliases)
+            func = node.value.func
+            if isinstance(func, ast.Name) and func.id in overrides:
+                kind = _override_return_kind(overrides[func.id])
+            else:
+                kind = _call_return_kind(node.value, definitions, call_aliases)
         if kind == "namespace":
             namespace_aliases.add(alias)
             possible_aliases.add(alias)
@@ -2047,28 +2097,30 @@ def _apply_alias_rebinding(
             else:
                 possible_aliases.discard(alias)
         return
-    if rebound is None:
-        targets = (
-            node.targets
-            if isinstance(node, ast.Assign)
-            else [node.target]
-            if isinstance(node, ast.AnnAssign)
-            else []
-        )
-        value = getattr(node, "value", None)
-        if (
-            len(targets) == 1
-            and isinstance(targets[0], ast.Name)
-            and isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and _resolve_local_name(value.func.id, definitions, call_aliases)
-        ):
+    targets = (
+        node.targets
+        if isinstance(node, ast.Assign)
+        else [node.target]
+        if isinstance(node, ast.AnnAssign)
+        else []
+    )
+    value = getattr(node, "value", None)
+    if (
+        len(targets) == 1
+        and isinstance(targets[0], ast.Name)
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and _resolve_local_name(value.func.id, definitions, call_aliases)
+    ):
+        if value.func.id in overrides:
+            kind = _override_return_kind(overrides[value.func.id])
+        else:
             kind = _call_return_kind(value, definitions, call_aliases)
-            if kind in {"namespace", "unknown"}:
-                possible_aliases.add(targets[0].id)
-                if kind == "namespace":
-                    namespace_aliases.add(targets[0].id)
-                return
+        if kind in {"namespace", "unknown"}:
+            possible_aliases.add(targets[0].id)
+            if kind == "namespace":
+                namespace_aliases.add(targets[0].id)
+            return
     # A conditional can restore or discard an alias; only a top-level
     # assignment makes the new value definite.
     for child in _iter_module_assignments([node]):
@@ -2186,6 +2238,7 @@ def _ordered_wsgi_app_state(
     """Return ``(proven, dynamic)`` for the ordered module statements."""
     proven = False
     dynamic = False
+    overrides = {}
     for node in nodes:
         state = _direct_wsgi_state(node, namespace_aliases)
         if state is None:
@@ -2214,11 +2267,25 @@ def _ordered_wsgi_app_state(
         else:
             dynamic = True
         _apply_alias_rebinding(
-            node, namespace_aliases, possible_aliases, definitions, call_aliases
+            node,
+            namespace_aliases,
+            possible_aliases,
+            definitions,
+            call_aliases,
+            overrides,
         )
         possible_aliases |= _helper_restored_aliases(
             node, definitions, call_aliases
         )
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets, value = _assignment_targets_and_value(node)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    overrides[target.id] = value
+        elif isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            overrides.pop(node.name, None)
     return proven, dynamic
 
 
@@ -2275,15 +2342,15 @@ def config_provides_setting(path, name):
     try:
         definitions = _module_local_definitions(tree.body)
         globals_aliases = _collect_globals_aliases(tree.body)
+        aliases = _collect_aliases(tree.body, definitions)
         supplied, dynamic = _scan_module_bindings(
-            tree.body, name, globals_aliases
+            tree.body, name, globals_aliases, definitions, aliases
         )
         if supplied == SUPPLIED:
             return SUPPLIED
         # A local helper invoked at import time can assign the setting even
         # though its body is not module scope. Only report uncertainty when the
         # called helper can actually write it; an unrelated helper stays ABSENT.
-        aliases = _collect_aliases(tree.body, definitions)
         if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
             definitions, name, aliases, globals_aliases
         ):
