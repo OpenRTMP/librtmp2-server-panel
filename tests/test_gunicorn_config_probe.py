@@ -530,6 +530,62 @@ def test_alias_reassignment_keeps_a_proven_app(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
 
 
+def test_helper_consuming_the_namespace_alias_is_uncertain(tmp_path):
+    """Passing the namespace to a helper can let the helper pop the app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def extract_app(settings):\n"
+        "    return settings.pop('wsgi_app', None)\n"
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "g = extract_app(g)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_setdefault_after_a_conditional_rebinding_keeps_the_app(tmp_path):
+    """An exact-key setdefault cannot replace an existing literal app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "if enabled:\n"
+        "    g = {}\n"
+        "g.setdefault('wsgi_app', 'fallback:app')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_helper_local_alias_does_not_leak_into_module_writes(tmp_path):
+    """A helper-local globals() alias does not alias a module dictionary."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "from settings import options\n"
+        "def configure():\n"
+        "    options = globals()\n"
+        "    options['workers'] = 2\n"
+        "configure()\n"
+        "options['wsgi_app'] = 'fixture:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_class_body_delete_of_bind_is_not_a_module_write(tmp_path):
+    """A class attribute delete does not remove a module Gunicorn setting."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "class Options:\n"
+        "    bind = '127.0.0.1:9000'\n"
+        "    listen = bind\n"
+        "    del bind\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
