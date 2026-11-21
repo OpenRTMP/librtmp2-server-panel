@@ -475,6 +475,61 @@ def test_helper_delete_through_namespace_alias_clears_the_app(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
 
 
+def test_helper_delete_from_a_private_object_keeps_bind_absent(tmp_path):
+    """Deleting an unrelated object's bind attribute is not a module write."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "from types import SimpleNamespace\n"
+        "def clean(options):\n"
+        "    del options.bind\n"
+        "clean(SimpleNamespace(bind='unused'))\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_conditional_private_rebinding_makes_a_direct_write_uncertain(tmp_path):
+    """A branch may keep the alias, so a later write cannot be proven."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "if enabled:\n"
+        "    g = {}\n"
+        "g['wsgi_app'] = 'other:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_conditional_private_rebinding_makes_a_clear_uncertain(tmp_path):
+    """A conditional rebinding keeps a later alias clear uncertain."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "if enabled:\n"
+        "    g = {}\n"
+        "g['wsgi_app'] = None\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_alias_reassignment_keeps_a_proven_app(tmp_path):
+    """Rebinding the alias name does not itself write wsgi_app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = {}\n"
+        "if enabled:\n"
+        "    g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "g = private_settings\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
