@@ -1381,6 +1381,91 @@ def _wsgi_app_assignment_state(node):
     return "dynamic"
 
 
+def _wsgi_value_state(value):
+    """Classify a literal/unknown ``wsgi_app`` value."""
+    if isinstance(value, ast.Constant):
+        if isinstance(value.value, str) and value.value:
+            return "proven"
+        if value.value is None:
+            return "none"
+    return "dynamic"
+
+
+def _mapping_wsgi_state(payload):
+    """Return the state of a literal mapping's ``wsgi_app`` entry, if written."""
+    if not isinstance(payload, ast.Dict):
+        return "dynamic"
+    for key, value in zip(payload.keys, payload.values):
+        if key is None or not isinstance(key, ast.Constant):
+            return "dynamic"
+        if key.value == "wsgi_app":
+            return _wsgi_value_state(value)
+    return None
+
+
+def _call_wsgi_state(call, globals_aliases=frozenset()):
+    """Return the state of a top-level namespace call that writes ``wsgi_app``."""
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and _is_namespace_reference(func.value, globals_aliases)
+    ):
+        return None
+    if func.attr == "update":
+        for arg in call.args:
+            if isinstance(arg, ast.Dict):
+                state = _mapping_wsgi_state(arg)
+                if state is not None:
+                    return state
+            else:
+                return "dynamic"
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                return "dynamic"
+            if keyword.arg == "wsgi_app":
+                return _wsgi_value_state(keyword.value)
+        return None
+    if func.attr in {"setdefault", "__setitem__"}:
+        if not call.args:
+            return None
+        if not _subscript_may_name(call.args[0], "wsgi_app"):
+            return None
+        if len(call.args) >= 2:
+            return _wsgi_value_state(call.args[1])
+        return "dynamic"
+    if func.attr == "__ior__":
+        if call.args:
+            return _mapping_wsgi_state(call.args[0])
+        return None
+    return None
+
+
+def _namespace_wsgi_app_state(node, globals_aliases=frozenset()):
+    """Return ``proven``/``none``/``dynamic`` for a namespace write, else None.
+
+    Only an unconditional top-level statement is considered; a write inside an
+    ``if``/``try`` or a called helper stays UNKNOWN, matching the direct
+    assignment rules.
+    """
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(
+            _target_writes_namespace(target, "wsgi_app", globals_aliases)
+            for target in targets
+        ):
+            return _wsgi_value_state(node.value)
+        return None
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.op, ast.BitOr)
+        and _is_namespace_reference(node.target, globals_aliases)
+    ):
+        return _mapping_wsgi_state(node.value)
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        return _call_wsgi_state(node.value, globals_aliases)
+    return None
+
+
 def _wsgi_app_statement_is_uncertain(node, globals_aliases):
     """Return True when a non-direct statement may write ``wsgi_app``."""
     if any(
@@ -1429,6 +1514,8 @@ def wsgi_app_provides_setting(path):
         dynamic = False
         for node in tree.body:
             state = _wsgi_app_assignment_state(node)
+            if state is None:
+                state = _namespace_wsgi_app_state(node, globals_aliases)
             if state == "proven":
                 proven = True
                 # A later unconditional assignment supersedes earlier writes.

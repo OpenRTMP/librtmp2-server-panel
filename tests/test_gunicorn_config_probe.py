@@ -138,13 +138,31 @@ def test_aliased_namespace_writes_are_not_absent(tmp_path, source):
         "g = globals()\ng.update({'wsgi_app': 'auth_wrapper:app'})\n",
         "g = globals()\ng['wsgi_app'] = 'auth_wrapper:app'\n",
         "g = globals()\ng |= {'wsgi_app': 'auth_wrapper:app'}\n",
+        "g = globals()\ng.setdefault('wsgi_app', 'auth_wrapper:app')\n",
+        "g = globals()\ng.__setitem__('wsgi_app', 'auth_wrapper:app')\n",
+        "g = globals()\ng.update(wsgi_app='auth_wrapper:app')\n",
     ],
 )
-def test_aliased_namespace_wsgi_app_is_not_absent(tmp_path, source):
-    """A namespace alias must not make the image keep its default app."""
+def test_aliased_namespace_wsgi_app_is_supplied(tmp_path, source):
+    """A literal alias write must drop the image's default app:app."""
     path = tmp_path / "gunicorn.conf.py"
     path.write_text(source, encoding="utf-8")
-    assert _config_provides(path, "wsgi-app") != probe.ABSENT
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "g = globals()\ng.update({'wsgi_app': None})\n",
+        "g = globals()\ng['wsgi_app'] = None\n",
+        "g = globals()\ng |= {'wsgi_app': None}\n",
+    ],
+)
+def test_aliased_namespace_wsgi_app_none_is_absent(tmp_path, source):
+    """An explicit None is not a proven application; keep the default."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(source, encoding="utf-8")
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
 
 
 def test_unrelated_alias_union_keeps_bind_absent(tmp_path):
