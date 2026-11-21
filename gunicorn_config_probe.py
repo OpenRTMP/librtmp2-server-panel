@@ -880,8 +880,8 @@ def _collect_globals_aliases(statements):
 
 
 def _collect_possible_aliases(tree):
-    """Return aliases that may name the module namespace at some point."""
-    return _collect_globals_aliases(tree.body) | _global_alias_names(tree)
+    """Return module-scope aliases that may be restored conditionally."""
+    return _collect_globals_aliases(tree.body)
 
 
 def _call_is_dynamic_eval_or_setattr(func):
@@ -990,7 +990,7 @@ def _targets_write_global(
 
 
 def _dynamic_assignment_writes_name(
-    child, name, globals_aliases, allow_locals
+    child, name, globals_aliases, allow_locals, allow_bare_name=True
 ):
     """Return True when an assignment or delete can write the named global."""
     if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
@@ -1005,7 +1005,11 @@ def _dynamic_assignment_writes_name(
         )
     if isinstance(child, ast.Delete):
         return _delete_writes_global(
-            child.targets, name, globals_aliases, allow_locals
+            child.targets,
+            name,
+            globals_aliases,
+            allow_locals,
+            allow_bare_name=allow_bare_name,
         )
     return False
 
@@ -1033,7 +1037,7 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
     for child, in_class_body in _iter_module_scope_entries(node):
         allow_locals = not in_class_body
         if _dynamic_assignment_writes_name(
-            child, name, globals_aliases, allow_locals
+            child, name, globals_aliases, allow_locals, allow_bare_name=not in_class_body
         ):
             return True
         if isinstance(child, ast.Call) and _call_writes_global(
@@ -1776,14 +1780,32 @@ def _direct_wsgi_state(node, namespace_aliases):
     return state
 
 
+def _call_receives_namespace_alias(node, definitions, call_aliases, aliases):
+    """Return True when a local helper receives a namespace alias argument."""
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Name):
+            continue
+        if _resolve_local_name(child.func.id, definitions, call_aliases) is None:
+            continue
+        values = [*child.args, *(keyword.value for keyword in child.keywords)]
+        if any(_is_namespace_reference(value, aliases) for value in values):
+            return True
+    return False
+
+
 def _statement_keeps_app_unknown(
     node, definitions, call_aliases, namespace_aliases, possible_aliases, proven
 ):
     """Return True when a statement without a direct write may clear the app."""
-    if _is_exact_wsgi_setdefault(node, namespace_aliases):
+    if _is_exact_wsgi_setdefault(node, possible_aliases):
         # It only writes when the key is absent. If an earlier literal
         # assignment proved the app, this is a no-op.
         return not proven
+    if _call_receives_namespace_alias(
+        node, definitions, call_aliases, possible_aliases
+    ):
+        # A helper can pop or clear the setting through its parameter.
+        return True
     # A helper called at this position may write wsgi_app. A later
     # unconditional assignment still clears the uncertainty.
     return _statement_calls_wsgi_writer(
