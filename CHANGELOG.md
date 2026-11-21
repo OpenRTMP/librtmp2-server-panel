@@ -36,8 +36,9 @@ only begin at a future `1.0.0`.
 - Stream and player deletes treat only a 2xx or the idempotent 404 as success
   and do not follow redirects, so a proxy redirect to a login page can no
   longer be reported as a revoked key.
-- The entrypoint no longer adds `--bind 0.0.0.0:8000` or `app:app` over an
-  aliased or abbreviated operator setting.
+- The entrypoint no longer adds `--bind 0.0.0.0:8000` over a recognized
+  aliased or abbreviated operator bind, or `app:app` over a proven literal
+  `wsgi_app` write. Uninspectable or dynamic writes keep the default.
 
 ### Changed
 - Dependency update: gunicorn 27.0.1.
