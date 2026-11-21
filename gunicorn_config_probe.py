@@ -900,13 +900,16 @@ def _call_is_namespace_attribute_mutation(
     func = call.func
     if not (
         isinstance(func, ast.Attribute)
-        and func.attr in {"update", "setdefault", "pop"}
+        and func.attr in {"update", "setdefault", "pop", "clear", "popitem"}
         and (
             _is_namespace_reference(func.value, globals_aliases, allow_locals)
             or _is_module_dict_reference(func.value)
         )
     ):
         return False
+    if func.attr in {"clear", "popitem"}:
+        # These remove an arbitrary entry, so they may remove the setting.
+        return True
     if func.attr == "update":
         return _dict_update_payload_may_name(call, name, start_index=0)
     if call.args:
@@ -1040,6 +1043,11 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
             child, name, globals_aliases, allow_locals, allow_bare_name=not in_class_body
         ):
             return True
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Lambda):
+            if _body_writes_global_name(
+                child.func.body, name, globals_aliases
+            ):
+                return True
         if isinstance(child, ast.Call) and _call_writes_global(
             child, name, globals_aliases, allow_locals
         ):
@@ -1369,6 +1377,119 @@ def _iter_scope_nodes(node):
         stack.extend(ast.iter_child_nodes(current))
 
 
+def _local_alias_names(node, aliases):
+    """Return names assigned directly from an alias in this scope."""
+    names = set()
+    for child in _iter_scope_nodes(node):
+        if not isinstance(child, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets, value = _assignment_targets_and_value(child)
+        if isinstance(value, ast.Name) and value.id in aliases:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+    return names
+
+
+def _class_body_writes_global(node, name, globals_aliases):
+    """Return True for module-namespace writes inside a class body."""
+    for child in _iter_scope_nodes(node):
+        if isinstance(child, ast.Call) and _call_writes_global(
+            child, name, globals_aliases, allow_locals=False
+        ):
+            return True
+        if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = (
+                child.targets if isinstance(child, ast.Assign) else (child.target,)
+            )
+            if any(
+                _target_writes_namespace(
+                    target, name, globals_aliases, allow_locals=False
+                )
+                for target in targets
+            ):
+                return True
+        if isinstance(child, ast.Delete) and _delete_writes_global(
+            child.targets,
+            name,
+            globals_aliases,
+            allow_locals=False,
+            allow_bare_name=False,
+        ):
+            return True
+    return False
+
+
+def _expanded_local_aliases(node, globals_aliases, keep_aliases):
+    """Return local aliases, following simple ``alias = namespace`` chains."""
+    local_aliases = _global_alias_names(node) | set(keep_aliases)
+    while True:
+        expanded = local_aliases | _local_alias_names(
+            node, globals_aliases | local_aliases
+        )
+        if expanded == local_aliases:
+            return local_aliases
+        local_aliases = expanded
+
+
+def _nested_definitions(node):
+    """Return nested function definitions grouped by name."""
+    nested = {}
+    for child in _iter_scope_nodes(node):
+        if (
+            isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and child is not node
+        ):
+            nested.setdefault(child.name, []).append(child)
+    return nested
+
+
+def _call_writes_in_scope(
+    child, name, scoped_aliases, definitions, call_aliases, seen, nested
+):
+    """Return True when a call in this scope can write the setting."""
+    if not isinstance(child, ast.Call):
+        return False
+    if _call_writes_global(child, name, scoped_aliases, allow_locals=False):
+        return True
+    if definitions is not None and _call_alias_writes(
+        child,
+        name,
+        definitions,
+        call_aliases,
+        scoped_aliases,
+        seen,
+        allow_locals=False,
+    ):
+        return True
+    if isinstance(child.func, ast.Lambda):
+        return _body_writes_global_name(
+            child.func.body,
+            name,
+            scoped_aliases,
+            definitions=definitions,
+            call_aliases=call_aliases,
+            seen=seen,
+        )
+    if isinstance(child.func, ast.Name):
+        branch_seen = set(seen or ())
+        if child.func.id in branch_seen:
+            return False
+        branch_seen.add(child.func.id)
+        return any(
+            _body_writes_global_name(
+                definition,
+                name,
+                scoped_aliases,
+                definitions=definitions,
+                call_aliases=call_aliases,
+                seen=branch_seen,
+            )
+            for definition in nested.get(child.func.id, [])
+        )
+    return False
+
+
 def _body_writes_global_name(
     node,
     name,
@@ -1389,7 +1510,7 @@ def _body_writes_global_name(
     """
     if _declares_global(node, name) and _binds_global(node, name):
         return True
-    local_aliases = _global_alias_names(node) | set(keep_aliases)
+    local_aliases = _expanded_local_aliases(node, globals_aliases, keep_aliases)
     scoped_aliases = globals_aliases | local_aliases
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         scoped_aliases -= {
@@ -1397,16 +1518,22 @@ def _body_writes_global_name(
             for local in _function_local_bindings(node)
             if local not in local_aliases and not _declares_global(node, local)
         }
+    nested = _nested_definitions(node)
     for child in _iter_scope_nodes(node):
-        if isinstance(child, ast.Call):
-            if _call_writes_global(
-                child, name, scoped_aliases, allow_locals=False
-            ):
-                return True
-            if definitions is not None and _call_alias_writes(
-                child, name, definitions, call_aliases, scoped_aliases, seen
-            ):
-                return True
+        if isinstance(child, ast.ClassDef) and _class_body_writes_global(
+            child, name, scoped_aliases
+        ):
+            return True
+        if _call_writes_in_scope(
+            child,
+            name,
+            scoped_aliases,
+            definitions,
+            call_aliases,
+            seen,
+            nested,
+        ):
+            return True
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and (
             _assignment_writes_global(
                 child, name, allow_locals=False, globals_aliases=scoped_aliases
@@ -1492,38 +1619,50 @@ def _called_names_in_definition(node, definitions, aliases):
     return names
 
 
-def _call_argument_alias_params(call, definition, aliases):
+def _call_argument_alias_params(call, definition, aliases, prebound=(), allow_locals=True):
     """Return parameter names bound to a namespace alias argument."""
     arguments = definition.args
-    parameters = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args)]
+    positional = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args)]
+    keyword_only = {arg.arg for arg in arguments.kwonlyargs}
     bound = {
         parameter
-        for parameter, value in zip(parameters, call.args)
-        if _is_namespace_reference(value, aliases)
+        for parameter, value in zip(positional, [*prebound, *call.args])
+        if _is_namespace_reference(value, aliases, allow_locals)
     }
     for keyword in call.keywords:
-        if keyword.arg in parameters and _is_namespace_reference(
-            keyword.value, aliases
-        ):
+        if (
+            keyword.arg in positional or keyword.arg in keyword_only
+        ) and _is_namespace_reference(keyword.value, aliases, allow_locals):
             bound.add(keyword.arg)
     return bound
 
 
 def _call_alias_writes(
-    call, name, definitions, call_aliases, aliases, seen=None
+    call, name, definitions, call_aliases, aliases, seen=None, allow_locals=True
 ):
     """Return True when a local helper writes ``name`` through an alias arg."""
-    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+    func = call.func if isinstance(call, ast.Call) else None
+    prebound = ()
+    if isinstance(func, ast.Name):
+        local = _resolve_local_name(func.id, definitions, call_aliases)
+    elif isinstance(func, ast.Call) and _is_partial_construction(func):
+        local = _partial_target(func, definitions, call_aliases)
+        prebound = tuple(func.args[1:])
+    else:
         return False
-    local = _resolve_local_name(call.func.id, definitions, call_aliases)
     if local is None:
         return False
     seen = set() if seen is None else seen
     if local in seen:
         return False
-    seen.add(local)
+    branch_seen = set(seen)
+    branch_seen.add(local)
     for definition in definitions.get(local, []):
-        params = _call_argument_alias_params(call, definition, aliases)
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = _call_argument_alias_params(
+            call, definition, aliases, prebound, allow_locals
+        )
         if not params:
             continue
         if _body_writes_global_name(
@@ -1533,7 +1672,7 @@ def _call_alias_writes(
             keep_aliases=params,
             definitions=definitions,
             call_aliases=call_aliases,
-            seen=seen,
+            seen=branch_seen,
         ):
             return True
     return False
@@ -1912,9 +2051,14 @@ def _direct_wsgi_state(node, namespace_aliases):
 
 def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
     """Return True when an import-time call can write ``wsgi_app``."""
-    for child in _iter_module_scope_nodes(node):
+    for child, in_class_body in _iter_module_scope_entries(node):
         if isinstance(child, ast.Call) and _call_alias_writes(
-            child, "wsgi_app", definitions, call_aliases, aliases
+            child,
+            "wsgi_app",
+            definitions,
+            call_aliases,
+            aliases,
+            allow_locals=not in_class_body,
         ):
             return True
     called = _called_local_names([node], definitions, call_aliases)

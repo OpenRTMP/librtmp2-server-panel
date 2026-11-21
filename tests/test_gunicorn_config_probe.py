@@ -691,6 +691,142 @@ def test_later_assignment_target_can_clear_the_app(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
 
 
+def test_constructing_a_local_class_does_not_crash_the_probe(tmp_path):
+    """A class definition has no argument list for alias binding."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "class Defaults:\n"
+        "    workers = 2\n"
+        "wsgi_app = 'custom:app'\n"
+        "Defaults()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_keyword_only_alias_argument_is_tracked(tmp_path):
+    """A keyword-only parameter can receive the namespace alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def clear(*, settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "clear(settings=globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_immediately_invoked_partial_binds_the_alias(tmp_path):
+    """A prebound partial argument shifts the parameter that receives g."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "from functools import partial\n"
+        "wsgi_app = 'custom:app'\n"
+        "def clear(flag, settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "partial(clear, False)(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_repeated_helper_calls_are_checked_independently(tmp_path):
+    """A private-dictionary visit does not hide a later alias visit."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def clear(settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "def configure(settings):\n"
+        "    clear(settings)\n"
+        "    clear({})\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_namespace_clear_is_a_write(tmp_path):
+    """dict.clear() removes the app without naming the key."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def clear_all(settings):\n"
+        "    settings.clear()\n"
+        "clear_all(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_locals_argument_in_a_helper_is_not_the_module(tmp_path):
+    """locals() inside a function names the function namespace."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure():\n"
+        "    clear(locals())\n"
+        "def clear(settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_local_alias_of_the_namespace_is_tracked(tmp_path):
+    """A local alias assigned from the namespace parameter is a live alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def configure(settings):\n"
+        "    alias = settings\n"
+        "    alias['wsgi_app'] = None\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_called_nested_function_is_scanned(tmp_path):
+    """A nested function called by the helper still runs its delete."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    def clean():\n"
+        "        del globals()['wsgi_app']\n"
+        "    clean()\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_class_body_namespace_write_is_detected(tmp_path):
+    """A class body can write a module global through globals()."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure():\n"
+        "    class Options:\n"
+        "        globals()['bind'] = '127.0.0.1:8000'\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
+def test_immediately_invoked_lambda_is_scanned(tmp_path):
+    """An immediately invoked lambda executes its body at import time."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "(lambda: globals().pop('wsgi_app', None))()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
