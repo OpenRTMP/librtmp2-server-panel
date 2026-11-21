@@ -931,6 +931,46 @@ def test_clear_without_a_bind_keeps_the_default(tmp_path):
     assert _config_provides(path) == probe.ABSENT
 
 
+def test_helper_returning_dict_is_private(tmp_path):
+    """dict() returns a fresh private mapping, not the module namespace."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def make_options():\n"
+        "    return dict()\n"
+        "options = make_options()\n"
+        "options['wsgi_app'] = 'example:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_rebound_helper_uses_the_new_binding(tmp_path):
+    """A helper name rebound to dict no longer returns the namespace."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def make_options():\n"
+        "    return globals()\n"
+        "make_options = dict\n"
+        "options = make_options()\n"
+        "options['wsgi_app'] = 'example:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_bind_probe_follows_a_helper_returned_alias(tmp_path):
+    """The bind probe tracks an alias returned by a local helper."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def make_options():\n"
+        "    return globals()\n"
+        "options = make_options()\n"
+        "options['bind'] = '127.0.0.1:8000'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
