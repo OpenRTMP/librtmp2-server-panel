@@ -600,6 +600,97 @@ def test_uncalled_helper_receiving_an_alias_is_not_a_writer(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.ABSENT
 
 
+def test_called_helper_forwards_the_alias_to_a_writer(tmp_path):
+    """A called helper that passes the namespace on can still pop the app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "def apply_overrides(settings):\n"
+        "    settings.pop('wsgi_app', None)\n"
+        "def configure():\n"
+        "    apply_overrides(g)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_nested_uncalled_delete_does_not_mark_the_caller(tmp_path):
+    """Defining a nested cleanup function does not run its delete."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "def configure():\n"
+        "    def clean():\n"
+        "        del g['wsgi_app']\n"
+        "    return clean\n"
+        "wsgi_app = 'custom:app'\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_helper_restored_alias_is_tracked_for_later_writes(tmp_path):
+    """A called helper can restore the namespace alias for a later write."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = {}\n"
+        "def restore():\n"
+        "    global g\n"
+        "    g = globals()\n"
+        "restore()\n"
+        "g.update(wsgi_app='custom:app')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_read_only_alias_argument_keeps_a_proven_app(tmp_path):
+    """A helper that only reads from the namespace does not clear the app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "def worker_count(settings):\n"
+        "    return settings.get('workers', 1)\n"
+        "worker_count(g)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_rhs_alias_argument_is_inspected_before_rebinding(tmp_path):
+    """A call in the right-hand side sees the incoming namespace alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "def extract_app(settings):\n"
+        "    return settings.pop('wsgi_app', None)\n"
+        "g = {'old_app': extract_app(g)}\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_later_assignment_target_can_clear_the_app(tmp_path):
+    """A later target's call runs after the literal wsgi_app store."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "sink = {}\n"
+        "wsgi_app = 'custom:app'\n"
+        "def clear_app():\n"
+        "    g.pop('wsgi_app', None)\n"
+        "    return 'sink'\n"
+        "g['wsgi_app'] = sink[clear_app()] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
