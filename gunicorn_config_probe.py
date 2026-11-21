@@ -1481,19 +1481,17 @@ def _call_wsgi_state(call, globals_aliases=frozenset()):
             else:
                 state = "dynamic"
         for keyword in call.keywords:
+            if keyword.arg == "wsgi_app":
+                # Duplicate keywords fail before update() runs, so a **
+                # unpack cannot replace an explicit keyword.
+                return _wsgi_value_state(keyword.value)
             if keyword.arg is None:
                 state = "dynamic"
-            elif keyword.arg == "wsgi_app":
-                state = _wsgi_value_state(keyword.value)
         return state
     if func.attr == "setdefault":
-        # setdefault only writes when the key is absent. Without the prior
-        # dictionary state, a present None is indistinguishable from a write
-        # that installs an app, so this stays uncertain.
-        if not call.args:
-            return None
-        if _subscript_may_name(call.args[0], "wsgi_app"):
-            return "dynamic"
+        # A matching setdefault is handled by the ordered scanner, which knows
+        # whether a proven app is already present. A dynamic key may name
+        # wsgi_app but cannot be resolved here.
         return None
     if func.attr == "__setitem__":
         if not call.args:
@@ -1510,6 +1508,19 @@ def _call_wsgi_state(call, globals_aliases=frozenset()):
             return _mapping_wsgi_state(call.args[0])
         return None
     return None
+
+
+def _is_exact_wsgi_setdefault(node, globals_aliases=frozenset()):
+    """Return True for an unconditional ``globals().setdefault('wsgi_app', ...)``."""
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "setdefault"
+        and _is_namespace_reference(node.value.func.value, globals_aliases)
+        and bool(node.value.args)
+        and _subscript_is_exactly(node.value.args[0], "wsgi_app")
+    )
 
 
 def _namespace_wsgi_app_state(node, globals_aliases=frozenset()):
@@ -1599,6 +1610,12 @@ def wsgi_app_provides_setting(path):
             if state is None:
                 state = _namespace_wsgi_app_state(node, globals_aliases)
             if state is None:
+                if _is_exact_wsgi_setdefault(node, globals_aliases):
+                    # It only writes when the key is absent. If an earlier
+                    # literal assignment proved the app, this is a no-op.
+                    if not proven:
+                        dynamic = True
+                    continue
                 # A helper called at this position may write wsgi_app. A later
                 # unconditional assignment still clears the uncertainty.
                 if _called_local_names([node], definitions, aliases) & writers:

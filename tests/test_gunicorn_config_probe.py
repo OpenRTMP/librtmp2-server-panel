@@ -254,6 +254,27 @@ def test_setdefault_on_an_existing_none_stays_uncertain(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
 
 
+def test_setdefault_leaves_an_already_assigned_app(tmp_path):
+    """setdefault cannot replace an existing non-None app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "globals().setdefault('wsgi_app', 'fallback:app')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_explicit_wsgi_keyword_beats_a_later_unpack(tmp_path):
+    """A ** unpack cannot replace an explicit keyword without a TypeError."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "globals().update(wsgi_app='custom:app', **{'workers': 2})\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
 def test_later_wsgi_app_keyword_override_wins(tmp_path):
     """dict.update applies keyword arguments after its positional mapping."""
     path = tmp_path / "gunicorn.conf.py"
