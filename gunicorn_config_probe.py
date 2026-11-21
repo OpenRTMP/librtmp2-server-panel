@@ -1004,9 +1004,21 @@ def _dynamic_assignment_writes_name(
             and _mapping_payload_may_name(child.value, name)
         )
     if isinstance(child, ast.Delete):
-        return _targets_write_global(
+        return _delete_writes_global(
             child.targets, name, globals_aliases, allow_locals
         )
+    return False
+
+
+def _delete_writes_global(
+    targets, name, globals_aliases=frozenset(), allow_locals=True, allow_bare_name=True
+):
+    """Return True when a delete can remove the named module setting."""
+    for target in targets:
+        if allow_bare_name and isinstance(target, ast.Name) and target.id == name:
+            return True
+        if _target_writes_namespace(target, name, globals_aliases, allow_locals):
+            return True
     return False
 
 
@@ -1356,8 +1368,12 @@ def _body_writes_global_name(node, name, globals_aliases=frozenset()):
             )
         ):
             return True
-        if isinstance(child, ast.Delete) and _targets_write_global(
-            child.targets, name, scoped_aliases, allow_locals=False
+        if isinstance(child, ast.Delete) and _delete_writes_global(
+            child.targets,
+            name,
+            scoped_aliases,
+            allow_locals=False,
+            allow_bare_name=_declares_global(node, name),
         ):
             return True
     return False
@@ -1714,20 +1730,20 @@ def _wsgi_app_call_aliases(tree, definitions):
 
 
 def _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
-    """Update live namespace aliases; return True when the value is unknown."""
+    """Update live namespace aliases for one top-level statement."""
     rebound = _alias_rebinding(node, possible_aliases)
     if rebound is not None:
         kind, alias = rebound
         if kind == "namespace":
             namespace_aliases.add(alias)
             possible_aliases.add(alias)
-            return False
-        namespace_aliases.discard(alias)
-        possible_aliases.discard(alias)
-        if kind == "unknown":
-            possible_aliases.add(alias)
-            return True
-        return False
+        else:
+            namespace_aliases.discard(alias)
+            if kind == "unknown":
+                possible_aliases.add(alias)
+            else:
+                possible_aliases.discard(alias)
+        return
     # A conditional can restore or discard an alias; only a top-level
     # assignment makes the new value definite.
     for child in _iter_module_assignments([node]):
@@ -1741,7 +1757,6 @@ def _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
             namespace_aliases.discard(alias)
             if kind == "unknown":
                 possible_aliases.add(alias)
-    return False
 
 
 def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
@@ -1773,7 +1788,7 @@ def _statement_keeps_app_unknown(
     # unconditional assignment still clears the uncertainty.
     return _statement_calls_wsgi_writer(
         node, definitions, call_aliases, possible_aliases
-    ) or _wsgi_app_statement_is_uncertain(node, namespace_aliases)
+    ) or _wsgi_app_statement_is_uncertain(node, possible_aliases)
 
 
 def _ordered_wsgi_app_state(
@@ -1783,8 +1798,7 @@ def _ordered_wsgi_app_state(
     proven = False
     dynamic = False
     for node in nodes:
-        if _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
-            dynamic = True
+        _apply_alias_rebinding(node, namespace_aliases, possible_aliases)
         state = _direct_wsgi_state(node, namespace_aliases)
         if state is None:
             if _statement_keeps_app_unknown(
