@@ -92,10 +92,14 @@ def bind_option_supplied(tokens):
     The scan is deliberately simple: a token that looks like a bind option
     counts even when another option's value happens to spell it, because the
     only consequence is that the image keeps its own default bind out of the
-    way (the safe direction).
+    way (the safe direction). Gunicorn's argparse also accepts unambiguous
+    long-option abbreviations, and ``--bi``/``--bin`` can only be ``--bind``
+    (``--backlog`` starts with ``--ba``).
     """
     for token in tokens:
         if token in _BIND_OPTIONS:
+            return True
+        if token.startswith("--bi"):
             return True
         if token.startswith("--bind="):
             return True
@@ -309,7 +313,10 @@ def _is_namespace_reference(node, globals_aliases=frozenset(), allow_locals=True
     ``globals()``, ``vars()`` and a ``globals`` alias always resolve the module
     namespace, even from a class body. Bare ``locals()`` resolves the
     *enclosing* namespace, so the caller disables it inside a class body.
+    An alias of the namespace *value* (``g = globals()``) is a plain name.
     """
+    if isinstance(node, ast.Name):
+        return node.id in globals_aliases
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
         return False
     if node.func.id in {"globals", "vars"} or node.func.id in globals_aliases:
@@ -799,11 +806,24 @@ def _call_is_invoked_partial_namespace_update(call, name, allow_locals=True):
 
 
 def _collect_globals_aliases(statements):
-    """Map simple ``g = globals`` aliases at module scope."""
+    """Map module-scope ``g = globals`` and ``g = globals()`` aliases.
+
+    Both the function alias (``g()`` is the namespace) and the value alias
+    (``g`` is the namespace) are recorded; treating the function object as a
+    namespace too is a safe false positive.
+    """
     aliases = set()
     for statement in _iter_module_assignments(statements):
         targets, value = _assignment_targets_and_value(statement)
-        if not isinstance(value, ast.Name) or value.id != "globals":
+        direct_function = isinstance(value, ast.Name) and value.id == "globals"
+        namespace_value = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in {"globals", "vars", "locals"}
+            and not value.args
+            and not value.keywords
+        )
+        if not (direct_function or namespace_value):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
@@ -924,6 +944,14 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
             if _targets_write_global(targets, name, globals_aliases, allow_locals):
+                return True
+            if (
+                isinstance(child, ast.AugAssign)
+                and isinstance(child.op, ast.BitOr)
+                and _is_namespace_reference(
+                    child.target, globals_aliases, allow_locals
+                )
+            ):
                 return True
         elif isinstance(child, ast.Delete) and _targets_write_global(
             child.targets, name, globals_aliases, allow_locals

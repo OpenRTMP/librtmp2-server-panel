@@ -129,3 +129,19 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         timeout=15,
     )
     assert "app:app" in args_file.read_text(encoding="utf-8").splitlines()
+
+    # Real probe: Gunicorn's argparse accepts unambiguous long-option
+    # abbreviations, so `--bi 127.0.0.1:8000` is a bind. The image default must
+    # not be added and override the operator's loopback bind.
+    real_env["GUNICORN_CMD_ARGS"] = "--bi 127.0.0.1:8000"
+    args_file.unlink(missing_ok=True)
+    subprocess.run(
+        [SH, script.as_posix(), "app:app"],
+        cwd=ROOT,
+        env=real_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "--bind" not in args_file.read_text(encoding="utf-8").splitlines()
