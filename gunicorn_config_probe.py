@@ -1731,6 +1731,29 @@ def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
     return bool(called & writers)
 
 
+def _direct_wsgi_state(node, namespace_aliases):
+    """Return the direct wsgi_app state of a statement, if it writes one."""
+    state = _wsgi_app_assignment_state(node)
+    if state is None:
+        state = _namespace_wsgi_app_state(node, namespace_aliases)
+    return state
+
+
+def _statement_keeps_app_unknown(
+    node, definitions, call_aliases, namespace_aliases, possible_aliases, proven
+):
+    """Return True when a statement without a direct write may clear the app."""
+    if _is_exact_wsgi_setdefault(node, namespace_aliases):
+        # It only writes when the key is absent. If an earlier literal
+        # assignment proved the app, this is a no-op.
+        return not proven
+    # A helper called at this position may write wsgi_app. A later
+    # unconditional assignment still clears the uncertainty.
+    return _statement_calls_wsgi_writer(
+        node, definitions, call_aliases, possible_aliases
+    ) or _wsgi_app_statement_is_uncertain(node, namespace_aliases)
+
+
 def _ordered_wsgi_app_state(
     nodes, definitions, call_aliases, namespace_aliases, possible_aliases
 ):
@@ -1740,21 +1763,16 @@ def _ordered_wsgi_app_state(
     for node in nodes:
         if _apply_alias_rebinding(node, namespace_aliases):
             dynamic = True
-        state = _wsgi_app_assignment_state(node)
+        state = _direct_wsgi_state(node, namespace_aliases)
         if state is None:
-            state = _namespace_wsgi_app_state(node, namespace_aliases)
-        if state is None:
-            if _is_exact_wsgi_setdefault(node, namespace_aliases):
-                # It only writes when the key is absent. If an earlier
-                # literal assignment proved the app, this is a no-op.
-                if not proven:
-                    dynamic = True
-                continue
-            # A helper called at this position may write wsgi_app. A later
-            # unconditional assignment still clears the uncertainty.
-            if _statement_calls_wsgi_writer(
-                node, definitions, call_aliases, possible_aliases
-            ) or _wsgi_app_statement_is_uncertain(node, namespace_aliases):
+            if _statement_keeps_app_unknown(
+                node,
+                definitions,
+                call_aliases,
+                namespace_aliases,
+                possible_aliases,
+                proven,
+            ):
                 dynamic = True
             continue
         if state == "proven":
