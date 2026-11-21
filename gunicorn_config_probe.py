@@ -1356,6 +1356,10 @@ def _body_writes_global_name(node, name, globals_aliases=frozenset()):
             )
         ):
             return True
+        if isinstance(child, ast.Delete) and _targets_write_global(
+            child.targets, name, scoped_aliases, allow_locals=False
+        ):
+            return True
     return False
 
 
@@ -1709,17 +1713,35 @@ def _wsgi_app_call_aliases(tree, definitions):
     return _collect_aliases(tree.body, definitions)
 
 
-def _apply_alias_rebinding(node, namespace_aliases):
+def _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
     """Update live namespace aliases; return True when the value is unknown."""
-    rebound = _alias_rebinding(node, namespace_aliases)
-    if rebound is None:
+    rebound = _alias_rebinding(node, possible_aliases)
+    if rebound is not None:
+        kind, alias = rebound
+        if kind == "namespace":
+            namespace_aliases.add(alias)
+            possible_aliases.add(alias)
+            return False
+        namespace_aliases.discard(alias)
+        possible_aliases.discard(alias)
+        if kind == "unknown":
+            possible_aliases.add(alias)
+            return True
         return False
-    kind, alias = rebound
-    if kind == "namespace":
-        namespace_aliases.add(alias)
-        return False
-    namespace_aliases.discard(alias)
-    return kind == "unknown"
+    # A conditional can restore or discard an alias; only a top-level
+    # assignment makes the new value definite.
+    for child in _iter_module_assignments([node]):
+        rebound = _alias_rebinding(child, possible_aliases)
+        if rebound is None:
+            continue
+        kind, alias = rebound
+        if kind == "namespace":
+            possible_aliases.add(alias)
+        else:
+            namespace_aliases.discard(alias)
+            if kind == "unknown":
+                possible_aliases.add(alias)
+    return False
 
 
 def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
@@ -1761,7 +1783,7 @@ def _ordered_wsgi_app_state(
     proven = False
     dynamic = False
     for node in nodes:
-        if _apply_alias_rebinding(node, namespace_aliases):
+        if _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
             dynamic = True
         state = _direct_wsgi_state(node, namespace_aliases)
         if state is None:
