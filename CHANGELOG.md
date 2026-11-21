@@ -21,8 +21,9 @@ only begin at a future `1.0.0`.
   `__reduce__`/`__getstate__`/`__copy__` hook is reported as dynamic instead
   of accepting `memory://` rate limiting with multiple workers.
 - The entrypoint bind probe detects `operator.ior`/`__ior__` writes to the
-  module namespace, so an indirect `bind` or `wsgi_app` no longer gets the
-  image default injected over it.
+  module namespace, so an indirect `bind` is not overridden by the image
+  default. An indirect `wsgi_app` write stays UNKNOWN, so the default app is
+  retained.
 - The bind probe also recognizes unambiguous Gunicorn option abbreviations
   (`--bi`/`--bin` for `--bind`) and namespace values such as
   `g = globals(); g.update({...})`, `g |= {...}` and `g[...] = ...`. A literal
