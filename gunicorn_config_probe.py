@@ -824,6 +824,43 @@ def _call_is_invoked_partial_namespace_update(call, name, allow_locals=True):
     )
 
 
+def _is_module_namespace_value(value):
+    """Return True for ``globals``/``globals()``/``vars()``/``locals()``."""
+    if isinstance(value, ast.Name) and value.id == "globals":
+        return True
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in {"globals", "vars", "locals"}
+        and not value.args
+        and not value.keywords
+    )
+
+
+def _is_global_namespace_value(value):
+    """Return True for a ``globals()`` call that always names the module."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "globals"
+        and not value.args
+        and not value.keywords
+    )
+
+
+def _global_alias_names(node):
+    """Return names assigned ``globals()`` anywhere under ``node``."""
+    names = set()
+    for child in ast.walk(node):
+        if not isinstance(child, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets, value = _assignment_targets_and_value(child)
+        if _is_global_namespace_value(value):
+            for target in targets:
+                names.update(_target_names(target))
+    return names
+
+
 def _collect_globals_aliases(statements):
     """Map module-scope ``g = globals`` and ``g = globals()`` aliases.
 
@@ -834,20 +871,17 @@ def _collect_globals_aliases(statements):
     aliases = set()
     for statement in _iter_module_assignments(statements):
         targets, value = _assignment_targets_and_value(statement)
-        direct_function = isinstance(value, ast.Name) and value.id == "globals"
-        namespace_value = (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id in {"globals", "vars", "locals"}
-            and not value.args
-            and not value.keywords
-        )
-        if not (direct_function or namespace_value):
+        if not _is_module_namespace_value(value):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
                 aliases.add(target.id)
     return aliases
+
+
+def _collect_possible_aliases(tree):
+    """Return aliases that may name the module namespace at some point."""
+    return _collect_globals_aliases(tree.body) | _global_alias_names(tree)
 
 
 def _call_is_dynamic_eval_or_setattr(func):
@@ -955,6 +989,27 @@ def _targets_write_global(
     )
 
 
+def _dynamic_assignment_writes_name(
+    child, name, globals_aliases, allow_locals
+):
+    """Return True when an assignment or delete can write the named global."""
+    if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
+        if _targets_write_global(targets, name, globals_aliases, allow_locals):
+            return True
+        return (
+            isinstance(child, ast.AugAssign)
+            and isinstance(child.op, ast.BitOr)
+            and _is_namespace_reference(child.target, globals_aliases, allow_locals)
+            and _mapping_payload_may_name(child.value, name)
+        )
+    if isinstance(child, ast.Delete):
+        return _targets_write_global(
+            child.targets, name, globals_aliases, allow_locals
+        )
+    return False
+
+
 def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
     """Return True when a module-scope statement can write the named global.
 
@@ -965,24 +1020,11 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
     """
     for child, in_class_body in _iter_module_scope_entries(node):
         allow_locals = not in_class_body
-        if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = child.targets if isinstance(child, ast.Assign) else (child.target,)
-            if _targets_write_global(targets, name, globals_aliases, allow_locals):
-                return True
-            if (
-                isinstance(child, ast.AugAssign)
-                and isinstance(child.op, ast.BitOr)
-                and _is_namespace_reference(
-                    child.target, globals_aliases, allow_locals
-                )
-            ):
-                if _mapping_payload_may_name(child.value, name):
-                    return True
-        elif isinstance(child, ast.Delete) and _targets_write_global(
-            child.targets, name, globals_aliases, allow_locals
+        if _dynamic_assignment_writes_name(
+            child, name, globals_aliases, allow_locals
         ):
             return True
-        elif isinstance(child, ast.Call) and _call_writes_global(
+        if isinstance(child, ast.Call) and _call_writes_global(
             child, name, globals_aliases, allow_locals
         ):
             return True
@@ -1234,31 +1276,32 @@ def _assignment_writes_global(
     )
 
 
+def _pattern_binding_names(pattern):
+    """Return every name captured by one ``match`` pattern."""
+    names = set()
+    for child in ast.walk(pattern):
+        if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name:
+            names.add(child.name)
+        elif isinstance(child, ast.MatchMapping) and child.rest:
+            names.add(child.rest)
+    return names
+
+
 def _collect_local_targets(statements, names):
     """Collect names bound by statements without entering nested scopes."""
     for statement in statements:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = (
-                statement.targets
-                if isinstance(statement, ast.Assign)
-                else (statement.target,)
-            )
-            for target in targets:
-                names.update(_target_names(target))
-        if isinstance(statement, (ast.For, ast.AsyncFor)):
+        names.update(_assignment_target_names(statement))
+        if isinstance(statement, ast.AnnAssign) and statement.value is None:
             names.update(_target_names(statement.target))
-        if isinstance(statement, (ast.With, ast.AsyncWith)):
-            for item in statement.items:
-                if item.optional_vars is not None:
-                    names.update(_target_names(item.optional_vars))
-        if isinstance(statement, ast.ExceptHandler) and statement.name:
-            names.add(statement.name)
         if isinstance(statement, _TRY_STATEMENT_TYPES):
-            for handler in statement.handlers:
-                if handler.name:
-                    names.add(handler.name)
+            names.update(
+                handler.name for handler in statement.handlers if handler.name
+            )
+        if isinstance(statement, ast.Match):
+            for case in statement.cases:
+                names.update(_pattern_binding_names(case.pattern))
         for block in _compound_statement_blocks(statement):
             _collect_local_targets(block, names)
 
@@ -1294,12 +1337,13 @@ def _body_writes_global_name(node, name, globals_aliases=frozenset()):
     """
     if _declares_global(node, name) and _binds_global(node, name):
         return True
-    scoped_aliases = globals_aliases
+    local_aliases = _global_alias_names(node)
+    scoped_aliases = globals_aliases | local_aliases
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        scoped_aliases = globals_aliases - {
+        scoped_aliases -= {
             local
             for local in _function_local_bindings(node)
-            if not _declares_global(node, local)
+            if local not in local_aliases and not _declares_global(node, local)
         }
     for child in ast.walk(node):
         if isinstance(child, ast.Call) and _call_writes_global(
@@ -1439,6 +1483,33 @@ def _delete_targets_name(node, name):
     )
 
 
+_KNOWN_SCALAR_TYPES = frozenset(
+    {
+        "dict",
+        "list",
+        "set",
+        "tuple",
+        "str",
+        "bytes",
+        "int",
+        "float",
+        "bool",
+        "object",
+    }
+)
+
+
+def _is_known_non_namespace_call(value):
+    """Return True for a bare builtin call that cannot name the module."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in _KNOWN_SCALAR_TYPES
+        and not value.args
+        and not value.keywords
+    )
+
+
 def _alias_rebinding(node, aliases):
     """Classify a top-level rebinding of a module namespace alias."""
     if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -1451,40 +1522,13 @@ def _alias_rebinding(node, aliases):
         return None
     alias = targets[0].id
     value = node.value
-    if isinstance(value, ast.Name) and value.id == "globals":
-        return ("namespace", alias)
-    if (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id in {"globals", "vars", "locals"}
-        and not value.args
-        and not value.keywords
-    ):
+    if _is_module_namespace_value(value):
         return ("namespace", alias)
     if alias not in aliases:
         return None
-    if isinstance(value, ast.Call):
-        if (
-            isinstance(value.func, ast.Name)
-            and value.func.id
-            in {
-                "dict",
-                "list",
-                "set",
-                "tuple",
-                "str",
-                "bytes",
-                "int",
-                "float",
-                "bool",
-                "object",
-            }
-            and not value.args
-            and not value.keywords
-        ):
-            return ("other", alias)
-        return ("unknown", alias)
-    if isinstance(value, ast.Name):
+    if _is_known_non_namespace_call(value):
+        return ("other", alias)
+    if isinstance(value, (ast.Call, ast.Name)):
         return ("unknown", alias)
     return ("other", alias)
 
@@ -1529,6 +1573,51 @@ def _mapping_wsgi_state(payload):
     return state
 
 
+def _update_call_wsgi_state(call):
+    """Return the wsgi_app state written by a namespace ``update`` call."""
+    state = None
+    for arg in call.args:
+        if isinstance(arg, ast.Dict):
+            mapped = _mapping_wsgi_state(arg)
+            if mapped is not None:
+                state = mapped
+        else:
+            state = "dynamic"
+    for keyword in call.keywords:
+        if keyword.arg == "wsgi_app":
+            # Duplicate keywords fail before update() runs, so a **
+            # unpack cannot replace an explicit keyword.
+            return _wsgi_value_state(keyword.value)
+        if keyword.arg is None:
+            state = "dynamic"
+    return state
+
+
+def _setitem_call_wsgi_state(call):
+    """Return the wsgi_app state written by ``ns.__setitem__(...)``."""
+    if not call.args:
+        return None
+    if _subscript_is_exactly(call.args[0], "wsgi_app"):
+        if len(call.args) >= 2:
+            return _wsgi_value_state(call.args[1])
+        return "dynamic"
+    if _subscript_may_name(call.args[0], "wsgi_app"):
+        return "dynamic"
+    return None
+
+
+def _ior_call_wsgi_state(call):
+    """Return the wsgi_app state written by ``ns.__ior__(mapping)``."""
+    return _mapping_wsgi_state(call.args[0]) if call.args else None
+
+
+_WSGI_CALL_STATES = {
+    "update": _update_call_wsgi_state,
+    "__setitem__": _setitem_call_wsgi_state,
+    "__ior__": _ior_call_wsgi_state,
+}
+
+
 def _call_wsgi_state(call, globals_aliases=frozenset()):
     """Return the state of a top-level namespace call that writes ``wsgi_app``."""
     func = call.func
@@ -1537,44 +1626,8 @@ def _call_wsgi_state(call, globals_aliases=frozenset()):
         and _is_namespace_reference(func.value, globals_aliases)
     ):
         return None
-    if func.attr == "update":
-        # Positional payloads apply first, then keyword arguments.
-        state = None
-        for arg in call.args:
-            if isinstance(arg, ast.Dict):
-                mapped = _mapping_wsgi_state(arg)
-                if mapped is not None:
-                    state = mapped
-            else:
-                state = "dynamic"
-        for keyword in call.keywords:
-            if keyword.arg == "wsgi_app":
-                # Duplicate keywords fail before update() runs, so a **
-                # unpack cannot replace an explicit keyword.
-                return _wsgi_value_state(keyword.value)
-            if keyword.arg is None:
-                state = "dynamic"
-        return state
-    if func.attr == "setdefault":
-        # A matching setdefault is handled by the ordered scanner, which knows
-        # whether a proven app is already present. A dynamic key may name
-        # wsgi_app but cannot be resolved here.
-        return None
-    if func.attr == "__setitem__":
-        if not call.args:
-            return None
-        if _subscript_is_exactly(call.args[0], "wsgi_app"):
-            if len(call.args) >= 2:
-                return _wsgi_value_state(call.args[1])
-            return "dynamic"
-        if _subscript_may_name(call.args[0], "wsgi_app"):
-            return "dynamic"
-        return None
-    if func.attr == "__ior__":
-        if call.args:
-            return _mapping_wsgi_state(call.args[0])
-        return None
-    return None
+    handler = _WSGI_CALL_STATES.get(func.attr)
+    return handler(call) if handler else None
 
 
 def _is_side_effect_free(node):
@@ -1656,6 +1709,66 @@ def _wsgi_app_call_aliases(tree, definitions):
     return _collect_aliases(tree.body, definitions)
 
 
+def _apply_alias_rebinding(node, namespace_aliases):
+    """Update live namespace aliases; return True when the value is unknown."""
+    rebound = _alias_rebinding(node, namespace_aliases)
+    if rebound is None:
+        return False
+    kind, alias = rebound
+    if kind == "namespace":
+        namespace_aliases.add(alias)
+        return False
+    namespace_aliases.discard(alias)
+    return kind == "unknown"
+
+
+def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
+    """Return True when a module-scope statement invokes a helper writer."""
+    called = _called_local_names([node], definitions, call_aliases)
+    if not called:
+        return False
+    writers = _local_writer_names(definitions, "wsgi_app", call_aliases, aliases)
+    return bool(called & writers)
+
+
+def _ordered_wsgi_app_state(
+    nodes, definitions, call_aliases, namespace_aliases, possible_aliases
+):
+    """Return ``(proven, dynamic)`` for the ordered module statements."""
+    proven = False
+    dynamic = False
+    for node in nodes:
+        if _apply_alias_rebinding(node, namespace_aliases):
+            dynamic = True
+        state = _wsgi_app_assignment_state(node)
+        if state is None:
+            state = _namespace_wsgi_app_state(node, namespace_aliases)
+        if state is None:
+            if _is_exact_wsgi_setdefault(node, namespace_aliases):
+                # It only writes when the key is absent. If an earlier
+                # literal assignment proved the app, this is a no-op.
+                if not proven:
+                    dynamic = True
+                continue
+            # A helper called at this position may write wsgi_app. A later
+            # unconditional assignment still clears the uncertainty.
+            if _statement_calls_wsgi_writer(
+                node, definitions, call_aliases, possible_aliases
+            ) or _wsgi_app_statement_is_uncertain(node, namespace_aliases):
+                dynamic = True
+            continue
+        if state == "proven":
+            proven = True
+            # A later unconditional assignment supersedes earlier writes.
+            dynamic = False
+        elif state == "none":
+            proven = False
+            dynamic = False
+        else:
+            dynamic = True
+    return proven, dynamic
+
+
 def wsgi_app_provides_setting(path):
     """Return ``0``/``1``/``2`` for a *proven* effective ``wsgi_app``.
 
@@ -1674,53 +1787,13 @@ def wsgi_app_provides_setting(path):
         return UNKNOWN
     try:
         definitions = _module_local_definitions(tree.body)
-        globals_aliases = _collect_globals_aliases(tree.body)
-        call_aliases = _wsgi_app_call_aliases(tree, definitions)
-        namespace_aliases = set(globals_aliases)
-        proven = False
-        dynamic = False
-        for node in tree.body:
-            rebound = _alias_rebinding(node, namespace_aliases)
-            if rebound is not None:
-                kind, alias = rebound
-                if kind == "namespace":
-                    namespace_aliases.add(alias)
-                else:
-                    namespace_aliases.discard(alias)
-                    if kind == "unknown":
-                        dynamic = True
-            state = _wsgi_app_assignment_state(node)
-            if state is None:
-                state = _namespace_wsgi_app_state(node, namespace_aliases)
-            if state is None:
-                if _is_exact_wsgi_setdefault(node, namespace_aliases):
-                    # It only writes when the key is absent. If an earlier
-                    # literal assignment proved the app, this is a no-op.
-                    if not proven:
-                        dynamic = True
-                    continue
-                # A helper called at this position may write wsgi_app. A later
-                # unconditional assignment still clears the uncertainty.
-                called = _called_local_names([node], definitions, call_aliases)
-                live_writers = _local_writer_names(
-                    definitions, "wsgi_app", call_aliases, namespace_aliases
-                )
-                if called & live_writers:
-                    dynamic = True
-                elif _wsgi_app_statement_is_uncertain(node, namespace_aliases):
-                    dynamic = True
-                continue
-            if state == "proven":
-                proven = True
-                # A later unconditional assignment supersedes earlier writes.
-                dynamic = False
-            elif state == "none":
-                proven = False
-                dynamic = False
-            elif state == "dynamic" or _wsgi_app_statement_is_uncertain(
-                node, globals_aliases
-            ):
-                dynamic = True
+        proven, dynamic = _ordered_wsgi_app_state(
+            tree.body,
+            definitions,
+            _wsgi_app_call_aliases(tree, definitions),
+            set(_collect_globals_aliases(tree.body)),
+            _collect_possible_aliases(tree),
+        )
     except RecursionError:
         return UNKNOWN
     if dynamic:

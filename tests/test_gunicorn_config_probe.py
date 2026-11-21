@@ -445,6 +445,53 @@ def test_helper_after_a_definite_rebinding_is_not_a_module_writer(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.ABSENT
 
 
+def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
+    """g = globals() inside an if may restore a discarded alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = {}\n"
+        "if enabled:\n"
+        "    g = globals()\n"
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g.update(wsgi_app=None)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_helper_restoring_the_module_alias_is_a_writer(tmp_path):
+    """A helper can rebind the module alias before clearing the app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = {}\n"
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g = globals()\n"
+        "    g.update(wsgi_app=None)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_helper_local_globals_alias_is_a_writer(tmp_path):
+    """A local g = globals() in a helper still writes the module."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    g = globals()\n"
+        "    g.update(wsgi_app=None)\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
