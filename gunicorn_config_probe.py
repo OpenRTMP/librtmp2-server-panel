@@ -978,7 +978,6 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
             ):
                 if _mapping_payload_may_name(child.value, name):
                     return True
-                continue
         elif isinstance(child, ast.Delete) and _targets_write_global(
             child.targets, name, globals_aliases, allow_locals
         ):
