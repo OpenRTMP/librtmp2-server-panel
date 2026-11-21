@@ -13,6 +13,36 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- The Gunicorn worker scanner resolves aliased, `from`-imported, re-imported
+  and keyword-passed (`obj=`, `x=`) `pickle`/`copy` serialization calls,
+  including `dump`, `protocol=`, self-assignment and same-line rebinds, and
+  ignores an empty positional splat. A config that can run a mutating
+  `__reduce__`/`__getstate__`/`__copy__` hook is reported as dynamic instead
+  of accepting `memory://` rate limiting with multiple workers.
+- The entrypoint bind probe detects `operator.ior`/`__ior__` writes to the
+  module namespace, so an indirect `bind` is not overridden by the image
+  default. An indirect `wsgi_app` write stays UNKNOWN, so the default app is
+  retained.
+- The bind probe also recognizes unambiguous Gunicorn option abbreviations
+  (`--bi`/`--bin` for `--bind`) and namespace values such as
+  `g = globals(); g.update({...})`, `g |= {...}` and `g[...] = ...`. A literal
+  non-empty `wsgi_app` write is proven and drops the image `app:app`, while
+  `None`, dynamic, shadowed, `setdefault` and computed-key cases stay
+  uncertain. An operator's loopback bind or auth wrapper is therefore no
+  longer replaced by the image default.
+
+### Fixed
+- Stream and player deletes treat only a 2xx or the idempotent 404 as success
+  and do not follow redirects, so a proxy redirect to a login page can no
+  longer be reported as a revoked key.
+- The entrypoint no longer adds `--bind 0.0.0.0:8000` over a recognized
+  aliased or abbreviated operator bind, or `app:app` over a proven literal
+  `wsgi_app` write. Uninspectable or dynamic writes keep the default.
+
+### Changed
+- Dependency update: gunicorn 27.0.1.
+
 ## [0.1.16] — 2026-11-12
 
 ### Added
