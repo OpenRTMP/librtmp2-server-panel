@@ -38,7 +38,9 @@ only begin at a future `1.0.0`.
   longer be reported as a revoked key.
 - The entrypoint no longer adds `--bind 0.0.0.0:8000` over a recognized
   aliased or abbreviated operator bind, or `app:app` over a proven literal
-  `wsgi_app` write. Uninspectable or dynamic writes keep the default.
+  `wsgi_app` write. The default image command keeps `app:app` for
+  uninspectable or dynamic writes; flags-only launches retain their existing
+  UNKNOWN behavior.
 
 ### Changed
 - Dependency update: gunicorn 27.0.1.
