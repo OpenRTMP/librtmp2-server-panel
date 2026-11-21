@@ -13,6 +13,8 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.17] — 2026-11-21
+
 ### Security
 - The Gunicorn worker scanner resolves aliased, `from`-imported, re-imported
   and keyword-passed (`obj=`, `x=`) `pickle`/`copy` serialization calls,
@@ -46,6 +48,7 @@ only begin at a future `1.0.0`.
   UNKNOWN behavior.
 
 ### Changed
+- Release version `0.1.16` → `0.1.17`.
 - Dependency update: gunicorn 27.0.1.
 - The app probe skips the transitive helper-writer scan for a statement that
   calls no local helper, avoiding repeated work on configs with many uncalled
@@ -641,7 +644,8 @@ First tagged pre-release.
 ### Planned
 - Further UI polish once user feedback comes in from the first release
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/OpenRTMP/librtmp2-server-panel/compare/v0.1.13...v0.1.14
