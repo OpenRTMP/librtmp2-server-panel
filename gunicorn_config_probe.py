@@ -511,6 +511,16 @@ def _dict_update_payload_may_name(call, name, *, start_index=1):
     )
 
 
+def _mapping_payload_may_name(node, name):
+    """Return True when a ``|=`` mapping can set module global ``name``."""
+    if not isinstance(node, ast.Dict):
+        return True
+    return any(
+        key is None or not isinstance(key, ast.Constant) or key.value == name
+        for key in node.keys
+    )
+
+
 def _call_is_dict_type_update_on_namespace(call, name, allow_locals=True):
     """Return True for ``builtins.dict.update(globals(), ...)``-style writes."""
     if not _is_dict_type_update_callable(call.func):
@@ -854,9 +864,14 @@ def _call_is_namespace_attribute_mutation(
         )
     ):
         return False
-    if func.attr == "update" and call.args and isinstance(call.args[0], ast.Dict):
+    if func.attr == "update":
         return _dict_update_payload_may_name(call, name, start_index=0)
-    return bool(call.args) or any(
+    if call.args:
+        return _subscript_may_name(call.args[0], name) or any(
+            keyword.arg is None or keyword.arg == name
+            for keyword in call.keywords
+        )
+    return any(
         keyword.arg is None or keyword.arg == name
         for keyword in call.keywords
     )
@@ -952,7 +967,7 @@ def _has_dynamic_namespace_write(node, name, globals_aliases=frozenset()):
                     child.target, globals_aliases, allow_locals
                 )
             ):
-                return True
+                return _mapping_payload_may_name(child.value, name)
         elif isinstance(child, ast.Delete) and _targets_write_global(
             child.targets, name, globals_aliases, allow_locals
         ):
@@ -1193,13 +1208,17 @@ def _binds_global(node, name):
     )
 
 
-def _assignment_writes_global(node, name, allow_locals=True):
+def _assignment_writes_global(
+    node, name, allow_locals=True, globals_aliases=frozenset()
+):
     """Return True when an assignment target writes the named global."""
     targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
-    return _targets_write_global(targets, name, allow_locals=allow_locals)
+    return _targets_write_global(
+        targets, name, globals_aliases, allow_locals=allow_locals
+    )
 
 
-def _body_writes_global_name(node, name):
+def _body_writes_global_name(node, name, globals_aliases=frozenset()):
     """Return True when executing ``node`` can rebind the module global ``name``.
 
     A plain assignment inside a function is local unless the function declares
@@ -1211,24 +1230,29 @@ def _body_writes_global_name(node, name):
         return True
     for child in ast.walk(node):
         if isinstance(child, ast.Call) and _call_writes_global(
-            child, name, allow_locals=False
+            child, name, globals_aliases, allow_locals=False
         ):
             return True
         if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and (
-            _assignment_writes_global(child, name, allow_locals=False)
+            _assignment_writes_global(
+                child, name, allow_locals=False, globals_aliases=globals_aliases
+            )
         ):
             return True
     return False
 
 
-def _definition_writes_setting(node, name):
+def _definition_writes_setting(node, name, globals_aliases=frozenset()):
     """Return True when defining or invoking ``node`` can write the setting."""
     if isinstance(node, ast.ClassDef):
         # A class body runs at import time. An instantiated local class can also
         # expose any method via an attribute call, so scan every method: the
         # conservative result is UNKNOWN rather than an override.
-        return any(_body_writes_global_name(child, name) for child in node.body)
-    return _body_writes_global_name(node, name)
+        return any(
+            _body_writes_global_name(child, name, globals_aliases)
+            for child in node.body
+        )
+    return _body_writes_global_name(node, name, globals_aliases)
 
 
 def _is_partial_construction(node):
@@ -1265,14 +1289,18 @@ def _called_names_in_definition(node, definitions, aliases):
     return names
 
 
-def _definition_is_writer(node, name, writers, definitions, aliases):
+def _definition_is_writer(
+    node, name, writers, definitions, aliases, globals_aliases=frozenset()
+):
     """Return True when ``node`` writes the setting or calls a known writer."""
-    return _definition_writes_setting(node, name) or bool(
+    return _definition_writes_setting(node, name, globals_aliases) or bool(
         _called_names_in_definition(node, definitions, aliases) & writers
     )
 
 
-def _local_writer_names(definitions, name, aliases):
+def _local_writer_names(
+    definitions, name, aliases, globals_aliases=frozenset()
+):
     """Return local definitions that can write ``name``, including transitively."""
     writers = set()
     changed = True
@@ -1282,7 +1310,9 @@ def _local_writer_names(definitions, name, aliases):
             if definition_name in writers:
                 continue
             if any(
-                _definition_is_writer(node, name, writers, definitions, aliases)
+                _definition_is_writer(
+                    node, name, writers, definitions, aliases, globals_aliases
+                )
                 for node in nodes
             ):
                 writers.add(definition_name)
@@ -1365,12 +1395,14 @@ def _wsgi_app_statement_is_uncertain(node, globals_aliases):
     return supplied == SUPPLIED or uncertain
 
 
-def _called_helper_writes_wsgi_app(tree, definitions):
+def _called_helper_writes_wsgi_app(tree, definitions, globals_aliases):
     """Return True when a helper called at import time may write ``wsgi_app``."""
     aliases = _collect_aliases(tree.body, definitions)
     return bool(
         _called_local_names(tree.body, definitions, aliases)
-        & _local_writer_names(definitions, "wsgi_app", aliases)
+        & _local_writer_names(
+            definitions, "wsgi_app", aliases, globals_aliases
+        )
     )
 
 
@@ -1408,7 +1440,9 @@ def wsgi_app_provides_setting(path):
                 node, globals_aliases
             ):
                 dynamic = True
-        if _called_helper_writes_wsgi_app(tree, definitions):
+        if _called_helper_writes_wsgi_app(
+            tree, definitions, globals_aliases
+        ):
             dynamic = True
     except RecursionError:
         return UNKNOWN
@@ -1448,7 +1482,7 @@ def config_provides_setting(path, name):
         # called helper can actually write it; an unrelated helper stays ABSENT.
         aliases = _collect_aliases(tree.body, definitions)
         if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
-            definitions, name, aliases
+            definitions, name, aliases, globals_aliases
         ):
             dynamic = True
     except RecursionError:

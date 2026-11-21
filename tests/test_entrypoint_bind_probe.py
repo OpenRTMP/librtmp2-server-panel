@@ -145,3 +145,41 @@ def test_entrypoint_does_not_override_an_operator_bind(tmp_path):
         timeout=15,
     )
     assert "--bind" not in args_file.read_text(encoding="utf-8").splitlines()
+
+    # A bind-only namespace alias must not mark wsgi_app uncertain: a
+    # flags-only launch still needs the image's default app, or Gunicorn
+    # starts with no application.
+    config_file.write_text(
+        "g = globals()\ng |= {'bind': '0.0.0.0:9000'}\n", encoding="utf-8"
+    )
+    real_env["GUNICORN_CMD_ARGS"] = f"--config {config_file.as_posix()}"
+    args_file.unlink(missing_ok=True)
+    subprocess.run(
+        [SH, script.as_posix(), "app:app"],
+        cwd=ROOT,
+        env=real_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert "--bind" not in args
+    assert "app:app" in args
+
+    # An aliased wsgi_app wrapper must replace the image's default target.
+    config_file.write_text(
+        "g = globals()\ng.update({'wsgi_app': 'auth_wrapper:app'})\n",
+        encoding="utf-8",
+    )
+    args_file.unlink(missing_ok=True)
+    subprocess.run(
+        [SH, script.as_posix(), "app:app"],
+        cwd=ROOT,
+        env=real_env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "app:app" not in args_file.read_text(encoding="utf-8").splitlines()

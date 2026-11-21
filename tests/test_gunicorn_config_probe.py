@@ -147,6 +147,45 @@ def test_aliased_namespace_wsgi_app_is_not_absent(tmp_path, source):
     assert _config_provides(path, "wsgi-app") != probe.ABSENT
 
 
+def test_unrelated_alias_union_keeps_bind_absent(tmp_path):
+    """A literal union of another setting must not make bind uncertain."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text("g = globals()\ng |= {'workers': 2}\n", encoding="utf-8")
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_unrelated_alias_union_keeps_a_proven_app(tmp_path):
+    """An unrelated union must not hide an explicit wsgi_app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'auth_wrapper:app'\ng = globals()\ng |= {'workers': 2}\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_alias_setdefault_other_key_keeps_bind_absent(tmp_path):
+    """A literal setdefault of another setting is not a bind write."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\ng.setdefault('workers', 2)\n", encoding="utf-8"
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_helper_called_at_import_time_uses_a_module_alias(tmp_path):
+    """A helper's aliased namespace write must reach the caller's scan."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "def configure():\n"
+        "    g.update(bind=['127.0.0.1:8000'])\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) != probe.ABSENT
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
