@@ -308,6 +308,61 @@ def test_computed_subscript_key_is_not_a_definite_wsgi_app(tmp_path):
     assert _config_provides(path, "wsgi-app") != probe.SUPPLIED
 
 
+def test_setdefault_with_a_computed_fallback_stays_uncertain(tmp_path):
+    """The fallback argument can mutate wsgi_app before setdefault runs."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def configure_default():\n"
+        "    global wsgi_app\n"
+        "    wsgi_app = None\n"
+        "    return 'fallback:app'\n"
+        "globals().setdefault('wsgi_app', configure_default())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_for_loop_target_shadows_a_module_alias(tmp_path):
+    """A loop target rebinds the name locally; its writes are not module writes."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "settings = globals()\n"
+        "def configure():\n"
+        "    for settings in [{}]:\n"
+        "        settings.update(wsgi_app='unused:app')\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_helper_namespace_union_is_a_writer(tmp_path):
+    """A helper's g |= {'bind': ...} must not be reported absent."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g |= {'bind': '127.0.0.1:8000'}\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) != probe.ABSENT
+
+
+def test_rebound_alias_is_not_the_module_namespace(tmp_path):
+    """After g = {}, g['wsgi_app'] no longer writes the module."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g = {}\n"
+        "g['wsgi_app'] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
