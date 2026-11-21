@@ -1981,11 +1981,45 @@ def _wsgi_app_call_aliases(tree, definitions):
     return _collect_aliases(tree.body, definitions)
 
 
-def _apply_alias_rebinding(node, namespace_aliases, possible_aliases):
+def _call_return_kind(call, definitions, call_aliases):
+    """Classify a local helper's return as namespace, other, or unknown."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        return "unknown"
+    local = _resolve_local_name(call.func.id, definitions, call_aliases)
+    if local is None:
+        return "unknown"
+    kinds = set()
+    for definition in definitions.get(local, []):
+        for child in _iter_scope_nodes(definition):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            if _is_module_namespace_value(child.value):
+                kinds.add("namespace")
+            elif isinstance(
+                child.value,
+                (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant),
+            ):
+                kinds.add("other")
+            else:
+                kinds.add("unknown")
+    if not kinds:
+        return "other"
+    if "namespace" in kinds:
+        return "namespace"
+    if "unknown" in kinds:
+        return "unknown"
+    return "other"
+
+
+def _apply_alias_rebinding(
+    node, namespace_aliases, possible_aliases, definitions, call_aliases
+):
     """Update live namespace aliases for one top-level statement."""
     rebound = _alias_rebinding(node, possible_aliases)
     if rebound is not None:
         kind, alias = rebound
+        if kind == "unknown" and isinstance(node.value, ast.Call):
+            kind = _call_return_kind(node.value, definitions, call_aliases)
         if kind == "namespace":
             namespace_aliases.add(alias)
             possible_aliases.add(alias)
@@ -2027,7 +2061,12 @@ def _helper_restored_aliases(node, definitions, call_aliases):
                         definition, target.id
                     ):
                         restored.add(target.id)
-    return restored
+    assigned = set()
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            assigned.update(_target_names(target))
+    return restored - assigned
 
 
 def _later_targets_may_write(node):
@@ -2116,7 +2155,9 @@ def _ordered_wsgi_app_state(
                 dynamic = False
         else:
             dynamic = True
-        _apply_alias_rebinding(node, namespace_aliases, possible_aliases)
+        _apply_alias_rebinding(
+            node, namespace_aliases, possible_aliases, definitions, call_aliases
+        )
         possible_aliases |= _helper_restored_aliases(
             node, definitions, call_aliases
         )

@@ -827,6 +827,22 @@ def test_immediately_invoked_lambda_is_scanned(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
 
 
+def test_helper_returning_a_private_dict_does_not_keep_the_alias(tmp_path):
+    """A helper that restores g but returns a private dict is overwritten."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = 'custom:app'\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g = globals()\n"
+        "    return {}\n"
+        "g = configure()\n"
+        "g.update(wsgi_app=None)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
 def test_conditional_alias_restore_makes_a_helper_a_writer(tmp_path):
     """g = globals() inside an if may restore a discarded alias."""
     path = tmp_path / "gunicorn.conf.py"
