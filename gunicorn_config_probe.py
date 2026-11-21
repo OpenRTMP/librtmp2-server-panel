@@ -1255,6 +1255,10 @@ def _collect_local_targets(statements, names):
                     names.update(_target_names(item.optional_vars))
         if isinstance(statement, ast.ExceptHandler) and statement.name:
             names.add(statement.name)
+        if isinstance(statement, _TRY_STATEMENT_TYPES):
+            for handler in statement.handlers:
+                if handler.name:
+                    names.add(handler.name)
         for block in _compound_statement_blocks(statement):
             _collect_local_targets(block, names)
 
@@ -1439,12 +1443,11 @@ def _alias_rebinding(node, aliases):
     """Classify a top-level rebinding of a module namespace alias."""
     if not isinstance(node, (ast.Assign, ast.AnnAssign)):
         return None
+    if isinstance(node, ast.AnnAssign) and node.value is None:
+        # A bare annotation updates __annotations__, not the binding.
+        return None
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    if not (
-        len(targets) == 1
-        and isinstance(targets[0], ast.Name)
-        and targets[0].id in aliases
-    ):
+    if not (len(targets) == 1 and isinstance(targets[0], ast.Name)):
         return None
     alias = targets[0].id
     value = node.value
@@ -1458,7 +1461,30 @@ def _alias_rebinding(node, aliases):
         and not value.keywords
     ):
         return ("namespace", alias)
-    if isinstance(value, (ast.Call, ast.Name)):
+    if alias not in aliases:
+        return None
+    if isinstance(value, ast.Call):
+        if (
+            isinstance(value.func, ast.Name)
+            and value.func.id
+            in {
+                "dict",
+                "list",
+                "set",
+                "tuple",
+                "str",
+                "bytes",
+                "int",
+                "float",
+                "bool",
+                "object",
+            }
+            and not value.args
+            and not value.keywords
+        ):
+            return ("other", alias)
+        return ("unknown", alias)
+    if isinstance(value, ast.Name):
         return ("unknown", alias)
     return ("other", alias)
 
@@ -1551,20 +1577,29 @@ def _call_wsgi_state(call, globals_aliases=frozenset()):
     return None
 
 
+def _is_side_effect_free(node):
+    """Return True when evaluating ``node`` cannot call code or rebind a name."""
+    return not any(
+        isinstance(child, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
+        for child in ast.walk(node)
+    )
+
+
 def _is_exact_wsgi_setdefault(node, globals_aliases=frozenset()):
-    """Return True for an unconditional ``globals().setdefault('wsgi_app', literal)``."""
-    return (
+    """Return True for an unconditional, side-effect-free ``setdefault``."""
+    if not (
         isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Attribute)
         and node.value.func.attr == "setdefault"
         and _is_namespace_reference(node.value.func.value, globals_aliases)
-        and len(node.value.args) >= 2
+        and bool(node.value.args)
         and _subscript_is_exactly(node.value.args[0], "wsgi_app")
-        # A call in the fallback can itself write wsgi_app before setdefault
-        # decides whether to insert. Only a literal fallback is side-effect free.
-        and isinstance(node.value.args[1], ast.Constant)
-    )
+    ):
+        return False
+    # An omitted fallback or a bare value cannot write wsgi_app; only a call
+    # (or walrus/yield) in the fallback can mutate it before setdefault runs.
+    return len(node.value.args) < 2 or _is_side_effect_free(node.value.args[1])
 
 
 def _namespace_wsgi_app_state(node, globals_aliases=frozenset()):
@@ -1616,13 +1651,9 @@ def _wsgi_app_statement_is_uncertain(node, globals_aliases):
     return supplied == SUPPLIED or uncertain
 
 
-def _wsgi_app_writer_names(tree, definitions, globals_aliases):
-    """Return the helper names that may write ``wsgi_app`` and the call aliases."""
-    aliases = _collect_aliases(tree.body, definitions)
-    return (
-        _local_writer_names(definitions, "wsgi_app", aliases, globals_aliases),
-        aliases,
-    )
+def _wsgi_app_call_aliases(tree, definitions):
+    """Return local-name aliases used to resolve helper calls in this config."""
+    return _collect_aliases(tree.body, definitions)
 
 
 def wsgi_app_provides_setting(path):
@@ -1644,9 +1675,7 @@ def wsgi_app_provides_setting(path):
     try:
         definitions = _module_local_definitions(tree.body)
         globals_aliases = _collect_globals_aliases(tree.body)
-        writers, call_aliases = _wsgi_app_writer_names(
-            tree, definitions, globals_aliases
-        )
+        call_aliases = _wsgi_app_call_aliases(tree, definitions)
         namespace_aliases = set(globals_aliases)
         proven = False
         dynamic = False
@@ -1672,7 +1701,11 @@ def wsgi_app_provides_setting(path):
                     continue
                 # A helper called at this position may write wsgi_app. A later
                 # unconditional assignment still clears the uncertainty.
-                if _called_local_names([node], definitions, call_aliases) & writers:
+                called = _called_local_names([node], definitions, call_aliases)
+                live_writers = _local_writer_names(
+                    definitions, "wsgi_app", call_aliases, namespace_aliases
+                )
+                if called & live_writers:
                     dynamic = True
                 elif _wsgi_app_statement_is_uncertain(node, namespace_aliases):
                     dynamic = True

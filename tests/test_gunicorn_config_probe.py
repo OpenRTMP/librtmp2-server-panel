@@ -363,6 +363,88 @@ def test_rebound_alias_is_not_the_module_namespace(tmp_path):
     assert _config_provides(path, "wsgi-app") == probe.ABSENT
 
 
+def test_bare_annotation_does_not_end_the_alias(tmp_path):
+    """g: dict changes __annotations__, not the namespace binding."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g: dict\n"
+        "g['wsgi_app'] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_namespace_alias_can_be_restored(tmp_path):
+    """g = globals() after a private rebinding makes g the module again."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g = {}\n"
+        "g = globals()\n"
+        "g['wsgi_app'] = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_known_dict_rebinding_does_not_make_the_app_uncertain(tmp_path):
+    """A bind-only config that ends with g = dict() still has no app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g['workers'] = 2\n"
+        "g = dict()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_setdefault_without_or_with_a_bare_fallback_keeps_a_proven_app(tmp_path):
+    """Neither an omitted nor a bare fallback can replace an existing app."""
+    for call in (
+        "globals().setdefault('wsgi_app')\n",
+        "fallback = 'other:app'\nglobals().setdefault('wsgi_app', fallback)\n",
+    ):
+        path = tmp_path / "gunicorn.conf.py"
+        path.write_text(
+            "wsgi_app = 'custom:app'\n" + call,
+            encoding="utf-8",
+        )
+        assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_except_alias_shadows_a_module_alias(tmp_path):
+    """An except ... as name binding shadows a module alias in the handler."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "settings = globals()\n"
+        "def configure():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as settings:\n"
+        "        settings.update(wsgi_app='unused:app')\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_helper_after_a_definite_rebinding_is_not_a_module_writer(tmp_path):
+    """A helper's g |= ... after g = {} targets a private dictionary."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g = {}\n"
+        "def configure():\n"
+        "    global g\n"
+        "    g |= {'workers': 2}\n"
+        "configure()\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
