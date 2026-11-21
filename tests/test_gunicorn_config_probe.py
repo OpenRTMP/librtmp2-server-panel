@@ -138,7 +138,6 @@ def test_aliased_namespace_writes_are_not_absent(tmp_path, source):
         "g = globals()\ng.update({'wsgi_app': 'auth_wrapper:app'})\n",
         "g = globals()\ng['wsgi_app'] = 'auth_wrapper:app'\n",
         "g = globals()\ng |= {'wsgi_app': 'auth_wrapper:app'}\n",
-        "g = globals()\ng.setdefault('wsgi_app', 'auth_wrapper:app')\n",
         "g = globals()\ng.__setitem__('wsgi_app', 'auth_wrapper:app')\n",
         "g = globals()\ng.update(wsgi_app='auth_wrapper:app')\n",
     ],
@@ -202,6 +201,90 @@ def test_helper_called_at_import_time_uses_a_module_alias(tmp_path):
         encoding="utf-8",
     )
     assert _config_provides(path) != probe.ABSENT
+
+
+def test_unrelated_union_does_not_hide_a_later_class_body_bind(tmp_path):
+    """An unrelated |= in a class body must not stop the statement scan."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "class Config:\n"
+        "    g |= {'workers': 2}\n"
+        "    g['bind'] = '127.0.0.1:8000'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) != probe.ABSENT
+
+
+def test_later_wsgi_app_assignment_clears_an_earlier_helper_write(tmp_path):
+    """A helper write before a final literal assignment must not hide it."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "def configure():\n"
+        "    g.update(wsgi_app=None)\n"
+        "configure()\n"
+        "wsgi_app = 'custom:app'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.SUPPLIED
+
+
+def test_shadowed_helper_parameter_is_not_a_module_alias(tmp_path):
+    """A helper parameter that shadows the alias must not count as a write."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "settings = globals()\n"
+        "def configure(settings):\n"
+        "    settings.update(wsgi_app='custom:app')\n"
+        "configure({})\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_setdefault_on_an_existing_none_stays_uncertain(tmp_path):
+    """setdefault may leave an explicit None in place; keep the default app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "wsgi_app = None\n"
+        "globals().setdefault('wsgi_app', 'custom:app')\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_later_wsgi_app_keyword_override_wins(tmp_path):
+    """dict.update applies keyword arguments after its positional mapping."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g.update({'wsgi_app': 'custom:app'}, wsgi_app=None)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.ABSENT
+
+
+def test_wsgi_app_unpack_after_a_literal_stays_uncertain(tmp_path):
+    """A later ** mapping can replace a literal wsgi_app value."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "g = globals()\n"
+        "g.update({'wsgi_app': 'custom:app', **{'wsgi_app': None}})\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") == probe.UNKNOWN
+
+
+def test_computed_subscript_key_is_not_a_definite_wsgi_app(tmp_path):
+    """A computed key may name another setting; do not drop the default app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "key = 'proc_name'\n"
+        "globals()[key] = 'panel'\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path, "wsgi-app") != probe.SUPPLIED
 
 
 @pytest.mark.parametrize(
