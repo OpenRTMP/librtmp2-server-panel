@@ -35,8 +35,11 @@ def test_split_command_args_reports_unparsable_env(monkeypatch):
     [
         (["--bind", "127.0.0.1:8000"], True),
         (["--bind=127.0.0.1:8000"], True),
+        (["--bi", "127.0.0.1:8000"], True),
+        (["--bin=127.0.0.1:8000"], True),
         (["-b", "127.0.0.1:8000"], True),
         (["-b127.0.0.1:8000"], True),
+        (["--backlog", "2048"], False),
         (["--workers", "2"], False),
         # A value that spells a bind option still counts: skipping the image
         # default is the safe direction.
@@ -108,6 +111,40 @@ def test_explicit_parent_relative_config_path_matches_gunicorn(tmp_path):
     assert probe._probe(
         "bind", ["-c", "../operator.conf.py"], [], str(working_dir)
     ) == probe.SUPPLIED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "g = globals()\ng['bind'] = ['127.0.0.1:8000']\n",
+        "g = globals()\ng.update({'bind': ['127.0.0.1:8000']})\n",
+        "g = globals()\ng.setdefault('bind', [])\n",
+        "g = globals()\ng.__setitem__('bind', [])\n",
+        "g = globals()\ng |= {'bind': []}\n",
+        "g = vars()\ng['bind'] = []\n",
+        "g = locals()\ng['bind'] = []\n",
+    ],
+)
+def test_aliased_namespace_writes_are_not_absent(tmp_path, source):
+    """A namespace alias must not hide an operator bind from the probe."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(source, encoding="utf-8")
+    assert _config_provides(path) != probe.ABSENT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "g = globals()\ng.update({'wsgi_app': 'auth_wrapper:app'})\n",
+        "g = globals()\ng['wsgi_app'] = 'auth_wrapper:app'\n",
+        "g = globals()\ng |= {'wsgi_app': 'auth_wrapper:app'}\n",
+    ],
+)
+def test_aliased_namespace_wsgi_app_is_not_absent(tmp_path, source):
+    """A namespace alias must not make the image keep its default app."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(source, encoding="utf-8")
+    assert _config_provides(path, "wsgi-app") != probe.ABSENT
 
 
 @pytest.mark.parametrize(
