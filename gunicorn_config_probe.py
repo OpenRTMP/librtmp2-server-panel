@@ -1728,6 +1728,14 @@ def _scan_module_bindings(
     namespace_aliases = set(globals_aliases)
     possible_aliases = set(globals_aliases)
     for node in _iter_module_assignments(statements):
+        # Python evaluates a statement's right-hand side before binding its
+        # target, so writes through the incoming alias count for this node and
+        # the rebinding only applies to later ones.
+        restored = (
+            _helper_restored_aliases(node, definitions, call_aliases)
+            if definitions is not None
+            else set()
+        )
         binding_kind = _import_binding_kind(node, name)
         if binding_kind == "explicit":
             return SUPPLIED, dynamic
@@ -1741,7 +1749,7 @@ def _scan_module_bindings(
         if _statement_writes_named_attribute(node, name):
             dynamic = True
         if _has_dynamic_namespace_write(
-            node, name, possible_aliases
+            node, name, possible_aliases | restored
         ) and not _is_namespace_clear(node, possible_aliases):
             dynamic = True
         if definitions is not None:
@@ -1752,9 +1760,7 @@ def _scan_module_bindings(
                 definitions,
                 call_aliases,
             )
-            possible_aliases |= _helper_restored_aliases(
-                node, definitions, call_aliases
-            )
+        possible_aliases |= restored
     return None, dynamic
 
 
