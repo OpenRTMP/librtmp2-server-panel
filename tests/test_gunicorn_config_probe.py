@@ -996,6 +996,32 @@ def test_bind_probe_follows_a_namespace_alias_argument_to_a_helper(tmp_path):
     assert _config_provides(path) == probe.UNKNOWN
 
 
+def test_bind_probe_ignores_an_alias_rebound_to_a_private_dict(tmp_path):
+    """The call-site alias set is ordered: a later private dict is not globals."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "options = globals()\n"
+        "options = {}\n"
+        "def configure(settings):\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure(options)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_bind_probe_ignores_a_helper_private_dict_argument(tmp_path):
+    """A helper writing a private dict argument does not supply bind."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure(settings):\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure({})\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
 def test_bind_write_before_alias_rebinding_is_seen(tmp_path):
     """The assignment RHS writes through the old alias before it is replaced."""
     path = tmp_path / "gunicorn.conf.py"

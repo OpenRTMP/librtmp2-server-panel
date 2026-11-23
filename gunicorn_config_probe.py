@@ -1752,6 +1752,14 @@ def _scan_module_bindings(
             node, name, possible_aliases | restored
         ) and not _is_namespace_clear(node, possible_aliases):
             dynamic = True
+        # A helper that writes through the namespace passed at this call site
+        # (`configure(globals())`); the alias set is the one in effect here, so
+        # a name already rebound to a private dict is not treated as the module
+        # namespace.
+        if definitions is not None and _statement_calls_alias_argument_writer(
+            node, name, definitions, call_aliases, possible_aliases | restored
+        ):
+            dynamic = True
         if definitions is not None:
             _apply_alias_rebinding(
                 node,
@@ -2188,10 +2196,10 @@ def _direct_wsgi_state(node, namespace_aliases):
     return state
 
 
-def _statement_calls_alias_writer(
+def _statement_calls_alias_argument_writer(
     node, name, definitions, call_aliases, aliases
 ):
-    """Return True when an import-time call can write ``name``."""
+    """Return True when an import-time call writes ``name`` through an alias arg."""
     for child, in_class_body in _iter_module_scope_entries(node):
         if isinstance(child, ast.Call) and _call_alias_writes(
             child,
@@ -2202,6 +2210,17 @@ def _statement_calls_alias_writer(
             allow_locals=not in_class_body,
         ):
             return True
+    return False
+
+
+def _statement_calls_alias_writer(
+    node, name, definitions, call_aliases, aliases
+):
+    """Return True when an import-time call can write ``name``."""
+    if _statement_calls_alias_argument_writer(
+        node, name, definitions, call_aliases, aliases
+    ):
+        return True
     called = _called_local_names([node], definitions, call_aliases)
     if not called:
         return False
@@ -2359,16 +2378,8 @@ def config_provides_setting(path, name):
         # A local helper invoked at import time can assign the setting even
         # though its body is not module scope. Only report uncertainty when the
         # called helper can actually write it; an unrelated helper stays ABSENT.
-        # A helper that writes through a namespace argument (`cfg(globals())`)
-        # is resolved at its call site, which `_local_writer_names` cannot see.
-        possible_aliases = _collect_possible_aliases(tree)
         if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
             definitions, name, aliases, globals_aliases
-        ) or any(
-            _statement_calls_alias_writer(
-                node, name, definitions, aliases, possible_aliases
-            )
-            for node in tree.body
         ):
             dynamic = True
     except RecursionError:
