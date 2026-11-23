@@ -1022,6 +1022,61 @@ def test_bind_probe_ignores_a_helper_private_dict_argument(tmp_path):
     assert _config_provides(path) == probe.ABSENT
 
 
+def test_bind_probe_ignores_a_parameter_rebound_before_the_write(tmp_path):
+    """A first-statement private rebinding ends the namespace alias."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure(settings):\n"
+        "    settings = {}\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.ABSENT
+
+
+def test_bind_probe_keeps_a_realiased_parameter_uncertain(tmp_path):
+    """A second store can put the namespace back into the parameter."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure(settings):\n"
+        "    settings = {}\n"
+        "    settings = globals()\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
+def test_bind_probe_keeps_a_write_made_before_the_parameter_rebind(tmp_path):
+    """A write before the rebinding still reaches the passed namespace."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure(settings):\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "    settings = {}\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
+def test_bind_probe_follows_a_helper_returned_namespace(tmp_path):
+    """An alias returned by a local helper is resolved in order."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def make_options():\n"
+        "    return globals()\n"
+        "options = make_options()\n"
+        "def configure(settings):\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure(options)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
 def test_bind_write_before_alias_rebinding_is_seen(tmp_path):
     """The assignment RHS writes through the old alias before it is replaced."""
     path = tmp_path / "gunicorn.conf.py"

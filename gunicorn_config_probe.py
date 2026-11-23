@@ -1644,6 +1644,48 @@ def _call_argument_alias_params(call, definition, aliases, prebound=(), allow_lo
     return bound
 
 
+def _first_statement_rebinds_parameter_to_private(definition, parameter):
+    """Return True when the parameter is definitely replaced before any use.
+
+    Only a direct first-statement assignment to a definitely non-namespace
+    literal counts, and only when no other part of the function stores to that
+    name or declares it nonlocal. Anything conditional, deferred or
+    self-referential stays unknown.
+    """
+    if not definition.body or not isinstance(parameter, str):
+        return False
+    first = definition.body[0]
+    private = (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant)
+    if isinstance(first, ast.Assign) and len(first.targets) == 1:
+        target = first.targets[0]
+        rebinds = (
+            isinstance(target, ast.Name)
+            and target.id == parameter
+            and isinstance(first.value, private)
+        )
+    elif isinstance(first, ast.AnnAssign) and first.value is not None:
+        rebinds = (
+            isinstance(first.target, ast.Name)
+            and first.target.id == parameter
+            and isinstance(first.value, private)
+        )
+    else:
+        rebinds = False
+    if not rebinds:
+        return False
+    stores = 0
+    for node in ast.walk(definition):
+        if (
+            isinstance(node, ast.Name)
+            and node.id == parameter
+            and isinstance(node.ctx, ast.Store)
+        ):
+            stores += 1
+        if isinstance(node, ast.Nonlocal) and parameter in node.names:
+            return False
+    return stores == 1
+
+
 def _call_alias_writes(
     call, name, definitions, call_aliases, aliases, seen=None, allow_locals=True
 ):
@@ -1670,6 +1712,13 @@ def _call_alias_writes(
         params = _call_argument_alias_params(
             call, definition, aliases, prebound, allow_locals
         )
+        params = {
+            parameter
+            for parameter in params
+            if not _first_statement_rebinds_parameter_to_private(
+                definition, parameter
+            )
+        }
         if not params:
             continue
         if _body_writes_global_name(
