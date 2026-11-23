@@ -13,6 +13,11 @@ only begin at a future `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- The bind probe resolves a helper that writes `bind` through a passed module
+  namespace (`configure(globals())`) or a namespace alias, so the entrypoint no
+  longer overrides an operator's loopback bind with its own `0.0.0.0:8000`.
+
 ## [0.1.17] — 2026-11-21
 
 ### Security

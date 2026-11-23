@@ -971,6 +971,31 @@ def test_bind_probe_follows_a_helper_returned_alias(tmp_path):
     assert _config_provides(path) == probe.UNKNOWN
 
 
+def test_bind_probe_follows_a_namespace_argument_to_a_helper(tmp_path):
+    """A helper writing through a passed namespace still supplies bind."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "def configure(settings):\n"
+        "    settings['bind'] = '127.0.0.1:8000'\n"
+        "configure(globals())\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
+def test_bind_probe_follows_a_namespace_alias_argument_to_a_helper(tmp_path):
+    """Passing a module-level namespace alias exercises the same path."""
+    path = tmp_path / "gunicorn.conf.py"
+    path.write_text(
+        "options = globals()\n"
+        "def configure(settings):\n"
+        "    settings.update(bind='127.0.0.1:8000')\n"
+        "configure(options)\n",
+        encoding="utf-8",
+    )
+    assert _config_provides(path) == probe.UNKNOWN
+
+
 def test_bind_write_before_alias_rebinding_is_seen(tmp_path):
     """The assignment RHS writes through the old alias before it is replaced."""
     path = tmp_path / "gunicorn.conf.py"
