@@ -2188,12 +2188,14 @@ def _direct_wsgi_state(node, namespace_aliases):
     return state
 
 
-def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
-    """Return True when an import-time call can write ``wsgi_app``."""
+def _statement_calls_alias_writer(
+    node, name, definitions, call_aliases, aliases
+):
+    """Return True when an import-time call can write ``name``."""
     for child, in_class_body in _iter_module_scope_entries(node):
         if isinstance(child, ast.Call) and _call_alias_writes(
             child,
-            "wsgi_app",
+            name,
             definitions,
             call_aliases,
             aliases,
@@ -2203,7 +2205,7 @@ def _statement_calls_wsgi_writer(node, definitions, call_aliases, aliases):
     called = _called_local_names([node], definitions, call_aliases)
     if not called:
         return False
-    writers = _local_writer_names(definitions, "wsgi_app", call_aliases, aliases)
+    writers = _local_writer_names(definitions, name, call_aliases, aliases)
     return bool(called & writers)
 
 
@@ -2233,8 +2235,8 @@ def _statement_keeps_app_unknown(
         return not proven
     # A helper called at this position may write wsgi_app. A later
     # unconditional assignment still clears the uncertainty.
-    return _statement_calls_wsgi_writer(
-        node, definitions, call_aliases, possible_aliases
+    return _statement_calls_alias_writer(
+        node, "wsgi_app", definitions, call_aliases, possible_aliases
     ) or _wsgi_app_statement_is_uncertain(node, possible_aliases)
 
 
@@ -2357,8 +2359,16 @@ def config_provides_setting(path, name):
         # A local helper invoked at import time can assign the setting even
         # though its body is not module scope. Only report uncertainty when the
         # called helper can actually write it; an unrelated helper stays ABSENT.
+        # A helper that writes through a namespace argument (`cfg(globals())`)
+        # is resolved at its call site, which `_local_writer_names` cannot see.
+        possible_aliases = _collect_possible_aliases(tree)
         if _called_local_names(tree.body, definitions, aliases) & _local_writer_names(
             definitions, name, aliases, globals_aliases
+        ) or any(
+            _statement_calls_alias_writer(
+                node, name, definitions, aliases, possible_aliases
+            )
+            for node in tree.body
         ):
             dynamic = True
     except RecursionError:
